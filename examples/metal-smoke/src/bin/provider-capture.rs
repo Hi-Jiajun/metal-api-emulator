@@ -9972,6 +9972,12 @@ fn run_render_case(
         // every other case leaves the list empty, which the rails execute as
         // "the fragment stage samples nothing" (`research/docs/23` §3.3, v70).
         textures,
+        // The suite's render window states no runtime sampler: every captured
+        // case's fragment stage reads through the state the module carries
+        // (reviewed pair) or the contract declares (translated arms), so the
+        // list stays empty and every captured frame keeps its bytes
+        // (`research/docs/23` §3.3, v102).
+        samplers: Vec::new(),
         present,
     }));
 

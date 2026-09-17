@@ -178,6 +178,7 @@ fn contract(sampler: SamplerPolicy, footprint: TextureFootprintProof) -> RenderP
             texture_type: TextureType::D2,
             format: TextureFormat::Rgba8Unorm,
             sampler: Some(sampler),
+            runtime_sampler: None,
             footprint,
         }],
     }
@@ -244,6 +245,7 @@ fn compile_declaring_kernel(
 
 fn render_pass(pipeline: PipelineId, textures: Vec<TextureView>) -> RenderPassDescriptor {
     RenderPassDescriptor {
+        samplers: Vec::new(),
         stage_buffers: Vec::new(),
         blend: None,
         cull: None,

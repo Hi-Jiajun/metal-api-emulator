@@ -309,6 +309,7 @@ mod tests {
 
     fn render_pass() -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,

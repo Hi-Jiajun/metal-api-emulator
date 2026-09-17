@@ -740,6 +740,42 @@ impl SamplerPolicy {
     }
 }
 
+/// One runtime sampler a render pass executes with
+/// (`research/docs/23` §3.3, v102).
+///
+/// A runtime sampler is Metal's `[[sampler(n)]]` argument, not the
+/// AIR-embedded `constexpr sampler` the module carries: the fragment stage's
+/// sampling operations were lowered against *whatever state the pass binds*,
+/// so the module holds no state and the request states it here. Entry
+/// `metal_binding` is the fragment stage's `[[sampler(n)]]` index, and `policy`
+/// is the state both rails create the descriptor's sampler from.
+///
+/// The list is canonical and unique — ascending `metal_binding`, no index
+/// twice, every index below [`MAX_RENDER_SAMPLERS`] — because the state is
+/// keyed by the Metal sampler index, exactly as the texture list is keyed by
+/// the Metal texture index. The *pairing* with the textures that sample
+/// through it is the pipeline contract's
+/// ([`TextureBindingContract::runtime_sampler`]), so a pass cannot bind a
+/// runtime sampler nothing pairs with and cannot leave one the module reads
+/// unbound ([`ContractError::UnpairedRuntimeSamplerBinding`] /
+/// [`ContractError::MissingRuntimeSamplerBinding`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderSamplerBinding {
+    /// The Metal `[[sampler(n)]]` argument index this state belongs to.
+    pub metal_binding: u32,
+    /// The state the descriptor's sampler is created with.
+    pub policy: SamplerPolicy,
+}
+
+impl RenderSamplerBinding {
+    pub const fn new(metal_binding: u32, policy: SamplerPolicy) -> Self {
+        Self {
+            metal_binding,
+            policy,
+        }
+    }
+}
+
 /// How far a shader reaches into one texture binding, or — for a storage
 /// image — the extent the provider lands back to the owner.
 ///
@@ -787,6 +823,23 @@ pub struct TextureBindingContract {
     /// rather than a second `None`-carrying policy value so a storage
     /// declaration cannot state a state the rail would then have to ignore.
     pub sampler: Option<SamplerPolicy>,
+    /// The runtime `[[sampler(n)]]` argument this binding's samples read
+    /// through, or `None` when the module's own AIR constexpr sampler states
+    /// them (`research/docs/23` §3.3, v102).
+    ///
+    /// A sampled binding states exactly one of [`Self::sampler`] and this
+    /// field: the first is the state the module's AIR embeds, the second names
+    /// the sampler *argument* whose state the pass declares
+    /// ([`RenderSamplerBinding`]). The index is the Metal sampler index, so it
+    /// names an entry of the pass's sampler list rather than a position, and
+    /// the pair rules in [`RenderPipelineContract::validate_against`] hold the
+    /// two lists to each other in both directions. A storage image states
+    /// neither, exactly as it states no [`Self::sampler`].
+    ///
+    /// The field stays `Option`-typed for the same reason [`Self::sampler`]
+    /// does: a declaration cannot name a sampler the access has no meaning
+    /// for, so there is no sentinel index that would have to be ignored.
+    pub runtime_sampler: Option<u32>,
     /// How far the module's own metadata says the shader reaches.
     pub footprint: TextureFootprintProof,
 }
@@ -827,6 +880,34 @@ impl TextureBindingContract {
             texture_type: TextureType::D2,
             format,
             sampler: Some(sampler),
+            runtime_sampler: None,
+            footprint: TextureFootprintProof::WholeView,
+        }
+    }
+
+    /// The render-side runtime-sampler shape (`research/docs/23` §3.3, v102):
+    /// a D2, single-sample texture the fragment stage samples through the
+    /// runtime `[[sampler(sampler_binding)]]` argument.
+    ///
+    /// The state is deliberately absent. A runtime sampler's state is a
+    /// request fact on both rails — Metal binds the `MTLSamplerState` when the
+    /// draw is encoded, not when the pipeline is created — so a declaration
+    /// that pinned one here would be stating something the pipeline does not
+    /// own. What the declaration does state is the *pair*: this texture reads
+    /// through that sampler argument, which is what the pair rules and the
+    /// rails' reflection walk check.
+    pub const fn sampled_runtime(
+        metal_binding: u32,
+        format: TextureFormat,
+        sampler_binding: u32,
+    ) -> Self {
+        Self {
+            metal_binding,
+            access: TextureAccess::Sampled,
+            texture_type: TextureType::D2,
+            format,
+            sampler: None,
+            runtime_sampler: Some(sampler_binding),
             footprint: TextureFootprintProof::WholeView,
         }
     }
@@ -850,6 +931,7 @@ impl TextureBindingContract {
             texture_type: TextureType::D2,
             format,
             sampler: None,
+            runtime_sampler: None,
             footprint: TextureFootprintProof::WholeView,
         }
     }
@@ -1227,6 +1309,20 @@ impl PipelineContract {
             previous_texture = Some(binding.metal_binding);
             if textures.insert(binding.metal_binding, ()).is_some() {
                 return Err(ContractError::DuplicateBinding(binding.metal_binding));
+            }
+            // The runtime `[[sampler(n)]]` form is the render face's
+            // (`research/docs/23` §3.3, v102), so it is refused before the
+            // half-statement rule below: a compute binding's state is the
+            // module's own AIR constexpr sampler, and a kernel that took a
+            // sampler argument would be a shape this narrow class has no
+            // descriptor slot for. Naming the face's own fact keeps the two
+            // refusals apart — "this face takes no runtime sampler" is not the
+            // same operator action as "this declaration states one half".
+            if let Some(sampler_binding) = binding.runtime_sampler {
+                return Err(ContractError::RuntimeSamplerDeclarationUnsupported {
+                    binding: binding.metal_binding,
+                    sampler_binding,
+                });
             }
             // The access decides whether the binding is executed with a
             // sampler at all (`research/docs/26` §21.4, C2): a sampled binding
@@ -1760,14 +1856,37 @@ pub enum StoreOp {
 /// of those attachments it can execute today (`docs/23` §4.2).
 pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 
-/// The sampled textures a render pass may bind, which is the render-sampler
-/// shape the fragment stage reads (`research/docs/23` §3.3, v70): one texture
-/// per draw, because the reviewed stage samples exactly one 4×4
-/// `rgba8_unorm` surface. A provider's
-/// `ProviderCapabilities::max_render_textures` stays independent of this
-/// value: the core contract admits the shape, while each rail declares how
-/// many of those bindings it can execute today (`docs/23` §4.2).
-pub const MAX_RENDER_TEXTURES: usize = 1;
+/// The sampled textures a render pass may bind (`research/docs/23` §3.3,
+/// v70/v102).
+///
+/// The render-sampler increment admitted one 4×4 `rgba8_unorm` surface,
+/// because the reviewed stage samples exactly one. The census that followed it
+/// found the first blocking shape on the *declaration* face: 2.5% of the
+/// sampled draws declare two or three textures, and a pass had no way to state
+/// them. Eight is the value this increment states, and it is a contract
+/// ceiling rather than a device fact: Vulkan's guaranteed
+/// `maxPerStageDescriptorSampledImages` floor is 16 and Metal's own fragment
+/// texture argument table is larger still, so eight covers the observed
+/// shapes with headroom while staying inside what every admitted device
+/// promises. A provider's `ProviderCapabilities::max_render_textures` stays
+/// independent of this value: the core contract admits the shape, while each
+/// rail declares how many of those bindings it can execute today (`docs/23`
+/// §4.2), and each rail's own window refuses the rest by name
+/// (`render_texture_limit`).
+pub const MAX_RENDER_TEXTURES: usize = 8;
+
+/// The runtime samplers a render pass may declare, and the largest
+/// `[[sampler(n)]]` index a render texture declaration may pair with
+/// (`research/docs/23` §3.3, v102).
+///
+/// A runtime sampler is a Metal sampler *argument* rather than an AIR
+/// constexpr sampler: the fragment stage's `[[sampler(n)]]` parameter, whose
+/// state the module does not carry and the pass states. Metal's argument table
+/// holds at most 16 such arguments on every device, and the pinned
+/// translator's own sampler table (`metal2vulkan::reflect::SAMPLER_ARGUMENT_COUNT`)
+/// is the same 16, so the bound is the platform's own rather than a narrowing
+/// this contract invents.
+pub const MAX_RENDER_SAMPLERS: usize = 16;
 
 /// The sampled textures a compute pass may bind, which is the compute-sampler
 /// shape the reviewed fixtures read (`research/docs/16` §4.5, §4.6; `docs/26`
@@ -2164,6 +2283,49 @@ pub fn validate_render_texture_binding(
             index,
             sample_count: texture.sample_count,
         });
+    }
+    Ok(())
+}
+
+/// Validate one pass's runtime sampler list (`research/docs/23` §3.3, v102).
+///
+/// The list is the request's own statement of the states its fragment stage's
+/// `[[sampler(n)]]` arguments execute with, so it answers to the same three
+/// rules the stage-buffer list does: inside the Metal argument table's own
+/// bound ([`MAX_RENDER_SAMPLERS`]), canonical (ascending `metal_binding`) and
+/// unique. A list that repeats an index would leave one state silently
+/// overwriting the other, and one that is not ascending would make the
+/// declaration's position mean something the Metal ABI does not.
+///
+/// Whether the list *pairs* with the pipeline contract's texture declarations
+/// is [`RenderPipelineContract::validate_against`]'s question: it is a fact
+/// about the two sides together, not about either list alone.
+pub fn validate_render_sampler_bindings(
+    samplers: &[RenderSamplerBinding],
+) -> Result<(), ContractError> {
+    if samplers.len() > MAX_RENDER_SAMPLERS {
+        return Err(ContractError::RenderSamplerLimitExceeded {
+            requested: samplers.len(),
+            maximum: MAX_RENDER_SAMPLERS,
+        });
+    }
+    let mut previous: Option<u32> = None;
+    for sampler in samplers {
+        if usize::try_from(sampler.metal_binding).unwrap_or(usize::MAX) >= MAX_RENDER_SAMPLERS {
+            return Err(ContractError::RenderSamplerIndexExceeded {
+                index: sampler.metal_binding,
+                maximum: MAX_RENDER_SAMPLERS,
+            });
+        }
+        if previous.is_some_and(|previous| previous >= sampler.metal_binding) {
+            if previous == Some(sampler.metal_binding) {
+                return Err(ContractError::DuplicateBinding(sampler.metal_binding));
+            }
+            return Err(ContractError::NonCanonicalBindingOrder(
+                "render sampler bindings",
+            ));
+        }
+        previous = Some(sampler.metal_binding);
     }
     Ok(())
 }
@@ -3661,11 +3823,24 @@ pub struct RenderPassDescriptor {
     /// compute pass at all — the same rule the vertex and index streams
     /// follow. The entry's position is the binding index,
     /// [`validate_render_texture_binding`] holds the view's own `metal_binding`
-    /// to it, and the first increment caps the list at
-    /// [`MAX_RENDER_TEXTURES`]: the reviewed fragment stage samples exactly
-    /// one single-sample 2D surface. A pass that binds none keeps the exact
-    /// pre-v70 bytes.
+    /// to it, and the list is capped at [`MAX_RENDER_TEXTURES`] single-sample
+    /// 2D surfaces (`research/docs/23` §3.3, v70/v102) — the reviewed stage
+    /// samples one, and the translated stage samples as many as its own
+    /// reflection names. A pass that binds none keeps the exact pre-v70 bytes.
     pub textures: Vec<TextureView>,
+    /// The runtime samplers the fragment stage executes with, in canonical
+    /// order (`research/docs/23` §3.3, v102).
+    ///
+    /// Entry `metal_binding` is the fragment stage's `[[sampler(n)]]` argument
+    /// and `policy` the state the descriptor's sampler is created with, so the
+    /// list is the request-side half of a pairing whose other half is the
+    /// pipeline contract's
+    /// ([`TextureBindingContract::runtime_sampler`]): every sampler the
+    /// contract pairs a texture with has to be bound here, and every sampler
+    /// bound here has to be one the contract pairs. A pass whose fragment
+    /// stage carries no `[[sampler(n)]]` argument binds none and keeps the
+    /// exact pre-v102 bytes.
+    pub samplers: Vec<RenderSamplerBinding>,
     /// Buffers the pass's stages read or write directly, in canonical order
     /// (`research/docs/23` §3.3, v83): vertex bindings first by index, then
     /// fragment bindings by index.
@@ -3903,6 +4078,12 @@ impl RenderPassDescriptor {
                 });
             }
         }
+        // Runtime samplers (`research/docs/23` §3.3, v102): the request's own
+        // half of the pairing, and the only statement of the state a runtime
+        // `[[sampler(n)]]` argument executes with. The rules are the list's own
+        // — bound, canonical and unique; the pairing with the pipeline's
+        // declarations is the pair walk's.
+        validate_render_sampler_bindings(&self.samplers)?;
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
             return Err(ContractError::VertexBufferLimitExceeded {
                 requested: self.vertex_buffers.len(),
@@ -4464,6 +4645,21 @@ pub struct RenderPipelineContract {
     /// names carries that same state is the execution rail's, exactly as it is
     /// for compute.
     ///
+    /// A declaration states its sampler in exactly one of two forms
+    /// (`research/docs/23` §3.3, v102). `sampler` is the state the module's own
+    /// AIR constexpr sampler carries, which is what the reviewed pair and every
+    /// translated module with static samplers answers with.
+    /// `runtime_sampler` names the `[[sampler(n)]]` *argument* the binding
+    /// samples through, whose state the module does not carry and the pass
+    /// states ([`RenderSamplerBinding`]); the pair rules hold the two lists to
+    /// each other in both directions, so the declaration cannot name a sampler
+    /// the pass leaves unbound and the pass cannot bind one nothing pairs with.
+    ///
+    /// The list is capped at [`MAX_RENDER_TEXTURES`] (`v102`): the reviewed
+    /// stage samples one surface, while a translated stage samples as many as
+    /// its own reflection names, and the rails' own windows refuse the rest by
+    /// name.
+    ///
     /// A pipeline that declares none — every pre-v100 registration — keeps the
     /// exact bytes it had, and its passes bind none either.
     pub textures: Vec<TextureBindingContract>,
@@ -4689,11 +4885,46 @@ impl RenderPipelineContract {
                     proof: declared.footprint,
                 });
             }
+            // A declaration that samples through a runtime `[[sampler(n)]]`
+            // argument pairs with the pass's own statement of that sampler's
+            // state (`research/docs/23` §3.3, v102). The two halves are the
+            // declaration's index and the pass's binding list, so a declaration
+            // whose sampler the pass never binds is refused here — the
+            // descriptor the module samples through would otherwise be
+            // undefined — and the reverse direction is the walk right below.
+            if let Some(sampler_binding) = declared.runtime_sampler {
+                if !pass
+                    .samplers
+                    .iter()
+                    .any(|sampler| sampler.metal_binding == sampler_binding)
+                {
+                    return Err(ContractError::MissingRuntimeSamplerBinding {
+                        texture_binding: declared.metal_binding,
+                        sampler_binding,
+                    });
+                }
+            }
         }
         for (index, bound) in pass.textures.iter().enumerate() {
             if self.textures.get(index).is_none() {
                 return Err(ContractError::UndeclaredTextureBinding {
                     binding: bound.metal_binding,
+                });
+            }
+        }
+        // The runtime sampler list's other direction: every sampler the pass
+        // binds has to be one a texture declaration pairs with. A state nothing
+        // samples through would fill a descriptor slot the registration never
+        // said a texture reads through, which is exactly the half-statement the
+        // declaration list exists to prevent.
+        for sampler in &pass.samplers {
+            let paired = self
+                .textures
+                .iter()
+                .any(|declared| declared.runtime_sampler == Some(sampler.metal_binding));
+            if !paired {
+                return Err(ContractError::UnpairedRuntimeSamplerBinding {
+                    sampler_binding: sampler.metal_binding,
                 });
             }
         }
@@ -4772,11 +5003,36 @@ fn validate_render_texture_declarations(
                 metal_binding: binding.metal_binding,
             });
         }
-        if binding.sampler.is_some() != (binding.access == TextureAccess::Sampled) {
+        // A sampled binding states *one* of the two sampler forms
+        // (`research/docs/23` §3.3, v100/v102): the AIR-embedded state the
+        // module carries, or the runtime `[[sampler(n)]]` argument the pass
+        // states the state of. Neither form alone would tell a rail where the
+        // sample's state comes from, and both together would leave it two
+        // answers to choose between; a storage image states neither, exactly as
+        // it states no sampler at all.
+        let sampled = binding.access == TextureAccess::Sampled;
+        let states_static = binding.sampler.is_some();
+        let states_runtime = binding.runtime_sampler.is_some();
+        // Stated as the two shapes that *are* admissible, so the refusal reads
+        // as one condition rather than as a negation of a disjunction.
+        let one_form_only = states_static != states_runtime;
+        let admissible = match sampled {
+            true => one_form_only,
+            false => !states_static && !states_runtime,
+        };
+        if !admissible {
             return Err(ContractError::TextureSamplerDeclarationMismatch {
                 binding: binding.metal_binding,
                 access: binding.access,
             });
+        }
+        if let Some(sampler_binding) = binding.runtime_sampler {
+            if usize::try_from(sampler_binding).unwrap_or(usize::MAX) >= MAX_RENDER_SAMPLERS {
+                return Err(ContractError::RenderSamplerIndexExceeded {
+                    index: sampler_binding,
+                    maximum: MAX_RENDER_SAMPLERS,
+                });
+            }
         }
         if binding.footprint == TextureFootprintProof::Unbounded {
             return Err(ContractError::RenderTextureFootprintProofUnsupported {
@@ -9684,6 +9940,30 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "render_texture_footprint_unsupported",
         ),
+        // Runtime sampler contract (`research/docs/23` §3.3, v102). The cap and
+        // the index bound are the texture list's own narrowings one face over;
+        // the two pairing rules name the runtime `[[sampler(n)]]` argument that
+        // had no counterpart, which is the shape this increment executes.
+        E::RenderSamplerLimitExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_sampler_limit",
+        ),
+        E::RenderSamplerIndexExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_sampler_index_unsupported",
+        ),
+        E::MissingRuntimeSamplerBinding { .. } => (
+            ProviderErrorClass::Capability,
+            "render_runtime_sampler_missing",
+        ),
+        E::UnpairedRuntimeSamplerBinding { .. } => (
+            ProviderErrorClass::Capability,
+            "render_runtime_sampler_unpaired",
+        ),
+        E::RuntimeSamplerDeclarationUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "compute_runtime_sampler_unsupported",
+        ),
         // Stage buffer contract (`research/docs/23` §3.3, v83). The cap, the
         // index bound and the admitted proof are first-increment narrowings on
         // a well-formed request, so they keep the same class and shape the
@@ -11655,6 +11935,43 @@ pub enum ContractError {
         index: u32,
         proof: TextureFootprintProof,
     },
+    // Runtime sampler contract (`research/docs/23` §3.3, v102). The cap and the
+    // index bound are the same first-increment narrowings the texture list's
+    // count and the stage-buffer index carry, so they keep their own
+    // capability slugs; the two pairing rules name the half that disagreed.
+    /// A render pass declares more runtime samplers than
+    /// [`MAX_RENDER_SAMPLERS`].
+    RenderSamplerLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
+    /// A runtime sampler binding index is at or past [`MAX_RENDER_SAMPLERS`],
+    /// which is the Metal sampler argument table's own size.
+    RenderSamplerIndexExceeded {
+        index: u32,
+        maximum: usize,
+    },
+    /// A render texture declaration pairs with a runtime `[[sampler(n)]]`
+    /// argument the pass does not bind, so the descriptor the module samples
+    /// through would be undefined (`research/docs/23` §3.3, v102).
+    MissingRuntimeSamplerBinding {
+        texture_binding: u32,
+        sampler_binding: u32,
+    },
+    /// A pass binds a runtime `[[sampler(n)]]` argument no texture declaration
+    /// pairs with, so the state would fill a slot the registration never said
+    /// a texture reads through.
+    UnpairedRuntimeSamplerBinding {
+        sampler_binding: u32,
+    },
+    /// A render texture declaration states a runtime sampler index the compute
+    /// face's narrow class cannot execute (`research/docs/26` §21.3): a
+    /// compute binding's state is the module's own AIR constexpr sampler, and
+    /// the face has no `[[sampler(n)]]` argument to pair one with.
+    RuntimeSamplerDeclarationUnsupported {
+        binding: u32,
+        sampler_binding: u32,
+    },
     // Compute texture contract (`research/docs/26` §21.3). The pair rules are
     // caller-fixable structure, so they keep the trace-contract slug; the
     // reach proof is the first-increment narrowing and keeps its own
@@ -12492,6 +12809,35 @@ impl fmt::Display for ContractError {
             Self::RenderTextureFootprintProofUnsupported { index, proof } => write!(
                 formatter,
                 "render texture declaration {index} states a {proof:?} footprint, but the render sampler reads a whole tightly packed view"
+            ),
+            Self::RenderSamplerLimitExceeded {
+                requested,
+                maximum,
+            } => write!(
+                formatter,
+                "render pass declares {requested} runtime samplers, above the contract maximum {maximum}"
+            ),
+            Self::RenderSamplerIndexExceeded { index, maximum } => write!(
+                formatter,
+                "runtime sampler binding index {index} is at or past the Metal sampler argument table's own size {maximum}"
+            ),
+            Self::MissingRuntimeSamplerBinding {
+                texture_binding,
+                sampler_binding,
+            } => write!(
+                formatter,
+                "render texture declaration {texture_binding} samples through runtime [[sampler({sampler_binding})]], but the pass binds no runtime sampler there"
+            ),
+            Self::UnpairedRuntimeSamplerBinding { sampler_binding } => write!(
+                formatter,
+                "the pass binds runtime [[sampler({sampler_binding})]], but no texture declaration pairs with it"
+            ),
+            Self::RuntimeSamplerDeclarationUnsupported {
+                binding,
+                sampler_binding,
+            } => write!(
+                formatter,
+                "compute texture declaration {binding} states runtime [[sampler({sampler_binding})]], but the compute narrow class reads through the module's own AIR constexpr sampler"
             ),
             Self::MissingTextureBinding { binding } => write!(
                 formatter,
@@ -13754,6 +14100,7 @@ mod tests {
 
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
@@ -17161,6 +17508,7 @@ mod tests {
 
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
@@ -19670,6 +20018,7 @@ mod tests {
 
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
@@ -19775,6 +20124,7 @@ mod tests {
             texture_type: view.texture_type,
             format: view.format,
             sampler: (view.access == TextureAccess::Sampled).then(SamplerPolicy::synthesized_read),
+            runtime_sampler: None,
             footprint: TextureFootprintProof::WholeView,
         }
     }
@@ -20520,15 +20870,216 @@ mod tests {
             })
         );
 
-        // The contract's own ceiling is one texture per pass: the second entry
-        // is refused before either texture's shape is read.
+        // The contract's own ceiling is [`MAX_RENDER_TEXTURES`] sampled
+        // surfaces per pass (`research/docs/23` §3.3, v102): two and three
+        // entries are the census's own shapes and are *admitted*, while the
+        // entry above the cap is refused before its shape is read. The views
+        // carry their own identities, because one view sampled twice is the
+        // duplicate-identity refusal rather than the count rule.
         let mut value = render_texture_trace();
         render_entry(&mut value).textures = vec![sampled_texture_view(0), sampled_texture_view(1)];
+        let mut second = sampled_texture_view(1);
+        second.view_id = ViewId::new(84);
+        second.allocation_id = AllocationId::new(54);
+        render_entry(&mut value).textures = vec![sampled_texture_view(0), second.clone()];
+        value
+            .validate()
+            .expect("two sampled textures are inside the v102 ceiling");
+        let mut value = render_texture_trace();
+        let mut textures = Vec::new();
+        for binding in 0..=MAX_RENDER_TEXTURES as u32 {
+            let mut view = sampled_texture_view(binding);
+            view.view_id = ViewId::new(83 + u64::from(binding));
+            view.allocation_id = AllocationId::new(53 + u64::from(binding));
+            textures.push(view);
+        }
+        render_entry(&mut value).textures = textures;
         assert_eq!(
             value.validate(),
             Err(ContractError::RenderTextureLimitExceeded {
-                requested: 2,
+                requested: MAX_RENDER_TEXTURES + 1,
                 maximum: MAX_RENDER_TEXTURES,
+            })
+        );
+    }
+
+    /// The runtime-sampler face of the render contract (`research/docs/23`
+    /// §3.3, v102): a declaration pairs its texture with a `[[sampler(n)]]`
+    /// argument, the pass states that argument's state, and the two halves are
+    /// held to each other in both directions — beside the list's own bound,
+    /// canonical order and the contract's wider texture ceiling.
+    #[test]
+    fn render_runtime_sampler_declarations_pair_with_the_pass() {
+        let state = SamplerPolicy {
+            filter: SamplerFilter::Nearest,
+            address: SamplerAddressMode::ClampToEdge,
+        };
+        // A registration whose one texture samples through a runtime
+        // `[[sampler(n)]]` argument, with the pass binding one texture.
+        let runtime_pair = |sampler_binding: u32| {
+            let mut value = render_texture_trace();
+            render_entry(&mut value).textures = vec![sampled_texture_view(0)];
+            if let Some(render) = value.pipelines[0].render.as_mut() {
+                render.textures = vec![TextureBindingContract {
+                    metal_binding: 0,
+                    access: TextureAccess::Sampled,
+                    texture_type: TextureType::D2,
+                    format: TextureFormat::Rgba8Unorm,
+                    sampler: None,
+                    runtime_sampler: Some(sampler_binding),
+                    footprint: TextureFootprintProof::WholeView,
+                }];
+            }
+            value
+        };
+        // The pair rules are the two sides' agreement, so they are asked of
+        // the contract *against* the pass, exactly as admission asks them
+        // (`RenderPipelineContract::validate_against`).
+        let pair = |value: &mut ComputeTrace| -> Result<(), ContractError> {
+            let contract = value.pipelines[0]
+                .render
+                .clone()
+                .expect("the fixture registers a render half");
+            contract.validate_against(render_entry(value), None)
+        };
+
+        // The pair both sides state is the executable shape.
+        let mut value = runtime_pair(0);
+        render_entry(&mut value).samplers = vec![RenderSamplerBinding::new(0, state)];
+        pair(&mut value).expect("a stated runtime sampler pair is well formed");
+        value
+            .validate()
+            .expect("the pass is structurally well formed");
+
+        // A declaration whose sampler argument the pass never binds: the
+        // descriptor the module samples through would be undefined.
+        let mut value = runtime_pair(1);
+        render_entry(&mut value).samplers = vec![RenderSamplerBinding::new(0, state)];
+        assert_eq!(
+            pair(&mut value),
+            Err(ContractError::MissingRuntimeSamplerBinding {
+                texture_binding: 0,
+                sampler_binding: 1,
+            })
+        );
+
+        // The other direction: a state the pass binds that no declaration pairs
+        // with would fill a slot nothing samples through.
+        let mut value = runtime_pair(0);
+        render_entry(&mut value).samplers = vec![
+            RenderSamplerBinding::new(0, state),
+            RenderSamplerBinding::new(1, state),
+        ];
+        assert_eq!(
+            pair(&mut value),
+            Err(ContractError::UnpairedRuntimeSamplerBinding { sampler_binding: 1 })
+        );
+
+        // The list is canonical and carries no index twice, exactly as the
+        // stage-buffer list does inside its own namespace.
+        let mut value = runtime_pair(0);
+        render_entry(&mut value).samplers = vec![
+            RenderSamplerBinding::new(0, state),
+            RenderSamplerBinding::new(0, state),
+        ];
+        assert_eq!(value.validate(), Err(ContractError::DuplicateBinding(0)));
+        let mut value = runtime_pair(0);
+        render_entry(&mut value).samplers = vec![
+            RenderSamplerBinding::new(1, state),
+            RenderSamplerBinding::new(0, state),
+        ];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::NonCanonicalBindingOrder(
+                "render sampler bindings"
+            ))
+        );
+
+        // The Metal sampler argument table bounds the index, and the
+        // declaration side answers with its own slug.
+        let mut value = runtime_pair(0);
+        render_entry(&mut value).samplers =
+            vec![RenderSamplerBinding::new(MAX_RENDER_SAMPLERS as u32, state)];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderSamplerIndexExceeded {
+                index: MAX_RENDER_SAMPLERS as u32,
+                maximum: MAX_RENDER_SAMPLERS,
+            })
+        );
+        let mut value = runtime_pair(MAX_RENDER_SAMPLERS as u32);
+        render_entry(&mut value).samplers = vec![RenderSamplerBinding::new(0, state)];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderSamplerIndexExceeded {
+                index: MAX_RENDER_SAMPLERS as u32,
+                maximum: MAX_RENDER_SAMPLERS,
+            })
+        );
+
+        // A sampled declaration states exactly one of the two sampler forms: a
+        // declaration carrying both would leave the rail two state sources.
+        let mut value = runtime_pair(0);
+        if let Some(render) = value.pipelines[0].render.as_mut() {
+            render.textures[0].sampler = Some(state);
+        }
+        render_entry(&mut value).samplers = vec![RenderSamplerBinding::new(0, state)];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::TextureSamplerDeclarationMismatch {
+                binding: 0,
+                access: TextureAccess::Sampled,
+            })
+        );
+
+        // Two and three sampled textures are the census's own shapes
+        // (`v102`): three entries inside the contract's ceiling pair with three
+        // views, and the entry above it is refused before any of them is read.
+        let mut value = render_texture_trace();
+        let distinct = |binding: u32| {
+            let mut view = sampled_texture_view(binding);
+            view.view_id = ViewId::new(83 + u64::from(binding));
+            view.allocation_id = AllocationId::new(53 + u64::from(binding));
+            view
+        };
+        render_entry(&mut value).textures = vec![distinct(0), distinct(1), distinct(2)];
+        if let Some(render) = value.pipelines[0].render.as_mut() {
+            render.textures = (0..3)
+                .map(|binding| {
+                    TextureBindingContract::sampled_runtime(
+                        binding,
+                        TextureFormat::Rgba8Unorm,
+                        binding,
+                    )
+                })
+                .collect();
+        }
+        render_entry(&mut value).samplers = (0..3)
+            .map(|index| RenderSamplerBinding::new(index, state))
+            .collect();
+        pair(&mut value).expect("three runtime sampler pairs are inside the v102 ceiling");
+        value
+            .validate()
+            .expect("three runtime sampler pairs are inside the v102 ceiling");
+
+        // The compute face keeps its own half-statement rule: a compute
+        // declaration has no `[[sampler(n)]]` argument to pair with, so the
+        // runtime form is refused by name there.
+        let mut compute = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        compute.pipelines[0].contract.texture_bindings = vec![TextureBindingContract {
+            metal_binding: 0,
+            access: TextureAccess::Sampled,
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            sampler: None,
+            runtime_sampler: Some(0),
+            footprint: TextureFootprintProof::WholeView,
+        }];
+        assert_eq!(
+            compute.validate(),
+            Err(ContractError::RuntimeSamplerDeclarationUnsupported {
+                binding: 0,
+                sampler_binding: 0,
             })
         );
     }

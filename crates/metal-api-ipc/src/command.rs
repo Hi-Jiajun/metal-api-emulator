@@ -1594,6 +1594,7 @@ mod tests {
         height: u64,
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
@@ -3674,6 +3675,8 @@ mod tests {
 
     #[test]
     fn a_sampled_pass_refuses_a_texture_count_above_the_contract_cap() {
+        use metal_api_core::provider::MAX_RENDER_TEXTURES;
+
         let frame = CommandCodec::encode_request(&CommandRequest::Submit {
             trace: sampled_multisample_trace(),
             resources: resources(),
@@ -3684,13 +3687,16 @@ mod tests {
             .position(|window| window == [0x12, 0x20, 0x01, 0x01])
             .expect("the sampled fixture carries its own tag");
         let mut patched = frame.clone();
-        patched[position + 3] = 0x02;
+        // One above the contract's own ceiling (`research/docs/23` §3.3,
+        // v102): the count byte is refused before a single texture is read, so
+        // the patched frame needs no matching block behind it.
+        patched[position + 3] = u8::try_from(MAX_RENDER_TEXTURES + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched),
             Err(CodecError::RenderTextureCount {
-                count: 2,
-                maximum: 1,
-            })
+                count,
+                maximum,
+            }) if count == MAX_RENDER_TEXTURES + 1 && maximum == MAX_RENDER_TEXTURES
         ));
     }
 

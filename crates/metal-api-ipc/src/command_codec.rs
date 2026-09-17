@@ -1902,6 +1902,12 @@ fn get_compute_texture_declarations(
             // wrote above.
             sampler: (access == TextureAccess::Sampled)
                 .then_some(SamplerPolicy { filter, address }),
+            // The compute declaration block carries no runtime sampler index:
+            // the runtime `[[sampler(n)]]` form is the render face's
+            // (`research/docs/23` §3.3, v102), and a compute declaration that
+            // stated one is refused by the contract before it reaches a rail.
+            // The block's own bytes are therefore unchanged.
+            runtime_sampler: None,
             footprint: get_texture_footprint(decoder)?,
         });
     }
@@ -3820,6 +3826,13 @@ fn get_render_pass(
         stage_buffers: Vec::new(),
         blend: None,
         cull: None,
+        // The runtime sampler list is a request fact this frame format does not
+        // carry yet (`research/docs/23` §3.3, v102): a decoded pass states no
+        // sampler, so a remote owner's runtime-sampler pass is refused by the
+        // contract's own pair rules rather than executed under a state nobody
+        // stated — the same rule the texture declarations follow until their
+        // own carrying increment lands.
+        samplers: Vec::new(),
         // A frame without the wide multisample bit runs the single-sample
         // raster every pre-v51 frame ran (`research/docs/23` §3.3, v51).
         multisample: None,

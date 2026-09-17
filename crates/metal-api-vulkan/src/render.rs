@@ -43,7 +43,7 @@ use metal_api_core::provider::{
     Retryability, SampleCount, SamplerPolicy, StencilCompare, StencilLoadOp, StencilOp,
     StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
     TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId, Winding,
-    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -293,6 +293,19 @@ const SAMPLED_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_s
 /// `DescriptorSet 0 / Binding 0`.
 const SAMPLED_TEXTURE_BINDING: u32 = 0;
 
+/// The sampled textures the reviewed sampling pair's module reads
+/// (`research/docs/23` §3.3, v102).
+///
+/// The reviewed pair is a hand-written module whose MSL sibling spells one
+/// `texture2d<float, sample>` argument and one `constexpr sampler`; its
+/// SPIR-V sibling samples through one combined image sampler. The pair
+/// therefore executes exactly one texture, and a registration or pass that
+/// declares more is refused by name
+/// ([`render_texture_slots`]) rather than executed with a second surface
+/// nothing reads. Two textures are the translated arm's shape, where the
+/// number of sampled textures is what the module's own reflection names.
+const REVIEWED_TEXTURE_COUNT: usize = 1;
+
 /// The sampler state the reviewed sampling pair is executed with
 /// (`research/docs/23` §3.3, v100).
 ///
@@ -328,7 +341,11 @@ pub(crate) enum RenderTextureSlot {
     /// texture and the AIR static sampler as two descriptors (`OpTypeImage` and
     /// `OpTypeSampler`, combined by the module's own `OpSampledImage`), so the
     /// rail binds a `SAMPLED_IMAGE` at the image's slot and a `SAMPLER` at the
-    /// sampler's.
+    /// sampler's. The state is the module's own AIR state when the module
+    /// carries one (`v100`), and the *pass's* declaration when the module
+    /// samples through a runtime `[[sampler(n)]]` argument (`v102`) — the two
+    /// arms resolve to one state before the slot is built, so the descriptor
+    /// creation below holds no branch of its own.
     Split {
         set: u32,
         image: u32,
@@ -378,6 +395,48 @@ fn texture_sampler_refusal(
         .with_field("address", address)
         .with_field("module_filter", module_filter)
         .with_field("module_address", module_address)
+}
+
+/// The refusal a *runtime* sampler's state gets when it is not the state the
+/// translation the registration names was given for that index
+/// (`research/docs/23` §3.3, v102).
+///
+/// The runtime sibling of [`texture_sampler_refusal`], with both halves of the
+/// pairing named: the texture binding that samples through the argument, the
+/// `[[sampler(n)]]` index itself, and the two states. A runtime sampler's state
+/// is the *request's* statement, so a disagreement here is a request naming a
+/// state the module behind it was not lowered against — creating the
+/// descriptor's `VkSampler` from it would change which texels the pass reads.
+fn runtime_sampler_refusal(
+    texture_binding: u32,
+    sampler_binding: u32,
+    declared: SamplerPolicy,
+    module: SamplerPolicy,
+) -> ProviderError {
+    capability_refusal("render_texture_sampler_unsupported")
+        .with_field("binding", FieldValue::Unsigned(u64::from(texture_binding)))
+        .with_field(
+            "sampler_binding",
+            FieldValue::Unsigned(u64::from(sampler_binding)),
+        )
+        .with_field("filter", FieldValue::Text(format!("{:?}", declared.filter)))
+        .with_field(
+            "address",
+            FieldValue::Text(format!("{:?}", declared.address)),
+        )
+        .with_field(
+            "module_filter",
+            FieldValue::Text(format!("{:?}", module.filter)),
+        )
+        .with_field(
+            "module_address",
+            FieldValue::Text(format!("{:?}", module.address)),
+        )
+        .with_detail(
+            "the translation this registration names was lowered against the module's state for \
+             this `[[sampler(n)]]` argument, so a request naming another filtering or addressing \
+             mode would be executed with a sampler the module was not lowered against",
+        )
 }
 
 /// The fragment stage this rail owns for the reviewed sampling pair
@@ -1276,6 +1335,9 @@ impl RenderStages {
             if declared.sampler == Some(REVIEWED_SAMPLER_POLICY) {
                 continue;
             }
+            if let Some(sampler_binding) = declared.runtime_sampler {
+                return Err(self.refuse_reviewed_runtime_sampler(declared, sampler_binding));
+            }
             return Err(texture_sampler_refusal(
                 declared.metal_binding,
                 declared.sampler,
@@ -1283,6 +1345,48 @@ impl RenderStages {
             ));
         }
         Ok(())
+    }
+
+    /// Refuse a reviewed registration that pairs a texture with a runtime
+    /// `[[sampler(n)]]` argument (`research/docs/23` §3.3, v102).
+    ///
+    /// The reviewed pair's MSL sibling spells its own `constexpr sampler` and
+    /// takes no sampler argument, so no reviewed module carries the state such
+    /// a declaration pairs its texture with. The refusal names both halves of
+    /// the pairing — the texture binding and the sampler index — beside the
+    /// state the review does cover, exactly as the state-mismatch refusal one
+    /// arm below does, so a caller can tell "a runtime sampler this rail has no
+    /// module for" apart from "a state no review covered".
+    fn refuse_reviewed_runtime_sampler(
+        &self,
+        declared: &metal_api_core::provider::TextureBindingContract,
+        sampler_binding: u32,
+    ) -> ProviderError {
+        capability_refusal("render_runtime_sampler_unsupported")
+            .with_field(
+                "binding",
+                FieldValue::Unsigned(u64::from(declared.metal_binding)),
+            )
+            .with_field(
+                "sampler_binding",
+                FieldValue::Unsigned(u64::from(sampler_binding)),
+            )
+            .with_field("filter", FieldValue::Text("None".to_owned()))
+            .with_field("address", FieldValue::Text("None".to_owned()))
+            .with_field(
+                "module_filter",
+                FieldValue::Text(format!("{:?}", REVIEWED_SAMPLER_POLICY.filter)),
+            )
+            .with_field(
+                "module_address",
+                FieldValue::Text(format!("{:?}", REVIEWED_SAMPLER_POLICY.address)),
+            )
+            .with_detail(
+                "the reviewed sampling pair's module spells its own `constexpr sampler` and \
+                 takes no `[[sampler(n)]]` argument, so the state the registration pairs with \
+                 this texture has no module behind it; a runtime sampler is executed on the \
+                 translated arm, where the module's own reflection names the sampler it reads",
+            )
     }
 
     /// A reviewed stage-buffer module reads its slot; nothing this rail
@@ -1515,7 +1619,17 @@ fn validate_translated_stage(
         );
     }
     if let Some(field) = unsupported_interface_field(reflection) {
-        return Err(unsupported_interface_refusal(stage, entry, field));
+        // The runtime sampler specializations are the *fragment* stage's own
+        // half (`research/docs/23` §3.3, v102): `validate_translated_stage_textures`
+        // holds each one to the declaration that pairs with it and to the state
+        // the request repeats, so a fragment reflection may carry them. A
+        // vertex reflection keeps the interface refusal, because the render
+        // sampler is the fragment stage's own.
+        let fragment_runtime_samplers =
+            stage == RenderStage::Fragment && field == "runtime_sampler_specializations";
+        if !fragment_runtime_samplers {
+            return Err(unsupported_interface_refusal(stage, entry, field));
+        }
     }
     validate_translated_stage_buffers(stages, stage, entry, reflection)?;
     validate_translated_stage_textures(stages, stage, entry, reflection)?;
@@ -1932,21 +2046,71 @@ fn validate_translated_stage_textures(
     entry: &str,
     reflection: &ShaderReflection,
 ) -> Result<(), ProviderError> {
-    translated_texture_slots(stages, stage, entry, reflection).map(|_| ())
+    translated_texture_pairs(stages, stage, entry, reflection).map(|_| ())
 }
 
-/// The slots and sampler states one translated fragment stage's sampled
-/// textures are executed with (`research/docs/23` §3.3, v100).
+/// One translated fragment stage's sampled texture and the sampler half it is
+/// read through (`research/docs/23` §3.3, v100/v102).
+///
+/// The pairing is the *module's*: a static half is the AIR constexpr sampler
+/// the module carries, and a runtime half is the `[[sampler(n)]]` argument
+/// whose state the module does not carry. Both halves keep the descriptor slot
+/// the reflection names, because the module's own `OpSampledImage` is what
+/// combines them; the state a runtime half executes with is resolved later,
+/// where the pass's own declaration is in hand.
+struct TranslatedTexturePair {
+    /// The Metal `[[texture(n)]]` index this pair came from, so a refusal can
+    /// name the texture half of the pairing as well as the sampler half.
+    texture_binding: u32,
+    /// The `SAMPLED_IMAGE` slot the module reads the texture from.
+    image: u32,
+    sampler: TranslatedSampler,
+}
+
+/// The sampler half of one translated texture pair, as the *module* states it
+/// (`research/docs/23` §3.3, v100/v102).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranslatedSampler {
+    /// An AIR-embedded constexpr sampler: the state travels with the module, so
+    /// a declaration naming another one is refused by name. `descriptor` is the
+    /// `SAMPLER` slot the module reads it from.
+    Module {
+        descriptor: u32,
+        policy: SamplerPolicy,
+    },
+    /// A runtime `[[sampler(n)]]` argument: the module carries the descriptor
+    /// but no state. `specialized` is the state the translation was handed for
+    /// this index when it was handed one — the caller's own statement, which
+    /// the request's declaration has to repeat, because creating another
+    /// sampler would change which texels a sample returns.
+    Runtime {
+        metal_binding: u32,
+        descriptor: u32,
+        specialized: Option<SamplerPolicy>,
+    },
+}
+
+/// Walk one translated fragment stage's image interface and pair every
+/// reflected texture with the sampler half it is read through
+/// (`research/docs/23` §3.3, v100/v102).
 ///
 /// [`validate_translated_stage_textures`] is this walk's answer as a gate, and
-/// [`render_texture_slots`] asks it again where the pass's own bindings are in
-/// hand, so a directly-constructed [`RenderStages`] cannot skip the pairing.
-fn translated_texture_slots(
+/// [`translated_texture_slots`] asks it again where the pass's own sampler
+/// states are in hand, so a directly-constructed [`RenderStages`] cannot skip
+/// the pairing. The walk answers the module-versus-contract half in both
+/// directions: every declaration the stage's reflection reaches is held to the
+/// shape the module binds, every sampled texture the module reads is declared,
+/// every runtime `[[sampler(n)]]` the module binds is paired by a declaration
+/// (`render_runtime_sampler_undeclared`), and a declaration naming a runtime
+/// sampler the module does not bind is refused by name
+/// (`render_runtime_sampler_unpaired`) instead of executed with a descriptor
+/// nothing samples through.
+fn translated_texture_pairs(
     stages: &RenderStages,
     stage: RenderStage,
     entry: &str,
     reflection: &ShaderReflection,
-) -> Result<Vec<RenderTextureSlot>, ProviderError> {
+) -> Result<Vec<TranslatedTexturePair>, ProviderError> {
     use metal2vulkan::meta::{TextureComponent, TextureDimension};
 
     if stage != RenderStage::Fragment {
@@ -1955,8 +2119,8 @@ fn translated_texture_slots(
     // The AIR-embedded constexpr samplers first: one sampled texture is read
     // through one of them, exactly as the compute face's narrow class states
     // it, so the two lists pair by position below.
-    let mut samplers = Vec::new();
-    let mut sampler_slots = Vec::new();
+    let mut static_samplers = Vec::new();
+    let mut static_slots = Vec::new();
     for binding in &reflection.bindings {
         if binding.kind != ResourceKind::StaticSampler {
             continue;
@@ -1993,19 +2157,78 @@ fn translated_texture_slots(
                      pipeline layout carries the sampled textures' slots",
                 ));
         }
-        sampler_slots.push(sampler_descriptor.binding);
+        static_slots.push(sampler_descriptor.binding);
         let Some(state) = binding.static_sampler.as_ref() else {
             return Err(unsupported(
                 "the AIR static sampler carries no decoded state".to_owned(),
             ));
         };
-        samplers.push(crate::static_sampler_policy(state).map_err(|error| {
+        static_samplers.push(crate::static_sampler_policy(state).map_err(|error| {
             unsupported(format!(
                 "the module's AIR sampler is outside the state family this rail creates: {error}"
             ))
         })?);
     }
-    let mut slots = Vec::new();
+    // The runtime `[[sampler(n)]]` arguments (`research/docs/23` §3.3, v102):
+    // the module names the descriptor but carries no state, so this list keeps
+    // the index, the slot, and the translation's own state where one was given.
+    let mut runtime_samplers = Vec::new();
+    for binding in &reflection.bindings {
+        if binding.kind != ResourceKind::Sampler {
+            continue;
+        }
+        let index = FieldValue::Unsigned(u64::from(binding.metal_index));
+        let unsupported = |detail: &str| {
+            unsupported_interface_refusal(stage, entry, "textures")
+                .with_field("sampler_binding", index.clone())
+                .with_detail(detail.to_owned())
+        };
+        if usize::try_from(binding.metal_index).unwrap_or(usize::MAX) >= MAX_RENDER_SAMPLERS {
+            return Err(unsupported(
+                "the Metal sampler argument table holds 16 `[[sampler(n)]]` arguments, and an \
+                 index above it is a shape this rail does not execute",
+            )
+            .with_field("maximum", FieldValue::Unsigned(MAX_RENDER_SAMPLERS as u64)));
+        }
+        let Some(descriptor) = binding.descriptor else {
+            return Err(unsupported(
+                "the runtime sampler consumes no Vulkan descriptor, so the pass's state would \
+                 have no `SAMPLER` slot to fill",
+            ));
+        };
+        if descriptor.count != 1 || descriptor.set != 0 {
+            return Err(capability_refusal("render_texture_layout_unsupported")
+                .with_field("sampler_binding", index)
+                .with_field("set", FieldValue::Unsigned(u64::from(descriptor.set)))
+                .with_field("count", FieldValue::Unsigned(u64::from(descriptor.count)))
+                .with_detail(
+                    "a runtime sampler is one descriptor in set 0, where the render pipeline \
+                     layout carries the sampled textures' slots",
+                ));
+        }
+        let specialized = reflection
+            .runtime_sampler_specializations
+            .iter()
+            .find(|specialization| specialization.metal_index == binding.metal_index)
+            .map(|specialization| {
+                crate::static_sampler_policy(&specialization.state.lowering_state()).map_err(
+                    |error| {
+                        unsupported(&format!(
+                            "the translation's own runtime sampler state is outside the state \
+                             family this rail creates: {error}"
+                        ))
+                    },
+                )
+            })
+            .transpose()?;
+        runtime_samplers.push(TranslatedSampler::Runtime {
+            metal_binding: binding.metal_index,
+            descriptor: descriptor.binding,
+            specialized,
+        });
+    }
+    let mut pairs = Vec::new();
+    let mut static_read = 0_usize;
     for binding in &reflection.bindings {
         if binding.kind != ResourceKind::Texture {
             continue;
@@ -2070,34 +2293,69 @@ fn translated_texture_slots(
                 "the module reads a sampled texture the contract does not declare",
             ));
         };
-        let Some(module_sampler) = samplers.get(slots.len()).copied() else {
-            return Err(mismatch(
-                "the module samples a texture without an AIR static sampler",
-            ));
-        };
-        if declared.sampler != Some(module_sampler) {
-            return Err(texture_sampler_refusal(
-                declared.metal_binding,
-                declared.sampler,
-                Some(module_sampler),
-            ));
-        }
         if declared.format != TextureFormat::Rgba8Unorm {
             return Err(capability_refusal("render_texture_format_unsupported")
                 .with_field("binding", index)
                 .with_field("format", FieldValue::Text(format!("{:?}", declared.format)))
                 .with_detail("the render sampler uploads and reads one rgba8_unorm surface"));
         }
-        let Some(sampler_binding) = sampler_slots.get(slots.len()).copied() else {
-            return Err(mismatch(
-                "the module samples a texture without a sampler descriptor",
-            ));
+        // Which sampler half this texture reads through is the declaration's
+        // statement (`research/docs/23` §3.3, v100/v102), and the module has to
+        // back it: a declaration naming a static state pairs with the module's
+        // own AIR sampler, and one naming a runtime index pairs with the
+        // module's `[[sampler(n)]]` argument. The static halves therefore pair
+        // positionally — one AIR sampler per static sample, the rule C1b states
+        // — while the runtime halves pair by the Metal index the declaration
+        // names.
+        let sampler = if let Some(sampler_binding) = declared.runtime_sampler {
+            let Some(runtime) = runtime_samplers.iter().find(|runtime| {
+                matches!(
+                    runtime,
+                    TranslatedSampler::Runtime {
+                        metal_binding,
+                        ..
+                    } if *metal_binding == sampler_binding
+                )
+            }) else {
+                return Err(capability_refusal("render_runtime_sampler_unpaired")
+                    .with_field("binding", index)
+                    .with_field(
+                        "sampler_binding",
+                        FieldValue::Unsigned(u64::from(sampler_binding)),
+                    )
+                    .with_detail(
+                        "the declaration pairs this texture with a runtime `[[sampler(n)]]` \
+                         argument, but the module's reflection binds no sampler descriptor at \
+                         that index, so the pass's state would fill a slot nothing samples \
+                         through",
+                    ));
+            };
+            *runtime
+        } else {
+            let Some(policy) = static_samplers.get(static_read).copied() else {
+                return Err(mismatch(
+                    "the module samples a texture without an AIR static sampler",
+                ));
+            };
+            if declared.sampler != Some(policy) {
+                return Err(texture_sampler_refusal(
+                    declared.metal_binding,
+                    declared.sampler,
+                    Some(policy),
+                ));
+            }
+            let Some(descriptor) = static_slots.get(static_read).copied() else {
+                return Err(mismatch(
+                    "the module samples a texture without a sampler descriptor",
+                ));
+            };
+            static_read += 1;
+            TranslatedSampler::Module { descriptor, policy }
         };
-        slots.push(RenderTextureSlot::Split {
-            set: descriptor.set,
+        pairs.push(TranslatedTexturePair {
+            texture_binding: binding.metal_index,
             image: descriptor.binding,
-            sampler_binding,
-            sampler: module_sampler,
+            sampler,
         });
     }
     for declared in &stages.contract.textures {
@@ -2116,47 +2374,174 @@ fn translated_texture_slots(
                 ));
         }
     }
-    if samplers.len() != slots.len() {
+    if static_samplers.len() != static_read {
         return Err(reflection_mismatch_refusal(stage, entry)
             .with_field("field", FieldValue::Text("textures".to_owned()))
-            .with_field("samplers", FieldValue::Unsigned(samplers.len() as u64))
-            .with_field("textures", FieldValue::Unsigned(slots.len() as u64))
+            .with_field(
+                "samplers",
+                FieldValue::Unsigned(static_samplers.len() as u64),
+            )
+            .with_field("textures", FieldValue::Unsigned(static_read as u64))
             .with_detail("this rail pairs one AIR static sampler with one sampled texture"));
+    }
+    // The other direction of the runtime half: every sampler argument the
+    // module binds has to be one a declaration pairs with. A module that binds
+    // `[[sampler(n)]]` while the registration says its textures read through AIR
+    // static samplers is refused by name
+    // (`render_runtime_sampler_undeclared`) instead of executed with a state
+    // nobody stated.
+    for runtime in &runtime_samplers {
+        let TranslatedSampler::Runtime {
+            metal_binding,
+            descriptor,
+            ..
+        } = runtime
+        else {
+            continue;
+        };
+        let paired = stages.contract.textures.iter().any(|declared| {
+            declared.runtime_sampler == Some(*metal_binding)
+                && reflection.bindings.iter().any(|binding| {
+                    binding.kind == ResourceKind::Texture
+                        && binding.metal_index == declared.metal_binding
+                })
+        });
+        if !paired {
+            return Err(capability_refusal("render_runtime_sampler_undeclared")
+                .with_field(
+                    "sampler_binding",
+                    FieldValue::Unsigned(u64::from(*metal_binding)),
+                )
+                .with_field("descriptor", FieldValue::Unsigned(u64::from(*descriptor)))
+                .with_detail(
+                    "the module binds a runtime `[[sampler(n)]]` argument, but no texture \
+                     declaration pairs with it, so the pass has no state the descriptor could \
+                     be filled with",
+                ));
+        }
+    }
+    Ok(pairs)
+}
+
+/// The slots one translated fragment stage's sampled textures are executed
+/// with (`research/docs/23` §3.3, v100/v102).
+///
+/// [`validate_translated_stage_textures`] has already held the contract's
+/// declarations to the module; this walk adds the pass's own half: a runtime
+/// `[[sampler(n)]]` the declaration pairs with must be bound by the pass
+/// (`render_runtime_sampler_missing`), and the state it names must be the state
+/// the translation was given for that index when it was given one
+/// (`render_texture_sampler_unsupported`, with both halves) — the rail creates
+/// one `VkSampler` per declaration, so a state that disagreed would silently
+/// change which texels a sample returns.
+fn translated_texture_slots(
+    stages: &RenderStages,
+    stage: RenderStage,
+    entry: &str,
+    reflection: &ShaderReflection,
+    pass: &RenderPassDescriptor,
+) -> Result<Vec<RenderTextureSlot>, ProviderError> {
+    let mut slots = Vec::new();
+    for pair in translated_texture_pairs(stages, stage, entry, reflection)? {
+        let (sampler, policy) = match pair.sampler {
+            TranslatedSampler::Module { descriptor, policy } => (descriptor, policy),
+            TranslatedSampler::Runtime {
+                metal_binding,
+                descriptor,
+                specialized,
+            } => {
+                let Some(bound) = pass
+                    .samplers
+                    .iter()
+                    .find(|sampler| sampler.metal_binding == metal_binding)
+                else {
+                    return Err(capability_refusal("render_runtime_sampler_missing")
+                        .with_field(
+                            "sampler_binding",
+                            FieldValue::Unsigned(u64::from(metal_binding)),
+                        )
+                        .with_field("descriptor", FieldValue::Unsigned(u64::from(descriptor)))
+                        .with_detail(
+                            "the module samples through a runtime `[[sampler(n)]]` argument the \
+                             registration pairs with a texture, but the pass states no state for \
+                             it, so the descriptor would be bound with a sampler nobody named",
+                        ));
+                };
+                if let Some(module) = specialized {
+                    if bound.policy != module {
+                        return Err(runtime_sampler_refusal(
+                            pair.texture_binding,
+                            metal_binding,
+                            bound.policy,
+                            module,
+                        ));
+                    }
+                }
+                (descriptor, bound.policy)
+            }
+        };
+        slots.push(RenderTextureSlot::Split {
+            set: 0,
+            image: pair.image,
+            sampler_binding: sampler,
+            sampler: policy,
+        });
     }
     Ok(slots)
 }
 
-/// The slots and states the pass's sampled textures are executed with
-/// (`research/docs/23` §3.3, v100).
+/// The slots the pass's sampled textures are executed with
+/// (`research/docs/23` §3.3, v100/v102).
 ///
-/// The reviewed sampling pair reads `DescriptorSet 0 / Binding i` for the
-/// pass's entry `i` — the layout `create_render_textures` builds — and is
-/// executed with the one state the review covers; a translated fragment stage
-/// answers with the slots its own reflection names, which
+/// The reviewed sampling pair reads `DescriptorSet 0 / Binding 0` for the one
+/// texture its own module samples, and is executed with the one state the
+/// review covers — so it executes exactly [`REVIEWED_TEXTURE_COUNT`] texture
+/// and refuses anything wider by name; the runtime `[[sampler(n)]]` state a
+/// translated module takes is a shape no reviewed module carries
+/// ([`RenderStages::validate_reviewed_texture_sampler`]). A translated fragment
+/// stage answers with the slots its own reflection names, which
 /// [`validate_translated_stage_textures`] has already held the contract's
-/// declarations to. The count is compared here rather than in the pair walk
-/// because this is where the pass's own binding list is in hand: a translated
-/// stage that samples no texture, under a pass that binds one, has no slot to
-/// bind it into and is refused by name instead.
+/// declarations to, and resolves each runtime pair's state from the pass
+/// itself. The count is compared here rather than in the pair walk because this
+/// is where the pass's own binding list is in hand: a translated stage that
+/// samples no texture, under a pass that binds one, has no slot to bind it into
+/// and is refused by name instead.
 fn render_texture_slots(
     stages: &RenderStages,
-    count: usize,
+    pass: &RenderPassDescriptor,
 ) -> Result<Vec<RenderTextureSlot>, ProviderError> {
+    let count = pass.textures.len();
     let slots = match &stages.fragment_translation {
-        None => (0..count)
-            .map(|index| RenderTextureSlot::Combined {
-                set: 0,
-                binding: u32::try_from(index).unwrap_or(SAMPLED_TEXTURE_BINDING),
-                sampler: REVIEWED_SAMPLER_POLICY,
-            })
-            .collect(),
+        None => {
+            if count == 0 {
+                Vec::new()
+            } else {
+                // The module's own window: the one slot the reviewed pair
+                // reads. A pass that binds more than
+                // [`REVIEWED_TEXTURE_COUNT`] textures keeps this list and is
+                // refused by the count check below, because the second texture
+                // has no slot the module would read it from.
+                (0..REVIEWED_TEXTURE_COUNT)
+                    .map(|_| RenderTextureSlot::Combined {
+                        set: 0,
+                        binding: SAMPLED_TEXTURE_BINDING,
+                        sampler: REVIEWED_SAMPLER_POLICY,
+                    })
+                    .collect()
+            }
+        }
         Some(reflection) => translated_texture_slots(
             stages,
             RenderStage::Fragment,
             &stages.contract.fragment_entry,
             reflection,
+            pass,
         )?,
     };
+    // The count is the one disagreement the two walks answer together: the
+    // reviewed pair's window is the module's own [`REVIEWED_TEXTURE_COUNT`], and
+    // a translated stage's is what its reflection names, so a pass that binds
+    // another number has no slot to bind one of them into (`v70`, `v102`).
     if slots.len() != count {
         return Err(capability_refusal("render_texture_stage_unsupported")
             .with_field("textures", FieldValue::Unsigned(count as u64))
@@ -2239,7 +2624,7 @@ fn validate_translated_stage_buffers(
         if stage == RenderStage::Fragment
             && matches!(
                 binding.kind,
-                ResourceKind::Texture | ResourceKind::StaticSampler
+                ResourceKind::Texture | ResourceKind::StaticSampler | ResourceKind::Sampler
             )
         {
             continue;
@@ -3338,7 +3723,7 @@ fn prepare_render_request_with_resident<'a>(
     // binding order with the one state the review covers, and a translated
     // fragment stage reads the slots its reflection names with the state its
     // AIR carries.
-    let texture_slots = render_texture_slots(stages, pass.textures.len())?;
+    let texture_slots = render_texture_slots(stages, pass)?;
     let textures = resolve_render_textures(pass, extent, leases, &texture_slots)?;
     // Stage buffers (`research/docs/23` §3.3, v83) resolve right beside them:
     // the same three-arm channel, one list carrying both stages' index spaces,
@@ -8971,45 +9356,47 @@ impl<'a> OffscreenObjects<'a> {
         // and its AIR static sampler as two descriptors — an `OpTypeImage` and
         // an `OpTypeSampler` the module combines itself — so that arm binds a
         // `SAMPLED_IMAGE` and a `SAMPLER` at the slots the reflection names.
-        let mut bindings = Vec::with_capacity(self.textures.len());
-        let mut combined_count = 0_u32;
-        let mut sampled_image_count = 0_u32;
-        let mut sampler_count = 0_u32;
+        // One layout entry per *slot*, not per texture: a runtime
+        // `[[sampler(n)]]` argument is one descriptor however many textures
+        // sample through it (`research/docs/23` §3.3, v102), and two identical
+        // `VkDescriptorSetLayoutBinding`s at one binding would be an invalid
+        // layout. The map keys the entries by binding and keeps the descriptor
+        // type each one is declared with, so a slot that two textures name
+        // still contributes one entry and one pool size.
+        let mut planned_bindings = BTreeMap::<u32, vk::DescriptorType>::new();
         for texture in &self.textures {
             match texture.slot {
                 RenderTextureSlot::Combined { binding, .. } => {
-                    combined_count += 1;
-                    bindings.push(
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(binding)
-                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                    );
+                    planned_bindings.insert(binding, vk::DescriptorType::COMBINED_IMAGE_SAMPLER);
                 }
                 RenderTextureSlot::Split {
                     image,
                     sampler_binding,
                     ..
                 } => {
-                    sampled_image_count += 1;
-                    sampler_count += 1;
-                    bindings.push(
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(image)
-                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                    );
-                    bindings.push(
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(sampler_binding)
-                            .descriptor_type(vk::DescriptorType::SAMPLER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                    );
+                    planned_bindings.insert(image, vk::DescriptorType::SAMPLED_IMAGE);
+                    planned_bindings.insert(sampler_binding, vk::DescriptorType::SAMPLER);
                 }
             }
+        }
+        let mut combined_count = 0_u32;
+        let mut sampled_image_count = 0_u32;
+        let mut sampler_count = 0_u32;
+        let mut bindings = Vec::with_capacity(planned_bindings.len());
+        for (binding, descriptor_type) in &planned_bindings {
+            match *descriptor_type {
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => combined_count += 1,
+                vk::DescriptorType::SAMPLED_IMAGE => sampled_image_count += 1,
+                vk::DescriptorType::SAMPLER => sampler_count += 1,
+                _ => {}
+            }
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(*binding)
+                    .descriptor_type(*descriptor_type)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
         }
         self.descriptor_set_layout = unsafe {
             self.context.device.create_descriptor_set_layout(
@@ -9068,6 +9455,13 @@ impl<'a> OffscreenObjects<'a> {
         let mut image_infos = Vec::new();
         let mut sampler_infos = Vec::new();
         let mut planned = Vec::new();
+        // One write per slot, like the layout above: a sampler argument two
+        // textures sample through is one descriptor, and updating one binding
+        // twice in a single `vkUpdateDescriptorSets` is invalid. The first
+        // texture that names the slot provides the handle, and every later one
+        // resolves to the same state by construction — the state is keyed by
+        // the Metal sampler index, not by the texture.
+        let mut written_bindings = std::collections::BTreeSet::new();
         for texture in &self.textures {
             // The upload lands the image in `GENERAL` before the draw
             // (`Self::record`), the same layout the compute rail binds its
@@ -9087,6 +9481,9 @@ impl<'a> OffscreenObjects<'a> {
             };
             match texture.slot {
                 RenderTextureSlot::Combined { binding, .. } => {
+                    if !written_bindings.insert(binding) {
+                        continue;
+                    }
                     let index = combined_infos.len();
                     combined_infos.push(info(texture));
                     planned.push((
@@ -9109,6 +9506,9 @@ impl<'a> OffscreenObjects<'a> {
                         write(image, vk::DescriptorType::SAMPLED_IMAGE),
                         Written::Image(image_index),
                     ));
+                    if !written_bindings.insert(sampler_binding) {
+                        continue;
+                    }
                     let sampler_index = sampler_infos.len();
                     sampler_infos.push(vk::DescriptorImageInfo::default().sampler(texture.sampler));
                     planned.push((
@@ -11597,10 +11997,10 @@ mod tests {
         AcquirePolicy, AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease,
         DepthFormat, DepthLoadOp, IndexBufferBinding, InitialState, LeaseReservation, PipelineId,
         PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment,
-        RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity, StageBufferBinding,
-        StageBufferView, StagedLease, StencilFormat, StencilLoadOp, TextureAccess,
-        TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView,
-        VertexLayout, ViewId,
+        RenderDepthIdentity, RenderSamplerBinding, RenderStencilAttachment, RenderStencilIdentity,
+        StageBufferBinding, StageBufferView, StagedLease, StencilFormat, StencilLoadOp,
+        TextureAccess, TextureBindingContract, TextureFormat, TextureSource, TextureType,
+        TextureView, VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -12140,6 +12540,227 @@ mod tests {
             .is_some_and(|detail| detail.contains("declares texture binding 0")));
     }
 
+    /// The reviewed pair's window in the runtime-sampler increment
+    /// (`research/docs/23` §3.3, v102): the pair's module spells one
+    /// `constexpr sampler` and samples one texture, so a registration that
+    /// pairs a texture with a runtime `[[sampler(n)]]` argument, or that
+    /// declares a second sampled texture, is refused by name before any
+    /// device object exists.
+    #[test]
+    fn the_reviewed_pair_refuses_a_runtime_sampler_and_a_second_texture() {
+        // A declaration that pairs its texture with a runtime sampler argument
+        // is a shape no reviewed module carries: the pair's MSL sibling spells
+        // the state itself. The refusal names both halves of the pairing.
+        let mut runtime_stages = reviewed_sampled_stages();
+        runtime_stages.contract.textures[0].sampler = None;
+        runtime_stages.contract.textures[0].runtime_sampler = Some(0);
+        let refused = runtime_stages
+            .validate_stage_pair()
+            .expect_err("the reviewed pair takes no runtime `[[sampler(n)]]` argument");
+        eprintln!("runtime sampler on the reviewed pair: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_runtime_sampler_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            refused.fields.get("sampler_binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            refused.fields.get("module_filter"),
+            Some(&FieldValue::Text("Nearest".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("module_address"),
+            Some(&FieldValue::Text("ClampToEdge".to_owned()))
+        );
+
+        // A second sampled texture is the translated arm's shape: the reviewed
+        // module reads one `texture2d<float>` argument, so the wider list has
+        // no slot the second texture could be bound into. The contract admits
+        // the list (`MAX_RENDER_TEXTURES`), which is what lets the translated
+        // arm state it, and this rail answers the half it cannot execute by
+        // name.
+        let mut two_textures = reviewed_sampled_stages();
+        two_textures
+            .contract
+            .textures
+            .push(TextureBindingContract::sampled(
+                1,
+                TextureFormat::Rgba8Unorm,
+                REVIEWED_SAMPLER_POLICY,
+            ));
+        let mut second = sampled_texture_view(4, 4);
+        second.view_id = ViewId::new(84);
+        second.allocation_id = AllocationId::new(54);
+        second.metal_binding = 1;
+        let mut pass = sampled_pass(4);
+        pass.textures.push(second);
+        let refused = match prepare_render_request(
+            &two_textures,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the reviewed pair samples one texture"),
+        };
+        eprintln!("two textures on the reviewed pair: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_stage_unsupported");
+        assert_eq!(
+            refused.fields.get("textures"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            refused.fields.get("bindings"),
+            Some(&FieldValue::Unsigned(1))
+        );
+    }
+
+    /// A runtime sampler's state is the *request's* statement, so the one
+    /// disagreement it can carry is with the state the translation was given
+    /// (`research/docs/23` §3.3, v102): the rail creates the descriptor's
+    /// `VkSampler` from the request, so a request naming a state the module was
+    /// not lowered against would change which texels a sample returns.
+    ///
+    /// This arm is measured against a *hand-built* `RenderStages` whose
+    /// reflection came out of a translation the rail's own entry point does not
+    /// expose — the state a caller hands the translator at translation time —
+    /// which is exactly the shape the test has to reach to pin the refusal.
+    #[test]
+    fn a_runtime_sampler_state_the_translation_did_not_name_is_refused() {
+        use metal2vulkan::passes::{Stage, TransformOptions};
+        use metal2vulkan::reflect::{
+            SamplerCompareFunction, SamplerCoordinates, SamplerFilter as AirFilter,
+            SamplerMipFilter, SamplerReduction,
+        };
+
+        let fixture = include_str!("../tests/fixtures/render_sample_texture_2d_runtime.frag.ll");
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        // The state the translation is given: linear filtering with clamped
+        // addressing, normalized coordinates — inside the family this rail
+        // creates, so the module keeps its two `[[sampler(n)]]` descriptors.
+        let state = metal2vulkan::reflect::RuntimeSamplerState {
+            min_filter: AirFilter::Linear,
+            mag_filter: AirFilter::Linear,
+            mip_filter: SamplerMipFilter::None,
+            address_mode_s: metal2vulkan::reflect::SamplerAddressMode::ClampToEdge,
+            address_mode_t: metal2vulkan::reflect::SamplerAddressMode::ClampToEdge,
+            address_mode_r: metal2vulkan::reflect::SamplerAddressMode::ClampToEdge,
+            coordinates: SamplerCoordinates::Normalized,
+            compare_function: SamplerCompareFunction::Never,
+            max_anisotropy: 1,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            border_color: metal2vulkan::reflect::SamplerBorderColor::TransparentBlack,
+            reduction: SamplerReduction::WeightedAverage,
+            lod_bias: 0.0,
+        };
+        let options = TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .expect("runtime sampler state");
+        let (fragment_spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            fixture,
+            Stage::Fragment,
+            scratch.path(),
+            options,
+        )
+        .expect("the runtime fixture translates");
+        assert_eq!(reflection.runtime_sampler_specializations.len(), 1);
+
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d_runtime".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![
+                    TextureBindingContract {
+                        sampler: None,
+                        runtime_sampler: Some(0),
+                        ..TextureBindingContract::sampled(
+                            0,
+                            TextureFormat::Rgba8Unorm,
+                            REVIEWED_SAMPLER_POLICY,
+                        )
+                    },
+                    TextureBindingContract {
+                        sampler: None,
+                        runtime_sampler: Some(1),
+                        ..TextureBindingContract::sampled(
+                            1,
+                            TextureFormat::Rgba8Unorm,
+                            REVIEWED_SAMPLER_POLICY,
+                        )
+                    },
+                ],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        stages
+            .validate_stage_pair()
+            .expect("the module's own pairing is executable");
+
+        // The request states nearest filtering for the argument the translation
+        // was given linear filtering for: the descriptor would be created from
+        // the request, so the pair is refused with both halves.
+        let mut second = sampled_texture_view(4, 4);
+        second.view_id = ViewId::new(84);
+        second.allocation_id = AllocationId::new(54);
+        second.metal_binding = 1;
+        let mut pass = sampled_pass(4);
+        pass.textures.push(second);
+        pass.samplers = vec![
+            RenderSamplerBinding::new(0, REVIEWED_SAMPLER_POLICY),
+            RenderSamplerBinding::new(
+                1,
+                SamplerPolicy {
+                    filter: metal_api_core::provider::SamplerFilter::Nearest,
+                    address: metal_api_core::provider::SamplerAddressMode::ClampToEdge,
+                },
+            ),
+        ];
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the request names a state the translation did not"),
+        };
+        eprintln!("runtime sampler state disagreement: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_sampler_unsupported");
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            refused.fields.get("sampler_binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            refused.fields.get("filter"),
+            Some(&FieldValue::Text("Nearest".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("module_filter"),
+            Some(&FieldValue::Text("Linear".to_owned()))
+        );
+    }
+
     /// R9f (`research/docs/23` §3.3, v86): the stage-buffer pairing is re-asked
     /// at execution, of the value the rail was handed.
     ///
@@ -12294,6 +12915,7 @@ mod tests {
     /// sentinel the coverage assertions look for.
     fn milestone_pass(format: AttachmentFormat) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,

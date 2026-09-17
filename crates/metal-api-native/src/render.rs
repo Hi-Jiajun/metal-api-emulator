@@ -223,6 +223,16 @@ pub(crate) const DEPTH_ONLY_FRAGMENT_ENTRY: &str = "render_depth_only_fragment";
 pub(crate) const REVIEWED_SAMPLED_SOURCE: &str =
     include_str!("../../../conformance/shaders/render_sampled_4x4.metal");
 
+/// The sampled textures the reviewed render-sampler module reads
+/// (`research/docs/23` §3.3, v102).
+///
+/// The module spells one `texture2d<float>` argument, so one is the number of
+/// pass bindings it executes; the contract admits more because a *translated*
+/// fragment stage may name two or three, and this rail refuses the difference
+/// by name (`render_texture_stage_unsupported`) instead of binding surfaces
+/// nothing reads.
+pub(crate) const REVIEWED_SAMPLED_TEXTURE_COUNT: usize = 1;
+
 /// Vertex entry of the reviewed render-sampler module.
 pub(crate) const SAMPLED_VERTEX_ENTRY: &str = "render_sampled_quad_vertex";
 
@@ -1078,7 +1088,14 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
 pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
     RenderTextureCapabilityBits {
         supports_render_texture_sampling: true,
-        max_render_textures: MAX_RENDER_TEXTURES,
+        // The *rail's* window, not the contract's cap
+        // (`research/docs/23` §3.3, v102): this rail executes the reviewed
+        // MSL module, which samples one texture argument, so one is how many
+        // bindings it can execute today. Core's own ceiling
+        // ([`metal_api_core::provider::MAX_RENDER_TEXTURES`]) admits the wider
+        // declarations a translated module names; declaring them here would
+        // promise a shape this rail's plan refuses by name.
+        max_render_textures: REVIEWED_SAMPLED_TEXTURE_COUNT as u32,
         supported_render_texture_formats: SUPPORTED_RENDER_TEXTURE_FORMATS.to_vec(),
     }
 }
@@ -1094,7 +1111,14 @@ pub(crate) struct RenderTextureCapabilityBits {
 
 /// The first render-sampler increment's binding cap, spelled once so the
 /// snapshot and its tests cannot drift from core's value
-/// (`research/docs/23` §3.3, v70).
+/// (`research/docs/23` §3.3, v70/v102).
+///
+/// This is the *contract's* ceiling, which the pass-side shape rules restate
+/// for a directly-constructed pass. The snapshot the provider publishes
+/// declares the rail's own window beside it
+/// ([`REVIEWED_SAMPLED_TEXTURE_COUNT`]), because those are two different
+/// questions: the contract admits what a translated module may name, the rail
+/// declares what its reviewed modules execute.
 pub(crate) const MAX_RENDER_TEXTURES: u32 = metal_api_core::provider::MAX_RENDER_TEXTURES as u32;
 
 /// The texture formats the first render-sampler increment samples: the
@@ -3538,6 +3562,54 @@ pub(crate) fn plan_with_leases<'a>(
         if declared.sampler == Some(SamplerPolicy::reviewed_render_sampler()) {
             continue;
         }
+        // A runtime `[[sampler(n)]]` argument is the sibling shape
+        // (`research/docs/23` §3.3, v102): the reviewed MSL module spells its
+        // own `constexpr sampler` and takes no sampler argument, so the state
+        // the pass states for that index has no module behind it. The refusal
+        // carries both halves of the pairing and both states — the request's,
+        // when it bound one, and the reviewed module's — so a caller can tell
+        // "a runtime sampler this rail has no module for" apart from "a state
+        // no review covered".
+        if let Some(sampler_binding) = declared.runtime_sampler {
+            let half = |policy: Option<SamplerPolicy>| match policy {
+                Some(policy) => (
+                    FieldValue::Text(format!("{:?}", policy.filter)),
+                    FieldValue::Text(format!("{:?}", policy.address)),
+                ),
+                None => (
+                    FieldValue::Text("None".to_owned()),
+                    FieldValue::Text("None".to_owned()),
+                ),
+            };
+            let bound = request
+                .pass
+                .samplers
+                .iter()
+                .find(|sampler| sampler.metal_binding == sampler_binding)
+                .map(|sampler| sampler.policy);
+            let (filter, address) = half(bound);
+            let (module_filter, module_address) =
+                half(Some(SamplerPolicy::reviewed_render_sampler()));
+            return Err(capability_refusal("render_runtime_sampler_unsupported")
+                .with_field(
+                    "binding",
+                    FieldValue::Unsigned(u64::from(declared.metal_binding)),
+                )
+                .with_field(
+                    "sampler_binding",
+                    FieldValue::Unsigned(u64::from(sampler_binding)),
+                )
+                .with_field("filter", filter)
+                .with_field("address", address)
+                .with_field("module_filter", module_filter)
+                .with_field("module_address", module_address)
+                .with_detail(
+                    "the reviewed MSL module spells its own `constexpr sampler` and takes no \
+                     `[[sampler(n)]]` argument, so a runtime sampler has no reviewed module to \
+                     execute it; the Vulkan rail's translated arm is where one runs, with the \
+                     state the translation's own reflection names",
+                ));
+        }
         let half = |policy: Option<SamplerPolicy>| match policy {
             Some(policy) => (
                 FieldValue::Text(format!("{:?}", policy.filter)),
@@ -3580,6 +3652,30 @@ pub(crate) fn plan_with_leases<'a>(
                 "the pass binds a render texture but its fragment stage is not the reviewed \
                  sampling module",
             ));
+            }
+            // The reviewed MSL module samples exactly one
+            // `MTLTexture` argument, so a pass that binds more is a shape no
+            // reviewed module carries (`research/docs/23` §3.3, v102). The
+            // contract admits up to `MAX_RENDER_TEXTURES` — which is what lets
+            // a *translated* stage state two or three — and this rail answers
+            // the half it cannot execute by name rather than binding surfaces
+            // nothing reads.
+            if request.pass.textures.len() != REVIEWED_SAMPLED_TEXTURE_COUNT {
+                return Err(capability_refusal("render_texture_stage_unsupported")
+                    .with_field(
+                        "textures",
+                        FieldValue::Unsigned(request.pass.textures.len() as u64),
+                    )
+                    .with_field(
+                        "bindings",
+                        FieldValue::Unsigned(REVIEWED_SAMPLED_TEXTURE_COUNT as u64),
+                    )
+                    .with_detail(
+                        "the reviewed MSL sampling module reads one sampled texture, so a pass \
+                         that binds another number has no reviewed module behind it; the wider \
+                         shapes are the translated arm's, where the module's own reflection \
+                         names the textures it reads",
+                    ));
             }
             resolve_render_textures(request.pass, extent, leases)?
         };
@@ -6763,6 +6859,7 @@ mod tests {
     /// as the full-screen triangle.
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
@@ -8292,6 +8389,102 @@ mod tests {
             resident: Vec::new(),
         })
         .expect("the reviewed state admits the reviewed pass");
+    }
+
+    /// The reviewed window in the runtime-sampler increment
+    /// (`research/docs/23` §3.3, v102): this rail has no MSL module that takes
+    /// a `[[sampler(n)]]` argument, and its reviewed module samples one
+    /// `MTLTexture`, so both shapes are refused by name instead of executed
+    /// through a module that does not carry them.
+    #[test]
+    fn a_runtime_sampler_and_a_second_texture_stay_outside_the_reviewed_table() {
+        // A declaration that pairs its texture with a runtime sampler argument:
+        // the reviewed module spells its own `constexpr sampler`, so the state
+        // the request states has no module behind it. The refusal names both
+        // halves of the pairing and both states.
+        let mut runtime = sampled_pipeline();
+        runtime.textures[0].sampler = None;
+        runtime.textures[0].runtime_sampler = Some(0);
+        let mut pass = sampled_pass(4);
+        pass.samplers = vec![metal_api_core::provider::RenderSamplerBinding::new(
+            0,
+            SamplerPolicy {
+                filter: SamplerFilter::Linear,
+                address: SamplerAddressMode::Repeat,
+            },
+        )];
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &runtime,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        eprintln!("runtime sampler refused: {error:?}");
+        assert_eq!(error.slug, "render_runtime_sampler_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.fields.get("binding"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            error.fields.get("sampler_binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            error.fields.get("filter"),
+            Some(&FieldValue::Text("Linear".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("address"),
+            Some(&FieldValue::Text("Repeat".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("module_filter"),
+            Some(&FieldValue::Text("Nearest".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("module_address"),
+            Some(&FieldValue::Text("ClampToEdge".to_owned()))
+        );
+
+        // A second sampled texture: the reviewed module reads one
+        // `texture2d<float>` argument, so the wider contract — which core
+        // admits for a translated stage's sake — is refused by name here.
+        let mut second = sampled_texture_view(4);
+        second.metal_binding = 1;
+        second.view_id = metal_api_core::provider::ViewId::new(84);
+        second.allocation_id = metal_api_core::provider::AllocationId::new(54);
+        let mut two = sampled_pass(4);
+        two.textures.push(second);
+        let mut wide = sampled_pipeline();
+        wide.textures
+            .push(metal_api_core::provider::TextureBindingContract::sampled(
+                1,
+                metal_api_core::provider::TextureFormat::Rgba8Unorm,
+                SamplerPolicy::reviewed_render_sampler(),
+            ));
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &two,
+            pipeline: &wide,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        eprintln!("two textures refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_stage_unsupported");
+        assert_eq!(error.fields.get("textures"), Some(&FieldValue::Unsigned(2)));
+        assert_eq!(error.fields.get("bindings"), Some(&FieldValue::Unsigned(1)));
+
+        // Control: the reviewed shape itself still plans, so the two refusals
+        // above are about the wider shapes rather than about the fixture.
+        plan_pass(&OffscreenRenderRequest {
+            pass: &sampled_pass(4),
+            pipeline: &sampled_pipeline(),
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .expect("the reviewed shape plans");
     }
 
     /// The render bits the provider declares now carry the sampler
@@ -9928,6 +10121,7 @@ mod tests {
     /// bound stream.
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,

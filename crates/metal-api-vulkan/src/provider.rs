@@ -191,9 +191,14 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // `sampled_texel_4x4` case on Lavapipe and on the RTX 5060 (the
         // attachment reads back the uploaded texels exactly), and the rail's
         // own `render_e2e` sampling test. The bits name the reviewed window —
-        // one binding, one `rgba8_unorm` format, one texture of the render
-        // area's own extent — so a wider request is refused by core admission
-        // or by the rail's shape gates rather than silently narrowed.
+        // one `rgba8_unorm` format and one texture of the render area's own
+        // extent — so a wider request is refused by core admission or by the
+        // rail's shape gates rather than silently narrowed. The binding count
+        // is the contract's own ceiling (`research/docs/23` §3.3, v102): a
+        // *translated* fragment stage samples as many textures as its
+        // reflection names, so the rail declares the list's cap, while the
+        // reviewed pair's one-texture window is refused at registration and at
+        // execution by name (`render_texture_stage_unsupported`).
         supports_render_texture_sampling: true,
         max_render_textures: MAX_RENDER_TEXTURES as u32,
         supported_render_texture_formats: vec![TextureFormat::Rgba8Unorm],

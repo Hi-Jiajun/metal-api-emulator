@@ -399,6 +399,7 @@ fn render_pass_sized(
     height: u32,
 ) -> RenderPassDescriptor {
     RenderPassDescriptor {
+        samplers: Vec::new(),
         stage_buffers: Vec::new(),
         blend: None,
         multisample: None,
