@@ -139,6 +139,16 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // limits — the contract's binding cap and both closed format families —
         // so a wider request is still refused by core admission
         // (`research/docs/23` §3.3).
+        //
+        // The normalized storages arrived with E-VF1 (`research/docs/23` §103):
+        // they are Vulkan's own *required* vertex input formats, so this rail
+        // declares all eight of the contract's values, and
+        // `tests/render_normalized_vertex_e2e.rs` measures the fetch on
+        // Lavapipe — one draw whose four normalized attributes land the stored
+        // integers' own quotients, and the swapped-bytes arm that changes the
+        // frame. The rail that does not declare them yet is the native one
+        // (`metal-api-native/src/render.rs::DECLARED_VERTEX_FORMATS`), where a
+        // declaration waits for an Apple-side reading.
         max_vertex_buffers: metal_api_core::provider::MAX_VERTEX_BUFFERS as u32,
         supported_vertex_formats: metal_api_core::provider::VertexFormat::ADMITTED.to_vec(),
         supported_index_formats: metal_api_core::provider::IndexFormat::ADMITTED.to_vec(),

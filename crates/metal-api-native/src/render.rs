@@ -1154,9 +1154,10 @@ pub(crate) fn present_capability_bits() -> PresentCapabilityBits {
 ///
 /// Split out from the render bits for the same reason the present bits are: the
 /// three values are the *rail's own* limits (as many streams as the contract
-/// caps, and exactly the formats the rail translates into
-/// `MTLVertexFormat` / `MTLIndexType`), so capability admission and this rail
-/// agree by construction instead of by a second list that could drift.
+/// caps, the formats this rail has an observation for —
+/// [`DECLARED_VERTEX_FORMATS`] — and the index widths it translates into
+/// `MTLIndexType`), so capability admission and this rail's declaration agree
+/// by construction instead of by a second list that could drift.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VertexInputCapabilityBits {
     pub(crate) max_vertex_buffers: u32,
@@ -1188,10 +1189,42 @@ pub(crate) struct VertexInputCapabilityBits {
 pub(crate) fn vertex_input_capability_bits() -> VertexInputCapabilityBits {
     VertexInputCapabilityBits {
         max_vertex_buffers: MAX_VERTEX_BUFFERS,
-        supported_vertex_formats: VertexFormat::ADMITTED.to_vec(),
+        supported_vertex_formats: DECLARED_VERTEX_FORMATS.to_vec(),
         supported_index_formats: IndexFormat::ADMITTED.to_vec(),
     }
 }
+
+/// The vertex formats this provider *declares* (`research/docs/23` §103,
+/// E-VF1).
+///
+/// The four 32-bit storages are the window the `--vertex-selftest` observation
+/// behind the vertex-input flip built: the reviewed indexed module over one
+/// `float32x2` stream and a `uint16` index buffer. The contract's four
+/// normalized storages arrived afterwards. Their descriptor mapping is already
+/// total ([`vertex_format`] and [`metal_vertex_format`]), and the
+/// `MTLVertexFormat` each one names is the reviewed one — but what core
+/// admission reads is this *declaration*, and this rail's discipline is that a
+/// capability follows an Apple-side observation rather than a table (the
+/// `--stage-buffer-selftest` / `--heap-selftest` flips record the same rule).
+///
+/// Flip condition: an Apple device reading of the normalized shape — the
+/// `--vertex-selftest` shape extended to a case whose descriptor declares
+/// `UChar4Normalized` and its siblings, landing the fixture's own bytes on the
+/// macOS runner. This local round cannot produce that reading (no push, no
+/// Apple device), so the four normalized storages stay out of the declaration:
+/// a trace that declares one is refused at admission with
+/// `vertex_format_unsupported` rather than executed on an unobserved path.
+///
+/// The Vulkan rail declares all eight (`crates/metal-api-vulkan/src/provider.rs`):
+/// these four are Vulkan's *required* vertex input formats, so that rail's
+/// declaration needs no device answer, and its execution is measured on
+/// Lavapipe by `tests/render_normalized_vertex_e2e.rs`.
+pub(crate) const DECLARED_VERTEX_FORMATS: [VertexFormat; 4] = [
+    VertexFormat::Float32x2,
+    VertexFormat::Float32x3,
+    VertexFormat::Float32x4,
+    VertexFormat::Uint32,
+];
 
 /// The instancing bits the provider declares, in one value so the macOS
 /// capability snapshot and the host-side tests cannot drift
@@ -1688,6 +1721,14 @@ pub(crate) enum RenderVertexFormat {
     Float3,
     Float4,
     Uint,
+    /// `MTLVertexFormat::UChar2Normalized` (`research/docs/23` §103, E-VF1).
+    UChar2Normalized,
+    /// `MTLVertexFormat::UChar4Normalized`.
+    UChar4Normalized,
+    /// `MTLVertexFormat::UShort2Normalized`.
+    UShort2Normalized,
+    /// `MTLVertexFormat::UShort4Normalized`.
+    UShort4Normalized,
 }
 
 impl RenderVertexFormat {
@@ -1698,22 +1739,40 @@ impl RenderVertexFormat {
             Self::Float3 => "float32x3",
             Self::Float4 => "float32x4",
             Self::Uint => "uint32",
+            // The spellings are the contract's own (`VertexFormat`), so a
+            // refusal that quotes this rail's plan and a suite that names the
+            // storage read the same word (`research/docs/23` §103).
+            Self::UChar2Normalized => "unorm8x2",
+            Self::UChar4Normalized => "unorm8x4",
+            Self::UShort2Normalized => "unorm16x2",
+            Self::UShort4Normalized => "unorm16x4",
         }
     }
 }
 
 /// Map an admitted vertex format onto the format this rail builds.
 ///
-/// Total: `VertexFormat`'s four values are exactly the four
-/// `MTLVertexFormat`s the reviewed rails translate, so a fifth wire code
-/// arriving without a mapping fails to compile here rather than silently
-/// becoming a different descriptor.
+/// Total over the contract's eight values, so a ninth wire code arriving
+/// without a mapping fails to compile here rather than silently becoming a
+/// different descriptor. The four normalized storages are mapped from the
+/// `MTLVertexFormat`s that name them exactly — `UChar2Normalized` and its three
+/// siblings carry the same `c / 255` / `c / 65535` conversion the contract
+/// states, so no arm here has to add or remove a normalization
+/// (`research/docs/23` §103).
+///
+/// Being mapped is not being *declared*: which of these the provider publishes
+/// is [`vertex_input_capability_bits`], and that window is where the Apple
+/// reading lives.
 pub(crate) const fn vertex_format(format: VertexFormat) -> RenderVertexFormat {
     match format {
         VertexFormat::Float32x2 => RenderVertexFormat::Float2,
         VertexFormat::Float32x3 => RenderVertexFormat::Float3,
         VertexFormat::Float32x4 => RenderVertexFormat::Float4,
         VertexFormat::Uint32 => RenderVertexFormat::Uint,
+        VertexFormat::Unorm8x2 => RenderVertexFormat::UChar2Normalized,
+        VertexFormat::Unorm8x4 => RenderVertexFormat::UChar4Normalized,
+        VertexFormat::Unorm16x2 => RenderVertexFormat::UShort2Normalized,
+        VertexFormat::Unorm16x4 => RenderVertexFormat::UShort4Normalized,
     }
 }
 
@@ -6804,6 +6863,14 @@ const fn metal_vertex_format(format: RenderVertexFormat) -> MTLVertexFormat {
         // attribute is one 32-bit unsigned integer, and `UInt` is the format
         // whose width matches `VertexFormat::Uint32::bytes()`.
         RenderVertexFormat::Uint => MTLVertexFormat::UInt,
+        // The four normalized storages, by their `MTLVertexFormat` names
+        // (`research/docs/23` §103): Metal normalizes each stored integer by
+        // its own maximum, which is the conversion the contract states, so the
+        // bytes Metal fetches are the bytes the fixture stored.
+        RenderVertexFormat::UChar2Normalized => MTLVertexFormat::UChar2Normalized,
+        RenderVertexFormat::UChar4Normalized => MTLVertexFormat::UChar4Normalized,
+        RenderVertexFormat::UShort2Normalized => MTLVertexFormat::UShort2Normalized,
+        RenderVertexFormat::UShort4Normalized => MTLVertexFormat::UShort4Normalized,
     }
 }
 
@@ -11800,15 +11867,24 @@ mod tests {
         );
         assert_eq!(
             bits.supported_vertex_formats,
-            VertexFormat::ADMITTED.to_vec()
+            DECLARED_VERTEX_FORMATS.to_vec()
         );
         assert_eq!(bits.supported_index_formats, IndexFormat::ADMITTED.to_vec());
-        // The four translated formats and both index widths are the whole
-        // admitted set, which is what makes the mapping total.
+        // The declared window is a strict subset of the contract's vocabulary:
+        // the four normalized storages are mapped (see the sibling test) but
+        // not declared, because the Apple-side reading that would declare them
+        // has not been taken (`research/docs/23` §103).
         assert_eq!(
             bits.supported_vertex_formats.len(),
-            VertexFormat::ADMITTED.len()
+            DECLARED_VERTEX_FORMATS.len()
         );
+        assert!(
+            VertexFormat::ADMITTED.len() > DECLARED_VERTEX_FORMATS.len(),
+            "the contract admits more storages than this rail declares"
+        );
+        for format in DECLARED_VERTEX_FORMATS {
+            assert!(VertexFormat::ADMITTED.contains(&format));
+        }
         assert_eq!(
             bits.supported_index_formats.len(),
             IndexFormat::ADMITTED.len()
@@ -11864,6 +11940,86 @@ mod tests {
         .unwrap_err();
         assert_eq!(refused.slug, "vertex_format_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
+    }
+
+    /// The normalized storages are *mapped* and not *declared*
+    /// (`research/docs/23` §103, E-VF1), and both halves are pinned here: the
+    /// contract's four new formats each translate into the `MTLVertexFormat`
+    /// that names them, while core admission refuses a trace whose layout
+    /// declares one — the fail-closed arm until an Apple device reading lands.
+    #[test]
+    fn the_normalized_storages_are_mapped_before_they_are_declared() {
+        for (format, expected, name, bytes) in [
+            (
+                VertexFormat::Unorm8x2,
+                RenderVertexFormat::UChar2Normalized,
+                "unorm8x2",
+                2,
+            ),
+            (
+                VertexFormat::Unorm8x4,
+                RenderVertexFormat::UChar4Normalized,
+                "unorm8x4",
+                4,
+            ),
+            (
+                VertexFormat::Unorm16x2,
+                RenderVertexFormat::UShort2Normalized,
+                "unorm16x2",
+                4,
+            ),
+            (
+                VertexFormat::Unorm16x4,
+                RenderVertexFormat::UShort4Normalized,
+                "unorm16x4",
+                8,
+            ),
+        ] {
+            assert_eq!(vertex_format(format), expected, "{name}");
+            assert_eq!(expected.name(), name);
+            assert_eq!(format.bytes(), bytes, "{name}");
+            assert!(
+                !DECLARED_VERTEX_FORMATS.contains(&format),
+                "{name} is not part of the declared window yet"
+            );
+        }
+        // The declared window is exactly what capability admission reads, so a
+        // normalized attribute is refused by name instead of being executed
+        // through a descriptor this rail never observed.
+        let (mut trace, resources) = quad_trace();
+        let entry = trace
+            .pipelines
+            .last_mut()
+            .expect("the fixture carries a pipeline table");
+        let contract = entry
+            .render
+            .as_mut()
+            .expect("the table entry carries the render contract");
+        let VertexLayout::Buffers(buffers) = &mut contract.vertex_layout else {
+            unreachable!("the reviewed layout is a buffer layout")
+        };
+        // The same reviewed stream, declared as one `unorm8x4` attribute: a
+        // four-byte storage in its own stride, so nothing but the storage
+        // differs from the trace the declared window admits.
+        buffers[0].stride = 4;
+        buffers[0].attributes[0].format = VertexFormat::Unorm8x4;
+        let refused = capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+            .admit(&trace, &resources)
+            .unwrap_err();
+        assert_eq!(refused.slug, "vertex_format_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("format"),
+            Some(&FieldValue::Unsigned(u64::from(
+                VertexFormat::Unorm8x4.code()
+            )))
+        );
+        // (The declaration itself is the thing that moves when the Apple
+        // reading lands; this test reads the same list the snapshot does rather
+        // than a second copy.)
+        assert!(!vertex_input_capability_bits()
+            .supported_vertex_formats
+            .contains(&VertexFormat::Unorm8x4));
     }
 
     /// The descriptor translation: what the rail hands Metal is the layout's

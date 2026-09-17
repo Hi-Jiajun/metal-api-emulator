@@ -1968,15 +1968,31 @@ pub const MAX_VERTEX_ATTRIBUTES: usize = 8;
 /// Component layout of one vertex attribute.
 ///
 /// The list is closed and contains only formats the reviewed Vulkan and Metal
-/// rails can both build from a vertex buffer: two, three and four `float32`
-/// components and one `uint32`. The code values are this contract's own
-/// (0..=3), because neither Vulkan's `VkFormat` nor Metal's `MTLVertexFormat`
-/// numbering is a stable wire vocabulary — the same reasoning
-/// [`AttachmentFormat`] records for its reuse of the texture codes.
+/// rails can both build from a vertex buffer. Its first half is the 32-bit
+/// storage the vertex-input increment opened — two, three and four `float32`
+/// components and one `uint32` (`research/docs/23` §3.3, v31); the four `unorm`
+/// values are the normalized 8- and 16-bit storages at the two component
+/// shapes the gate-3 census's refusals sit in (`research/docs/23` §103, E-VF1).
 ///
-/// 8-bit and 16-bit packed formats (Metal's `half`, `uchar4`, `short2`, …) are
-/// deliberately absent: their Vulkan counterparts carry normalisation state
-/// that the byte-parity discipline would have to pin first.
+/// The normalized half carries a conversion, which is why it arrived as its own
+/// increment and why its rule is stated here rather than left to each rail: the
+/// stored integer is read as the exact quotient the format names — `c / 255`
+/// for the 8-bit storages, `c / 65535` for the 16-bit ones — and nothing else
+/// is applied. A fixture whose 16-bit component is `k * 257` therefore reads
+/// back as the 8-bit byte `k`, so the two rails' comparison stays a byte
+/// comparison. A raw (non-normalized) read of the same bytes is a *different*
+/// format and is not this one.
+///
+/// The code values are this contract's own (0..=7), because neither Vulkan's
+/// `VkFormat` nor Metal's `MTLVertexFormat` numbering is a stable wire
+/// vocabulary — the same reasoning [`AttachmentFormat`] records for its reuse
+/// of the texture codes.
+///
+/// Deliberately absent, i.e. the storages this increment does not schedule: the
+/// signed normalized family, the packed `10:10:10:2` and `11:11:10` shapes, the
+/// `_bgra` channel order, the 16-bit floats and every three-channel 8- and
+/// 16-bit storage — Vulkan leaves the last group optional as vertex input
+/// formats, so it needs a measured device answer rather than a table entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VertexFormat {
     /// `VK_FORMAT_R32G32_SFLOAT` / `MTLVertexFormat::Float2`.
@@ -1987,17 +2003,34 @@ pub enum VertexFormat {
     Float32x4,
     /// `VK_FORMAT_R32_UINT` / `MTLVertexFormat::UInt`.
     Uint32,
+    /// `VK_FORMAT_R8G8_UNORM` / `MTLVertexFormat::UChar2Normalized`.
+    Unorm8x2,
+    /// `VK_FORMAT_R8G8B8A8_UNORM` / `MTLVertexFormat::UChar4Normalized`.
+    Unorm8x4,
+    /// `VK_FORMAT_R16G16_UNORM` / `MTLVertexFormat::UShort2Normalized`.
+    Unorm16x2,
+    /// `VK_FORMAT_R16G16B16A16_UNORM` / `MTLVertexFormat::UShort4Normalized`.
+    Unorm16x4,
 }
 
 impl VertexFormat {
-    /// Formats this increment admits. All four, because each one already has a
+    /// Formats the contract admits. All eight, because each one already has a
     /// reviewed mapping on both rails; the list stays closed so admitting a
-    /// fifth is a deliberate wire-visible change.
-    pub const ADMITTED: [Self; 4] = [
+    /// ninth is a deliberate wire-visible change.
+    ///
+    /// A *rail* may publish a narrower `supported_vertex_formats` — the
+    /// capability snapshot is where a rail states the window it has an
+    /// observation for — so this list is the vocabulary, not a claim about any
+    /// one device.
+    pub const ADMITTED: [Self; 8] = [
         Self::Float32x2,
         Self::Float32x3,
         Self::Float32x4,
         Self::Uint32,
+        Self::Unorm8x2,
+        Self::Unorm8x4,
+        Self::Unorm16x2,
+        Self::Unorm16x4,
     ];
 
     /// Bytes one attribute of this format occupies in the vertex stream.
@@ -2007,6 +2040,10 @@ impl VertexFormat {
             Self::Float32x3 => 12,
             Self::Float32x4 => 16,
             Self::Uint32 => 4,
+            Self::Unorm8x2 => 2,
+            Self::Unorm8x4 => 4,
+            Self::Unorm16x2 => 4,
+            Self::Unorm16x4 => 8,
         }
     }
 
@@ -2018,6 +2055,10 @@ impl VertexFormat {
             Self::Float32x3 => 1,
             Self::Float32x4 => 2,
             Self::Uint32 => 3,
+            Self::Unorm8x2 => 4,
+            Self::Unorm8x4 => 5,
+            Self::Unorm16x2 => 6,
+            Self::Unorm16x4 => 7,
         }
     }
 
@@ -2029,6 +2070,10 @@ impl VertexFormat {
             1 => Some(Self::Float32x3),
             2 => Some(Self::Float32x4),
             3 => Some(Self::Uint32),
+            4 => Some(Self::Unorm8x2),
+            5 => Some(Self::Unorm8x4),
+            6 => Some(Self::Unorm16x2),
+            7 => Some(Self::Unorm16x4),
             _ => None,
         }
     }
@@ -2039,7 +2084,14 @@ impl VertexFormat {
     pub const fn is_admitted(self) -> bool {
         matches!(
             self,
-            Self::Float32x2 | Self::Float32x3 | Self::Float32x4 | Self::Uint32
+            Self::Float32x2
+                | Self::Float32x3
+                | Self::Float32x4
+                | Self::Uint32
+                | Self::Unorm8x2
+                | Self::Unorm8x4
+                | Self::Unorm16x2
+                | Self::Unorm16x4
         )
     }
 }
@@ -18906,6 +18958,18 @@ mod tests {
         assert!(layout.binds_buffers());
         assert_eq!(layout.buffers().len(), 1);
         assert_eq!(VertexFormat::Float32x2.bytes(), 8);
+        // The normalized storages' widths come from their own component shape:
+        // two 8-bit components are two bytes and four 16-bit ones are eight,
+        // which is what the layout proof reads (`research/docs/23` §103).
+        for (format, bytes) in [
+            (VertexFormat::Unorm8x2, 2),
+            (VertexFormat::Unorm8x4, 4),
+            (VertexFormat::Unorm16x2, 4),
+            (VertexFormat::Unorm16x4, 8),
+        ] {
+            assert_eq!(format.bytes(), bytes, "{format:?}");
+            assert!(VertexFormat::ADMITTED.contains(&format));
+        }
         assert_eq!(IndexFormat::Uint16.bytes(), 2);
         assert_eq!(IndexFormat::Uint32.bytes(), 4);
         // The code space is closed and round-trips through `from_code`.
@@ -18917,7 +18981,11 @@ mod tests {
             assert_eq!(IndexFormat::from_code(format.code()), Some(format));
             assert!(format.is_admitted());
         }
-        assert_eq!(VertexFormat::from_code(4), None);
+        assert_eq!(VertexFormat::ADMITTED.len(), 8);
+        // The first code past the closed list, which moved from 4 to 8 when the
+        // normalized storages took 4..=7: an unknown code is still a decoder
+        // error rather than a silent default.
+        assert_eq!(VertexFormat::from_code(8), None);
         assert_eq!(IndexFormat::from_code(2), None);
     }
 
