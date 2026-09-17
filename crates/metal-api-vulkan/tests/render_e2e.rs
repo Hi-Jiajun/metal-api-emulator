@@ -4629,3 +4629,809 @@ fn a_translated_stage_reads_its_stage_buffer_and_lands_its_bytes() {
         "the fragment set's translated stage lands the same bytes as the default set's"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R9f (`research/docs/23` §3.3, v86): writable stage buffers and affine
+// footprints.
+//
+// The two halves are measured apart. The write half is one translated fragment
+// stage that copies its read-only slot into its writable one, so a submission
+// has two falsifiable readings: the frame is the source's payload, and the
+// sink's *writeback* is that same payload — moving the payload moves both, and a
+// rail that bound the sink read-only or dropped its landing leaves one of them
+// behind. The affine half is one translated vertex stage that reads
+// `positions[vertex_id]`, so the draw's own vertex count is the bound the
+// contract's affine declaration is proven against.
+// ---------------------------------------------------------------------------
+
+/// The translated fragment stage of the write half: a read-only `source` at
+/// `[[buffer(0)]]` and a writable `sink` at `[[buffer(1)]]`.
+const WRITE_STAGE_BUFFER_FRAGMENT_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_write.frag.ll");
+const WRITE_STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_stage_buffer_write_rgba8";
+
+/// The translated vertex stage of the affine half: `positions[vertex_id]`.
+const AFFINE_STAGE_BUFFER_VERTEX_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_positions.vert.ll");
+const AFFINE_STAGE_BUFFER_VERTEX_ENTRY: &str = "render_vertex_positions";
+
+/// The affine half's fragment stage: the solid 8-bit UNORM module that reads no
+/// buffer at all, so the draw's only stage buffer is the vertex one.
+const AFFINE_STAGE_BUFFER_FRAGMENT_AIR: &str =
+    include_str!("fixtures/render_offscreen_2x2.frag.ll");
+const AFFINE_STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
+
+/// The declaring pass's kernel for the write half: three bindings, so the
+/// pass can declare the attachment (read), its own copy landing (write) and the
+/// writable stage buffer's sink (read) in one go. The witness binding is what
+/// keeps the sink's pool entry a *read*: a compute pass may not write bytes the
+/// draw writes (`RenderInputComputeConflict`), and the pool entry the
+/// writeback lands in is what the trace has to declare.
+const COPY_WORD_WITH_WITNESS_AIR: &str =
+    include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word_with_witness.ll");
+
+const WRITE_STAGE_BUFFER_SOURCE_VIEW: ViewId = ViewId::new(716);
+const WRITE_STAGE_BUFFER_SOURCE_ALLOCATION: AllocationId = AllocationId::new(816);
+const WRITE_STAGE_BUFFER_SINK_VIEW: ViewId = ViewId::new(717);
+const WRITE_STAGE_BUFFER_SINK_ALLOCATION: AllocationId = AllocationId::new(817);
+const WRITE_STAGE_BUFFER_WITNESS_VIEW: ViewId = ViewId::new(719);
+const WRITE_STAGE_BUFFER_WITNESS_ALLOCATION: AllocationId = AllocationId::new(819);
+const AFFINE_STAGE_BUFFER_VIEW: ViewId = ViewId::new(718);
+const AFFINE_STAGE_BUFFER_ALLOCATION: AllocationId = AllocationId::new(818);
+
+/// The write half's declaration pair: the source is read with a static extent,
+/// the sink written with one (`research/docs/23` §3.3, v86).
+fn write_stage_buffer_declarations(
+    source_access: BufferAccess,
+    sink_access: BufferAccess,
+) -> Vec<StageBufferBinding> {
+    vec![
+        StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: source_access,
+            footprint: FootprintProof::Static { max_bytes: 16 },
+        },
+        StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 1,
+            access: sink_access,
+            footprint: FootprintProof::Static { max_bytes: 16 },
+        },
+    ]
+}
+
+/// Register the write half's two pipelines: the declaring pass's kernel and
+/// one translated pair whose fragment stage is the copy fixture.
+fn write_stage_buffer_registration(
+    declarations: Vec<StageBufferBinding>,
+) -> Result<
+    (
+        VulkanComputeProvider,
+        CompiledComputePipeline,
+        CompiledComputePipeline,
+    ),
+    ProviderError,
+> {
+    let Some(executor) = executor() else {
+        return Err(ProviderError::new(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "render_e2e_no_device",
+        )
+        .expect("static slug"));
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .expect("the provider context builds");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_WITH_WITNESS_AIR)
+        .expect("the witness fixture loads")
+        .function("copy_word_with_witness")
+        .expect("the witness entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_r9f_write_compute"))
+        .expect("the compute pipeline registers");
+    let vertex_library = device
+        .new_library_with_air(TRANSLATED_STAGE_BUFFER_VERTEX_AIR)
+        .expect("the translated vertex fixture loads");
+    let vertex_function = vertex_library
+        .function(TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY)
+        .expect("the translated vertex entry exists");
+    let vertex = TranslatedRenderStage::translate(RenderStage::Vertex, &vertex_function)
+        .expect("the vertex stage translates");
+    let fragment_library = device
+        .new_library_with_air(WRITE_STAGE_BUFFER_FRAGMENT_AIR)
+        .expect("the write fixture loads");
+    let fragment_function = fragment_library
+        .function(WRITE_STAGE_BUFFER_FRAGMENT_ENTRY)
+        .expect("the write entry exists");
+    let fragment = TranslatedRenderStage::translate(RenderStage::Fragment, &fragment_function)
+        .expect("the fragment stage translates");
+    let render = provider.register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+        contract: RenderPipelineContract {
+            vertex_entry: TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY.to_owned(),
+            fragment_entry: WRITE_STAGE_BUFFER_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::None,
+            stage_buffers: declarations,
+        },
+        vertex,
+        fragment,
+        logical_digest: digest(b"render_e2e_r9f_write_stages"),
+    })?;
+    Ok((provider, compute, render))
+}
+
+/// The refusal of one registration that is expected to fail: `expect_err`
+/// needs `Debug` on the success half, and a provider context is not `Debug`.
+fn registration_refusal(
+    result: Result<
+        (
+            VulkanComputeProvider,
+            CompiledComputePipeline,
+            CompiledComputePipeline,
+        ),
+        ProviderError,
+    >,
+) -> ProviderError {
+    match result {
+        Ok(_) => panic!("the registration was expected to be refused"),
+        Err(error) => error,
+    }
+}
+
+/// The three registrations one positive R9f fixture expects, with "this box has
+/// no device" the only refusal that silently skips the test.
+fn expect_registration(
+    result: Result<
+        (
+            VulkanComputeProvider,
+            CompiledComputePipeline,
+            CompiledComputePipeline,
+        ),
+        ProviderError,
+    >,
+) -> Option<(
+    VulkanComputeProvider,
+    CompiledComputePipeline,
+    CompiledComputePipeline,
+)> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) if error.slug == "render_e2e_no_device" => None,
+        Err(error) => panic!("the fixture registration was refused: {error:?}"),
+    }
+}
+
+/// One trace of the write half: the declaring compute pass and the render pass
+/// whose fragment stage copies `source` into `sink`.
+///
+/// `sink_in_pool` is the trace's own declaration choice, and it is the shape
+/// the no-landing refusal is about: with the sink declared by the compute pass
+/// the pool holds its view and the writeback lands there; without it the view
+/// is not part of the trace's pool at all.
+fn write_stage_buffer_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    source: &[u8],
+    sink_in_pool: bool,
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = vec![
+        StageBufferView {
+            stage: RenderPipelineStage::Fragment,
+            view: BufferView {
+                view_id: WRITE_STAGE_BUFFER_SOURCE_VIEW,
+                metal_binding: 0,
+                allocation_id: WRITE_STAGE_BUFFER_SOURCE_ALLOCATION,
+                offset: 0,
+                length: u64::try_from(source.len()).expect("source length"),
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(source.to_vec()),
+            },
+        },
+        StageBufferView {
+            stage: RenderPipelineStage::Fragment,
+            view: BufferView {
+                view_id: WRITE_STAGE_BUFFER_SINK_VIEW,
+                metal_binding: 1,
+                allocation_id: WRITE_STAGE_BUFFER_SINK_ALLOCATION,
+                offset: 0,
+                length: 16,
+                access: BufferAccess::Write,
+                attribute_stride: None,
+                // The sink starts as zeros: a rail that executes the pass but
+                // lands nothing would publish these bytes.
+                source: BufferSource::OwnedBytes(vec![0; 16]),
+            },
+        },
+    ];
+    let mut buffers = vec![
+        BufferView {
+            view_id: ATTACHMENT_VIEW,
+            metal_binding: 0,
+            allocation_id: ATTACHMENT_ALLOCATION,
+            offset: 0,
+            length: attachment_length(AttachmentFormat::Rgba8Unorm) as u64,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 16]),
+        },
+        BufferView {
+            view_id: SCRATCH_VIEW,
+            metal_binding: 1,
+            allocation_id: SCRATCH_ALLOCATION,
+            offset: 0,
+            length: 4,
+            access: BufferAccess::Write,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0xab; 4]),
+        },
+    ];
+    if sink_in_pool {
+        buffers.push(BufferView {
+            view_id: WRITE_STAGE_BUFFER_SINK_VIEW,
+            metal_binding: 2,
+            allocation_id: WRITE_STAGE_BUFFER_SINK_ALLOCATION,
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 16]),
+        });
+    } else {
+        // The same three-binding kernel with its witness slot filled by a view
+        // of its own: the compute pass stays legal, and the writable stage
+        // buffer's view is what the trace does *not* declare.
+        buffers.push(BufferView {
+            view_id: WRITE_STAGE_BUFFER_WITNESS_VIEW,
+            metal_binding: 2,
+            allocation_id: WRITE_STAGE_BUFFER_WITNESS_ALLOCATION,
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 16]),
+        });
+    }
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(14),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers,
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(pass),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, 16),
+        (SCRATCH_ALLOCATION, 8),
+        (WRITE_STAGE_BUFFER_SOURCE_ALLOCATION, 16),
+        (WRITE_STAGE_BUFFER_SINK_ALLOCATION, 16),
+        (WRITE_STAGE_BUFFER_WITNESS_ALLOCATION, 16),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+    (trace, resources)
+}
+
+/// Submit one write-half trace and return `(frame, sink bytes)`.
+fn write_stage_buffer_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    source: &[u8],
+    sink_in_pool: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    let (trace, resources) =
+        write_stage_buffer_trace(provider, compute, render, source, sink_in_pool);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the write-half trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    (
+        readback(&writebacks, ATTACHMENT_VIEW),
+        readback(&writebacks, WRITE_STAGE_BUFFER_SINK_VIEW),
+    )
+}
+
+/// The write half of `research/docs/23` §3.3 v86 on the Vulkan rail: the
+/// declaration says the fragment stage writes its `[[buffer(1)]]`, the module's
+/// reflection says the same, the pass binds it writable, and the bytes land
+/// through the same writeback channel the attachments use.
+#[test]
+fn a_writable_stage_buffer_lands_its_bytes_through_the_writeback_channel() {
+    let Some((provider, compute, render)) = expect_registration(write_stage_buffer_registration(
+        write_stage_buffer_declarations(BufferAccess::Read, BufferAccess::Write),
+    )) else {
+        return;
+    };
+    let payload = stage_buffer_tint();
+    let (frame, sink) = write_stage_buffer_readback(&provider, &compute, &render, &payload, true);
+    eprintln!("write-half frame: {}", hex(&frame));
+    eprintln!("write-half source payload: {}", hex(&payload));
+    eprintln!("write-half sink writeback: {}", hex(&sink));
+    assert_eq!(frame.len(), 16);
+    assert_eq!(
+        frame,
+        [0x40, 0x80, 0xc0, 0xff].repeat(4),
+        "the frame is the source payload through the format's quantisation: {}",
+        hex(&frame)
+    );
+    assert_eq!(
+        sink,
+        payload,
+        "the sink's writeback is the stage's own write: {}",
+        hex(&sink)
+    );
+    assert_ne!(
+        sink,
+        vec![0_u8; 16],
+        "the sink starts as zeros, so a rail that landed nothing would publish them"
+    );
+
+    // The mutation control, in the other direction: another payload lands
+    // another frame *and* another sink, so both readings are the stage's own
+    // bytes rather than a constant either rail carries.
+    let green: Vec<u8> = [0.0_f32, 1.0, 0.0, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let (mutated_frame, mutated_sink) =
+        write_stage_buffer_readback(&provider, &compute, &render, &green, true);
+    eprintln!("write-half mutated frame: {}", hex(&mutated_frame));
+    eprintln!("write-half mutated sink: {}", hex(&mutated_sink));
+    assert_eq!(mutated_frame, [0x00, 0xff, 0x00, 0xff].repeat(4));
+    assert_eq!(mutated_sink, green);
+}
+
+/// The write half's refusal face: every shape that would execute a write the
+/// declaration and the module do not agree on stays on this side of the device
+/// and is refused by name.
+#[test]
+fn the_writable_stage_buffer_face_refuses_what_it_cannot_land() {
+    // One: the declaration says the source is written, the module only reads
+    // it (`research/docs/23` §3.3, v86). Refused at registration, before any
+    // device object exists.
+    let refusal = registration_refusal(write_stage_buffer_registration(
+        write_stage_buffer_declarations(BufferAccess::Write, BufferAccess::Write),
+    ));
+    eprintln!("write-half refusal, written source: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refusal.fields.get("declared_access"),
+        Some(&FieldValue::Text("write".to_owned()))
+    );
+    assert_eq!(
+        refusal.fields.get("reflected_access"),
+        Some(&FieldValue::Text("read".to_owned()))
+    );
+
+    // Two: a read-only declaration for the slot the module writes — the same
+    // disagreement from the other side.
+    let refusal = registration_refusal(write_stage_buffer_registration(
+        write_stage_buffer_declarations(BufferAccess::Read, BufferAccess::Read),
+    ));
+    eprintln!("write-half refusal, read sink: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refusal.fields.get("declared_access"),
+        Some(&FieldValue::Text("read".to_owned()))
+    );
+    assert_eq!(
+        refusal.fields.get("reflected_access"),
+        Some(&FieldValue::Text("write".to_owned()))
+    );
+
+    // Three: this rail's *reviewed* stage-buffer modules read their slots, so a
+    // writable declaration has no writer behind it.
+    let Some(executor) = executor() else {
+        return;
+    };
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .expect("the provider context builds");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let refusal = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "stage_buffer_positions_main".to_owned(),
+                fragment_entry: "stage_buffer_tint_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: vec![StageBufferBinding {
+                    stage: RenderPipelineStage::Vertex,
+                    index: 0,
+                    access: BufferAccess::Write,
+                    footprint: FootprintProof::Static { max_bytes: 24 },
+                }],
+            },
+            vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
+            fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_r9f_reviewed_write"),
+        })
+        .expect_err("a writable declaration under a reviewed module is refused");
+    eprintln!("write-half refusal, reviewed module: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_buffer_write_unsupported");
+    assert_eq!(
+        refusal.fields.get("stage"),
+        Some(&FieldValue::Text("vertex".to_owned()))
+    );
+    assert_eq!(refusal.fields.get("index"), Some(&FieldValue::Unsigned(0)));
+    assert_eq!(
+        refusal.fields.get("access"),
+        Some(&FieldValue::Text("write".to_owned()))
+    );
+
+    // Four: a writable stage buffer whose view the trace does not declare has
+    // no pool entry the writeback could land in.
+    let Some((provider, compute, render)) = expect_registration(write_stage_buffer_registration(
+        write_stage_buffer_declarations(BufferAccess::Read, BufferAccess::Write),
+    )) else {
+        return;
+    };
+    let payload = stage_buffer_tint();
+    let (trace, resources) =
+        write_stage_buffer_trace(&provider, &compute, &render, &payload, false);
+    let refusal = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect_err("a write with no landing view is refused");
+    eprintln!("write-half refusal, no landing: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_buffer_writeback_unknown");
+    assert_eq!(refusal.class, ProviderErrorClass::Resource);
+    assert_eq!(refusal.phase, ProviderPhase::Resolve);
+
+    // Five: the pass's own half of the pair. A read-only declaration beside a
+    // *writable* view is the disagreement the pair rules answer, one layer
+    // below the module pairing that cases one and two measured.
+    let Some((provider, compute, reviewed, _other)) = stage_buffer_fixture() else {
+        return;
+    };
+    let mut pass = render_pass(reviewed.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = vec![
+        stage_buffer_view(
+            RenderPipelineStage::Vertex,
+            0,
+            STAGE_BUFFER_POSITION_VIEW,
+            STAGE_BUFFER_POSITION_ALLOCATION,
+            &stage_buffer_positions(),
+        ),
+        StageBufferView {
+            stage: RenderPipelineStage::Fragment,
+            view: BufferView {
+                access: BufferAccess::Write,
+                ..stage_buffer_view(
+                    RenderPipelineStage::Fragment,
+                    0,
+                    STAGE_BUFFER_TINT_VIEW,
+                    STAGE_BUFFER_TINT_ALLOCATION,
+                    &stage_buffer_tint(),
+                )
+                .view
+            },
+        },
+    ];
+    let (trace, resources) = stage_buffer_trace_with_pass(&provider, &compute, &reviewed, pass);
+    let refusal = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect_err("a writable view under a read-only declaration is refused");
+    eprintln!("write-half refusal, writable view: {refusal:?}");
+    assert_eq!(refusal.slug, "trace_contract_invalid");
+    assert!(
+        refusal
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("fragment stage buffer 0 is bound Write")),
+        "the detail names the bound access and the declared one: {:?}",
+        refusal.detail
+    );
+}
+
+/// The affine declaration of the vertex fixture: the two `float2` component
+/// loads the reflection reports, each `base + vertex_id * 8` (`fields` are the
+/// reflection's own numbers — the declaration is a second measurement of one
+/// module, not a guess).
+fn affine_stage_buffer_declaration() -> StageBufferBinding {
+    StageBufferBinding {
+        stage: RenderPipelineStage::Vertex,
+        index: 0,
+        access: BufferAccess::Read,
+        footprint: FootprintProof::Affine {
+            accesses: vec![
+                metal_api_core::provider::AffineAccess {
+                    base_offset: 0,
+                    access_size: 4,
+                    terms: vec![metal_api_core::provider::AffineTerm { axis: 0, stride: 8 }],
+                },
+                metal_api_core::provider::AffineAccess {
+                    base_offset: 4,
+                    access_size: 4,
+                    terms: vec![metal_api_core::provider::AffineTerm { axis: 0, stride: 8 }],
+                },
+            ],
+        },
+    }
+}
+
+/// Register the affine half's pair: the translated vertex stage that reads
+/// `positions[vertex_id]` beside the translated solid fragment stage.
+fn affine_stage_buffer_registration(
+    declaration: StageBufferBinding,
+) -> Result<
+    (
+        VulkanComputeProvider,
+        CompiledComputePipeline,
+        CompiledComputePipeline,
+    ),
+    ProviderError,
+> {
+    let Some(executor) = executor() else {
+        return Err(ProviderError::new(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "render_e2e_no_device",
+        )
+        .expect("static slug"));
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .expect("the provider context builds");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_r9f_affine_compute"))
+        .expect("the compute pipeline registers");
+    let vertex_library = device
+        .new_library_with_air(AFFINE_STAGE_BUFFER_VERTEX_AIR)
+        .expect("the affine vertex fixture loads");
+    let vertex_function = vertex_library
+        .function(AFFINE_STAGE_BUFFER_VERTEX_ENTRY)
+        .expect("the affine vertex entry exists");
+    let vertex = TranslatedRenderStage::translate(RenderStage::Vertex, &vertex_function)
+        .expect("the affine vertex stage translates");
+    let fragment_library = device
+        .new_library_with_air(AFFINE_STAGE_BUFFER_FRAGMENT_AIR)
+        .expect("the affine fragment fixture loads");
+    let fragment_function = fragment_library
+        .function(AFFINE_STAGE_BUFFER_FRAGMENT_ENTRY)
+        .expect("the affine fragment entry exists");
+    let fragment = TranslatedRenderStage::translate(RenderStage::Fragment, &fragment_function)
+        .expect("the fragment stage translates");
+    let render = provider.register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+        contract: RenderPipelineContract {
+            vertex_entry: AFFINE_STAGE_BUFFER_VERTEX_ENTRY.to_owned(),
+            fragment_entry: AFFINE_STAGE_BUFFER_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::None,
+            stage_buffers: vec![declaration],
+        },
+        vertex,
+        fragment,
+        logical_digest: digest(b"render_e2e_r9f_affine_stages"),
+    })?;
+    Ok((provider, compute, render))
+}
+
+/// One affine-half trace: the declaring compute pass and one draw whose vertex
+/// stage reads its positions out of the bound view.
+fn affine_stage_buffer_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    positions: &[u8],
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = vec![StageBufferView {
+        stage: RenderPipelineStage::Vertex,
+        view: BufferView {
+            view_id: AFFINE_STAGE_BUFFER_VIEW,
+            metal_binding: 0,
+            allocation_id: AFFINE_STAGE_BUFFER_ALLOCATION,
+            offset: 0,
+            length: u64::try_from(positions.len()).expect("positions length"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(positions.to_vec()),
+        },
+    }];
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(15),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        length: attachment_length(AttachmentFormat::Rgba8Unorm) as u64,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; 16]),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(pass),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, 16),
+        (SCRATCH_ALLOCATION, 8),
+        (
+            AFFINE_STAGE_BUFFER_ALLOCATION,
+            u64::try_from(positions.len()).expect("positions length"),
+        ),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+    (trace, resources)
+}
+
+/// Submit one affine-half trace and return the frame's readback.
+fn affine_stage_buffer_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    positions: &[u8],
+) -> Vec<u8> {
+    let (trace, resources) = affine_stage_buffer_trace(provider, compute, render, positions);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the affine-half trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    readback(&writebacks, ATTACHMENT_VIEW)
+}
+
+/// The affine half of `research/docs/23` §3.3 v86: the declaration states the
+/// module's reflected `0/4 + vertex_id * 8` reach, the draw's own vertex count
+/// (three) is what bounds it, and the frame is a function of the bytes the
+/// vertex stage reads.
+#[test]
+fn an_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
+    let Some((provider, compute, render)) = expect_registration(affine_stage_buffer_registration(
+        affine_stage_buffer_declaration(),
+    )) else {
+        return;
+    };
+    let positions = stage_buffer_positions();
+    let frame = affine_stage_buffer_readback(&provider, &compute, &render, &positions);
+    eprintln!("affine-half frame: {}", hex(&frame));
+    eprintln!("affine-half positions: {}", hex(&positions));
+    assert_eq!(frame.len(), 16);
+    assert_eq!(
+        &frame[..4],
+        &[0x40, 0x80, 0xc0, 0xff],
+        "the covered texel is the solid fragment stage's constant: {}",
+        hex(&frame)
+    );
+    assert!(
+        frame[4..]
+            .chunks_exact(4)
+            .all(|texel| texel == CLEAR_SENTINEL),
+        "the buffer's triangle covers exactly one texel: {}",
+        hex(&frame)
+    );
+
+    // The falsification: moving the buffer's own vertices moves the covered
+    // texel, so the frame is what the vertex stage read rather than a constant
+    // or a geometry the rail computed itself.
+    let shifted: Vec<u8> = [-0.9_f32, -0.9, 0.0, -0.9, -0.9, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let moved = affine_stage_buffer_readback(&provider, &compute, &render, &shifted);
+    eprintln!("affine-half shifted frame: {}", hex(&moved));
+    assert_ne!(moved, frame, "the frame follows the buffer's own vertices");
+
+    // The bound is the draw's, so a view that stops short of
+    // `(vertices - 1) * stride + access_size` is refused at admission: three
+    // vertices of eight bytes are 24 bytes, and this view declares 16.
+    let (trace, resources) =
+        affine_stage_buffer_trace(&provider, &compute, &render, &positions[..16]);
+    let refusal = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect_err("a view shorter than the affine bound is refused");
+    eprintln!("affine-half refusal, short view: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_buffer_footprint_unsupported");
+    assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+    // And the other shape of the same gate: a declaration that states a static
+    // extent where the module's reach is affine is a disagreement between the
+    // declaration and the module, refused at registration.
+    let refusal = registration_refusal(affine_stage_buffer_registration(StageBufferBinding {
+        stage: RenderPipelineStage::Vertex,
+        index: 0,
+        access: BufferAccess::Read,
+        footprint: FootprintProof::Static { max_bytes: 24 },
+    }));
+    eprintln!("affine-half refusal, static declaration: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_reflection_mismatch");
+    assert_eq!(refusal.fields.get("index"), Some(&FieldValue::Unsigned(0)));
+    assert_eq!(
+        refusal.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned()))
+    );
+}

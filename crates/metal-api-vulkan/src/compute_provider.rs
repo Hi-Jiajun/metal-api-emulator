@@ -1528,6 +1528,33 @@ impl VulkanComputeProvider {
                     });
                 }
             }
+            // A writable stage buffer is a landing like a stored attachment
+            // (`research/docs/23` §3.3, v86): one complete writeback for the
+            // view the trace declared, in the same byte-keyed channel and in
+            // the pass's canonical binding order. The bytes are only published
+            // when the trace asked for a host readback — the same rule the
+            // attachment landings follow, and the reason the rail reads them
+            // unconditionally is that the read is a mapping the bytes already
+            // live in.
+            if host_readback {
+                for landing in readback.stage_buffers {
+                    let view = planned.pass.stage_buffers.iter().find(|stage| {
+                        stage.stage == landing.stage && stage.view.metal_binding == landing.index
+                    });
+                    // The pair rules held every readable or writable stage
+                    // buffer to a declaration, so a landing without its view
+                    // is a rail state the contract cannot produce; skipping it
+                    // would publish a partial set of writebacks, which is why
+                    // the lookup is an expectation rather than a filter.
+                    let view = view.expect("every stage buffer landing has its own view");
+                    writebacks.push(BufferWriteback {
+                        view_id: view.view.view_id,
+                        allocation_id: view.view.allocation_id,
+                        offset: view.view.offset,
+                        bytes: landing.bytes,
+                    });
+                }
+            }
             // The depth landing follows the colour ones, in the same channel
             // and in the same (allocation, view) order the writeback contract
             // states (`research/docs/23` §3.3, v43).
