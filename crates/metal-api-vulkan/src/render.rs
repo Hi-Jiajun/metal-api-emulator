@@ -29,18 +29,18 @@
 //! attachment.
 
 use ash::vk;
-use metal2vulkan::reflect::{ShaderReflection, ShaderStage};
+use metal2vulkan::reflect::{ResourceAccess, ResourceKind, ShaderReflection, ShaderStage};
 use metal_api_core::provider::{
     AttachmentFormat, BlendFactor, BlendOperation, BorrowedLeaseRegistry, BorrowedView,
-    BufferSource, BufferView, ClearColor, CompareFunction, CullMode, DepthLoadOp,
-    DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, IndexFormat,
-    IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp, MultisampleDepthResolve,
-    MultisampleState, MultisampleStencilResolve, ProviderError, ProviderErrorClass, ProviderPhase,
-    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
-    RenderPipelineStage, ResourceTableSnapshot, Retryability, SampleCount, StencilCompare,
-    StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp, TextureFormat,
-    TextureSource, TextureType, TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId,
-    Winding, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction, CullMode, DepthLoadOp,
+    DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, FootprintProof,
+    IndexFormat, IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp,
+    MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, Retryability, SampleCount,
+    StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp,
+    TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout, VertexFormat,
+    VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -131,6 +131,16 @@ impl RenderStage {
         match self {
             Self::Vertex => spirv::ExecutionModel::Vertex,
             Self::Fragment => spirv::ExecutionModel::Fragment,
+        }
+    }
+
+    /// The core contract's spelling of this stage, which the stage-buffer
+    /// declaration and the pass's view list pair on
+    /// (`research/docs/23` §3.3, v83/v84).
+    pub(crate) const fn pipeline_stage(self) -> RenderPipelineStage {
+        match self {
+            Self::Vertex => RenderPipelineStage::Vertex,
+            Self::Fragment => RenderPipelineStage::Fragment,
         }
     }
 }
@@ -343,6 +353,25 @@ const STAGE_BUFFER_VERTEX_BINDING: u32 = 0;
 /// The fragment stage's binding inside its own descriptor set (set 2): the
 /// module's `[[buffer(0)]]` tint.
 const STAGE_BUFFER_FRAGMENT_BINDING: u32 = 0;
+
+/// The descriptor set the vertex stage's bindings live in
+/// (`research/docs/23` §3.3, v83): set 1, with the fragment stage's one set
+/// above it. [`RenderPipelineStage::code`] is the stage's own ordinal, so the
+/// two reviewed sets are this base plus that code.
+const STAGE_BUFFER_REVIEWED_SET_BASE: u32 = 1;
+
+/// The highest descriptor set this rail's render pipeline layout names
+/// (`research/docs/23` §3.3, v84).
+///
+/// Entry `i` of the pipeline layout is set `i`, and the rail's own faces fill
+/// at most three of them: set 0 is the sampled pipeline's when a pass samples,
+/// set 1 is the vertex stage's and set 2 the fragment stage's — the R9 layout
+/// the reviewed stage-buffer pair is written for. A translated module that
+/// places a `[[buffer(n)]]` binding above set 2 is refused by name rather than
+/// executed through a pipeline layout this rail cannot state, because the
+/// layout's positions below the binding would have to be padded with empty
+/// sets the module's own ABI never asked for.
+const STAGE_BUFFER_SET_CEILING: u32 = 2;
 
 /// The fragment stage this rail owns for the reviewed stage-buffer pair
 /// (`research/docs/23` §3.3, v83).
@@ -667,15 +696,58 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 /// (`research/docs/23` §3.3, v83).
 ///
 /// The binding number is carried beside the source because the two stages'
-/// descriptor sets are distinct: the vertex stage's bindings live in set 1 and
-/// the fragment stage's in set 2, so one list can carry both namespaces
+/// index spaces are distinct: the contract's `index` is the slot inside the
+/// stage's own Metal buffer namespace, so one list can carry both namespaces
 /// without a position becoming ambiguous. The source is resolved through the
 /// same three-arm channel the streams and textures use, before any device
 /// object exists.
 pub(crate) struct StageBufferStream<'a> {
     pub stage: RenderPipelineStage,
     pub index: u32,
+    /// The Vulkan descriptor slot the stage's own module reads this binding
+    /// from (`research/docs/23` §3.3, v84).
+    pub slot: StageBufferSlot,
     pub source: RenderInputSource<'a>,
+}
+
+/// The Vulkan descriptor slot one stage buffer is bound to
+/// (`research/docs/23` §3.3, v84).
+///
+/// The two arms are the two ways this rail learns a slot. A reviewed module
+/// reads the fixed slots the reviewed stage-buffer pair was written for — set
+/// 1 for the vertex stage, set 2 for the fragment stage, binding = the
+/// contract's `index` — while a translated module names the set and binding of
+/// every `[[buffer(n)]]` argument in the reflection that came with it. The
+/// origin is carried beside the numbers because the execution gate refuses the
+/// reviewed slots under modules that do not read them, so "which module does
+/// this slot belong to" has to stay answerable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StageBufferSlot {
+    /// A slot of one of this rail's reviewed modules.
+    Reviewed { set: u32, binding: u32 },
+    /// A slot the translated module's own reflection names.
+    Translated { set: u32, binding: u32 },
+}
+
+impl StageBufferSlot {
+    /// The descriptor set the binding lives in.
+    pub(crate) const fn set(self) -> u32 {
+        match self {
+            Self::Reviewed { set, .. } | Self::Translated { set, .. } => set,
+        }
+    }
+
+    /// The binding inside [`Self::set`].
+    pub(crate) const fn binding(self) -> u32 {
+        match self {
+            Self::Reviewed { binding, .. } | Self::Translated { binding, .. } => binding,
+        }
+    }
+
+    /// Whether the slot belongs to one of this rail's reviewed modules.
+    pub(crate) const fn is_reviewed(self) -> bool {
+        matches!(self, Self::Reviewed { .. })
+    }
 }
 
 /// One sampled texture a render pass binds: the source of its texel bytes plus
@@ -1145,7 +1217,11 @@ fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
 ///    what a translation of one stage produces;
 /// 3. the interface the rail does not execute yet
 ///    ([`unsupported_interface_field`]) is refused by name instead of being
-///    silently ignored;
+///    silently ignored — with the stage's own `[[buffer(N)]]` arguments
+///    paired against the contract's declaration beside it
+///    ([`validate_translated_stage_buffers`]), because a pipeline-level buffer
+///    binding the contract declares is interface this rail *does* execute
+///    (`research/docs/23` §3.3, v84);
 /// 4. the contract's own shape — vertex attributes against the declared vertex
 ///    layout, render targets against the declared colour format list.
 ///
@@ -1202,6 +1278,7 @@ fn validate_translated_stage(
     if let Some(field) = unsupported_interface_field(reflection) {
         return Err(unsupported_interface_refusal(stage, entry, field));
     }
+    validate_translated_stage_buffers(stages, stage, entry, reflection)?;
     match stage {
         RenderStage::Vertex => validate_translated_vertex(stages, entry, reflection),
         RenderStage::Fragment => validate_translated_fragment(stages, entry, reflection),
@@ -1525,9 +1602,16 @@ fn varying_locations(varyings: &BTreeMap<u32, Option<&str>>) -> String {
 /// capability fact rather than a mismatch: the translation may describe its
 /// stage perfectly and the rail still has no shape for it, so it refuses by name
 /// instead of executing the stage with that interface silently dropped.
+///
+/// The reflected buffer bindings are deliberately *not* on this list any more
+/// (`research/docs/23` §3.3, v84): a `[[buffer(N)]]` argument is executed when
+/// the contract declares the slot, which is a pairing question rather than a
+/// capability one, so [`validate_translated_stage_buffers`] answers it field by
+/// field. Everything a binding beyond that shape states — an undeclared slot, a
+/// texture, a sampler — is refused by that function under the same
+/// `bindings` field name this list used to report.
 fn unsupported_interface_field(reflection: &ShaderReflection) -> Option<&'static str> {
     [
-        (!reflection.bindings.is_empty(), "bindings"),
         (
             !reflection.argument_buffer_fields.is_empty(),
             "argument_buffer_fields",
@@ -1569,6 +1653,206 @@ fn unsupported_interface_field(reflection: &ShaderReflection) -> Option<&'static
     ]
     .into_iter()
     .find_map(|(present, field)| present.then_some(field))
+}
+
+/// Pair one translated stage's reflected buffer bindings with the contract's
+/// stage-buffer declarations (`research/docs/23` §3.3, v84).
+///
+/// A `[[buffer(N)]]` argument is a pipeline-level binding: the module reads the
+/// descriptor slot its reflection names, and the contract declares what the
+/// stage reaches there ([`StageBufferBinding`](metal_api_core::provider::StageBufferBinding)).
+/// The rail executes the pair only when the two halves agree field by field,
+/// and each disagreement has its own arm:
+///
+/// * a reflected slot the contract does not declare is interface this rail has
+///   no bytes for — refused by name under the `bindings` field
+///   (`render_stage_unsupported_interface`), which is also the refusal every
+///   non-buffer Metal binding keeps;
+/// * a reflected access other than read-only — the one access the render
+///   contract admits — is a disagreement between the declaration and the
+///   module (`render_stage_reflection_mismatch`);
+/// * a reflected footprint that is not a static byte extent inside the
+///   declared one is the same disagreement: the declaration's `max_bytes` is
+///   the ceiling `RenderPipelineContract::validate_against` proves the pass's
+///   view against, so a translation that reaches further — or whose reach is
+///   affine or unbounded — must not be executed under it;
+/// * a declaration this stage's reflection never reaches is the other
+///   direction of the same pairing.
+///
+/// The descriptor slot itself (`set`/`binding`) is not part of this pairing:
+/// it is what the *module* reads, so the execution side binds the contract's
+/// view into the slot the reflection names ([`stage_buffer_slot`]).
+fn validate_translated_stage_buffers(
+    stages: &RenderStages,
+    stage: RenderStage,
+    entry: &str,
+    reflection: &ShaderReflection,
+) -> Result<(), ProviderError> {
+    let pipeline_stage = stage.pipeline_stage();
+    let declaration = |index: u32| {
+        stages
+            .contract
+            .stage_buffers
+            .iter()
+            .find(|binding| binding.stage == pipeline_stage && binding.index == index)
+    };
+    let mismatch = |index: u32| {
+        reflection_mismatch_refusal(stage, entry)
+            .with_field("field", FieldValue::Text("bindings".to_owned()))
+            .with_field("index", FieldValue::Unsigned(u64::from(index)))
+    };
+    let unsupported = |index: u32, detail: &str| {
+        unsupported_interface_refusal(stage, entry, "bindings")
+            .with_field("index", FieldValue::Unsigned(u64::from(index)))
+            .with_detail(detail.to_owned())
+    };
+    for binding in &reflection.bindings {
+        let index = binding.metal_index;
+        if binding.kind != ResourceKind::Buffer {
+            return Err(unsupported(
+                index,
+                "the translated render rail binds `[[buffer(n)]]` arguments alone; every other \
+                 Metal resource kind is refused by name rather than executed with the binding \
+                 dropped",
+            )
+            .with_field("kind", FieldValue::Text(format!("{:?}", binding.kind))));
+        }
+        let Some(declared) = declaration(index) else {
+            return Err(unsupported(
+                index,
+                "the translation reads a stage buffer the contract does not declare, so the pass \
+                 has no view the slot could be filled with; the contract's `stage_buffers` list is \
+                 what states the slot's bytes",
+            ));
+        };
+        let Some(descriptor) = binding.descriptor else {
+            return Err(unsupported(
+                index,
+                "the reflected buffer consumes no Vulkan descriptor — threadgroup memory is the \
+                 shape this arm does not execute",
+            ));
+        };
+        if descriptor.count != 1 {
+            return Err(unsupported(
+                index,
+                "one stage buffer is one descriptor; an arrayed binding is a shape this rail does \
+                 not execute",
+            )
+            .with_field("count", FieldValue::Unsigned(u64::from(descriptor.count))));
+        }
+        if descriptor.set > STAGE_BUFFER_SET_CEILING {
+            return Err(unsupported(
+                index,
+                "the module reads this stage buffer from a descriptor set above the ones this \
+                 rail's render pipeline layout names (set 0 for the sampled pipeline's own \
+                 layout, set 1 for the vertex stage's buffers and set 2 for the fragment \
+                 stage's)",
+            )
+            .with_field("set", FieldValue::Unsigned(u64::from(descriptor.set)))
+            .with_field(
+                "set_ceiling",
+                FieldValue::Unsigned(u64::from(STAGE_BUFFER_SET_CEILING)),
+            ));
+        }
+        let reflected_access =
+            match binding.access {
+                Some(ResourceAccess::ReadOnly) => BufferAccess::Read,
+                Some(ResourceAccess::Unused) => BufferAccess::Unused,
+                Some(ResourceAccess::WriteOnly) => BufferAccess::Write,
+                Some(ResourceAccess::ReadWrite) => BufferAccess::ReadWrite,
+                Some(ResourceAccess::Sampled | ResourceAccess::Storage) => {
+                    return Err(mismatch(index).with_detail(
+                        "the reflection classifies a buffer argument with an image access \
+                     classification, so the two ends do not describe one buffer",
+                    ))
+                }
+                None => return Err(mismatch(index).with_detail(
+                    "the reflection carries no access classification for this buffer, so the rail \
+                     cannot hold the module to the read the contract declares",
+                )),
+            };
+        if reflected_access != declared.access {
+            return Err(mismatch(index)
+                .with_field(
+                    "declared_access",
+                    FieldValue::Text(buffer_access_name(declared.access).to_owned()),
+                )
+                .with_field(
+                    "reflected_access",
+                    FieldValue::Text(buffer_access_name(reflected_access).to_owned()),
+                )
+                .with_detail(
+                    "the reflection and the contract classify this binding's access differently, \
+                     so the bytes the pass binds are not the interface the module states",
+                ));
+        }
+        let Some(footprint) = binding.footprint.as_ref() else {
+            return Err(mismatch(index).with_detail(
+                "the reflection carries no byte footprint for this buffer, and the contract's \
+                 declared extent is what the pass's view is proven against",
+            ));
+        };
+        if footprint.has_unbounded_access || !footprint.strided_accesses.is_empty() {
+            return Err(mismatch(index).with_detail(
+                "the reflected reach is not a static byte extent, and the render contract states \
+                 stage buffer footprints as static extents alone",
+            ));
+        }
+        let Some(reflected_bytes) = footprint
+            .static_ranges
+            .iter()
+            .map(|range| range.offset.saturating_add(range.size))
+            .max()
+        else {
+            return Err(mismatch(index).with_detail(
+                "the reflection states no byte range for this read binding, so the declared extent \
+                 is not what its reach was proven against",
+            ));
+        };
+        let FootprintProof::Static { max_bytes } = declared.footprint else {
+            return Err(mismatch(index).with_detail(
+                "the declared footprint is not a static byte extent, and this rail executes stage \
+                 buffers whose reach is stated as bytes",
+            ));
+        };
+        if reflected_bytes > max_bytes {
+            return Err(mismatch(index)
+                .with_field("declared_bytes", FieldValue::Unsigned(max_bytes))
+                .with_field("reflected_bytes", FieldValue::Unsigned(reflected_bytes))
+                .with_detail(
+                    "the translation reaches past the declared extent, and the pass's view is \
+                     proven against the declaration rather than the reflection",
+                ));
+        }
+    }
+    for declared in stages
+        .contract
+        .stage_buffers
+        .iter()
+        .filter(|binding| binding.stage == pipeline_stage)
+    {
+        let reached = reflection.bindings.iter().any(|binding| {
+            binding.kind == ResourceKind::Buffer && binding.metal_index == declared.index
+        });
+        if !reached {
+            return Err(mismatch(declared.index).with_detail(
+                "the contract declares a stage buffer this stage's translation never reads, so the \
+                 declaration and the module describe different interfaces",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The name one contract access is reported under, in the spelling the
+/// refusal's fields use.
+fn buffer_access_name(access: BufferAccess) -> &'static str {
+    match access {
+        BufferAccess::Read => "read",
+        BufferAccess::Write => "write",
+        BufferAccess::ReadWrite => "read_write",
+        BufferAccess::Unused => "unused",
+    }
 }
 
 /// Whether one AIR type name is the component shape a contract vertex format
@@ -2383,8 +2667,10 @@ fn prepare_render_request_with_resident<'a>(
     // Stage buffers (`research/docs/23` §3.3, v83) resolve right beside them:
     // the same three-arm channel, one list carrying both stages' index spaces,
     // and every binding the pipeline declared already paired with the pass in
-    // `validate_against`.
-    let stage_buffers = resolve_stage_buffers(pass, leases)?;
+    // `validate_against`. Each stream also carries the descriptor slot the
+    // *module* reads — the reviewed pair's fixed slots, or the set and binding
+    // a translated module's reflection names (`research/docs/23` §3.3, v84).
+    let stage_buffers = resolve_stage_buffers(stages, pass, leases)?;
     let streams = resolve_vertex_streams(stages, pass, leases)?;
     // A per-instance stream's record count is the draw's instance count, so its
     // footprint is proved against that count instead of the vertex span
@@ -3183,6 +3469,7 @@ fn resolve_vertex_streams<'a>(
 /// pipeline did not declare never reaches this walk: `prepare_render_request`
 /// ran `validate_against` before it.
 fn resolve_stage_buffers<'a>(
+    stages: &RenderStages,
     pass: &'a RenderPassDescriptor,
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<StageBufferStream<'a>>, ProviderError> {
@@ -3203,6 +3490,10 @@ fn resolve_stage_buffers<'a>(
     let mut streams = Vec::with_capacity(pass.stage_buffers.len());
     for stage in &pass.stage_buffers {
         let index = stage.view.metal_binding;
+        // Which descriptor slot the binding fills is the module's own answer
+        // (`research/docs/23` §3.3, v84): a translated stage names its set and
+        // binding in the reflection, the reviewed pair reads its fixed slots.
+        let slot = stage_buffer_slot(stages, stage.stage, index)?;
         let source = resolve_render_input(&stage.view, leases, RenderInputRole::StageBuffer, {
             usize::try_from(index).unwrap_or(usize::MAX)
         })?;
@@ -3220,10 +3511,90 @@ fn resolve_stage_buffers<'a>(
         streams.push(StageBufferStream {
             stage: stage.stage,
             index,
+            slot,
             source,
         });
     }
     Ok(streams)
+}
+
+/// The descriptor slot one stage buffer is bound into
+/// (`research/docs/23` §3.3, v83/v84).
+///
+/// A translated stage answers with the slot its own reflection names: the
+/// registration gate paired that reflection with the contract field by field
+/// ([`validate_translated_stage_buffers`]), and `prepare_render_request` re-asks
+/// the gate before this runs, so the lookup is the reading of an already-settled
+/// pairing rather than a second check. A reviewed stage has no reflection to
+/// read: its modules were written against the rail's own layout, so the slot is
+/// the fixed one that layout gives them — set 1 for the vertex stage, set 2 for
+/// the fragment stage, binding = the contract's `index`.
+fn stage_buffer_slot(
+    stages: &RenderStages,
+    stage: RenderPipelineStage,
+    index: u32,
+) -> Result<StageBufferSlot, ProviderError> {
+    let translation = match stage {
+        RenderPipelineStage::Vertex => &stages.vertex_translation,
+        RenderPipelineStage::Fragment => &stages.fragment_translation,
+    };
+    let Some(reflection) = translation else {
+        return Ok(StageBufferSlot::Reviewed {
+            set: STAGE_BUFFER_REVIEWED_SET_BASE + u32::from(stage.code()),
+            binding: index,
+        });
+    };
+    let binding = reflection
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == index)
+        .ok_or_else(|| {
+            stage_buffer_slot_refusal(
+                stage,
+                index,
+                "the reflection this stage was registered with carries no buffer binding for this \
+                 slot, so the pairing the registration gate settles is not the one this request \
+                 was built against",
+            )
+        })?;
+    let descriptor = binding.descriptor.ok_or_else(|| {
+        stage_buffer_slot_refusal(
+            stage,
+            index,
+            "the reflected buffer binding consumes no Vulkan descriptor, so the rail has no slot \
+             its bytes could be written into",
+        )
+    })?;
+    Ok(StageBufferSlot::Translated {
+        set: descriptor.set,
+        binding: descriptor.binding,
+    })
+}
+
+/// The refusal for a stage buffer whose reflected slot cannot be answered
+/// (`research/docs/23` §3.3, v84).
+fn stage_buffer_slot_refusal(
+    stage: RenderPipelineStage,
+    index: u32,
+    detail: &str,
+) -> ProviderError {
+    capability_refusal("render_stage_reflection_mismatch")
+        .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+        .with_field("field", FieldValue::Text("bindings".to_owned()))
+        .with_field("index", FieldValue::Unsigned(u64::from(index)))
+        .with_detail(detail.to_owned())
+}
+
+/// The `VkShaderStageFlags` one stage's stage buffer binding is created with.
+///
+/// A slot belongs to exactly one stage — the collision check in
+/// [`OffscreenObjects::create_stage_buffers`] is what keeps two streams from
+/// sharing one — so the flag is the stage's own and never a combination.
+fn stage_shader_flags(stage: RenderPipelineStage) -> vk::ShaderStageFlags {
+    match stage {
+        RenderPipelineStage::Vertex => vk::ShaderStageFlags::VERTEX,
+        RenderPipelineStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
+    }
 }
 
 /// One contract blend factor as the `VkBlendFactor` it names. Closed for the
@@ -4139,15 +4510,20 @@ fn execute_offscreen_render_with_retains(
             ),
         );
     }
-    // The stage-buffer pair and the pass's bindings are one decision the same
-    // way (`research/docs/23` §3.3, v83): the reviewed vertex stage reads set 1
+    // The stage buffers and the pass's bindings are one decision the same way
+    // (`research/docs/23` §3.3, v83/v84). The reviewed vertex stage reads set 1
     // binding 0 and the reviewed fragment stage reads set 2 binding 0, so a
     // pass that names the pair without those slots would draw from
-    // descriptors nobody bound, and a pass that binds stage buffers under
-    // another pair would leave them unread. Both are refused by name instead
-    // of executed as the other shape. The core pair rules
-    // (`StageBufferBinding` ↔ `StageBufferView`) already saw the declared
-    // set, so this check is about the *reviewed modules'* own fixed slots.
+    // descriptors nobody bound. A translated stage is the other arm: every
+    // stream it owns was resolved to the slot its own reflection names
+    // (`stage_buffer_slot`), and the registration gate paired that reflection
+    // with the contract field by field
+    // (`validate_translated_stage_buffers`) — so those streams are executable,
+    // while a stream whose slot belongs to a reviewed module under a pipeline
+    // that does not read it would be a binding silently dropped, which is
+    // refused by name. The core pair rules (`StageBufferBinding` ↔
+    // `StageBufferView`) already saw the declared set, so what is left here is
+    // the *modules'* own slots.
     if vertex_stage_uses_stage_buffers(&request.vertex.entry, request.vertex.spirv) {
         let bound = |stage: RenderPipelineStage, index: u32| {
             request
@@ -4165,13 +4541,19 @@ fn execute_offscreen_render_with_retains(
                 ),
             );
         }
-    } else if !request.stage_buffers.is_empty() {
-        return Err(
-            capability_refusal("render_stage_buffer_stage_unsupported").with_detail(
-                "the pass binds a stage buffer but its stages are not the reviewed \
-                 stage-buffer pair",
-            ),
-        );
+    } else if let Some(stream) = request
+        .stage_buffers
+        .iter()
+        .find(|stream| stream.slot.is_reviewed())
+    {
+        return Err(capability_refusal("render_stage_buffer_stage_unsupported")
+            .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
+            .with_field("binding", FieldValue::Unsigned(u64::from(stream.index)))
+            .with_detail(
+                "the pass binds a stage buffer under a stage that is one of this rail's \
+                     reviewed modules and reads no `[[buffer(n)]]` argument; only a translated \
+                     stage carries the slots its reflection names",
+            ));
     }
     let tiling = vk::ImageTiling::OPTIMAL;
     let vk_formats = formats
@@ -5578,6 +5960,23 @@ fn select_graphics_queue(context: &VulkanContext) -> Result<usize, ProviderError
 
 /// Owns every object one offscreen render pass creates.
 ///
+/// One descriptor set the pass's stage buffers are bound through
+/// (`research/docs/23` §3.3, v83/v84).
+///
+/// One set per set index, whatever number of stages read from it: the reviewed
+/// pair's two stages own one set each (1 and 2), while a translated module's
+/// reflection may place both stages' bindings in one set — the translator's
+/// default layout puts every `[[buffer(n)]]` in set 0 — or in two. The set is
+/// destroyed with the pass by [`OffscreenObjects::drop`].
+struct StageBufferDescriptorSet {
+    /// The Vulkan set index: what `vkCmdBindDescriptorSets` binds this set at
+    /// and what the pipeline layout's positional list names it by.
+    set: u32,
+    layout: vk::DescriptorSetLayout,
+    pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+}
+
 /// A failure at any step destroys exactly what already exists, which is the
 /// ownership shape `ExecutionResources` gives the compute rail scoped to this
 /// one-shot rail (`research/docs/23` §6 Step 3b).
@@ -5642,17 +6041,22 @@ struct OffscreenObjects<'a> {
     /// pass, which is the shape the pipeline layout and the descriptor binds
     /// branch on.
     stage_buffer_inputs: Vec<(vk::Buffer, vk::DeviceMemory)>,
-    /// The vertex stage's descriptor set (set 1): its layout, pool and set, or
-    /// null for a pre-v83 pass. The stage buffer's binding index is the
-    /// descriptor binding, because the stage's own Metal buffer index space is
-    /// what the contract declares.
-    stage_vertex_layout: vk::DescriptorSetLayout,
-    stage_vertex_pool: vk::DescriptorPool,
-    stage_vertex_set: vk::DescriptorSet,
-    /// The fragment stage's descriptor set (set 2), the vertex half's sibling.
-    stage_fragment_layout: vk::DescriptorSetLayout,
-    stage_fragment_pool: vk::DescriptorPool,
-    stage_fragment_set: vk::DescriptorSet,
+    /// The descriptor sets the pass's stage buffers are bound through, one per
+    /// set index the streams land in, in ascending set order
+    /// (`research/docs/23` §3.3, v83/v84): the reviewed pair's fixed sets 1
+    /// and 2, or the sets a translated stage's reflection names. Empty for
+    /// every pre-v83 pass.
+    stage_buffer_sets: Vec<StageBufferDescriptorSet>,
+    /// The pipeline layout's own set list for a pass that binds stage buffers:
+    /// entry `i` is the layout of set `i`. Positions no input face occupies
+    /// carry an empty layout — including set 0 on the reviewed pair's shape,
+    /// where nothing reads the position the sampled pipeline would have taken
+    /// (`research/docs/23` §3.3, v83). Empty for every pre-v83 pass, which is
+    /// the shape the pipeline layout above branches on.
+    stage_buffer_layout_slots: Vec<vk::DescriptorSetLayout>,
+    /// The empty layouts [`Self::stage_buffer_layout_slots`] created to hold
+    /// the positions no input face occupies, destroyed with the pass.
+    stage_buffer_gap_layouts: Vec<vk::DescriptorSetLayout>,
     /// The host-visible `INDIRECT_BUFFER` an indirect draw replays from. Null
     /// for a direct draw.
     indirect_buffer: vk::Buffer,
@@ -5986,12 +6390,9 @@ impl<'a> OffscreenObjects<'a> {
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set: vk::DescriptorSet::null(),
             stage_buffer_inputs: Vec::new(),
-            stage_vertex_layout: vk::DescriptorSetLayout::null(),
-            stage_vertex_pool: vk::DescriptorPool::null(),
-            stage_vertex_set: vk::DescriptorSet::null(),
-            stage_fragment_layout: vk::DescriptorSetLayout::null(),
-            stage_fragment_pool: vk::DescriptorPool::null(),
-            stage_fragment_set: vk::DescriptorSet::null(),
+            stage_buffer_sets: Vec::new(),
+            stage_buffer_layout_slots: Vec::new(),
+            stage_buffer_gap_layouts: Vec::new(),
             indirect_buffer: vk::Buffer::null(),
             indirect_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
@@ -7811,22 +8212,26 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
-    /// Bind every stage buffer the pass's two stages read
-    /// (`research/docs/23` §3.3, v83).
+    /// Bind every stage buffer the pass's stages read
+    /// (`research/docs/23` §3.3, v83/v84).
     ///
     /// One device buffer per binding, holding that view's bytes exactly as the
     /// vertex-input path does: the trace-owned and staged arms upload into a
     /// host-visible `STORAGE_BUFFER` of the rail's own, and a borrowed window
-    /// is imported at the owner's address instead (R3c). The two stages get
-    /// one descriptor set each — the vertex stage's bindings in set 1, the
-    /// fragment stage's in set 2 — because their Metal buffer index spaces are
-    /// independent, and a pass with no stage buffers creates neither layout
-    /// nor set, so every pre-v83 pipeline layout is byte-identical to the one
-    /// it had.
+    /// is imported at the owner's address instead (R3c).
     ///
-    /// The binding numbers are the contract's own `index` values rather than
-    /// list positions: the reviewed modules address `[[buffer(0)]]`, and the
-    /// pipeline's declaration is what core already held the pass to.
+    /// One descriptor set per set index the streams land in, one binding per
+    /// stream — the reviewed pair's two stages own one set each (the vertex
+    /// stage's bindings in set 1, the fragment stage's in set 2, binding =
+    /// the contract's `index`), while a translated module's slots are the ones
+    /// its reflection names, so both stages' bindings may share set 0. A pass
+    /// with no stage buffers creates neither layout, pool nor set, so every
+    /// pre-v83 pipeline layout is byte-identical to the one it had.
+    ///
+    /// Two streams on one slot would make one write silently overwrite the
+    /// other's bytes — the shape the translator's default layout produces when
+    /// both stages read `[[buffer(n)]]` with the same index — so it is refused
+    /// by name rather than executed with one stage reading the other's buffer.
     fn create_stage_buffers(
         &mut self,
         streams: &[StageBufferStream<'_>],
@@ -7834,46 +8239,71 @@ impl<'a> OffscreenObjects<'a> {
         if streams.is_empty() {
             return Ok(());
         }
-        // The two stages' sets are 1 and 2, so set 0 has to exist even when
-        // the pass samples no texture: a pipeline layout whose first entry was
-        // the vertex stage's layout would renumber every set the reviewed
-        // modules declare, and Lavapipe answers that mismatch with a segfault
-        // inside `vkCreateGraphicsPipelines` rather than an error. The layout
-        // is empty — nothing reads set 0 in this shape — and no descriptor set
-        // is allocated for it, because `record` binds nothing where nothing is
-        // read (`research/docs/23` §3.3, v83).
-        if self.descriptor_set_layout == vk::DescriptorSetLayout::null() {
-            self.descriptor_set_layout = unsafe {
-                self.context.device.create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default(),
-                    None,
-                )
+        // One entry per set index, ascending; the slots inside one set are the
+        // bindings the modules read there.
+        let mut by_set: BTreeMap<u32, Vec<&StageBufferStream<'_>>> = BTreeMap::new();
+        for stream in streams {
+            let set = stream.slot.set();
+            if set > STAGE_BUFFER_SET_CEILING {
+                return Err(capability_refusal("render_stage_buffer_layout_unsupported")
+                    .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
+                    .with_field(
+                        "binding",
+                        FieldValue::Unsigned(u64::from(stream.slot.binding())),
+                    )
+                    .with_field("set", FieldValue::Unsigned(u64::from(set)))
+                    .with_field(
+                        "set_ceiling",
+                        FieldValue::Unsigned(u64::from(STAGE_BUFFER_SET_CEILING)),
+                    )
+                    .with_detail(
+                        "the module reads this stage buffer from a descriptor set above the \
+                             ones this rail's render pipeline layout names",
+                    ));
             }
-            .map_err(|error| {
-                execution_refusal(
-                    "create the empty set-0 descriptor set layout",
-                    &error.to_string(),
-                )
-            })?;
+            by_set.entry(set).or_default().push(stream);
         }
-        for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
-            let mut stage_streams = streams
-                .iter()
-                .filter(|stream| stream.stage == stage)
-                .collect::<Vec<_>>();
-            stage_streams.sort_by_key(|stream| stream.index);
-            let stage_flags = match stage {
-                RenderPipelineStage::Vertex => vk::ShaderStageFlags::VERTEX,
-                RenderPipelineStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
-            };
-            let bindings = stage_streams
+        for streams in by_set.values() {
+            for (position, stream) in streams.iter().enumerate() {
+                let Some(other) = streams[..position]
+                    .iter()
+                    .find(|other| other.slot.binding() == stream.slot.binding())
+                else {
+                    continue;
+                };
+                return Err(capability_refusal("render_stage_buffer_layout_unsupported")
+                    .with_field("set", FieldValue::Unsigned(u64::from(stream.slot.set())))
+                    .with_field(
+                        "binding",
+                        FieldValue::Unsigned(u64::from(stream.slot.binding())),
+                    )
+                    .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
+                    .with_field(
+                        "occupied_by",
+                        FieldValue::Text(other.stage.name().to_owned()),
+                    )
+                    .with_field("index", FieldValue::Unsigned(u64::from(stream.index)))
+                    .with_field(
+                        "occupied_index",
+                        FieldValue::Unsigned(u64::from(other.index)),
+                    )
+                    .with_detail(
+                        "two stage buffers resolve to one descriptor slot, so the second \
+                             write would overwrite the first's bytes; the two stages' Metal buffer \
+                             namespaces are independent and have to stay so in the module's own \
+                             descriptor layout",
+                    ));
+            }
+        }
+        for (set, set_streams) in &by_set {
+            let bindings = set_streams
                 .iter()
                 .map(|stream| {
                     vk::DescriptorSetLayoutBinding::default()
-                        .binding(stream.index)
+                        .binding(stream.slot.binding())
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
-                        .stage_flags(stage_flags)
+                        .stage_flags(stage_shader_flags(stream.stage))
                 })
                 .collect::<Vec<_>>();
             let layout = unsafe {
@@ -7884,7 +8314,7 @@ impl<'a> OffscreenObjects<'a> {
             }
             .map_err(|error| {
                 execution_refusal(
-                    &format!("create {} stage descriptor set layout", stage.name()),
+                    &format!("create set-{set} stage descriptor set layout"),
                     &error.to_string(),
                 )
             })?;
@@ -7906,7 +8336,7 @@ impl<'a> OffscreenObjects<'a> {
                         .destroy_descriptor_set_layout(layout, None)
                 };
                 execution_refusal(
-                    &format!("create {} stage descriptor pool", stage.name()),
+                    &format!("create set-{set} stage descriptor pool"),
                     &error.to_string(),
                 )
             })?;
@@ -7926,21 +8356,21 @@ impl<'a> OffscreenObjects<'a> {
                         .destroy_descriptor_set_layout(layout, None);
                 }
                 execution_refusal(
-                    &format!("allocate {} stage descriptor set", stage.name()),
+                    &format!("allocate set-{set} stage descriptor set"),
                     &error.to_string(),
                 )
             })?;
-            let set = sets.into_iter().next().ok_or_else(|| {
+            let descriptor_set = sets.into_iter().next().ok_or_else(|| {
                 execution_refusal(
-                    &format!("allocate {} stage descriptor set", stage.name()),
+                    &format!("allocate set-{set} stage descriptor set"),
                     "driver returned no set",
                 )
             })?;
             // The view's bytes are bound through the same two arms the streams
             // use; the buffers are kept alive with the pass and destroyed
             // beside it.
-            let mut buffer_infos = Vec::with_capacity(stage_streams.len());
-            for stream in &stage_streams {
+            let mut buffer_infos = Vec::with_capacity(set_streams.len());
+            for stream in set_streams {
                 let (buffer, memory) = self.bind_render_input(
                     &stream.source,
                     vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -7958,11 +8388,11 @@ impl<'a> OffscreenObjects<'a> {
             }
             let writes = buffer_infos
                 .iter()
-                .zip(&stage_streams)
+                .zip(set_streams)
                 .map(|(info, stream)| {
                     vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(stream.index)
+                        .dst_set(descriptor_set)
+                        .dst_binding(stream.slot.binding())
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
                         .buffer_info(std::slice::from_ref(info))
@@ -7971,18 +8401,52 @@ impl<'a> OffscreenObjects<'a> {
             unsafe {
                 self.context.device.update_descriptor_sets(&writes, &[]);
             }
-            match stage {
-                RenderPipelineStage::Vertex => {
-                    self.stage_vertex_layout = layout;
-                    self.stage_vertex_pool = pool;
-                    self.stage_vertex_set = set;
-                }
-                RenderPipelineStage::Fragment => {
-                    self.stage_fragment_layout = layout;
-                    self.stage_fragment_pool = pool;
-                    self.stage_fragment_set = set;
-                }
+            self.stage_buffer_sets.push(StageBufferDescriptorSet {
+                set: *set,
+                layout,
+                pool,
+                descriptor_set,
+            });
+        }
+        // The pipeline layout's positional list is built last, once every set
+        // index the streams land in is known: entry `i` is the layout of set
+        // `i`, so a gap below the highest set has to exist as an empty layout —
+        // Lavapipe answers a module that reads a set the pipeline layout does
+        // not declare with a segfault inside `vkCreateGraphicsPipelines`
+        // rather than an error, which is why the reviewed pair's set 0 is
+        // already carried this way (`research/docs/23` §3.3, v83).
+        let highest = *by_set
+            .keys()
+            .next_back()
+            .expect("the stream list is non-empty");
+        for set in 0..=highest {
+            if let Some(entry) = self.stage_buffer_sets.iter().find(|entry| entry.set == set) {
+                self.stage_buffer_layout_slots.push(entry.layout);
+                continue;
             }
+            if set == 0 && self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                // The sampled pipeline's own layout is set 0 (`create_render_textures`).
+                self.stage_buffer_layout_slots
+                    .push(self.descriptor_set_layout);
+                continue;
+            }
+            // Nothing reads this position: the layout is empty, no set is
+            // allocated for it, and `record` binds nothing where nothing is
+            // read.
+            let layout = unsafe {
+                self.context.device.create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default(),
+                    None,
+                )
+            }
+            .map_err(|error| {
+                execution_refusal(
+                    &format!("create the empty set-{set} descriptor set layout"),
+                    &error.to_string(),
+                )
+            })?;
+            self.stage_buffer_gap_layouts.push(layout);
+            self.stage_buffer_layout_slots.push(layout);
         }
         Ok(())
     }
@@ -8143,24 +8607,25 @@ impl<'a> OffscreenObjects<'a> {
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        // The pipeline layout carries, in set order, the sets the two input
-        // faces install: set 0 is the sampled pipeline's — the layout
+        // The pipeline layout carries, in set order, the sets the input faces
+        // install: set 0 is the sampled pipeline's — the layout
         // `create_render_textures` builds, present for every pass of this rail
-        // — then set 1 for the vertex stage's buffers and set 2 for the
-        // fragment stage's (`research/docs/23` §3.3, v70/v83). A pass that
-        // binds neither keeps exactly the one-set layout every earlier
-        // increment built, so the sets above can never shift an existing
-        // pass's numbering.
-        let mut descriptor_set_layouts = Vec::new();
-        if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
-            descriptor_set_layouts.push(self.descriptor_set_layout);
-        }
-        if self.stage_vertex_layout != vk::DescriptorSetLayout::null() {
-            descriptor_set_layouts.push(self.stage_vertex_layout);
-        }
-        if self.stage_fragment_layout != vk::DescriptorSetLayout::null() {
-            descriptor_set_layouts.push(self.stage_fragment_layout);
-        }
+        // — and the stage buffers' sets follow (`research/docs/23` §3.3,
+        // v70/v83/v84). `create_stage_buffers` already laid that list out
+        // positionally — entry `i` is set `i`, including the empty layouts that
+        // hold the positions nothing reads — so this is a copy, and a pass
+        // that binds no stage buffer keeps exactly the one-set layout every
+        // earlier increment built. Nothing can shift an existing pass's
+        // numbering because the positional list starts at set 0.
+        let descriptor_set_layouts = if self.stage_buffer_layout_slots.is_empty() {
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                vec![self.descriptor_set_layout]
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.stage_buffer_layout_slots.clone()
+        };
         let pipeline_layout_info =
             vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
         self.pipeline_layout = unsafe {
@@ -9248,20 +9713,19 @@ impl<'a> OffscreenObjects<'a> {
                     &[],
                 );
             }
-            // The two stage sets follow, in the same set order the pipeline
-            // layout declared them (`research/docs/23` §3.3, v83): set 1 for
-            // the vertex stage's buffers, set 2 for the fragment stage's. A
-            // pass that binds no stage buffer has neither set, exactly as it
-            // had before this increment.
-            if self.stage_vertex_set != vk::DescriptorSet::null()
-                && self.stage_fragment_set != vk::DescriptorSet::null()
-            {
+            // The stage-buffer sets follow, each at its own set number, in the
+            // same order the pipeline layout declared them
+            // (`research/docs/23` §3.3, v83/v84): the reviewed pair's sets 1
+            // and 2, or the sets a translated module's reflection names. A
+            // pass that binds no stage buffer has none, exactly as it had
+            // before this increment.
+            for entry in &self.stage_buffer_sets {
                 self.context.device.cmd_bind_descriptor_sets(
                     self.command,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
-                    1,
-                    &[self.stage_vertex_set, self.stage_fragment_set],
+                    entry.set,
+                    std::slice::from_ref(&entry.descriptor_set),
                     &[],
                 );
             }
@@ -9664,17 +10128,24 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             }
-            // The two stage sets are destroyed in the order the pipeline
-            // layout declared them (`research/docs/23` §3.3, v83): pool then
-            // layout per stage, and the buffers the sets pointed at beside
-            // them.
-            for (pool, layout) in [
-                (self.stage_vertex_pool, self.stage_vertex_layout),
-                (self.stage_fragment_pool, self.stage_fragment_layout),
-            ] {
-                if pool != vk::DescriptorPool::null() {
-                    self.context.device.destroy_descriptor_pool(pool, None);
+            // The stage-buffer sets are destroyed in the order the pipeline
+            // layout declared them (`research/docs/23` §3.3, v83/v84): pool
+            // then layout per set, then the empty layouts that held the
+            // positions nothing read, and the buffers the sets pointed at
+            // beside them.
+            for entry in self.stage_buffer_sets.drain(..) {
+                if entry.pool != vk::DescriptorPool::null() {
+                    self.context
+                        .device
+                        .destroy_descriptor_pool(entry.pool, None);
                 }
+                if entry.layout != vk::DescriptorSetLayout::null() {
+                    self.context
+                        .device
+                        .destroy_descriptor_set_layout(entry.layout, None);
+                }
+            }
+            for layout in self.stage_buffer_gap_layouts.drain(..) {
                 if layout != vk::DescriptorSetLayout::null() {
                     self.context
                         .device

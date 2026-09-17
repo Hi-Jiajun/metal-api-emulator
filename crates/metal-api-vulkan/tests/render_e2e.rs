@@ -43,10 +43,13 @@ use metal_api_core::provider::{
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
-    DeviceLossPoint, RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor,
-    PRESENT_TARGET_BUDGET, RESIDENT_TARGET_BUDGET,
+    DeviceLossPoint, RenderPipelineRequest, RenderStage, TranslatedRenderPipelineRequest,
+    TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor, PRESENT_TARGET_BUDGET,
+    RESIDENT_TARGET_BUDGET,
 };
 use std::sync::Arc;
+
+use metal2vulkan::reflect::DescriptorLayout;
 
 /// Vertex stage of the milestone: `spirv-as` output of the reviewed
 /// `render_spv/fullscreen_triangle.vert.spvasm` (entry `vertex_main`).
@@ -4418,4 +4421,211 @@ fn the_reviewed_stage_buffer_pair_requires_its_two_bindings() {
     };
     eprintln!("unbound stage-buffer pair refused: {refused:?}");
     assert_eq!(refused.slug, "render_stage_buffer_binding_required");
+}
+
+/// The translated stage-buffer fixture (`research/docs/23` §3.3, v84): the
+/// milestone's own two AIR stages, with the fragment half reading its colour
+/// from its `[[buffer(0)]]` argument instead of an immediate. Both stages are
+/// translations, so the descriptor slot is the one the fragment reflection
+/// names — the translator's default layout puts it at `DescriptorSet 0 /
+/// Binding 0` — rather than one of the reviewed pair's fixed sets.
+const TRANSLATED_STAGE_BUFFER_VERTEX_AIR: &str =
+    include_str!("fixtures/render_offscreen_2x2.vert.ll");
+const TRANSLATED_STAGE_BUFFER_FRAGMENT_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_tint.frag.ll");
+const TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY: &str = "render_fullscreen_triangle";
+const TRANSLATED_STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_stage_buffer_rgba8";
+
+const TRANSLATED_STAGE_BUFFER_TINT_VIEW: ViewId = ViewId::new(715);
+const TRANSLATED_STAGE_BUFFER_TINT_ALLOCATION: AllocationId = AllocationId::new(815);
+
+/// The translated stage-buffer fixture's registrations: the declaring pass's
+/// compute kernel and the translated pair whose fragment stage reads the slot
+/// the contract declares.
+///
+/// `set` is the descriptor set the fragment stage is translated into: the
+/// translator's default (set 0, every Metal resource in one set) or the
+/// fragment set of the reviewed pair's arrangement (set 2, the vertex stage's
+/// buffers would be set 1). The rail binds whichever set the reflection names
+/// (`research/docs/23` §3.3, v84).
+fn translated_stage_buffer_fixture(
+    set: u32,
+) -> Option<(
+    VulkanComputeProvider,
+    CompiledComputePipeline,
+    CompiledComputePipeline,
+)> {
+    let executor = executor()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(
+            &function,
+            digest(b"render_e2e_translated_stage_buffer_compute"),
+        )
+        .expect("the compute pipeline registers");
+    let vertex_library = device
+        .new_library_with_air(TRANSLATED_STAGE_BUFFER_VERTEX_AIR)
+        .expect("the translated vertex fixture loads");
+    let vertex_function = vertex_library
+        .function(TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY)
+        .expect("the translated vertex entry exists");
+    let vertex = TranslatedRenderStage::translate(RenderStage::Vertex, &vertex_function)
+        .expect("the vertex stage translates");
+    let fragment_library = device
+        .new_library_with_air(TRANSLATED_STAGE_BUFFER_FRAGMENT_AIR)
+        .expect("the translated fragment fixture loads");
+    let fragment_function = fragment_library
+        .function(TRANSLATED_STAGE_BUFFER_FRAGMENT_ENTRY)
+        .expect("the translated fragment entry exists");
+    let fragment = TranslatedRenderStage::translate_with_policy_and_layout(
+        RenderStage::Fragment,
+        &fragment_function,
+        executor.spirv_feature_policy(),
+        DescriptorLayout {
+            set,
+            ..DescriptorLayout::default()
+        },
+    )
+    .expect("the fragment stage translates");
+    let binding = fragment
+        .reflection()
+        .bindings
+        .iter()
+        .find(|binding| binding.metal_index == 0)
+        .expect("the fixture declares one Metal buffer");
+    eprintln!(
+        "translated stage-buffer reflection: descriptor {:?} access {:?} footprint {:?}",
+        binding.descriptor, binding.access, binding.footprint
+    );
+    let render = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY.to_owned(),
+                fragment_entry: TRANSLATED_STAGE_BUFFER_FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: vec![StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index: 0,
+                    access: BufferAccess::Read,
+                    // One `float4` load is the whole reach of the fixture.
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                }],
+            },
+            vertex,
+            fragment,
+            logical_digest: digest(b"render_e2e_translated_stage_buffer"),
+        })
+        .expect("the translated stage-buffer pair registers");
+    Some((provider, compute, render))
+}
+
+/// One render-bearing trace whose pass binds the translated fragment stage's
+/// stage buffer: the same declaring-compute + render shape the reviewed
+/// stage-buffer trace has, with the slot bound at the fragment stage alone.
+fn translated_stage_buffer_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    tint: &[u8],
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = vec![stage_buffer_view(
+        RenderPipelineStage::Fragment,
+        0,
+        TRANSLATED_STAGE_BUFFER_TINT_VIEW,
+        TRANSLATED_STAGE_BUFFER_TINT_ALLOCATION,
+        tint,
+    )];
+    stage_buffer_trace_with_pass(provider, compute, render, pass)
+}
+
+/// Submit one translated stage-buffer trace and return the attachment's
+/// readback.
+fn translated_stage_buffer_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    tint: &[u8],
+) -> Vec<u8> {
+    let (trace, resources) = translated_stage_buffer_trace(provider, compute, render, tint);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the translated stage-buffer trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    readback(&writebacks, ATTACHMENT_VIEW)
+}
+
+/// The translated arm of the stage-buffer face (`research/docs/23` §3.3,
+/// v84): the module's own reflection names the descriptor slot, the contract
+/// declares the bytes, and the pass's view is what the attachment lands. The
+/// falsification is the buffer's own payload — the full-screen triangle covers
+/// every texel of the 2×2 area, so all four readback texels are the stage
+/// buffer's bytes through the format's quantisation, and swapping the payload
+/// swaps the frame. The same stage is executed twice: once translated into the
+/// translator's default set 0 and once into set 2 — the reviewed pair's
+/// fragment set — so the slot the rail binds is the module's own in both
+/// arrangements and the two land the same bytes.
+#[test]
+fn a_translated_stage_reads_its_stage_buffer_and_lands_its_bytes() {
+    let Some((provider, compute, render)) = translated_stage_buffer_fixture(0) else {
+        return;
+    };
+    let tint = stage_buffer_tint();
+    let attachment = translated_stage_buffer_readback(&provider, &compute, &render, &tint);
+    eprintln!(
+        "translated stage-buffer attachment readback: {}",
+        hex(&attachment)
+    );
+    eprintln!("stage buffer payload: {}", hex(&tint));
+    assert_eq!(attachment.len(), 16);
+    assert_eq!(
+        attachment,
+        [0x40, 0x80, 0xc0, 0xff].repeat(4),
+        "every texel is the stage buffer's own payload: {}",
+        hex(&attachment)
+    );
+
+    // The mutation control: the same pass with another payload lands that
+    // payload's bytes, so the readback is the buffer's content rather than a
+    // constant the module carries.
+    let green: Vec<u8> = [0.0_f32, 1.0, 0.0, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let mutated = translated_stage_buffer_readback(&provider, &compute, &render, &green);
+    eprintln!("mutated stage-buffer readback: {}", hex(&mutated));
+    assert_eq!(mutated, [0x00, 0xff, 0x00, 0xff].repeat(4));
+
+    // The arrangement control: the same stage translated into set 2 is bound
+    // through that set and lands the same bytes, so the slot really is the
+    // reflection's own rather than the reviewed pair's fixed one.
+    let Some((set2_provider, set2_compute, set2_render)) = translated_stage_buffer_fixture(2)
+    else {
+        return;
+    };
+    let set2 = translated_stage_buffer_readback(&set2_provider, &set2_compute, &set2_render, &tint);
+    eprintln!("fragment-set stage-buffer readback: {}", hex(&set2));
+    assert_eq!(
+        set2, attachment,
+        "the fragment set's translated stage lands the same bytes as the default set's"
+    );
 }
