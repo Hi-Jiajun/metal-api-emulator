@@ -1783,6 +1783,47 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 64 },
                     "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1 "
                     + "and a 64-byte read buffer at 2")
+    case "render_declaring_stage_buffer_sink":
+        // v31's sink declaring case: the reviewed `copy_word_with_witness`
+        // kernel reads one word from the stage-buffer source view (16 bytes)
+        // and one from the writer's own read view (16 bytes) and writes their
+        // xor into the 4-byte output view, so the render case's frame and its
+        // sink writeback both rest on the declaring pass (`research/docs/23`
+        // §3.3, v31).
+        try require(definition.entry == "copy_word_with_witness"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3,
+                    "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains {
+                        $0.binding == 0 && $0.access == "read" && $0.length == 16
+                    }
+                    && definition.buffers.contains {
+                        $0.binding == 1 && $0.access == "write" && $0.length == 4
+                    }
+                    && definition.buffers.contains {
+                        $0.binding == 2 && $0.access == "read" && $0.length == 16
+                    },
+                    "\(definition.id): expected a 16-byte read buffer at 0, a write buffer at 1 "
+                    + "and a 16-byte read buffer at 2")
+    case "render_declaring_stage_buffer_lease":
+        // v31's borrowed-lease declaring case: the reviewed `copy_word` kernel
+        // reads one word from the fragment stage's tint view (16 bytes) and
+        // writes it into the 4-byte output view, which is the word the render
+        // case imports as a no-copy window (`research/docs/23` §3.3, v31).
+        try require(definition.entry == "copy_word"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 2,
+                    "\(definition.id): expected two buffers")
+        try require(definition.buffers.contains {
+                        $0.binding == 0 && $0.access == "read" && $0.length == 16
+                    }
+                    && definition.buffers.contains {
+                        $0.binding == 1 && $0.access == "write" && $0.length == 4
+                    },
+                    "\(definition.id): expected a 16-byte read buffer at 0 and a write "
+                    + "buffer at 1")
     case "render_declaring_depth_resolve":
         // v57d's declaring case: the depth-store sibling's own shape — the
         // reviewed `copy_word_with_witness` kernel over the colour view (64
