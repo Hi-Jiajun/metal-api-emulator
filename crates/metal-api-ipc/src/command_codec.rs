@@ -2490,6 +2490,10 @@ fn put_load_op(encoder: &mut Encoder, load: LoadOp) {
         }
         LoadOp::Load => encoder.u8(1),
         LoadOp::DontCare => encoder.u8(2),
+        // R7 (`research/docs/23` §76): the resident load carries no payload —
+        // the identity is the attachment's own, so the tag is the whole
+        // declaration, exactly like `Load`'s.
+        LoadOp::Resident => encoder.u8(3),
     }
 }
 
@@ -2497,6 +2501,9 @@ fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
     encoder.u8(match store {
         StoreOp::Store => 0,
         StoreOp::DontCare => 1,
+        // R7 (`research/docs/23` §76): the resident store's source of bytes is
+        // the pass's own raster, so the tag is the whole declaration.
+        StoreOp::Resident => 2,
     });
 }
 
@@ -3613,6 +3620,7 @@ fn get_load_op(decoder: &mut Decoder<'_>) -> Result<LoadOp, CodecError> {
         }
         1 => Ok(LoadOp::Load),
         2 => Ok(LoadOp::DontCare),
+        3 => Ok(LoadOp::Resident),
         value => Err(CodecError::UnknownEnumValue {
             field: "attachment load op",
             value,
@@ -3624,6 +3632,7 @@ fn get_store_op(decoder: &mut Decoder<'_>) -> Result<StoreOp, CodecError> {
     match decoder.u8()? {
         0 => Ok(StoreOp::Store),
         1 => Ok(StoreOp::DontCare),
+        2 => Ok(StoreOp::Resident),
         value => Err(CodecError::UnknownEnumValue {
             field: "attachment store op",
             value,

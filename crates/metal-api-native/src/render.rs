@@ -1105,6 +1105,12 @@ pub(crate) fn load_action(
         LoadOp::Clear(clear) => Ok(RenderLoadAction::Clear(clear_components(clear, format))),
         LoadOp::Load => Ok(RenderLoadAction::Load),
         LoadOp::DontCare => Ok(RenderLoadAction::DontCare),
+        // The provider-resident load (`research/docs/23` §76, R7) keeps the
+        // bytes of an image this rail does not own; `plan_trace` refuses the
+        // whole trace by name before an encoder is built, so this arm is the
+        // value-level second line.
+        LoadOp::Resident => Err(capability_refusal("resident_target_unsupported")
+            .with_detail("this rail keeps no provider-owned render target across submissions")),
     }
 }
 
@@ -1119,6 +1125,14 @@ pub(crate) fn store_action(store: StoreOp) -> Result<RenderStoreAction, Provider
     Ok(match store {
         StoreOp::Store => RenderStoreAction::Store,
         StoreOp::DontCare => RenderStoreAction::DontCare,
+        // A resident store keeps the pass's bytes in an image this rail does
+        // not own (`research/docs/23` §76, R7); `plan_trace` refuses the trace
+        // by name, and this arm keeps a directly-built plan from encoding
+        // `Store` under a name the trace did not ask for.
+        StoreOp::Resident => {
+            return Err(capability_refusal("resident_target_unsupported")
+                .with_detail("this rail keeps no provider-owned render target across submissions"))
+        }
     })
 }
 
@@ -2362,6 +2376,7 @@ pub(crate) fn plan_with_leases<'a>(
                         match stencil.store {
                             Some(StoreOp::Store) => "store",
                             Some(StoreOp::DontCare) => "dontcare",
+                            Some(StoreOp::Resident) => "resident",
                             None => "unstated",
                         }
                         .to_owned(),
@@ -3001,6 +3016,16 @@ pub(crate) fn previous_source<'a>(
                 error.with_field("attachment", FieldValue::Unsigned(attachment as u64))
             }),
         LoadOp::Clear(_) | LoadOp::DontCare => Ok(None),
+        // A resident load declares no view at all (`research/docs/23` §76, R7):
+        // the rail-level gate refuses the trace by name, and a caller that
+        // reached here anyway is refused rather than handed a per-pass image's
+        // bytes.
+        LoadOp::Resident => Err(capability_refusal("resident_target_unsupported")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_detail(
+                "a resident load keeps the provider image's own contents; this rail keeps no \
+                 provider-owned render target across submissions",
+            )),
     }
 }
 
@@ -3336,6 +3361,29 @@ pub(crate) fn plan_trace_with_leases<'a>(
 ) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
     if !trace.has_render_passes() {
         return Ok(Vec::new());
+    }
+    // The provider-resident render target is the Vulkan rail's R7 increment
+    // (`research/docs/23` §76): this rail keeps no provider-owned image across
+    // submissions yet, so a pass that declares one is refused by name — before
+    // any other plan work — instead of being executed as a per-pass attachment
+    // the trace did not ask for, or as a load that reads bytes this rail never
+    // kept.
+    for attachment in trace
+        .render_passes()
+        .flat_map(|pass| pass.color_attachments.iter())
+    {
+        if attachment.declares_resident_target() {
+            return Err(capability_refusal("resident_target_unsupported")
+                .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(attachment.allocation_id.get()),
+                )
+                .with_detail(
+                    "this rail does not keep a provider-owned render target across submissions; \
+                     the resident target is the Vulkan rail's increment",
+                ));
+        }
     }
     refuse_reordered_render_reads(trace)?;
     let mut planned = Vec::with_capacity(trace.render_passes().count());

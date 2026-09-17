@@ -3873,6 +3873,83 @@ mod tests {
     }
 
     #[test]
+    fn resident_load_and_store_take_their_own_tags_and_round_trip() {
+        // R7 (`research/docs/23` §76): the provider-resident target is one more
+        // tag in the field that already carries the attachment's load and store
+        // decisions, so the frame keeps the pre-R7 order and a resident load
+        // simply stops paying for the clear payload it does not carry.
+        let sentinel = [0xfe_u8; 4];
+        let clear_tape = LEGACY_RENDER_SUBMIT_FRAME
+            .windows(sentinel.len())
+            .position(|window| window == sentinel)
+            .expect("the frozen frame carries the fixture's clear payload");
+        assert_eq!(
+            LEGACY_RENDER_SUBMIT_FRAME[clear_tape - 1],
+            0x00,
+            "the frozen frame's load tag is the `Clear` tag"
+        );
+
+        let mut trace = render_only_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the fixture ends in a render pass");
+        };
+        pass.color_attachments[0].load = LoadOp::Resident;
+        pass.color_attachments[0].store = StoreOp::Resident;
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+
+        // The two tags replace the four-byte clear payload, so the frame is
+        // exactly four bytes shorter than the frozen pre-R7 shape and the sentinel
+        // is gone from it.
+        assert_eq!(
+            frame.len() + sentinel.len(),
+            LEGACY_RENDER_SUBMIT_FRAME.len()
+        );
+        assert!(
+            !frame
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+            "a resident load carries no clear payload"
+        );
+        assert_eq!(
+            frame[clear_tape - 1],
+            0x03,
+            "the resident load takes the tag after `Clear`/`Load`/`DontCare`"
+        );
+
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        assert_eq!(decoded, request);
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        let pass = trace.passes[0]
+            .as_render()
+            .expect("the fixture is a render pass");
+        assert_eq!(pass.color_attachments[0].load, LoadOp::Resident);
+        assert_eq!(pass.color_attachments[0].store, StoreOp::Resident);
+
+        // An unknown tag is a decoder error rather than a silent `Load` or
+        // discard, so an older bridge refuses the frame it does not know.
+        let mut unknown = frame.clone();
+        unknown[clear_tape - 1] = 0x04;
+        let error = CommandCodec::decode_request(&unknown)
+            .expect_err("an unknown load tag is refused by name");
+        assert!(
+            matches!(
+                error,
+                CodecError::UnknownEnumValue {
+                    field: "attachment load op",
+                    value: 0x04,
+                }
+            ),
+            "the refusal names the field and the tag: {error:?}"
+        );
+    }
+
+    #[test]
     fn render_frames_without_a_present_keep_their_pre_present_bytes() {
         let request = CommandRequest::Submit {
             trace: render_only_trace(),

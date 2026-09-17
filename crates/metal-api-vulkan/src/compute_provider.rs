@@ -10,16 +10,16 @@ use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
-    allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
-    CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
-    ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, HeapId,
-    HeapResource, IndirectCommandDescriptor, IndirectCommandKind, LeaseId, LeaseImporter,
-    LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
-    PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
-    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, TerminalState, TracePass, ValidatedComputeTrace,
-    ViewId,
+    allocate_device_epoch, AliasMode, AllocationId, AttachmentFormat, BufferSource, BufferView,
+    BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken,
+    ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
+    FunctionSource, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind, LeaseId,
+    LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
+    PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
+    SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TerminalState, TracePass,
+    ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -46,6 +46,22 @@ const GPU_DEADLINE: Duration = Duration::from_secs(20);
 /// entry beyond this budget, and a target is also retired as soon as the lease
 /// its allocation was imported under is released.
 pub const PRESENT_TARGET_BUDGET: usize = 8;
+
+/// How many provider-resident render target identities the provider keeps
+/// across submissions at once (`research/docs/23` §76, R7).
+///
+/// The R4a present registry's rule, generalised to the render rail: a resident
+/// target's identity is the `(allocation, view)` pair of the attachment that
+/// declares it, so a guest rendering many surfaces would otherwise keep one
+/// full-size image per identity for the process's lifetime with no release
+/// surface at all. The registry evicts the least recently used entry beyond this
+/// budget, and an identity is also retired as soon as the lease its allocation
+/// was imported under is released or the device epoch advances. A later
+/// `LoadOp::Resident` for an evicted or retired identity is refused by name
+/// (`resident_target_evicted` / `resident_target_released` /
+/// `resident_target_stale`) — never served from the bytes the image used to
+/// hold.
+pub const RESIDENT_TARGET_BUDGET: usize = 8;
 
 /// One heap placement a provider executed: which heap a resource landed in,
 /// which allocation it belongs to, and the byte range it occupies there.
@@ -249,9 +265,28 @@ pub struct VulkanComputeProvider {
     /// Cumulative present targets retired before the device epoch ended: the
     /// budget's evictions plus the retirements a lease release drives.
     present_target_evictions: AtomicU64,
+    /// The provider-resident render targets the R7 increment adds
+    /// (`research/docs/23` §76): the same `(allocation, view)` key and the same
+    /// budget/LRU shape as the present registry, but armed by a render pass's
+    /// `LoadOp::Resident` / `StoreOp::Resident` instead of a present action, and
+    /// loadable by a later submission.
+    resident_targets: Mutex<BTreeMap<(AllocationId, ViewId), ResidentTargetEntry>>,
+    /// Monotonic use stamp behind the resident registry's least-recently-used
+    /// order, exactly as [`Self::present_target_stamp`] orders the present one.
+    resident_target_stamp: AtomicU64,
+    /// Cumulative resident targets retired before the device epoch ended: the
+    /// budget's evictions plus the retirements a lease release or an epoch
+    /// advance drives.
+    resident_target_evictions: AtomicU64,
+    /// The identities the registry has retired in the *current* epoch, with the
+    /// rule that retired them. A `LoadOp::Resident` for one of them is refused
+    /// with that rule's name; a `StoreOp::Resident` creates the identity again
+    /// and clears its tombstone.
+    resident_target_tombstones: Mutex<BTreeMap<(AllocationId, ViewId), ResidentTargetRetirement>>,
     /// The allocation each imported lease reserves. A release retires the
-    /// present targets created for that allocation, exactly as the native
-    /// rail's `drop_present_targets_for` does (`research/docs/24` §5.2).
+    /// present targets *and* the resident render targets created for that
+    /// allocation, exactly as the native rail's `drop_present_targets_for` does
+    /// (`research/docs/24` §5.2, `research/docs/23` §76).
     lease_allocations: Mutex<BTreeMap<LeaseId, AllocationId>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     heap_observations: Mutex<Vec<HeapPlacementObservation>>,
@@ -267,8 +302,62 @@ pub struct VulkanComputeProvider {
 /// One resident present target: the provider-owned image and the stamp that
 /// orders it in the registry's least-recently-used eviction.
 struct PresentTargetEntry {
-    image: Arc<render::PresentTargetImage>,
+    image: Arc<render::ProviderTargetImage>,
     last_used: u64,
+}
+
+/// One resident render target: the provider-owned image, the shape the trace
+/// declared for it, and the bookkeeping the registry's budget and the rail's
+/// published layout need (`research/docs/23` §76, R7).
+struct ResidentTargetEntry {
+    image: Arc<render::ProviderTargetImage>,
+    /// The format the identity was created with. A later pass naming the same
+    /// identity with a different format is refused by name rather than rendered
+    /// into an image of the wrong format.
+    format: AttachmentFormat,
+    width: u64,
+    height: u64,
+    /// Whether a completed pass has defined the image's bytes. An entry is
+    /// created before its first pass runs, so this is what keeps a refused or
+    /// failed pass from leaving an image a later `LoadOp::Resident` could read
+    /// as "the target's contents".
+    defined: bool,
+    last_used: u64,
+}
+
+/// Why a resident target identity is no longer in the registry
+/// (`research/docs/23` §76, R7).
+///
+/// The tombstone is what makes the refusal nameable: a `LoadOp::Resident` for
+/// an identity that is gone says *which* rule retired it, so the guest can
+/// re-render the frame instead of guessing whether it forgot to store one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentTargetRetirement {
+    /// The registry's budget evicted the least recently used identity.
+    Budget,
+    /// The lease the identity's allocation was imported under was released.
+    LeaseReleased,
+    /// The device epoch advanced: every image of the dead device is gone.
+    EpochAdvance,
+}
+
+impl ResidentTargetRetirement {
+    /// The refusal slug a load of this retired identity states.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Budget => "resident_target_evicted",
+            Self::LeaseReleased => "resident_target_released",
+            Self::EpochAdvance => "resident_target_stale",
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::LeaseReleased => "lease_released",
+            Self::EpochAdvance => "epoch_advance",
+        }
+    }
 }
 
 /// The provider-side capability snapshot for one device owner.
@@ -331,6 +420,10 @@ impl VulkanComputeProvider {
             present_targets: Mutex::new(BTreeMap::new()),
             present_target_stamp: AtomicU64::new(0),
             present_target_evictions: AtomicU64::new(0),
+            resident_targets: Mutex::new(BTreeMap::new()),
+            resident_target_stamp: AtomicU64::new(0),
+            resident_target_evictions: AtomicU64::new(0),
+            resident_target_tombstones: Mutex::new(BTreeMap::new()),
             lease_allocations: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
             heap_observations: Mutex::new(Vec::new()),
@@ -446,6 +539,22 @@ impl VulkanComputeProvider {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        // Every resident target image belongs to the dead device, so the whole
+        // registry goes with it — and each identity that was alive leaves a
+        // tombstone naming the epoch advance, so a trace that later loads one of
+        // them is refused with `resident_target_stale` instead of being served
+        // an image from a device that no longer exists
+        // (`research/docs/23` §76, R7).
+        let retired_resident = {
+            let mut registry = self
+                .resident_targets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *registry)
+                .into_iter()
+                .collect::<Vec<((AllocationId, ViewId), ResidentTargetEntry)>>()
+        };
+        self.retire_resident_targets(&retired_resident, ResidentTargetRetirement::EpochAdvance)?;
         self.completions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1078,6 +1187,29 @@ impl VulkanComputeProvider {
                     )
                     .with_detail("the present rail executes exactly one colour attachment"));
                 };
+                // The present rail hands its target on through the present
+                // action, which is the R4a registry's own shape
+                // (`docs/24` §5.2): a pass that also declares the render rail's
+                // resident target would be asking two registries to own one
+                // identity, so it is refused by name instead of executed with
+                // one of them silently winning (`research/docs/23` §76, R7).
+                if attachment.declares_resident_target() {
+                    return Err(refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "resident_target_present_unsupported",
+                    )
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the present action keeps its own provider-owned target; a pass that \
+                         declares the render rail's resident target beside it is outside this \
+                         increment",
+                    ));
+                }
                 // The declared view serves two purposes: it is the attachment's
                 // landing for the writeback channel, and it is the source of
                 // the previous contents a `LoadOp::Load` pass uploads before it
@@ -1154,13 +1286,62 @@ impl VulkanComputeProvider {
             // than being snapshotted here (`research/docs/23` §74, R5b).
             let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
             let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
+            // The provider-resident targets this pass declares, in location
+            // order (`research/docs/23` §76, R7). The identity is the
+            // attachment's own pair, so the registry and the contract cannot
+            // disagree about *which* target a pass means.
+            let mut resident = Vec::with_capacity(planned.pass.color_attachments.len());
+            let mut resident_identities = Vec::new();
             for attachment in &planned.pass.color_attachments {
                 let declared = pool.iter().find(|view| {
                     view.view_id == attachment.view_id
                         && view.allocation_id == attachment.allocation_id
                 });
+                // A resident target is resolved — or refused by name — before
+                // any device object exists: the registry decides whether the
+                // identity holds bytes a load may read, and a pass that renders
+                // into a resident identity without declaring it is refused
+                // rather than silently overwriting the provider's bytes.
+                if attachment.declares_resident_target() {
+                    let identity = (attachment.allocation_id, attachment.view_id);
+                    let image =
+                        self.resident_target(attachment, attachment.loads_resident_target())?;
+                    resident_identities.push(identity);
+                    resident.push(Some(image));
+                } else {
+                    if self.resident_target_identity_is_resident(
+                        attachment.allocation_id,
+                        attachment.view_id,
+                    ) {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "resident_target_undeclared",
+                        )
+                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                        .with_field(
+                            "allocation",
+                            FieldValue::Unsigned(attachment.allocation_id.get()),
+                        )
+                        .with_detail(
+                            "the provider holds this identity's image and the pass declares \
+                             neither `LoadOp::Resident` nor `StoreOp::Resident` for it, so the \
+                             trace would be reading or overwriting bytes it never named",
+                        ));
+                    }
+                    resident.push(None);
+                }
+                // The landing view is the writeback channel's declaration, and
+                // `LoadOp::Load` uploads the trace's own bytes through it. A
+                // resident store has neither: its bytes stay in the provider's
+                // image and the pass publishes no writeback for it, so it needs
+                // no landing view even when the trace asks for a host readback
+                // (`research/docs/23` §76, R7). Every other store arm keeps the
+                // pre-R7 rule unchanged.
                 let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
-                let view = if host_readback || loading {
+                let landing_needed = host_readback
+                    && attachment.store != metal_api_core::provider::StoreOp::Resident;
+                let view = if landing_needed || loading {
                     Some(declared.ok_or_else(|| {
                         refusal(
                             ProviderPhase::Resolve,
@@ -1278,34 +1459,60 @@ impl VulkanComputeProvider {
                 None => None,
             };
             let executor = self.lock_executor()?;
-            let readback = match trace.indirect.as_deref() {
+            // The resident slice the rail borrows for this pass, in location
+            // order: `Some` exactly for the attachments whose declaration
+            // named the provider's image (`research/docs/23` §76, R7).
+            let resident_refs: Vec<_> = resident.iter().map(|image| image.as_deref()).collect();
+            let outcome = match trace.indirect.as_deref() {
                 Some(payload) => {
-                    let readback = render::execute_indirect_render_pass(
+                    let outcome = render::execute_indirect_render_pass(
                         &executor.context,
                         &planned.stages,
                         &planned.pass,
                         &payload.command,
                         &previous,
+                        &resident_refs,
                         Some(&leases),
-                    )?;
-                    // Publish what was actually replayed: the command kind,
-                    // the range and the one command the first increment
-                    // encodes (`research/docs/25` §5.1).
-                    self.publish_icb_observation(
-                        payload.command.kind(),
-                        payload.range.start,
-                        payload.range.count,
-                        1,
                     );
-                    readback
+                    if outcome.is_ok() {
+                        // Publish what was actually replayed: the command kind,
+                        // the range and the one command the first increment
+                        // encodes (`research/docs/25` §5.1).
+                        self.publish_icb_observation(
+                            payload.command.kind(),
+                            payload.range.start,
+                            payload.range.count,
+                            1,
+                        );
+                    }
+                    outcome
                 }
                 None => render::execute_render_pass(
                     &executor.context,
                     &planned.stages,
                     &planned.pass,
                     &previous,
+                    &resident_refs,
                     Some(&leases),
-                )?,
+                ),
+            };
+            let readback = match outcome {
+                Ok(readback) => {
+                    // The pass completed, so the bytes the resident targets
+                    // hold are the ones this pass left there: a later
+                    // `LoadOp::Resident` for those identities resolves instead
+                    // of being refused as undefined.
+                    self.note_resident_targets(&resident_identities, true)?;
+                    readback
+                }
+                Err(error) => {
+                    // A pass that was refused or failed defines nothing: the
+                    // identities it named stay unloadable until a later pass
+                    // renders them again, rather than serving bytes of unknown
+                    // state (`research/docs/23` §76, R7).
+                    self.note_resident_targets(&resident_identities, false)?;
+                    return Err(error);
+                }
             };
             for (view, texels) in views.into_iter().zip(readback.attachments) {
                 // `None` is the discarded attachment: no bytes, no writeback,
@@ -1364,7 +1571,7 @@ impl VulkanComputeProvider {
         &self,
         present: &PresentDescriptor,
         attachment: &RenderAttachment,
-    ) -> Result<Arc<render::PresentTargetImage>, ProviderError> {
+    ) -> Result<Arc<render::ProviderTargetImage>, ProviderError> {
         let key = (present.target.allocation_id, present.target.view_id);
         {
             let mut registry = self
@@ -1379,7 +1586,7 @@ impl VulkanComputeProvider {
         // The image is created outside the registry lock: it runs device calls
         // and a sentinel pre-fill, and the registry is only the admission
         // point that decides which identities stay resident.
-        let mut image = render::PresentTargetImage::create(
+        let mut image = render::ProviderTargetImage::create(
             Arc::clone(&self.lock_executor()?.context),
             attachment.format,
             attachment.width,
@@ -1439,16 +1646,273 @@ impl VulkanComputeProvider {
         self.present_target_stamp.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Resolve the provider-resident target of one attachment that declares it,
+    /// creating the identity on a resident store
+    /// (`research/docs/23` §76, R7).
+    ///
+    /// `loading` is the trace's own decision: a `LoadOp::Resident` attachment
+    /// keeps the image's contents, so the identity has to exist *and* hold
+    /// bytes a completed pass defined. Every way it can fail is refused by name
+    /// rather than served from a fresh image or from bytes no pass defined:
+    ///
+    /// - a resident load of an identity no pass ever stored is
+    ///   `resident_target_unavailable`;
+    /// - one the budget evicted, a lease release retired, or an epoch advance
+    ///   cleared states that rule (`resident_target_evicted`,
+    ///   `resident_target_released`, `resident_target_stale`);
+    /// - one whose creating pass never completed is
+    ///   `resident_target_undefined`;
+    /// - one whose shape changed is `resident_target_shape_changed`.
+    fn resident_target(
+        &self,
+        attachment: &RenderAttachment,
+        loading: bool,
+    ) -> Result<Arc<render::ProviderTargetImage>, ProviderError> {
+        let key = (attachment.allocation_id, attachment.view_id);
+        {
+            let mut registry = self
+                .resident_targets
+                .lock()
+                .map_err(|_| registry_poisoned())?;
+            if let Some(entry) = registry.get_mut(&key) {
+                if entry.format != attachment.format
+                    || entry.width != attachment.width
+                    || entry.height != attachment.height
+                {
+                    return Err(refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "resident_target_shape_changed",
+                    )
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_field(
+                        "format",
+                        FieldValue::Unsigned(u64::from(attachment.format.code())),
+                    )
+                    .with_field("width", FieldValue::Unsigned(attachment.width))
+                    .with_field("height", FieldValue::Unsigned(attachment.height))
+                    .with_field(
+                        "expected_format",
+                        FieldValue::Unsigned(u64::from(entry.format.code())),
+                    )
+                    .with_field("expected_width", FieldValue::Unsigned(entry.width))
+                    .with_field("expected_height", FieldValue::Unsigned(entry.height))
+                    .with_detail(
+                        "the resident target's identity is reused for one image, so a pass that \
+                         declares a different shape for it is refused instead of rendered into \
+                         an image of the wrong format or extent",
+                    ));
+                }
+                if loading && !entry.defined {
+                    return Err(refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "resident_target_undefined",
+                    )
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the resident target's image exists but no completed pass has defined \
+                         its bytes: the pass that created it was refused or failed",
+                    ));
+                }
+                entry.last_used = self.next_resident_target_stamp();
+                return Ok(Arc::clone(&entry.image));
+            }
+            if loading {
+                // The identity is gone. The tombstone names the rule that
+                // retired it; an identity with no tombstone was never stored in
+                // this epoch at all.
+                let tombstones = self
+                    .resident_target_tombstones
+                    .lock()
+                    .map_err(|_| registry_poisoned())?;
+                let retirement = tombstones.get(&key).copied();
+                let mut error = refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    retirement.map_or("resident_target_unavailable", |rule| rule.slug()),
+                )
+                .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(attachment.allocation_id.get()),
+                );
+                if let Some(rule) = retirement {
+                    error =
+                        error.with_field("retired_by", FieldValue::Text(rule.name().to_owned()));
+                }
+                return Err(error.with_detail(
+                    "a `LoadOp::Resident` attachment keeps the bytes the provider holds for its \
+                     identity; this identity holds none, so the pass has to render the frame \
+                     again instead of reading an image that is gone",
+                ));
+            }
+        }
+        // The image is created outside the registry lock: it runs device calls,
+        // and the registry is only the admission point that decides which
+        // identities stay resident.
+        let image = Arc::new(render::ProviderTargetImage::create(
+            Arc::clone(&self.lock_executor()?.context),
+            attachment.format,
+            attachment.width,
+            attachment.height,
+        )?);
+        let mut registry = self
+            .resident_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        let stamp = self.next_resident_target_stamp();
+        if let Some(entry) = registry.get_mut(&key) {
+            // Two submissions raced to create the same identity: the first
+            // insert stays authoritative and this one's image is dropped at the
+            // end of the call, once no submission can still hold it.
+            entry.last_used = stamp;
+            return Ok(Arc::clone(&entry.image));
+        }
+        registry.insert(
+            key,
+            ResidentTargetEntry {
+                image: Arc::clone(&image),
+                format: attachment.format,
+                width: attachment.width,
+                height: attachment.height,
+                // The pass that creates the identity has not run yet, so its
+                // bytes are not defined until it completes.
+                defined: false,
+                last_used: stamp,
+            },
+        );
+        // The budget is a provider-internal policy, exactly as it is for the
+        // present registry: the identities beyond it are retired after the
+        // registry lock is released, so their images' device teardown cannot
+        // run under it, and each one leaves a tombstone a later resident load
+        // is refused by name with.
+        let mut retired = Vec::new();
+        while registry.len() > RESIDENT_TARGET_BUDGET {
+            let Some(victim) = registry
+                .iter()
+                .filter(|(identity, _)| **identity != key)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(identity, _)| *identity)
+            else {
+                break;
+            };
+            if let Some(entry) = registry.remove(&victim) {
+                retired.push((victim, entry));
+            }
+        }
+        drop(registry);
+        self.retire_resident_targets(&retired, ResidentTargetRetirement::Budget)?;
+        drop(retired);
+        // A stored identity is alive again, so its tombstone goes with it.
+        self.resident_target_tombstones
+            .lock()
+            .map_err(|_| registry_poisoned())?
+            .remove(&key);
+        Ok(image)
+    }
+
+    /// Retire resident target identities and record the rule that retired them
+    /// (`research/docs/23` §76, R7).
+    ///
+    /// The tombstone is what makes a later `LoadOp::Resident` refusal nameable,
+    /// and the counter follows the present registry's rule: budget evictions and
+    /// lease-release retirements are counted, the epoch advance that clears the
+    /// whole registry is not — it is observable through the epoch itself.
+    fn retire_resident_targets(
+        &self,
+        retired: &[((AllocationId, ViewId), ResidentTargetEntry)],
+        rule: ResidentTargetRetirement,
+    ) -> Result<(), ProviderError> {
+        if retired.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut tombstones = self
+                .resident_target_tombstones
+                .lock()
+                .map_err(|_| registry_poisoned())?;
+            for (identity, _) in retired {
+                tombstones.insert(*identity, rule);
+            }
+        }
+        if rule != ResidentTargetRetirement::EpochAdvance {
+            self.resident_target_evictions
+                .fetch_add(retired.len() as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// The next least-recently-used stamp of the resident registry; only that
+    /// registry's lock holders call it, so the order is the lock's serial
+    /// order.
+    fn next_resident_target_stamp(&self) -> u64 {
+        self.resident_target_stamp.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Whether the provider currently holds a resident target for one
+    /// attachment identity (`research/docs/23` §76, R7).
+    ///
+    /// A pass that renders into an identity the provider holds has to declare
+    /// it — a resident load or a resident store — so this is the question
+    /// behind `resident_target_undeclared`: the provider's bytes are not
+    /// silently overwritten by a pass that never named them.
+    fn resident_target_identity_is_resident(
+        &self,
+        allocation_id: AllocationId,
+        view_id: ViewId,
+    ) -> bool {
+        self.resident_targets
+            .lock()
+            .map(|registry| registry.contains_key(&(allocation_id, view_id)))
+            .unwrap_or(false)
+    }
+
+    /// State whether the bytes of the identities a pass declared are defined
+    /// now that the pass has completed (`research/docs/23` §76, R7).
+    ///
+    /// A completed pass defines them: it cleared the image, kept contents a
+    /// previous pass defined, or stored the raster into it. A pass that was
+    /// refused or failed defines nothing, and its identity stays unloadable
+    /// until a later pass renders it again.
+    fn note_resident_targets(
+        &self,
+        identities: &[(AllocationId, ViewId)],
+        defined: bool,
+    ) -> Result<(), ProviderError> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let mut registry = self
+            .resident_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        for identity in identities {
+            if let Some(entry) = registry.get_mut(identity) {
+                entry.defined = defined;
+            }
+        }
+        Ok(())
+    }
+
     /// Drop any present target reserved for the allocation of a released
     /// lease.
     ///
     /// A present target lives across submissions until its allocation's lease
     /// is released (`docs/24` §5.2), so releasing the lease has to retire the
     /// target too — the same rule the native rail states in its own
-    /// `drop_present_targets_for`. The lease→allocation mapping is removed in
+    /// `drop_provider_targets_for`. The lease→allocation mapping is removed in
     /// the same call, so a double release cannot retire a sibling
     /// allocation's targets.
-    fn drop_present_targets_for(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+    fn drop_provider_targets_for(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
         let allocation_id = self
             .lease_allocations
             .lock()
@@ -1470,6 +1934,27 @@ impl VulkanComputeProvider {
             self.present_target_evictions
                 .fetch_add(retired as u64, Ordering::Relaxed);
         }
+        // The resident registry is retired by the same rule and for the same
+        // reason (`research/docs/23` §76, R7): the images a released allocation
+        // backed are gone, so a later `LoadOp::Resident` names the release
+        // (`resident_target_released`) instead of reading an image whose
+        // backing the owner has taken back.
+        let retired_resident = {
+            let mut registry = self
+                .resident_targets
+                .lock()
+                .map_err(|_| registry_poisoned())?;
+            let identities: Vec<_> = registry
+                .keys()
+                .filter(|(allocation, _)| *allocation == allocation_id)
+                .copied()
+                .collect();
+            identities
+                .into_iter()
+                .filter_map(|identity| registry.remove(&identity).map(|entry| (identity, entry)))
+                .collect::<Vec<_>>()
+        };
+        self.retire_resident_targets(&retired_resident, ResidentTargetRetirement::LeaseReleased)?;
         Ok(())
     }
 
@@ -1492,6 +1977,38 @@ impl VulkanComputeProvider {
     #[doc(hidden)]
     pub fn present_target_evictions(&self) -> u64 {
         self.present_target_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Number of provider-resident render targets still alive
+    /// (`research/docs/23` §76, R7).
+    ///
+    /// The observation the resident chain's own test reads: two submissions
+    /// that name the same identity keep one image, and a submission that names
+    /// a new one adds exactly one entry until the budget evicts.
+    #[doc(hidden)]
+    pub fn resident_target_count(&self) -> usize {
+        self.resident_targets
+            .lock()
+            .map(|registry| registry.len())
+            .unwrap_or(0)
+    }
+
+    /// Cumulative resident targets retired before the device epoch ended: the
+    /// budget's evictions plus the retirements a lease release drives
+    /// (`research/docs/23` §76, R7). The device-loss teardown that clears the
+    /// registry is not counted here, exactly as the present registry's
+    /// counter states; the epoch advance is its observation.
+    #[doc(hidden)]
+    pub fn resident_target_evictions(&self) -> u64 {
+        self.resident_target_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Whether one `(allocation, view)` identity is resident, i.e. whether a
+    /// later `LoadOp::Resident` for it resolves instead of being refused
+    /// (`research/docs/23` §76, R7).
+    #[doc(hidden)]
+    pub fn resident_target_is_live(&self, allocation_id: AllocationId, view_id: ViewId) -> bool {
+        self.resident_target_identity_is_resident(allocation_id, view_id)
     }
 
     /// Cumulative present acquire / present completions of the presentation
@@ -1899,7 +2416,7 @@ impl LeaseImporter for VulkanComputeProvider {
 
     fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
         self.staging.release(lease_id)?;
-        self.drop_present_targets_for(lease_id)
+        self.drop_provider_targets_for(lease_id)
     }
 }
 
@@ -1952,7 +2469,7 @@ impl NoCopyLeaseImporter for VulkanComputeProvider {
 
     fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
         self.borrowed.release(lease_id)?;
-        self.drop_present_targets_for(lease_id)
+        self.drop_provider_targets_for(lease_id)
     }
 }
 

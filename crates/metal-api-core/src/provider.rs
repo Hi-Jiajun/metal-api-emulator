@@ -1237,6 +1237,28 @@ pub enum LoadOp {
     Clear(ClearColor),
     /// Keep the attachment's previous contents.
     Load,
+    /// Keep the *provider-resident* target's own contents
+    /// (`research/docs/23` §76, R7).
+    ///
+    /// The arm is [`LoadOp::Load`]'s sibling with the other source: `Load`
+    /// takes the attachment's previous bytes from the view the trace declares
+    /// for it, while `Resident` names the image the provider owns under the
+    /// attachment's own `(allocation, view)` identity and keeps its bytes where
+    /// they already are. The guest therefore never has to hand back a frame it
+    /// still holds in engine memory, which is exactly the seam the production
+    /// profile measured (`evidence/reviews/writeback-class-probe-2026-09-17.md`
+    /// §3/§5): every last record of a packet armed a resident store rail and
+    /// the frame never left the guest.
+    ///
+    /// The identity is the attachment's own, so no second naming channel
+    /// exists and the pair cannot disagree. A pass that declares this arm is
+    /// refused by name when the provider holds no *defined* contents for that
+    /// identity: never stored, evicted by the budget, retired by the release
+    /// of the allocation's lease, cleared by a device-loss rebuild, or left
+    /// undefined by a pass that failed after its image was created. Silently
+    /// executing it as a clear — or worse, as whatever bytes the image happens
+    /// to hold — is what the arm exists to prevent.
+    Resident,
     /// Leave the previous contents undefined. Admitted since v20: the pass
     /// neither reads nor presets the attachment's pre-pass bytes, so the
     /// compared bytes come from the draw's own writes and never from state no
@@ -1249,6 +1271,21 @@ pub enum LoadOp {
 pub enum StoreOp {
     /// Store the pass's writes. This is what makes the attachment comparable.
     Store,
+    /// Keep the pass's writes in the *provider-resident* target
+    /// (`research/docs/23` §76, R7).
+    ///
+    /// The bytes land in the image the provider owns under the attachment's
+    /// own `(allocation, view)` identity — the landing [`StoreOp::Store`]
+    /// makes observable through the buffer writeback channel — and no
+    /// writeback is published for it. It is the shape the production profile's
+    /// `skip_readback` bucket arms: the guest's own engine holds the frame, so
+    /// the provider is the only place the bytes have to stay readable and a
+    /// later pass loads them with [`LoadOp::Resident`].
+    ///
+    /// A stored resident target is still a landing: the pass-level "one
+    /// observable landing point" rule counts it, because the bytes are
+    /// observable through the pass that later loads them.
+    Resident,
     /// Discard the pass's writes. Admitted by `docs/23` §3.6's v19 rule: the
     /// pass must still store at least one attachment, and the discarded
     /// attachment disappears from the observable surface instead of passing
@@ -1719,7 +1756,44 @@ impl RenderAttachment {
         if !self.format.is_admitted_for_color_attachment() {
             return Err(ContractError::UnsupportedAttachmentFormat(self.format));
         }
+        // The two resident arms (`research/docs/23` §76, R7) are a load and a
+        // store decision about *one* image the provider owns, so the pair has
+        // to keep that image's contents defined on both sides. A pass that
+        // loads the resident contents and discards its own raster would leave
+        // the image holding bytes no pass defined — the draw ran over them and
+        // the trace threw the result away. A pass that keeps its raster
+        // resident but declares its pre-pass contents undefined asks a later
+        // `LoadOp::Resident` to read exactly those undefined bytes. Both are
+        // refused here, before any provider sees the pass, rather than being
+        // executed as "whatever the image happened to hold".
+        if self.load == LoadOp::Resident && self.store == StoreOp::DontCare {
+            return Err(ContractError::ResidentLoadDiscardingStore);
+        }
+        if self.load == LoadOp::DontCare && self.store == StoreOp::Resident {
+            return Err(ContractError::ResidentStoreUndefinedLoad);
+        }
         Ok(())
+    }
+
+    /// Whether the pass publishes this attachment's bytes through the buffer
+    /// writeback channel: [`StoreOp::Store`] alone, because a resident store
+    /// keeps them in the provider's image instead
+    /// (`research/docs/23` §76, R7).
+    pub fn publishes_bytes(&self) -> bool {
+        self.store == StoreOp::Store
+    }
+
+    /// Whether this attachment names the provider's resident target on either
+    /// side: its load keeps the image's own contents, or its store keeps the
+    /// pass's writes there (`research/docs/23` §76, R7).
+    pub fn declares_resident_target(&self) -> bool {
+        self.load == LoadOp::Resident || self.store == StoreOp::Resident
+    }
+
+    /// Whether the pass loads the resident target's own contents rather than
+    /// declaring the bytes it uploads (`research/docs/23` §76, R7).
+    pub fn loads_resident_target(&self) -> bool {
+        self.load == LoadOp::Resident
     }
 }
 
@@ -2754,10 +2828,17 @@ impl RenderPassDescriptor {
         // depth-only pass expressible: every colour attachment discards, the
         // pass keeps its depth surface, and the depth texels are the whole
         // observation.
+        //
+        // A *resident* store is a landing as well
+        // (`research/docs/23` §76, R7): the bytes the pass draws stay in the
+        // provider's own image, where the pass that later loads them observes
+        // them. The rule counts it for the same reason it counts a stored
+        // depth surface: what it refuses is a pass whose whole output is
+        // thrown away, not a pass whose landing is not a guest writeback.
         let stored_colour = self
             .color_attachments
             .iter()
-            .any(|attachment| matches!(attachment.store, StoreOp::Store));
+            .any(|attachment| matches!(attachment.store, StoreOp::Store | StoreOp::Resident));
         let stored_depth = self
             .depth
             .as_ref()
@@ -3093,6 +3174,17 @@ impl RenderPassDescriptor {
             // (`research/docs/23` §3.3, v43/v49).
             match (stencil.store, stencil.identity) {
                 (None, None) | (Some(StoreOp::DontCare), None) => {}
+                // A resident store names the provider's own image under the
+                // *colour* attachment's identity (`research/docs/23` §76, R7):
+                // the stencil surface has no such channel — its store travels
+                // as one bit beside the identity that lands its bytes in the
+                // writeback channel — so the arm is refused here rather than
+                // encoded as a discard.
+                (Some(StoreOp::Resident), _) => {
+                    return Err(ContractError::UnsupportedAttachmentStoreOp(
+                        StoreOp::Resident,
+                    ));
+                }
                 (None, Some(_))
                 | (Some(StoreOp::Store), None)
                 | (Some(StoreOp::DontCare), Some(_)) => {
@@ -6365,7 +6457,14 @@ fn validate_writebacks_for_trace(
             {
                 match attachment.store {
                     StoreOp::Store => stored = true,
-                    StoreOp::DontCare => discarded = true,
+                    // A resident store keeps the pass's bytes in the provider's
+                    // own image rather than the writeback channel
+                    // (`research/docs/23` §76, R7), so the view lands no
+                    // writeback — exactly the obligation a discarded
+                    // attachment is excused from. A view some pass stores and
+                    // another keeps resident still has to land the store's own
+                    // writeback, which is what the two flags together state.
+                    StoreOp::Resident | StoreOp::DontCare => discarded = true,
                 }
             }
             if discarded && !stored {
@@ -7883,6 +7982,8 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MissingSnapshotIdentity(_)
         | E::UnknownSnapshotIdentity(_)
         | E::EmptyAttachmentList
+        | E::ResidentLoadDiscardingStore
+        | E::ResidentStoreUndefinedLoad
         | E::AllRenderAttachmentsDiscarded
         // Render pipeline, Step 3a: the entry shape and the
         // pipeline/attachment agreement are structural, like the pass rules
@@ -9145,6 +9246,16 @@ pub enum ContractError {
     UnsupportedAttachmentFormat(AttachmentFormat),
     UnsupportedAttachmentLoadOp(LoadOp),
     UnsupportedAttachmentStoreOp(StoreOp),
+    /// A pass loads the provider-resident target and discards the raster it
+    /// draws over it (`research/docs/23` §76, R7). The resident image is the
+    /// pass's own render target, so a discarded store would leave bytes the
+    /// draw wrote observable only as "whatever the image holds next time".
+    ResidentLoadDiscardingStore,
+    /// A pass keeps its raster resident while declaring its pre-pass contents
+    /// undefined (`research/docs/23` §76, R7). A later `LoadOp::Resident` would
+    /// then read bytes no pass defined, so the pair is refused instead of being
+    /// executed as a mix of the old image and the new draw.
+    ResidentStoreUndefinedLoad,
     /// Every attachment's store operation is `DontCare`, so the pass has no
     /// observable landing point: discarding the whole pass would let "nothing
     /// landed" pass as "landed correctly" (`docs/23` §3.6, v19).
@@ -9813,6 +9924,14 @@ impl fmt::Display for ContractError {
             Self::UnsupportedAttachmentStoreOp(store) => write!(
                 formatter,
                 "attachment store operation {store:?} is outside the first render increment"
+            ),
+            Self::ResidentLoadDiscardingStore => formatter.write_str(
+                "a pass that loads the provider-resident target cannot discard the raster it \
+                 draws over it: the image would hold bytes no pass defined",
+            ),
+            Self::ResidentStoreUndefinedLoad => formatter.write_str(
+                "a pass that keeps its raster resident cannot declare its pre-pass contents \
+                 undefined: a later resident load would read those undefined bytes",
             ),
             Self::AllRenderAttachmentsDiscarded => formatter.write_str(
                 "render pass discards every colour attachment and keeps no depth attachment, \
@@ -15339,6 +15458,96 @@ mod tests {
             ))
             .slug,
             "attachment_store_op_unsupported"
+        );
+    }
+
+    #[test]
+    fn render_pass_admits_the_resident_target_arms_and_refuses_the_two_contradictions() {
+        // R7 (`research/docs/23` §76): the provider-resident target is a load
+        // arm and a store arm of its own. A pass that clears the image and
+        // keeps the raster resident is a landing: the bytes stay in the
+        // provider's own image and the pass that later loads them observes
+        // them.
+        let mut seeding = render_pass();
+        seeding.color_attachments[0].store = StoreOp::Resident;
+        seeding
+            .validate()
+            .expect("a resident store is a landing of its own");
+
+        // The pass that follows keeps the image's contents and publishes the
+        // mixed raster through the writeback channel.
+        let mut chained = render_pass();
+        chained.color_attachments[0].load = LoadOp::Resident;
+        chained
+            .validate()
+            .expect("a resident load beside a storing attachment is well formed");
+
+        // The two contradictions are refused by name before any provider sees
+        // the pass: a pass that loads the image and discards its own raster
+        // would leave bytes no pass defined, and one that keeps its raster
+        // resident under an undefined pre-pass would hand a later resident load
+        // exactly those undefined bytes.
+        let mut discarded = render_pass();
+        discarded.color_attachments[0].load = LoadOp::Resident;
+        discarded.color_attachments[0].store = StoreOp::DontCare;
+        assert_eq!(
+            discarded.validate(),
+            Err(ContractError::ResidentLoadDiscardingStore)
+        );
+
+        let mut undefined = render_pass();
+        undefined.color_attachments[0].load = LoadOp::DontCare;
+        undefined.color_attachments[0].store = StoreOp::Resident;
+        assert_eq!(
+            undefined.validate(),
+            Err(ContractError::ResidentStoreUndefinedLoad)
+        );
+
+        // Both are structural: the trace contradicts itself rather than asking
+        // for a shape the rail cannot execute.
+        for error in [
+            ContractError::ResidentLoadDiscardingStore,
+            ContractError::ResidentStoreUndefinedLoad,
+        ] {
+            let refusal = contract_error_refusal(error);
+            assert_eq!(refusal.class, ProviderErrorClass::Args);
+            assert_eq!(refusal.slug, "trace_contract_invalid");
+        }
+
+        // A resident store beside a discarded sibling is the mixed shape: the
+        // resident attachment is the landing, so the pass stays observable.
+        let mut mixed = render_pass();
+        mixed.color_attachments[0].store = StoreOp::Resident;
+        let mut discarded_sibling = render_attachment(AttachmentFormat::Bgra8Unorm);
+        discarded_sibling.store = StoreOp::DontCare;
+        mixed.color_attachments.push(discarded_sibling);
+        mixed
+            .validate()
+            .expect("the resident store keeps the pass observable");
+        assert!(mixed.color_attachments[0].declares_resident_target());
+        assert!(!mixed.color_attachments[0].loads_resident_target());
+        assert!(!mixed.color_attachments[0].publishes_bytes());
+
+        // A resident store is not a stencil shape: the stencil surface has no
+        // provider-owned identity to keep its bytes under, and its store
+        // travels as one bit (`research/docs/23` §76, R7).
+        let mut stencil = render_pass();
+        stencil.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::Clear(0),
+            store: Some(StoreOp::Resident),
+            identity: Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(960),
+                view_id: ViewId::new(970),
+            }),
+        });
+        assert_eq!(
+            stencil.validate(),
+            Err(ContractError::UnsupportedAttachmentStoreOp(
+                StoreOp::Resident
+            ))
         );
     }
 

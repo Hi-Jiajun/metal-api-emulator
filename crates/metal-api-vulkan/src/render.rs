@@ -685,6 +685,16 @@ pub(crate) struct OffscreenColorAttachment<'a> {
     /// owner window is imported as the copy's own source, and the retain the
     /// pass took keeps it alive until the fence signals (R5b).
     pub previous: Option<RenderInputSource<'a>>,
+    /// The provider-owned image this attachment renders into instead of a
+    /// per-pass attachment image, or `None` for the offscreen shape every
+    /// earlier increment published (`research/docs/23` §76, R7).
+    ///
+    /// `Some` means the pass's store lands in the provider's own image under
+    /// the attachment's `(allocation, view)` identity, and a `Resident` load
+    /// keeps that image's own contents instead of uploading `previous`. The
+    /// image is borrowed for the pass; the provider keeps owning it, exactly
+    /// as the present rail borrows its target (`docs/24` §5.2).
+    pub resident: Option<&'a ProviderTargetImage>,
 }
 
 /// One caller-held vertex stream: the layout the pipeline is built from plus
@@ -1662,18 +1672,35 @@ fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) ->
 /// `LoadOp::Load`, and `None` for every other load operation. The rail resolves
 /// that declaration into the bytes it uploads (`research/docs/23` §74, R5b), so
 /// the caller hands over the declaration rather than a snapshot of it.
+///
+/// `resident` carries the same arity again: the provider-owned image of each
+/// attachment that declares [`LoadOp::Resident`] or [`StoreOp::Resident`], and
+/// `None` for every attachment that does not (`research/docs/23` §76, R7). The
+/// provider owns the registry that decides which identities are resident, so
+/// the rail only checks that the two sides agree — a declaration without an
+/// image, or an image without a declaration, is refused by name rather than
+/// rendered into a per-pass image the trace did not ask for.
+/// `resident` is either empty — the shape every pre-R7 caller hands over, which
+/// means "this pass declares no resident target" — or one entry per colour
+/// attachment, exactly as `previous` is (`research/docs/23` §76, R7).
 pub(crate) fn execute_render_pass<'a>(
     context: &VulkanContext,
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
     previous: &'a [Option<&'a BufferView>],
+    resident: &[Option<&'a ProviderTargetImage>],
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     refuse_attachment_extent(context, pass)?;
-    let request = prepare_render_request(
+    let request = prepare_render_request_with_resident(
         stages,
         pass,
         previous,
+        if resident.is_empty() {
+            None
+        } else {
+            Some(resident)
+        },
         leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
@@ -1700,6 +1727,44 @@ fn prepare_render_request<'a>(
     stencil_resolve_modes: u32,
     policy: SpirvFeaturePolicy,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
+    // The pre-R7 shape every non-resident caller states: the pass declares no
+    // provider-resident target, so the general form below is handed no
+    // resident list at all and refuses a pass that declares one
+    // (`research/docs/23` §76, R7).
+    prepare_render_request_with_resident(
+        stages,
+        pass,
+        previous,
+        None,
+        leases,
+        depth_resolve_modes,
+        stencil_resolve_modes,
+        policy,
+    )
+}
+
+/// [`prepare_render_request`] with the resident-target declarations of a pass
+/// that names them (`research/docs/23` §76, R7).
+///
+/// `resident` is `None` for a pass that declares no resident target, and
+/// otherwise carries one entry per colour attachment, exactly as `previous`
+/// does.
+// The parameter list is the pass's own declaration surface: attachments,
+// their previous contents, their resident targets, the lease context, the two
+// admitted resolve-mode masks, and the device's SPIR-V policy. The blank
+// wrapper above already models the non-resident shape; splitting this into a
+// struct would just move the same seven fields somewhere else (R7 + R8).
+#[allow(clippy::too_many_arguments)]
+fn prepare_render_request_with_resident<'a>(
+    stages: &'a RenderStages,
+    pass: &'a RenderPassDescriptor,
+    previous: &'a [Option<&'a BufferView>],
+    resident: Option<&[Option<&'a ProviderTargetImage>]>,
+    leases: Option<&RenderLeaseContext<'_>>,
+    depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
+    policy: SpirvFeaturePolicy,
+) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     // The device's capability subset is asked first (R8), in the order the
     // translation entry point asks it: a module this device could not create is
     // refused by name before the rail asks what the module or the pass is.
@@ -1721,6 +1786,23 @@ fn prepare_render_request<'a>(
             "the previous-contents list must carry one entry per colour attachment",
         ));
     }
+    // The resident list is the previous-contents list's sibling
+    // (`research/docs/23` §76, R7): one entry per colour attachment, and the
+    // two declarations have to agree in both directions. A pass that declares
+    // the resident target without an image would be executed as a clear over a
+    // fresh per-pass image — the silent downgrade the arm exists to prevent —
+    // and an image handed over for an attachment that declares no residency
+    // would render the provider's bytes where the trace asked for a clear.
+    if let Some(resident) = resident {
+        if resident.len() != pass.color_attachments.len() {
+            return Err(contract_refusal(
+                "the resident-target list must carry one entry per colour attachment",
+            ));
+        }
+    }
+    let resident_of = |index: usize| -> Option<&'a ProviderTargetImage> {
+        resident.and_then(|list| list.get(index).copied().flatten())
+    };
     // The registration gate is re-asked of the value the rail was handed, so a
     // directly-constructed `RenderStages` cannot skip it: the same two arms that
     // settled the pairing at registration decide here, whether a stage arrived
@@ -1970,6 +2052,46 @@ fn prepare_render_request<'a>(
     let mut attachments = Vec::with_capacity(pass.color_attachments.len());
     let mut extent: Option<[u32; 2]> = None;
     for (index, (attachment, declared)) in pass.color_attachments.iter().zip(previous).enumerate() {
+        let resident = resident_of(index);
+        // The two declarations have to agree in both directions
+        // (`research/docs/23` §76, R7). A pass that declares the resident
+        // target and hands over no image would be executed as a per-pass
+        // attachment image — a clear where the trace asked for the provider's
+        // own bytes — and an image handed over for an attachment that declares
+        // no residency would render the provider's image where the trace
+        // declared a per-pass one. Both are refused here, before any device
+        // object exists, rather than resolved into "whichever image came
+        // first".
+        let declares_resident = attachment.declares_resident_target();
+        match (declares_resident, resident.is_some()) {
+            (true, false) => {
+                return Err(capability_refusal("resident_target_undeclared")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the pass declares the provider-resident target and the provider handed \
+                         over no image for it",
+                    ));
+            }
+            (false, true) => {
+                return Err(capability_refusal("resident_target_undeclared")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the provider holds a resident target for this attachment and the pass \
+                         declares neither a resident load nor a resident store",
+                    ));
+            }
+            _ => {}
+        }
         // The attachment's previous contents come from the view the trace
         // declares for it, exactly as a stream's bytes come from their own
         // declaration: the source is resolved here, before any device object
@@ -1989,6 +2111,25 @@ fn prepare_render_request<'a>(
         };
         match attachment.load {
             LoadOp::Clear(_) => {}
+            LoadOp::Resident => {
+                // The attachment's previous contents are the provider image's
+                // own (`research/docs/23` §76, R7): there is nothing to
+                // resolve, nothing to upload, and the render pass opens the
+                // borrowed image from the layout the provider published. A
+                // caller that also declared bytes for this attachment is
+                // refused rather than having one of the two sources silently
+                // win — the trace named both, so the rail cannot know which
+                // one it meant.
+                if declared.is_some() {
+                    return Err(capability_refusal("resident_target_undeclared")
+                        .with_field("attachment", FieldValue::Unsigned(index as u64))
+                        .with_field("load_op", FieldValue::Text("resident".to_owned()))
+                        .with_detail(
+                            "a `LoadOp::Resident` attachment keeps the provider image's own \
+                             contents; the trace declares no previous bytes for it",
+                        ));
+                }
+            }
             LoadOp::Load => {
                 // The rail uploads the attachment's previous bytes before
                 // opening the render pass (`research/docs/23` §3.3). The caller
@@ -2049,6 +2190,7 @@ fn prepare_render_request<'a>(
             store: attachment.store,
             load: attachment.load,
             previous,
+            resident,
         });
     }
     // A pass with no colour attachment takes its extent from the depth
@@ -2878,6 +3020,7 @@ pub(crate) fn execute_indirect_render_pass<'a>(
     pass: &'a RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
     previous: &'a [Option<&'a BufferView>],
+    resident: &[Option<&'a ProviderTargetImage>],
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     let replay = match command {
@@ -2924,10 +3067,15 @@ pub(crate) fn execute_indirect_render_pass<'a>(
         }
     };
     refuse_attachment_extent(context, pass)?;
-    let mut request = prepare_render_request(
+    let mut request = prepare_render_request_with_resident(
         stages,
         pass,
         previous,
+        if resident.is_empty() {
+            None
+        } else {
+            Some(resident)
+        },
         leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
@@ -3586,6 +3734,28 @@ fn execute_offscreen_render_with_retains(
         }
         None => vk::SampleCountFlags::TYPE_1,
     };
+    // A multisampled raster resolves into a single-sample landing the pass
+    // owns, while a resident target *is* the landing (`research/docs/23` §76,
+    // R7). The two shapes meet only through the present rail's v62 resolve
+    // (`research/docs/24` §3.5), which R7 does not widen: a pass that declares
+    // a resident target beside a multisample raster is refused here, before
+    // the first image exists, instead of resolving into an image the trace
+    // believes it named.
+    if samples != vk::SampleCountFlags::TYPE_1
+        && request
+            .attachments
+            .iter()
+            .any(|attachment| attachment.resident.is_some())
+    {
+        return Err(
+            capability_refusal("resident_target_multisample_unsupported")
+                .with_field("samples", FieldValue::Unsigned(u64::from(samples.as_raw())))
+                .with_detail(
+                    "a multisampled pass resolves into a single-sample landing of its own; the \
+                 resident target is the landing of a single-sample raster in this increment",
+                ),
+        );
+    }
     if samples != vk::SampleCountFlags::TYPE_1 {
         if request
             .depth
@@ -3894,16 +4064,34 @@ fn execute_offscreen_render_with_retains(
     let vertex_entry = stage_entry_cstring("vertex", &request.vertex.entry)?;
     let fragment_entry = stage_entry_cstring("fragment", fragment_entry_name)?;
 
+    // One layout guard per resident attachment, taken in attachment order
+    // before the first device object exists (`research/docs/23` §76, R7). The
+    // guard is the target's serialization point, exactly as it is for the
+    // present action (`research/docs/24` §3.3 rule 1): the value it holds *is*
+    // the `initialLayout` this submission has to declare, and the terminal
+    // layout is published through the same guard before it drops. Taking them
+    // in location order is what keeps two passes naming two resident targets in
+    // opposite orders from interleaving their transitions.
+    let mut resident_layouts = ResidentTargetLayouts::acquire(request);
     let mut objects = OffscreenObjects::new(context);
-    for (attachment, vk_format) in request.attachments.iter().zip(&vk_formats) {
-        objects.create_attachment(
-            *vk_format,
-            width,
-            height,
-            attachment.load,
-            attachment.store == StoreOp::Store,
-            samples,
-        )?;
+    for (index, (attachment, vk_format)) in request.attachments.iter().zip(&vk_formats).enumerate()
+    {
+        match attachment.resident {
+            Some(target) => objects.attach_resident_target(
+                index,
+                target,
+                resident_layouts.layout(index),
+                attachment,
+            )?,
+            None => objects.create_attachment(
+                *vk_format,
+                width,
+                height,
+                attachment.load,
+                attachment.store == StoreOp::Store,
+                samples,
+            )?,
+        }
     }
     // The combined depth-stencil shape (`research/docs/23` §3.3, v60): Vulkan
     // binds one attachment for both faces, so a pass that opens both creates
@@ -4074,11 +4262,24 @@ fn execute_offscreen_render_with_retains(
             if let Some(retains) = retains.as_mut() {
                 retains.retire();
             }
+            // The pass completed, so every resident target is now in the
+            // layout the next submission starts from — and, for the provider's
+            // own bookkeeping, in a state a later `LoadOp::Resident` may read
+            // (`research/docs/23` §76, R7).
+            resident_layouts.publish(true);
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
                 retains.after_submission_failure(&error, objects.submitted);
             }
+            // A submission the driver refused before it ran leaves the image
+            // exactly as it was; a submission that reached the queue may have
+            // left any layout and any bytes behind, so the target states
+            // `UNDEFINED` — the one old layout that is always legal to
+            // declare — and the provider marks the identity undefined rather
+            // than letting a later resident load read an image of unknown
+            // state.
+            resident_layouts.publish(!objects.submitted);
             return Err(error);
         }
     }
@@ -4115,22 +4316,27 @@ fn execute_offscreen_render_with_retains(
     })
 }
 
-/// One provider-owned presentable target image (`research/docs/24` §3.6).
+/// One provider-owned target image: the present rail's presentable target
+/// (`research/docs/24` §3.6) and the resident render target the R7 increment
+/// adds (`research/docs/23` §76) are the same object.
 ///
 /// Unlike the one-shot attachment [`OffscreenObjects`] creates per pass, this
 /// image is owned by the provider and survives every submission until the
 /// allocation lease it backs is released. That is what makes `docs/24` §3.3's
-/// second rule ("the target stays readable after `wait`") hold: the target's
-/// bytes have to remain observable after a submission, so the image cannot live
-/// in the pass's own drop scope (`docs/24` §5.2). It is created once per
+/// second rule ("the target stays readable after `wait`") hold — and it is the
+/// same property a resident target needs to be loadable by a later
+/// submission: the bytes have to remain observable (or loadable) after a
+/// submission, so the image cannot live in the pass's own drop scope
+/// (`docs/24` §5.2, `research/docs/23` §76). It is created once per
 /// `(allocation, view)` identity and reused by later submissions that present
-/// the same target.
+/// or render into the same target.
 ///
 /// The image carries `TRANSFER_DST` in addition to the
 /// `COLOR_ATTACHMENT | TRANSFER_SRC` pair the offscreen attachment uses: the
 /// sentinel pre-fill (`docs/24` §3.1) uploads through
-/// `vkCmdClearColorImage`, which is a transfer-destination operation.
-pub(crate) struct PresentTargetImage {
+/// `vkCmdClearColorImage`, which is a transfer-destination operation, and the
+/// pre-fill path is the same `Clear` a resident target's first pass states.
+pub(crate) struct ProviderTargetImage {
     context: Arc<VulkanContext>,
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -4142,7 +4348,7 @@ pub(crate) struct PresentTargetImage {
     layout: Mutex<vk::ImageLayout>,
 }
 
-impl PresentTargetImage {
+impl ProviderTargetImage {
     pub(crate) fn create(
         context: Arc<VulkanContext>,
         format: AttachmentFormat,
@@ -4376,8 +4582,10 @@ impl PresentTargetImage {
         self.view
     }
 
-    /// Begin one present round trip on this target, holding its layout lock
-    /// until the returned guard is dropped.
+    /// Begin one round trip on this target, holding its layout lock until the
+    /// returned guard is dropped. Both rails that render into a provider-owned
+    /// image take it: the present action (`research/docs/24` §3.6) and a pass
+    /// that declares the resident target (`research/docs/23` §76, R7).
     ///
     /// The guard is the target's serialization point: a present action must
     /// read the layout it is about to submit against and publish the new
@@ -4388,7 +4596,7 @@ impl PresentTargetImage {
     /// layout mismatch the driver is entitled to reject (`research/docs/24`
     /// §3.3 rule 1). The caller publishes the terminal layout by writing
     /// through the guard; dropping it releases the next round trip.
-    pub(crate) fn begin_present(&self) -> std::sync::MutexGuard<'_, vk::ImageLayout> {
+    pub(crate) fn begin_target_pass(&self) -> std::sync::MutexGuard<'_, vk::ImageLayout> {
         self.layout_lock()
     }
 
@@ -4399,7 +4607,7 @@ impl PresentTargetImage {
     }
 }
 
-impl Drop for PresentTargetImage {
+impl Drop for ProviderTargetImage {
     fn drop(&mut self) {
         unsafe {
             if self.view != vk::ImageView::null() {
@@ -4475,7 +4683,7 @@ pub(crate) fn execute_present_render<'a>(
     context: &VulkanContext,
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
-    target: &PresentTargetImage,
+    target: &ProviderTargetImage,
     previous: Option<&'a BufferView>,
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<u8>, ProviderError> {
@@ -4553,6 +4761,10 @@ pub(crate) fn execute_present_render<'a>(
                     match stencil.store {
                         Some(StoreOp::Store) => "store",
                         Some(StoreOp::DontCare) => "dontcare",
+                        // A resident stencil store is refused by core admission
+                        // (`research/docs/23` §76, R7): the stencil surface has
+                        // no provider-owned identity to keep its bytes under.
+                        Some(StoreOp::Resident) => "resident",
                         None => "unstated",
                     }
                     .to_owned(),
@@ -4670,7 +4882,7 @@ pub(crate) fn execute_present_render<'a>(
     // terminal layout is published through the same guard before it drops, so
     // a concurrent present of this target cannot read a layout that another
     // submission has already changed.
-    let mut layout = target.begin_present();
+    let mut layout = target.begin_target_pass();
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
     objects.attach_present_target(target, *layout, samples, vk_format, width, height)?;
@@ -5004,7 +5216,7 @@ struct AttachmentObjects {
     initial_layout: vk::ImageLayout,
     /// Whether this pass scope created the attachment's own image, memory and
     /// view and has to destroy them on Drop. A single-sample present pass
-    /// borrows the provider-owned [`PresentTargetImage`] for this half, so it
+    /// borrows the provider-owned [`ProviderTargetImage`] for this half, so it
     /// does not own them; a multisampled present pass creates the n-sample
     /// surface itself and owns it (`research/docs/24` §5.2, v62).
     owns_image: bool,
@@ -5014,10 +5226,75 @@ struct AttachmentObjects {
     /// provider-owned present image, which survives the submission
     /// (`research/docs/24` §5.2, v62).
     owns_resolve: bool,
+    /// Whether this attachment's bytes leave through the pass's readback
+    /// channel: the trace's [`StoreOp::Store`] alone. A resident store keeps
+    /// them in the provider's image instead, so the attachment carries a
+    /// `STORE` action (the image must keep its bytes) but no readback buffer —
+    /// which is why the copy-out pairs buffers by this flag rather than by the
+    /// Vulkan store action (`research/docs/23` §76, R7).
+    publishes: bool,
     /// The host-visible staging buffer holding this attachment's previous bytes
     /// for a `LoadOp::Load` pass. Null unless the attachment loads.
     previous_buffer: vk::Buffer,
     previous_memory: vk::DeviceMemory,
+}
+
+/// The layout guards one pass holds on the provider-owned images it renders
+/// into (`research/docs/23` §76, R7).
+///
+/// The guard is the target's serialization point, exactly as it is for the
+/// present action (`research/docs/24` §3.3 rule 1): the value it holds is the
+/// `initialLayout` the submission declares, and the terminal layout is
+/// published through the same guard before the round trip ends. Acquiring every
+/// guard in attachment order before the first device object exists is what
+/// keeps two passes that name two resident targets in opposite orders from
+/// interleaving their transitions.
+struct ResidentTargetLayouts<'a> {
+    /// One entry per colour attachment, in location order. `Some` exactly for
+    /// the attachments whose declaration named the provider's resident target.
+    guards: Vec<Option<std::sync::MutexGuard<'a, vk::ImageLayout>>>,
+}
+
+impl<'a> ResidentTargetLayouts<'a> {
+    fn acquire(request: &'a OffscreenRenderRequest<'a>) -> Self {
+        let guards = request
+            .attachments
+            .iter()
+            .map(|attachment| {
+                attachment
+                    .resident
+                    .map(ProviderTargetImage::begin_target_pass)
+            })
+            .collect();
+        Self { guards }
+    }
+
+    /// The layout the attachment's submission has to declare as its
+    /// `initialLayout`, or `UNDEFINED` for an attachment that renders into a
+    /// per-pass image of its own.
+    fn layout(&self, index: usize) -> vk::ImageLayout {
+        self.guards
+            .get(index)
+            .and_then(|guard| guard.as_ref())
+            .map_or(vk::ImageLayout::UNDEFINED, |guard| **guard)
+    }
+
+    /// Publish the terminal layout of every resident image: the layout the next
+    /// submission starts from once the pass completed, or `UNDEFINED` when a
+    /// submission that reached the queue failed and the image's state is
+    /// unknown. `UNDEFINED` is the one old layout that is always legal to
+    /// declare, and the provider marks the identity undefined in the same
+    /// case, so a later `LoadOp::Resident` refuses instead of reading it.
+    fn publish(&mut self, completed: bool) {
+        let terminal = if completed {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        } else {
+            vk::ImageLayout::UNDEFINED
+        };
+        for guard in self.guards.iter_mut().flatten() {
+            **guard = terminal;
+        }
+    }
 }
 
 /// The single-sample resolve target of one multisampled colour attachment
@@ -5033,7 +5310,7 @@ struct ResolveObjects {
     /// The layout the image is actually in when the render pass opens it.
     /// A rail-owned resolve target is freshly created and opens from
     /// `UNDEFINED`; a present pass's resolve target is the provider-owned
-    /// [`PresentTargetImage`], which a sentinel preset or an earlier present
+    /// [`ProviderTargetImage`], which a sentinel preset or an earlier present
     /// has already moved, so its description has to restate that layout
     /// (`research/docs/24` §3.3 rule 1, v62).
     initial_layout: vk::ImageLayout,
@@ -5101,7 +5378,7 @@ impl<'a> OffscreenObjects<'a> {
     /// multisampled one.
     fn attach_present_target(
         &mut self,
-        target: &PresentTargetImage,
+        target: &ProviderTargetImage,
         initial_layout: vk::ImageLayout,
         samples: vk::SampleCountFlags,
         format: vk::Format,
@@ -5126,6 +5403,7 @@ impl<'a> OffscreenObjects<'a> {
                 // none of its image, memory or view (`docs/24` §5.2).
                 owns_image: false,
                 owns_resolve: false,
+                publishes: true,
                 previous_buffer: vk::Buffer::null(),
                 previous_memory: vk::DeviceMemory::null(),
             });
@@ -5188,10 +5466,98 @@ impl<'a> OffscreenObjects<'a> {
             initial_layout: vk::ImageLayout::UNDEFINED,
             owns_image: true,
             owns_resolve: false,
+            publishes: true,
             previous_buffer: vk::Buffer::null(),
             previous_memory: vk::DeviceMemory::null(),
         });
         self.present = true;
+        Ok(())
+    }
+
+    /// Render this attachment into the provider-owned resident target instead
+    /// of a per-pass image (`research/docs/23` §76, R7).
+    ///
+    /// The image and view are borrowed for the pass's lifetime; the provider's
+    /// registry keeps owning them, exactly as the present rail borrows its
+    /// target (`docs/24` §5.2). The load decision is the trace's own: a
+    /// `Resident` load keeps the image's contents (`LOAD` from the layout the
+    /// provider published), a `Clear` clears it (`CLEAR`, opened from
+    /// `UNDEFINED` because the pre-pass contents are discarded either way), and
+    /// a `Load` uploads the trace's declared previous bytes into it first
+    /// (`LOAD` from `COLOR_ATTACHMENT_OPTIMAL`, which is where the upload
+    /// leaves the image).
+    ///
+    /// The store action is `STORE` for both store arms: a resident store keeps
+    /// the bytes in the image, and a [`StoreOp::Store`] publishes them through
+    /// the readback channel as well. What the two disagree about is
+    /// [`AttachmentObjects::publishes`], which is the flag the copy-out pairs
+    /// its buffers by.
+    fn attach_resident_target(
+        &mut self,
+        index: usize,
+        target: &ProviderTargetImage,
+        layout: vk::ImageLayout,
+        attachment: &OffscreenColorAttachment<'_>,
+    ) -> Result<(), ProviderError> {
+        let uploading = attachment.previous.is_some();
+        let load_op = match attachment.load {
+            LoadOp::Resident | LoadOp::Load => vk::AttachmentLoadOp::LOAD,
+            LoadOp::Clear(_) => vk::AttachmentLoadOp::CLEAR,
+            LoadOp::DontCare => {
+                // Core admission refuses this pair (a resident target whose
+                // pre-pass contents are undefined), so reaching it means a
+                // hand-built request skipped that gate. The rail refuses it by
+                // name rather than letting the image hold bytes no pass
+                // defined.
+                return Err(capability_refusal("resident_target_undeclared")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
+                    .with_detail(
+                        "a resident attachment defines its contents before the pass: \
+                         `DontCare` is refused",
+                    ));
+            }
+        };
+        // Three load arms, three `initialLayout`s — and the rule is which of
+        // them the render pass may *keep*:
+        //
+        // - a `Load` uploads the trace's own bytes into the image and its
+        //   barriers leave it in the attachment layout, so that is the layout
+        //   the pass declares (`research/docs/23` §3.3, R5b);
+        // - a `Resident` load keeps the image's own bytes, so the pass declares
+        //   the layout the provider published through the guard;
+        // - a `Clear` discards whatever the image held, so it opens from
+        //   `UNDEFINED` — the layout that is legal from any state.
+        //
+        // Declaring `UNDEFINED` beside a `LOAD` action is the one combination
+        // that must not happen: it is the "contents are discarded" spelling.
+        let initial_layout = if uploading {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else if matches!(attachment.load, LoadOp::Clear(_)) {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            layout
+        };
+        self.attachments.push(AttachmentObjects {
+            image: target.image(),
+            memory: vk::DeviceMemory::null(),
+            view: target.view(),
+            // A resident raster is single-sample in this increment: the
+            // multisampled shape resolves into a landing of its own, which the
+            // executor refuses before this runs.
+            samples: vk::SampleCountFlags::TYPE_1,
+            resolve: None,
+            load_op,
+            store_op: vk::AttachmentStoreOp::STORE,
+            initial_layout,
+            // The image is the provider's: this pass scope destroys none of
+            // its image, memory or view (`research/docs/23` §76, R7).
+            owns_image: false,
+            owns_resolve: false,
+            publishes: attachment.store == StoreOp::Store,
+            previous_buffer: vk::Buffer::null(),
+            previous_memory: vk::DeviceMemory::null(),
+        });
         Ok(())
     }
 
@@ -5733,6 +6099,18 @@ impl<'a> OffscreenObjects<'a> {
                 LoadOp::Load => vk::AttachmentLoadOp::LOAD,
                 LoadOp::Clear(_) => vk::AttachmentLoadOp::CLEAR,
                 LoadOp::DontCare => vk::AttachmentLoadOp::DONT_CARE,
+                // A resident load never creates a per-pass attachment image:
+                // the pass renders into the provider's own image, which is
+                // [`OffscreenObjects::attach_resident_target`]'s half
+                // (`research/docs/23` §76, R7). Reaching this arm means the
+                // request's two declaration lists disagreed, so the rail
+                // refuses instead of creating an image the trace did not ask
+                // for.
+                LoadOp::Resident => return Err(capability_refusal("resident_target_undeclared")
+                    .with_detail(
+                        "a `LoadOp::Resident` attachment renders into the provider's own image; \
+                         this request handed the rail no resident target for it",
+                    )),
             },
             store_op: if storing {
                 vk::AttachmentStoreOp::STORE
@@ -5744,6 +6122,7 @@ impl<'a> OffscreenObjects<'a> {
             } else {
                 vk::ImageLayout::UNDEFINED
             },
+            publishes: storing,
             // An offscreen attachment and its resolve target are both created
             // by this pass scope and destroyed with it
             // (`research/docs/23` §3.3, v51).
@@ -7551,8 +7930,13 @@ impl<'a> OffscreenObjects<'a> {
                         LoadOp::Clear(clear) => clear,
                         // A loading or `DontCare` attachment carries no clear
                         // colour: Vulkan ignores this entry when the load op
-                        // is not `CLEAR`.
-                        LoadOp::Load | LoadOp::DontCare => ClearColor::new([0; 4]),
+                        // is not `CLEAR`. A resident load is `Load`'s sibling
+                        // here: the image's own bytes are kept, so the clear
+                        // value is never read either
+                        // (`research/docs/23` §76, R7).
+                        LoadOp::Load | LoadOp::Resident | LoadOp::DontCare => {
+                            ClearColor::new([0; 4])
+                        }
                     },
                 ),
             })
@@ -7989,7 +8373,12 @@ impl<'a> OffscreenObjects<'a> {
         for (attachment, readback) in self
             .attachments
             .iter()
-            .filter(|attachment| attachment.store_op == vk::AttachmentStoreOp::STORE)
+            // The pair is the trace's own store decision, not the Vulkan
+            // action: a resident store also renders with `STORE` (the image
+            // keeps its bytes) but lands no readback buffer, so filtering by
+            // `store_op` would shift every later attachment's copy by one
+            // (`research/docs/23` §76, R7).
+            .filter(|attachment| attachment.publishes)
             .zip(&self.readbacks)
         {
             // A multisampled location's bytes are the resolve target's, not the
@@ -9049,7 +9438,7 @@ mod tests {
         };
         let context = std::sync::Arc::new(context);
         let target = std::sync::Arc::new(
-            PresentTargetImage::create(
+            ProviderTargetImage::create(
                 std::sync::Arc::clone(&context),
                 AttachmentFormat::Rgba8Unorm,
                 2,
@@ -9058,11 +9447,11 @@ mod tests {
             .expect("the present target is created"),
         );
 
-        let first = target.begin_present();
+        let first = target.begin_target_pass();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let waiting = std::sync::Arc::clone(&target);
         let handle = std::thread::spawn(move || {
-            let _second = waiting.begin_present();
+            let _second = waiting.begin_target_pass();
             let _ = started_tx.send(());
         });
         assert!(
@@ -9103,6 +9492,7 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
+                    resident: None,
                 }],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
@@ -9398,6 +9788,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                resident: None,
             }],
             extent: [2, 2],
             vertex: milestone_vertex(),
@@ -9470,6 +9861,7 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(clear),
                         previous: None,
+                        resident: None,
                     }],
                     extent: [2, 2],
                     vertex: single_pixel_vertex(),
@@ -9620,6 +10012,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                resident: None,
             }],
             extent: [2, 0],
             vertex: milestone_vertex(),
@@ -10147,12 +10540,14 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        resident: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        resident: None,
                     },
                 ],
                 extent: [2, 2],
@@ -10219,12 +10614,14 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        resident: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        resident: None,
                     },
                 ],
                 extent: [2, 2],
@@ -10295,12 +10692,14 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        resident: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
                         load: LoadOp::Load,
                         previous: Some(RenderInputSource::TraceBytes(&previous)),
+                        resident: None,
                     },
                 ],
                 extent: [2, 2],
@@ -10348,6 +10747,7 @@ mod tests {
                 store: StoreOp::DontCare,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                resident: None,
             }],
             extent: [2, 2],
             vertex: milestone_vertex(),
@@ -10443,12 +10843,14 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
+                    resident: None,
                 },
                 OffscreenColorAttachment {
                     format: AttachmentFormat::R32Float,
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
+                    resident: None,
                 },
             ],
             extent: [2, 2],
@@ -10613,7 +11015,7 @@ mod tests {
         stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
         let pass = milestone_pass(AttachmentFormat::R32Float);
         pass.validate().expect("the fixture pass is a legal shape");
-        let refused = execute_render_pass(&context, &stages, &pass, &[None], None)
+        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None)
             .expect_err("the mismatched pairing is refused before any Vulkan object exists");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
@@ -10634,7 +11036,7 @@ mod tests {
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
-        let refused = execute_render_pass(&context, &stages, &pass, &[None], None)
+        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None)
             .expect_err("`Load` needs an upload rail this increment does not have");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
@@ -10671,6 +11073,7 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::DontCare,
                     previous: None,
+                    resident: None,
                 }],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
@@ -10791,6 +11194,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                resident: None,
             }],
             extent: [2, 2],
             vertex: milestone_vertex(),
@@ -10882,6 +11286,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                resident: None,
             }],
             extent: [4, 4],
             vertex: milestone_vertex(),
@@ -10945,7 +11350,7 @@ mod tests {
         let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
-        let error = execute_render_pass(&context, &stages, &pass, &[None], None)
+        let error = execute_render_pass(&context, &stages, &pass, &[None], &[], None)
             .expect_err("the substituted driver answer refuses the render submission");
         eprintln!("render device loss: {error:?}");
         assert_eq!(error.class, ProviderErrorClass::DeviceLost);
