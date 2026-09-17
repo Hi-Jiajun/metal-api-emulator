@@ -624,6 +624,13 @@ impl TextureType {
 /// How a shader uses one texture binding.
 ///
 /// `Sampled` is the read-only sampled face (`research/docs/16` §4.1).
+/// `Fetched` is the read-only *texel-fetch* face (`research/docs/23` §3.3,
+/// v105): Metal spells it `texture2d<T, access::read>` and the module reads its
+/// texels directly, with an explicit level of detail and no sampler anywhere —
+/// no AIR-embedded constexpr sampler, no runtime `[[sampler(n)]]` argument, and
+/// no `OpSampledImage` in the emitted SPIR-V. The binding therefore states no
+/// sampler form either, and a rail executes it by binding the image alone
+/// (Vulkan's `SAMPLED_IMAGE` descriptor and the module's own `OpImageFetch`).
 /// `Storage` is the writable face Metal spells `texture2d<T, access::write>`
 /// and `texture2d<T, access::read_write>` (`research/docs/26` §21.4, C2): the
 /// translator classifies both as one storage image (`ResourceAccess::Storage`)
@@ -633,6 +640,7 @@ impl TextureType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureAccess {
     Sampled,
+    Fetched,
     Storage,
     Unused,
 }
@@ -817,8 +825,10 @@ pub struct TextureBindingContract {
     ///
     /// `Some` exactly when the access is [`TextureAccess::Sampled`]: a storage
     /// image is bound as a storage descriptor with no sampler at all, and a
-    /// declaration whose access and sampler presence disagree is refused by
-    /// name in [`PipelineContract::validate`]
+    /// texel-fetch binding (`TextureAccess::Fetched`) is bound as a plain image
+    /// — the module's own `OpImageFetch` reads it and nothing samples through a
+    /// sampler. A declaration whose access and sampler presence disagree is
+    /// refused by name in [`PipelineContract::validate`]
     /// (`TextureSamplerDeclarationMismatch`). The sampler stays `Option`-typed
     /// rather than a second `None`-carrying policy value so a storage
     /// declaration cannot state a state the rail would then have to ignore.
@@ -834,7 +844,9 @@ pub struct TextureBindingContract {
     /// names an entry of the pass's sampler list rather than a position, and
     /// the pair rules in [`RenderPipelineContract::validate_against`] hold the
     /// two lists to each other in both directions. A storage image states
-    /// neither, exactly as it states no [`Self::sampler`].
+    /// neither, exactly as it states no [`Self::sampler`], and so does a
+    /// texel-fetch binding: a module that reads its texels through
+    /// `texture.read()` carries no sampler argument to name.
     ///
     /// The field stays `Option`-typed for the same reason [`Self::sampler`]
     /// does: a declaration cannot name a sampler the access has no meaning
@@ -908,6 +920,31 @@ impl TextureBindingContract {
             format,
             sampler: None,
             runtime_sampler: Some(sampler_binding),
+            footprint: TextureFootprintProof::WholeView,
+        }
+    }
+
+    /// The read-only texel-fetch shape (`research/docs/23` §3.3, v105): a D2,
+    /// single-sample texture the fragment stage reads with `texture.read()` —
+    /// Metal's `access::read` qualifier — at an explicit level of detail.
+    ///
+    /// The binding states no sampler form at all, and that absence is the
+    /// declaration: the module carries no AIR-embedded sampler state and names
+    /// no runtime `[[sampler(n)]]` argument, so a rail that bound a sampler
+    /// would be filling a descriptor nothing samples through. The Vulkan rail
+    /// binds one `SAMPLED_IMAGE` descriptor at the slot the module's own
+    /// reflection names and executes the module's `OpImageFetch` verbatim. A
+    /// module whose reflection samples that same texture instead is refused by
+    /// name (`render_texture_access_unsupported`), because executing it under
+    /// this declaration would silently substitute a fetch for a sample.
+    pub const fn fetched(metal_binding: u32, format: TextureFormat) -> Self {
+        Self {
+            metal_binding,
+            access: TextureAccess::Fetched,
+            texture_type: TextureType::D2,
+            format,
+            sampler: None,
+            runtime_sampler: None,
             footprint: TextureFootprintProof::WholeView,
         }
     }
@@ -1330,6 +1367,19 @@ impl PipelineContract {
             // lowered against, while a storage image is a storage descriptor
             // with no sampler. A declaration whose two halves disagree is
             // refused here rather than executed with one half ignored.
+            //
+            // The compute face has no texel-fetch arm (`research/docs/23` §3.3,
+            // v105): its narrow class reads through a sampler or writes through
+            // a storage image, and a kernel that reads with `texture.read()`
+            // needs the image-only descriptor the render rail builds. The
+            // access is refused by name here, with the binding in hand, rather
+            // than passed on to a rail that would have to refuse a descriptor
+            // shape the contract already stated it does not own.
+            if binding.access == TextureAccess::Fetched {
+                return Err(ContractError::TextureFetchAccessUnsupported {
+                    binding: binding.metal_binding,
+                });
+            }
             if binding.sampler.is_some() != (binding.access == TextureAccess::Sampled) {
                 return Err(ContractError::TextureSamplerDeclarationMismatch {
                     binding: binding.metal_binding,
@@ -2320,8 +2370,8 @@ pub fn validate_vertex_buffer_binding(
     Ok(())
 }
 
-/// Validate one sampled texture bound in a pass's texture list
-/// (`research/docs/23` §3.3, v70/v104).
+/// Validate one texture bound in a pass's texture list
+/// (`research/docs/23` §3.3, v70/v104/v105).
 ///
 /// `position` is the entry's place inside
 /// [`RenderPassDescriptor::textures`] — the list's own canonical order — and
@@ -2336,9 +2386,12 @@ pub fn validate_vertex_buffer_binding(
 /// list rather than about one entry.
 ///
 /// The render-sampler increment reads, and only reads, a single-sample surface:
-/// a writable binding is a `Storage` access the reviewed fragment stage has no
-/// shape for, and a multisampled one is not a texel the sampling instruction
-/// can reduce on either rail.
+/// a writable binding is a `Storage` access no render module reads, and a
+/// multisampled one is not a texel the sampling instruction can reduce on
+/// either rail. The list carries both read-only arms the fragment stage may
+/// state — the sampled one (`Sampled`) and the sampler-free texel fetch
+/// (`Fetched`, v105) — so a list that binds a texture the module fetches is
+/// accepted here and held to the module's own reflection by the rail.
 pub fn validate_render_texture_binding(
     position: usize,
     texture: &TextureView,
@@ -2350,11 +2403,14 @@ pub fn validate_render_texture_binding(
             maximum: MAX_RENDER_TEXTURE_INDEX,
         });
     }
-    if texture.access != TextureAccess::Sampled {
-        return Err(ContractError::RenderTextureAccessUnsupported {
-            index: position,
-            access: texture.access,
-        });
+    match texture.access {
+        TextureAccess::Sampled | TextureAccess::Fetched => {}
+        TextureAccess::Storage | TextureAccess::Unused => {
+            return Err(ContractError::RenderTextureAccessUnsupported {
+                index: position,
+                access: texture.access,
+            });
+        }
     }
     if texture.sample_count != 1 {
         return Err(ContractError::RenderTextureSampleCountUnsupported {
@@ -5105,20 +5161,22 @@ fn validate_render_texture_declarations(
                 maximum: MAX_RENDER_TEXTURE_INDEX,
             });
         }
-        // A sampled binding states *one* of the two sampler forms
+        // A binding that samples states *one* of the two sampler forms
         // (`research/docs/23` §3.3, v100/v102): the AIR-embedded state the
         // module carries, or the runtime `[[sampler(n)]]` argument the pass
         // states the state of. Neither form alone would tell a rail where the
         // sample's state comes from, and both together would leave it two
-        // answers to choose between; a storage image states neither, exactly as
-        // it states no sampler at all.
-        let sampled = binding.access == TextureAccess::Sampled;
+        // answers to choose between. A binding that does not sample states
+        // neither — a storage image exactly as no sampler at all, and a
+        // texel-fetch binding (v105) because the fetch names no state to bind
+        // and a sampler there would fill a descriptor nothing reads.
+        let reads_through_sampler = binding.access == TextureAccess::Sampled;
         let states_static = binding.sampler.is_some();
         let states_runtime = binding.runtime_sampler.is_some();
         // Stated as the two shapes that *are* admissible, so the refusal reads
         // as one condition rather than as a negation of a disjunction.
         let one_form_only = states_static != states_runtime;
-        let admissible = match sampled {
+        let admissible = match reads_through_sampler {
             true => one_form_only,
             false => !states_static && !states_runtime,
         };
@@ -10107,6 +10165,14 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "compute_texture_footprint_unsupported",
         ),
+        // The texel-fetch access is the render face's arm (`research/docs/23`
+        // §3.3, v105). A compute declaration that states it is the face's own
+        // narrowing, not a malformed pair, so it keeps a capability slug of its
+        // own instead of joining the pair rules below.
+        E::TextureFetchAccessUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "texture_fetch_access_unsupported",
+        ),
         E::EmptyVertexLayout
         | E::ZeroVertexStride { .. }
         | E::EmptyVertexBufferLayout { .. }
@@ -12133,6 +12199,17 @@ pub enum ContractError {
         binding: u32,
         proof: TextureFootprintProof,
     },
+    /// A texture declaration states the read-only texel-fetch access on a face
+    /// that does not execute it (`research/docs/23` §3.3, v105).
+    ///
+    /// The arm exists for the render face's sampler-free texture reads. A
+    /// compute declaration that states it is refused by name here — the
+    /// kernel's own narrow class reads through a sampler or writes a storage
+    /// image, and no compute descriptor is built for an image the module only
+    /// fetches.
+    TextureFetchAccessUnsupported {
+        binding: u32,
+    },
     // Stage buffer contract (`research/docs/23` §3.3, v83). The count, the
     // index bound and the footprint proof are first-increment narrowings on a
     // well-formed request; the missing, undeclared, mismatched and
@@ -12903,7 +12980,7 @@ impl fmt::Display for ContractError {
             ),
             Self::RenderTextureAccessUnsupported { index, access } => write!(
                 formatter,
-                "render texture {index} is declared {access:?}, but the fragment stage only samples its textures"
+                "render texture {index} is declared {access:?}, but the fragment stage only reads its textures — through a sampler or through a texel fetch"
             ),
             Self::RenderTextureSampleCountUnsupported { index, sample_count } => write!(
                 formatter,
@@ -12986,6 +13063,10 @@ impl fmt::Display for ContractError {
             Self::TextureFootprintProofUnsupported { binding, proof } => write!(
                 formatter,
                 "texture {binding} states reach {proof:?}, which the first increment cannot size"
+            ),
+            Self::TextureFetchAccessUnsupported { binding } => write!(
+                formatter,
+                "texture {binding} is declared Fetched, a read the render face executes; this face's narrow class reads through a sampler or writes a storage image"
             ),
             Self::RenderStageBufferLimitExceeded {
                 requested,

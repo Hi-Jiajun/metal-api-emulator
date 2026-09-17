@@ -66,8 +66,8 @@ use metal_api_core::provider::{
     LeaseRegistry, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SampleCount, SamplerPolicy,
-    StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
-    TextureView, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
+    StencilResolveFilter, StencilTest, StoreOp, TextureAccess, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
@@ -3632,6 +3632,27 @@ pub(crate) fn plan_with_leases<'a>(
     // state and reported under another. A second reviewed module per state is
     // what would lift this, not a silently substituted sampler.
     for declared in &request.pipeline.textures {
+        // The sampler-free texel-fetch arm is the render face's own
+        // (`research/docs/23` §3.3, v105), and no reviewed MSL module reads a
+        // texture without a sampler: the reviewed pair's `constexpr sampler` is
+        // what its `sample` calls go through. The declaration is refused by
+        // name here instead of being executed as one of the sampled shapes this
+        // rail's modules carry — the Vulkan rail's translated arm is where a
+        // fetch runs, under the module's own `OpImageFetch`.
+        if declared.access == TextureAccess::Fetched {
+            return Err(capability_refusal("render_texture_access_unsupported")
+                .with_field(
+                    "binding",
+                    FieldValue::Unsigned(u64::from(declared.metal_binding)),
+                )
+                .with_field("declared_access", FieldValue::Text("Fetched".to_owned()))
+                .with_field("module_access", FieldValue::Text("sampled".to_owned()))
+                .with_detail(
+                    "the reviewed render modules sample every texture they read through their \
+                     own `constexpr sampler`, so a sampler-free texel fetch has no reviewed \
+                     module behind it on this rail",
+                ));
+        }
         if declared.sampler == Some(SamplerPolicy::reviewed_render_sampler()) {
             continue;
         }

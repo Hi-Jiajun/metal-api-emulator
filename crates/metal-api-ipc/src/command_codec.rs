@@ -2351,6 +2351,10 @@ fn put_texture_access(encoder: &mut Encoder, access: TextureAccess) {
         TextureAccess::Sampled => 0,
         TextureAccess::Storage => 1,
         TextureAccess::Unused => 2,
+        // `Fetched` is appended rather than inserted (`research/docs/23` §3.3,
+        // v105): the three codes above are the wire's existing statements, and
+        // a renumbering would read old bytes as another access.
+        TextureAccess::Fetched => 3,
     });
 }
 
@@ -2359,6 +2363,7 @@ fn get_texture_access(decoder: &mut Decoder<'_>) -> Result<TextureAccess, CodecE
         0 => Ok(TextureAccess::Sampled),
         1 => Ok(TextureAccess::Storage),
         2 => Ok(TextureAccess::Unused),
+        3 => Ok(TextureAccess::Fetched),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture access",
             value,
