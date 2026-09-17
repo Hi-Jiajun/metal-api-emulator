@@ -4038,7 +4038,10 @@ impl RenderCommandEncoder {
             .render
             .as_ref()
             .ok_or(Error::InvalidPipelineMetadata)?
-            .validate_against(&descriptor)?;
+            // The object API records shapes and resolves no lease: its index
+            // bytes are the ones the descriptor carries, so the strict arm is
+            // the only one it can state (`research/docs/23` §92, R9k).
+            .validate_against(&descriptor, None)?;
         let mut inner = lock(&self.shared.inner, "provider command")?;
         if indirect.is_some() && inner.indirect.is_some() {
             return Err(Error::IndirectAlreadyRecorded);

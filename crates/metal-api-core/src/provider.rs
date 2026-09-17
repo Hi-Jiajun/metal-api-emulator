@@ -4066,7 +4066,22 @@ impl RenderPipelineContract {
     /// attachment list is reported as the pass's own
     /// [`ContractError::EmptyAttachmentList`] rather than as a vacuous
     /// agreement about formats that are not there.
-    pub fn validate_against(&self, pass: &RenderPassDescriptor) -> Result<(), ContractError> {
+    ///
+    /// `resolved_index_bytes` is `None` on the default path — every caller that
+    /// runs before any lease exists, which is where a provider's own
+    /// `admit_render_passes` and a rail's plan validate the pair. Only the arm
+    /// that reads an index view the trace does not carry
+    /// (`BufferSource::StagedLease` / `BorrowedNoCopy`) reads it: an affine
+    /// stage-buffer proof is bounded by the draw's own index values, and the
+    /// caller that has resolved those bytes hands them over here instead of
+    /// leaving the bound unprovable. A caller that has none passes `None` and
+    /// the declaration is refused by name, exactly as before (`research/docs/23`
+    /// §92, R9k).
+    pub fn validate_against(
+        &self,
+        pass: &RenderPassDescriptor,
+        resolved_index_bytes: Option<&[u8]>,
+    ) -> Result<(), ContractError> {
         self.validate()?;
         // A pass with no colour attachment is the depth-only shape (`v46`), and
         // its pipeline states no colour format: the count rule right below is
@@ -4135,7 +4150,12 @@ impl RenderPipelineContract {
             let required = match &declared.footprint {
                 FootprintProof::Static { max_bytes } => *max_bytes,
                 FootprintProof::Affine { accesses } => {
-                    let counts = render_affine_axis_counts(pass, declared.stage, declared.index)?;
+                    let counts = render_affine_axis_counts(
+                        pass,
+                        declared.stage,
+                        declared.index,
+                        resolved_index_bytes,
+                    )?;
                     render_affine_required_bytes(accesses, counts).ok_or(
                         ContractError::StageBufferFootprintProofUnsupported {
                             stage: declared.stage,
@@ -4170,6 +4190,34 @@ impl RenderPipelineContract {
             }
         }
         Ok(())
+    }
+
+    /// The two invocation counts one stage buffer's affine footprint is
+    /// evaluated over (`research/docs/23` §3.3, v86; §92, R9k).
+    ///
+    /// Entry 0 counts the vertex indices the pass's draw can name — `vertices`
+    /// for a non-indexed draw, and `base_vertex + highest index + 1` for an
+    /// indexed one, read out of that pass's index bytes — and entry 1 the
+    /// draw's instance count. Both are the arithmetic [`Self::validate_against`]
+    /// uses to bound a [`FootprintProof::Affine`] declaration.
+    ///
+    /// The distinction is where the index bytes come from: this entry takes the
+    /// *resolved* window, so a rail that read a lease's index bytes out of the
+    /// provider registries can hand the very bytes the device will read over and
+    /// have the contract state the bound, instead of restating the count rule of
+    /// its own (`research/docs/23` §92.5). The signature is the strict one:
+    /// `resolved_index_bytes` is `None` for every caller that has resolved
+    /// nothing, and an index view the trace does not carry is then refused by
+    /// [`ContractError::StageBufferFootprintProofUnsupported`] rather than
+    /// bounded on a guess.
+    pub fn affine_axis_counts(
+        &self,
+        pass: &RenderPassDescriptor,
+        stage: RenderPipelineStage,
+        index: u32,
+        resolved_index_bytes: Option<&[u8]>,
+    ) -> Result<[u64; 2], ContractError> {
+        render_affine_axis_counts(pass, stage, index, resolved_index_bytes)
     }
 }
 
@@ -8415,7 +8463,13 @@ impl ProviderCapabilities {
                 })
             })?;
             render
-                .validate_against(pass)
+                // Admission runs before any lease is resolved: a snapshot
+                // knows the declarations and the trace's own bytes, and the
+                // arm that needs a resolved index window is refused by name
+                // rather than bounded on a guess (`research/docs/23` §92,
+                // R9k). The rail that owns the registries re-asks the pair
+                // with the resolved bytes before it records any device work.
+                .validate_against(pass, None)
                 .map_err(contract_error_refusal)?;
             // The vertex formats and strides the layout asks for are the last
             // bits only this snapshot can answer: the pass already agreed with
@@ -8819,9 +8873,17 @@ fn ceil_div(value: u64, divisor: u64) -> Option<u64> {
 /// index the pass's own buffer holds, so the count is that highest reached
 /// vertex plus one — the same `base_vertex + index` arithmetic the vertex
 /// stream footprint proof states (`research/docs/23` §3.3, v34), read from the
-/// same bytes. An index view whose bytes do not travel with the trace (a staged
-/// or borrowed lease) leaves the count unprovable here, and the declaration is
-/// refused by name instead of being evaluated against a bound nothing states.
+/// same bytes.
+///
+/// `resolved_index_bytes` is the index view's own window for the arm whose
+/// bytes do not travel with the trace: a staged or borrowed lease's bytes are
+/// read out of the provider's registries, and the caller that did that hands
+/// them over here (`research/docs/23` §92, R9k). `None` is every caller that
+/// has not resolved anything — the strict path, which refuses the lease arms by
+/// name instead of evaluating a bound nothing states. Bytes handed over for a
+/// view the trace *does* carry are refused the same way: the two are one
+/// measurement of one window, and a caller that passes both has read the wrong
+/// one.
 ///
 /// A count of zero (an empty draw, which the pass's own validation refuses)
 /// bounds every expression at its constant term, which is the sound reading:
@@ -8830,15 +8892,24 @@ fn render_affine_axis_counts(
     pass: &RenderPassDescriptor,
     stage: RenderPipelineStage,
     index: u32,
+    resolved_index_bytes: Option<&[u8]>,
 ) -> Result<[u64; 2], ContractError> {
     let unsupported = || ContractError::StageBufferFootprintProofUnsupported { stage, index };
     let vertices = match &pass.indices {
-        None => u64::from(pass.vertices),
+        None => {
+            if resolved_index_bytes.is_some() {
+                return Err(unsupported());
+            }
+            u64::from(pass.vertices)
+        }
         Some(indices) => {
             let width = usize::try_from(indices.format.bytes()).map_err(|_| unsupported())?;
             let count = usize::try_from(pass.vertices).map_err(|_| unsupported())?;
-            let BufferSource::OwnedBytes(bytes) = &indices.view.source else {
-                return Err(unsupported());
+            let bytes = match (&indices.view.source, resolved_index_bytes) {
+                (BufferSource::OwnedBytes(bytes), None) => bytes.as_slice(),
+                (BufferSource::OwnedBytes(_), Some(_)) => return Err(unsupported()),
+                (_, Some(bytes)) => bytes,
+                (_, None) => return Err(unsupported()),
             };
             let Some(readable) = count.checked_mul(width) else {
                 return Err(unsupported());
@@ -17660,7 +17731,7 @@ mod tests {
             ..render_pipeline_contract()
         };
         contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("one layout entry binds the one stream");
 
         // A pass that binds a second stream the layout does not describe is a
@@ -17668,7 +17739,7 @@ mod tests {
         let mut extra = pass.clone();
         extra.vertex_buffers.push(stream_view(49, 1, 51, 32));
         assert_eq!(
-            contract.validate_against(&extra),
+            contract.validate_against(&extra, None),
             Err(ContractError::VertexLayoutBindingMismatch {
                 pipeline_buffers: 1,
                 pass_buffers: 2,
@@ -17687,14 +17758,14 @@ mod tests {
         // stream, and a pass that binds none keeps the milestone's shape.
         let vertex_id_contract = render_pipeline_contract();
         assert_eq!(
-            vertex_id_contract.validate_against(&pass),
+            vertex_id_contract.validate_against(&pass, None),
             Err(ContractError::VertexLayoutBindingMismatch {
                 pipeline_buffers: 0,
                 pass_buffers: 1,
             })
         );
         vertex_id_contract
-            .validate_against(&render_pass())
+            .validate_against(&render_pass(), None)
             .expect("the milestone pass still agrees with its own layout");
     }
 
@@ -18314,6 +18385,216 @@ mod tests {
                 "render_stage_buffer_footprint_unsupported"
             );
         }
+    }
+
+    /// The affine bound of an indexed draw whose index bytes do **not** travel
+    /// with the trace (`research/docs/23` §92, R9k; E-L1).
+    ///
+    /// One declaration, three states: the default path has resolved nothing and
+    /// refuses by name; a caller that resolved the lease's window hands the very
+    /// bytes over — the core entry `affine_axis_counts` / the resolved arm of
+    /// `validate_against` — and the same declaration is bounded and admitted;
+    /// and bytes that cannot carry the draw's indices are refused with the
+    /// bound and the view, exactly as the trace-owned arm is.
+    #[test]
+    fn an_affine_stage_buffer_footprint_is_bounded_by_resolved_lease_index_bytes() {
+        /// One `float2` per vertex: `0 / 4 + vertex_id * 8`, the shape the
+        /// reviewed write module declares.
+        fn per_vertex() -> FootprintProof {
+            FootprintProof::Affine {
+                accesses: vec![
+                    AffineAccess {
+                        base_offset: 0,
+                        access_size: 4,
+                        terms: vec![AffineTerm { axis: 0, stride: 8 }],
+                    },
+                    AffineAccess {
+                        base_offset: 4,
+                        access_size: 4,
+                        terms: vec![AffineTerm { axis: 0, stride: 8 }],
+                    },
+                ],
+            }
+        }
+        /// The same indexed pass the trace-owned case states, with a lease view
+        /// whose bytes only the provider's registries hold.
+        fn leased_index_pass(view_length: u64) -> ComputeTrace {
+            let mut value = stage_buffer_trace();
+            value.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half")
+                .stage_buffers[0]
+                .footprint = per_vertex();
+            let pass = render_entry(&mut value);
+            pass.base_vertex = 1;
+            pass.indices = Some(IndexBufferBinding {
+                view: BufferView {
+                    source: BufferSource::BorrowedNoCopy(LeaseId::new(71)),
+                    ..stream_view(45, 0, 47, usize::try_from(view_length).unwrap_or(0))
+                },
+                format: IndexFormat::Uint16,
+            });
+            value
+        }
+        fn indexed_capabilities() -> ProviderCapabilities {
+            let mut provider = stage_buffer_capabilities();
+            provider.supported_index_formats = vec![IndexFormat::Uint16];
+            provider
+        }
+        // `[0, 1, 2]` read through `base_vertex = 1` names vertices `1..4`, so
+        // the reach is `(4 - 1) * 8 + 4 + 4 = 32` bytes of the 24-byte view:
+        // four vertices, two four-byte accesses eight bytes apart.
+        let lease_index_bytes = [0_u8, 0, 1, 0, 2, 0];
+
+        // State one: the default path refuses the declaration by name. The
+        // refusal travels through admission's own mapping, so a trace that
+        // never reaches a rail with the registry sees the published slug.
+        let declared = leased_index_pass(6);
+        let refusal = indexed_capabilities()
+            .admit(&declared, &landing_resources())
+            .expect_err("an unresolved lease index view leaves the bound unprovable");
+        eprintln!("unresolved lease index view: {refusal:?}");
+        assert_eq!(refusal.slug, "render_stage_buffer_footprint_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("affine stage buffer")
+                    || detail.contains("footprint proof")),
+            "the refusal names the unprovable proof: {:?}",
+            refusal.detail
+        );
+        let contract = declared.pipelines[0]
+            .render
+            .clone()
+            .expect("the fixture declares the render half");
+        let pass = declared
+            .passes
+            .last()
+            .and_then(TracePass::as_render)
+            .expect("the fixture carries a render pass");
+        assert_eq!(
+            contract
+                .validate_against(pass, None)
+                .expect_err("the strict arm refuses the lease view by name"),
+            ContractError::StageBufferFootprintProofUnsupported {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+            }
+        );
+        let unsupported = ContractError::StageBufferFootprintProofUnsupported {
+            stage: RenderPipelineStage::Vertex,
+            index: 0,
+        }
+        .to_string();
+        eprintln!("by-name refusal: {unsupported}");
+        assert!(
+            unsupported.contains("affine") || unsupported.contains("footprint"),
+            "the by-name refusal states what could not be proven: {unsupported}"
+        );
+
+        // State two: the resolved bytes are handed over and the bound comes out
+        // of the core rule — four vertices on axis 0, one instance on axis 1.
+        let counts = contract
+            .affine_axis_counts(
+                pass,
+                RenderPipelineStage::Vertex,
+                0,
+                Some(&lease_index_bytes),
+            )
+            .expect("the resolved window states the draw's own indices");
+        eprintln!("resolved lease index affine counts: {counts:?}");
+        assert_eq!(counts, [4, 1]);
+        let refusal = contract
+            .validate_against(pass, Some(&lease_index_bytes))
+            .expect_err("the 24-byte view is one vertex short of the 32-byte bound");
+        assert_eq!(
+            refusal,
+            ContractError::StageBufferFootprintExceeded {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+                required: 32,
+                declared: 24,
+            }
+        );
+
+        // The same shape with a view that covers the bound is admitted, so the
+        // refusal above is the bound and not the lease arm itself.
+        let mut roomy = leased_index_pass(6);
+        render_entry(&mut roomy).stage_buffers[0].view = stream_view(51, 0, 53, 32);
+        let roomy_pass = roomy
+            .passes
+            .last()
+            .and_then(TracePass::as_render)
+            .expect("the fixture carries a render pass");
+        let roomy_contract = roomy.pipelines[0]
+            .render
+            .clone()
+            .expect("the fixture declares the render half");
+        roomy_contract
+            .validate_against(roomy_pass, Some(&lease_index_bytes))
+            .expect("a view covering `base_vertex + highest index + 1` is admitted");
+        assert_eq!(
+            roomy_contract
+                .affine_axis_counts(
+                    roomy_pass,
+                    RenderPipelineStage::Vertex,
+                    0,
+                    Some(&lease_index_bytes),
+                )
+                .expect("the bound is the same one"),
+            counts
+        );
+
+        // State three: resolved bytes that cannot carry the draw's indices are
+        // refused by the same name the trace-owned arm publishes, and an
+        // unindexed pass handed index bytes is refused too — the two are one
+        // measurement of one window.
+        let short = leased_index_pass(6);
+        let short_pass = short
+            .passes
+            .last()
+            .and_then(TracePass::as_render)
+            .expect("the fixture carries a render pass");
+        assert_eq!(
+            contract
+                .validate_against(short_pass, Some(&lease_index_bytes[..2]))
+                .expect_err("two resolved bytes carry no three-index draw"),
+            ContractError::StageBufferFootprintProofUnsupported {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+            }
+        );
+        let mut unindexed = stage_buffer_trace();
+        unindexed.pipelines[0]
+            .render
+            .as_mut()
+            .expect("the fixture declares the render half")
+            .stage_buffers[0]
+            .footprint = per_vertex();
+        let unindexed_pass = render_entry(&mut unindexed);
+        assert_eq!(
+            contract
+                .affine_axis_counts(
+                    unindexed_pass,
+                    RenderPipelineStage::Vertex,
+                    0,
+                    Some(&lease_index_bytes),
+                )
+                .expect_err("a non-indexed draw has no index window to resolve"),
+            ContractError::StageBufferFootprintProofUnsupported {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+            }
+        );
+        assert_eq!(
+            contract
+                .affine_axis_counts(unindexed_pass, RenderPipelineStage::Vertex, 0, None)
+                .expect("the non-indexed arm counts `vertices` itself"),
+            [3, 1]
+        );
     }
 
     #[test]
@@ -19925,7 +20206,7 @@ mod tests {
         let mut pass = render_pass();
         pass.color_attachments[0].format = AttachmentFormat::Rgba8Unorm;
         assert_eq!(
-            contract.validate_against(&pass),
+            contract.validate_against(&pass, None),
             Err(ContractError::UnsupportedAttachmentFormat(
                 AttachmentFormat::R32Uint
             ))
@@ -19946,7 +20227,7 @@ mod tests {
         let mut colour_pass = render_pass();
         colour_pass.depth = Some(depth_attachment());
         assert_eq!(
-            contract.validate_against(&colour_pass),
+            contract.validate_against(&colour_pass, None),
             Err(ContractError::RenderPipelineFormatCountMismatch {
                 pipeline: 0,
                 attachments: 1,
@@ -19972,7 +20253,7 @@ mod tests {
             .validate()
             .expect("a pass with no colour attachment is well formed");
         contract
-            .validate_against(&depth_only)
+            .validate_against(&depth_only, None)
             .expect("a depth-only pipeline renders into a depth-only pass");
     }
 
@@ -19988,14 +20269,14 @@ mod tests {
         pass.validate()
             .expect("the dual-attachment pass is well formed");
         contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the pipeline compiles one format per location");
 
         // A count disagreement is a caller-fixable structural refusal, not a
         // capability narrowing.
         let single = render_pipeline_contract();
         assert_eq!(
-            single.validate_against(&pass),
+            single.validate_against(&pass, None),
             Err(ContractError::RenderPipelineFormatCountMismatch {
                 pipeline: 1,
                 attachments: 2,
@@ -20017,7 +20298,7 @@ mod tests {
         pass.color_attachments
             .push(render_attachment(AttachmentFormat::Rgba8Unorm));
         assert_eq!(
-            contract.validate_against(&pass),
+            contract.validate_against(&pass, None),
             Err(ContractError::RenderPipelineFormatMismatch {
                 pipeline: AttachmentFormat::Bgra8Unorm,
                 attachment: AttachmentFormat::Rgba8Unorm,
@@ -20162,7 +20443,7 @@ mod tests {
         let mut pass = render_pass();
         pass.color_attachments[0].format = AttachmentFormat::Bgra8Unorm;
         assert_eq!(
-            contract.validate_against(&pass),
+            contract.validate_against(&pass, None),
             Err(ContractError::RenderPipelineFormatMismatch {
                 pipeline: AttachmentFormat::Rgba8Unorm,
                 attachment: AttachmentFormat::Bgra8Unorm,
@@ -20372,7 +20653,7 @@ mod tests {
             pass.color_attachments[0].format = format;
             pass.color_attachments[0].load = LoadOp::Clear(one_texel_clear(format));
             contract
-                .validate_against(&pass)
+                .validate_against(&pass, None)
                 .expect("a pipeline compiles for the attachment it renders into");
             // The pass keeps its own shape rules; agreement does not replace
             // them.
@@ -20389,7 +20670,7 @@ mod tests {
         let mut pass = render_pass();
         pass.color_attachments.clear();
         assert_eq!(
-            contract.validate_against(&pass),
+            contract.validate_against(&pass, None),
             Err(ContractError::RenderPipelineFormatCountMismatch {
                 pipeline: 1,
                 attachments: 0,

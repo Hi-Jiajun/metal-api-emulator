@@ -2426,9 +2426,20 @@ fn prepare_render_request_with_resident<'a>(
     // translation entry point asks it: a module this device could not create is
     // refused by name before the rail asks what the module or the pass is.
     validate_module_capabilities(stages, policy)?;
+    // The contract pairs the pass with the pipeline it names, and the pass's
+    // index bytes take part in that pairing when a stage buffer declares an
+    // affine footprint (`research/docs/23` §92, R9k): the bound is the draw's
+    // own `base_vertex + highest index + 1`, so a view whose bytes do not travel
+    // with the trace is read out of the provider's registries here — the same
+    // three-armed channel the streams resolve through, one resolution width
+    // earlier — and handed to the contract's resolved arm. A pass whose bound
+    // needs no resolved window hands over `None`, which is the strict arm: the
+    // declaration is refused by name rather than bounded on a guess, exactly as
+    // this entry refused it before the resolved arm existed.
+    let resolved_index = resolve_affine_index_bytes(stages, pass, leases)?;
     stages
         .contract
-        .validate_against(pass)
+        .validate_against(pass, resolved_index.as_deref())
         .map_err(|error| contract_refusal(&error.to_string()))?;
     // The MRT increment executes one or two attachments; a three- or
     // four-attachment pass is admitted by the frozen core contract but refused
@@ -3326,6 +3337,55 @@ impl RenderInputSource<'_> {
             Self::Borrowed { lease, .. } => Some(*lease),
         }
     }
+}
+
+/// The pass's index bytes, resolved for the contract's affine bound when the
+/// pipeline needs them (`research/docs/23` §92, R9k).
+///
+/// An affine stage-buffer footprint is bounded by the draw's own
+/// `base_vertex + highest index + 1`, and that arithmetic reads the index
+/// buffer's bytes. A view the trace carries states them itself; a lease view
+/// (`BufferSource::StagedLease` / `BorrowedNoCopy`) does not, and the
+/// contract's default arm refuses that declaration by name. The rail is the
+/// half that owns the registries — [`resolve_render_input`] is the same
+/// three-armed resolution the streams and the encoder use — so it hands the
+/// resolved window over and the contract states the bound.
+///
+/// `None` is every other shape: a pipeline whose declarations all state a
+/// static (or no) footprint evaluates no index arithmetic at all
+/// ([`RenderPipelineContract::stage_buffers`]), a pass with no index buffer
+/// names its vertices by `vertices`, and an unreadable window keeps the
+/// contract's own by-name refusal once it gets there. Resolving nothing is a
+/// decision of the declaration, not a fallback: the contract is never handed a
+/// guess in place of bytes.
+fn resolve_affine_index_bytes(
+    stages: &RenderStages,
+    pass: &RenderPassDescriptor,
+    leases: Option<&RenderLeaseContext<'_>>,
+) -> Result<Option<Vec<u8>>, ProviderError> {
+    let reads_index_axis = stages.contract.stage_buffers.iter().any(|binding| {
+        matches!(
+            &binding.footprint,
+            FootprintProof::Affine { accesses }
+                if accesses
+                    .iter()
+                    .any(|access| access.terms.iter().any(|term| term.axis == 0))
+        )
+    });
+    let Some(binding) = pass.indices.as_ref() else {
+        return Ok(None);
+    };
+    // A view the trace carries states its own bytes: the contract reads them
+    // itself, and handing the same window over as if it had been resolved would
+    // be one measurement stated twice.
+    if matches!(binding.view.source, BufferSource::OwnedBytes(_)) {
+        return Ok(None);
+    }
+    if !reads_index_axis {
+        return Ok(None);
+    }
+    let source = resolve_render_input(&binding.view, leases, RenderInputRole::Index, 0)?;
+    Ok(Some(source.proof_bytes().to_vec()))
 }
 
 /// Resolve one render input's source into the window the rail reads
@@ -10134,6 +10194,41 @@ impl<'a> OffscreenObjects<'a> {
                         ));
                     }
                 }
+            } else if self.input_index_buffer != vk::Buffer::null() {
+                // An indexed draw whose vertex stage reads no `[[stage_in]]` at
+                // all (`research/docs/23` §92, R9k): the reviewed stage-buffer
+                // vertex stage takes its positions from a descriptor, so the
+                // draw binds no vertex stream and the index window is the only
+                // draw input. The arm used to be unreachable because only a
+                // vertex-stream draw could be indexed; the resolved-index
+                // increment is what makes the shape executable, and the bound
+                // the contract stated for it was read from this same window.
+                self.context.device.cmd_bind_index_buffer(
+                    self.command,
+                    self.input_index_buffer,
+                    0,
+                    self.input_index_type,
+                );
+                match self.draw {
+                    DrawShape::Indexed { index_count } => {
+                        self.context.device.cmd_draw_indexed(
+                            self.command,
+                            index_count,
+                            self.instance_count,
+                            0,
+                            i32::try_from(self.base_vertex).unwrap_or(i32::MAX),
+                            0,
+                        );
+                    }
+                    // A non-indexed draw binds no index window, so this arm is
+                    // the indexed one's alone; anything else here is a draw the
+                    // rail never prepared.
+                    DrawShape::Milestone | DrawShape::Vertices { .. } => {
+                        return Err(contract_refusal(
+                            "an index window reached the rail without an indexed draw",
+                        ));
+                    }
+                }
             } else if self.index_buffer != vk::Buffer::null() {
                 // An indexed indirect replay binds the rail's own `[0, 1, 2]`
                 // index buffer and reads its counts from the `INDIRECT_BUFFER`
@@ -10873,11 +10968,11 @@ mod tests {
     use super::*;
     use metal_api_core::provider::{
         AcquirePolicy, AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease,
-        DepthFormat, DepthLoadOp, InitialState, LeaseReservation, PipelineId, PresentDescriptor,
-        PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderStencilAttachment, RenderStencilIdentity, StageBufferBinding, StagedLease,
-        StencilFormat, StencilLoadOp, TextureAccess, TextureFormat, TextureSource, TextureType,
-        TextureView, VertexLayout, ViewId,
+        DepthFormat, DepthLoadOp, IndexBufferBinding, InitialState, LeaseReservation, PipelineId,
+        PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment,
+        RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity, StageBufferBinding,
+        StageBufferView, StagedLease, StencilFormat, StencilLoadOp, TextureAccess, TextureFormat,
+        TextureSource, TextureType, TextureView, VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -10987,6 +11082,233 @@ mod tests {
             vertex_translation: None,
             fragment_translation: None,
         }
+    }
+
+    /// Decode a lower-case hex literal of the fixtures above, byte by byte.
+    fn unhex(literal: &str) -> Vec<u8> {
+        assert!(
+            literal.len().is_multiple_of(2),
+            "a hex literal is a whole number of bytes"
+        );
+        literal
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("the fixture's hex is ASCII");
+                u8::from_str_radix(text, 16).expect("the fixture's hex is well formed")
+            })
+            .collect()
+    }
+
+    /// The reviewed stage-buffer registration (`research/docs/23` §3.3,
+    /// v83/v86): one `Rgba8Unorm` attachment, an empty vertex layout because
+    /// the vertex stage reads its positions from `DescriptorSet 1 / Binding 0`,
+    /// and one declaration per stage slot. The vertex declaration is the affine
+    /// reach the reviewed module's reflection states (`0 / 4 + vertex_id * 8`),
+    /// which is the rule the E-L1 fixture measures the index bound against.
+    fn reviewed_stage_buffer_stages() -> RenderStages {
+        RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: vec![
+                    StageBufferBinding {
+                        stage: RenderPipelineStage::Vertex,
+                        index: STAGE_BUFFER_VERTEX_BINDING,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Affine {
+                            accesses: vec![
+                                AffineAccess {
+                                    base_offset: 0,
+                                    access_size: 4,
+                                    terms: vec![AffineTerm { axis: 0, stride: 8 }],
+                                },
+                                AffineAccess {
+                                    base_offset: 4,
+                                    access_size: 4,
+                                    terms: vec![AffineTerm { axis: 0, stride: 8 }],
+                                },
+                            ],
+                        },
+                    },
+                    StageBufferBinding {
+                        stage: RenderPipelineStage::Fragment,
+                        index: STAGE_BUFFER_FRAGMENT_BINDING,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 16 },
+                    },
+                ],
+                vertex_entry: STAGE_BUFFER_POSITIONS_VERTEX_ENTRY.to_owned(),
+                fragment_entry: STAGE_BUFFER_TINT_FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                // The reviewed vertex stage reads no `[[stage_in]]` at all: its
+                // positions come from the descriptor the stage buffer fills, so
+                // the layout binds no stream and the indexed draw reads only the
+                // index window (E-L1).
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
+            fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
+            vertex_translation: None,
+            fragment_translation: None,
+        }
+    }
+
+    /// The four `vec2` positions the E-L1 frame fixture draws (`66 66 66 bf`
+    /// is `-0.9`, `66 66 66 3f` is `0.9`, and the two y components are the
+    /// captured fixture's):
+    ///
+    /// ```text
+    ///   vertex 0 (-0.9, -0.9)   vertex 1 (0.9, -0.9)
+    ///   vertex 2 (-0.9,  0.9)   vertex 3 (0.9,  0.9)
+    /// ```
+    const AFFINE_INDEX_POSITIONS_HEX: &str =
+        "666666bf666666bf6666663f666666bf666666bf6666663f6666663f6666663f";
+
+    /// The tint the fragment stage forwards (`1.01, 1.0, 1.505, 1.0`, the
+    /// captured fixture's own bytes), which an 8-bit UNORM attachment stores as
+    /// `ff ff ff ff` — a byte no clear sentinel of this fixture can coincide
+    /// with.
+    const AFFINE_INDEX_TINT_HEX: &str = "8180803e8180003fc1c0403f0000803f";
+
+    /// The one reviewed stage-buffer pass shape, with the index view's source
+    /// the caller's and the position view's length the caller's. `vertices` is
+    /// the pass's index count, so the draw reads the first `vertices` indices of
+    /// the window.
+    fn stage_buffer_index_pass(
+        index_source: BufferSource,
+        index_length: u64,
+        position_view_length: u64,
+        vertices: u32,
+    ) -> RenderPassDescriptor {
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.vertices = vertices;
+        // The clear sentinel is one byte, so a stored texel of the tint's bytes
+        // proves the draw's own output rather than the clear.
+        pass.color_attachments[0].load = LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4]));
+        pass.stage_buffers = vec![
+            StageBufferView {
+                stage: RenderPipelineStage::Vertex,
+                view: BufferView {
+                    view_id: ViewId::new(51),
+                    metal_binding: STAGE_BUFFER_VERTEX_BINDING,
+                    allocation_id: AllocationId::new(53),
+                    offset: 0,
+                    length: position_view_length,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(unhex(AFFINE_INDEX_POSITIONS_HEX)),
+                },
+            },
+            StageBufferView {
+                stage: RenderPipelineStage::Fragment,
+                view: BufferView {
+                    view_id: ViewId::new(55),
+                    metal_binding: STAGE_BUFFER_FRAGMENT_BINDING,
+                    allocation_id: AllocationId::new(57),
+                    offset: 0,
+                    length: 16,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(unhex(AFFINE_INDEX_TINT_HEX)),
+                },
+            },
+        ];
+        pass.indices = Some(IndexBufferBinding {
+            format: IndexFormat::Uint16,
+            view: BufferView {
+                view_id: ViewId::new(45),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(47),
+                offset: 0,
+                length: index_length,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: index_source,
+            },
+        });
+        pass
+    }
+
+    /// One staged index lease over `allocation`, holding exactly `index_hex`'s
+    /// bytes (`research/docs/23` §71, R3c).
+    fn staged_index_lease_with(
+        index_lease: LeaseId,
+        allocation: AllocationId,
+        index_hex: &str,
+    ) -> (
+        LeaseRegistry,
+        Arc<BorrowedLeaseRegistry>,
+        ResourceTableSnapshot,
+    ) {
+        let epoch = DeviceEpoch::new(1);
+        let bytes = unhex(index_hex);
+        let reservation = lease_registration(
+            index_lease,
+            allocation,
+            u64::try_from(bytes.len()).unwrap_or(0),
+            epoch,
+        );
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(reservation, bytes)
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 16,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture reservation is admitted");
+        (staging, borrowed, resources)
+    }
+
+    /// Prepare and execute one staged index lease's frame, through the same two
+    /// calls the provider's submit path makes (`prepare_render_request` with the
+    /// lease context, then the lease-aware execution entry).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_staged_index_frame(
+        context: &VulkanContext,
+        stages: &RenderStages,
+        index_hex: &str,
+        index_lease: LeaseId,
+        index_allocation: AllocationId,
+        position_view_length: u64,
+    ) -> Vec<u8> {
+        let (staging, borrowed, resources) =
+            staged_index_lease_with(index_lease, index_allocation, index_hex);
+        let leases =
+            attachment_lease_context(&staging, &borrowed, &resources, DeviceEpoch::new(1), 4096);
+        let pass = stage_buffer_index_pass(
+            BufferSource::StagedLease(index_lease),
+            u64::try_from(unhex(index_hex).len()).unwrap_or(0),
+            position_view_length,
+            3,
+        );
+        let request = prepare_render_request(
+            stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the resolved index bytes state the affine bound");
+        let retains = RenderInputRetains::retain(Some(&leases), &request)
+            .expect("the fixture's inputs resolve");
+        let mut readback = execute_offscreen_render_with_retains(context, &request, retains)
+            .expect("the resolved pass executes");
+        readback
+            .attachments
+            .remove(0)
+            .expect("the stored attachment reads back")
     }
 
     /// One registration for the reviewed dual `[Rgba8Unorm, Rgba8Unorm]` shape.
@@ -12284,7 +12606,7 @@ mod tests {
         }
         stages
             .contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the fixture describes one format per location");
         let previous = vec![None; maximum + 1];
 
@@ -12347,7 +12669,7 @@ mod tests {
         let pass = depth_resolving_pass();
         stages
             .contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the fixture describes the reviewed single-attachment shape");
         let request = prepare_render_request(
             &stages,
@@ -12436,7 +12758,7 @@ mod tests {
         });
         stages
             .contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the fixture describes the reviewed single-attachment shape");
         let request = prepare_render_request(
             &stages,
@@ -12528,7 +12850,7 @@ mod tests {
         let pass = stencil_resolving_pass();
         stages
             .contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the fixture describes the reviewed single-attachment shape");
         let request = prepare_render_request(
             &stages,
@@ -12658,7 +12980,7 @@ mod tests {
         let pass = rail_owned_combined_pass();
         stages
             .contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the fixture describes the reviewed single-attachment shape");
         let request = prepare_render_request(
             &stages,
@@ -13211,7 +13533,7 @@ mod tests {
         // purpose.
         stages
             .contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect("the pipeline compiles one format per location");
 
         let refused = match prepare_render_request(
@@ -13786,6 +14108,210 @@ mod tests {
             0,
             "the substituted loss never reached the driver"
         );
+    }
+
+    /// E-L1 (`research/docs/23` §92/§96): the affine bound of an indexed draw
+    /// whose index view is a **lease**.
+    ///
+    /// Three readings in one fixture, all against the reviewed stage-buffer pair
+    /// whose vertex declaration is an affine reach over `vertex_id`:
+    ///
+    /// 1. `prepare_render_request` resolves the staged lease's index window and
+    ///    hands it to the contract's resolved arm, so the declaration is
+    ///    admitted with the bound the draw's own indices state — `[0, 1, 2]`
+    ///    names vertices `0..3`, which is exactly the 24 bytes the position view
+    ///    declares;
+    /// 2. the same pass whose position view is one vertex short is refused by
+    ///    name against the *resolved* bound (`vertex stage buffer 0 reads 24
+    ///    bytes, but the bound view declares 16`);
+    /// 3. the frame follows the index bytes the owner's window holds: `[0, 1,
+    ///    2]` covers the lower-left triangle, `[1, 2, 3]` the upper-right one,
+    ///    and the two readbacks differ — so a rail that ignored the resolved
+    ///    index bytes could not land both;
+    /// 4. a staged window that cannot carry the view's own bytes is refused by
+    ///    name (`lease_range_out_of_bounds`) instead of the bound being read out
+    ///    of a shorter copy.
+    #[test]
+    fn an_indexed_draw_whose_index_bytes_are_a_lease_states_its_affine_bound() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let stages = reviewed_stage_buffer_stages();
+        let index_lease = LeaseId::new(61);
+        let index_allocation = AllocationId::new(47);
+        let (staging, borrowed, resources) =
+            staged_index_lease_with(index_lease, index_allocation, "000001000200");
+        let leases =
+            attachment_lease_context(&staging, &borrowed, &resources, DeviceEpoch::new(1), 4096);
+
+        // Reading one: the declaration is admitted, and the window the rail
+        // resolves for the bound is the owner's own index bytes. The rail's
+        // resolver is the one `prepare_render_request` calls, so the bytes below
+        // are the bytes the bound was evaluated over.
+        // Four `vec2` positions are 32 bytes and the view declares all of them,
+        // so the 24-byte affine bound of a three-index draw has room to spare.
+        let suitable = stage_buffer_index_pass(BufferSource::StagedLease(index_lease), 6, 32, 3);
+        let resolved = resolve_affine_index_bytes(&stages, &suitable, Some(&leases))
+            .expect("the staged lease resolves");
+        eprintln!(
+            "resolved lease index bytes: {}",
+            hex(resolved
+                .as_deref()
+                .expect("an indexed pass resolves its window"))
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some(unhex("000001000200").as_slice()),
+            "the bound is read from the owner's own index bytes"
+        );
+        let prepared = prepare_render_request(
+            &stages,
+            &suitable,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_or_else(|error| {
+            panic!("a resolved lease index view states the affine bound: {error:?}")
+        });
+        assert_eq!(prepared.draw, DrawShape::Indexed { index_count: 3 });
+        assert_eq!(prepared.stage_buffers.len(), 2);
+
+        // Reading two: the bound is the resolved one. The same pass whose
+        // position view covers only two vertices (16 bytes) is refused by name,
+        // and the refusal carries both numbers.
+        let too_short = stage_buffer_index_pass(BufferSource::StagedLease(index_lease), 6, 16, 3);
+        let refused = match prepare_render_request(
+            &stages,
+            &too_short,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a view below the resolved bound is refused"),
+        };
+        eprintln!("resolved-bound refusal: {refused:?}");
+        // The contract's refusal reaches this rail through the same
+        // `contract_refusal` mapping every pair rule uses, so the slug is the
+        // trace-level one and the numbers are the observable.
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert!(
+            refused.detail.as_deref().is_some_and(|detail| {
+                detail.contains("reads 24 bytes") && detail.contains("declares 16")
+            }),
+            "the refusal carries the resolved bound and the view: {:?}",
+            refused.detail
+        );
+
+        // Reading four: the window itself is the first gate. A view that reaches
+        // past the reservation it names cannot state any bound at all, and the
+        // registry is what refuses it by name — the same refusal a snapshot
+        // whose copy is short would have to take.
+        let short_lease = LeaseId::new(62);
+        let short_allocation = AllocationId::new(48);
+        let (short_staging, short_borrowed, short_resources) = {
+            let epoch = DeviceEpoch::new(1);
+            // The reservation covers four bytes; the pass's index view asks for
+            // six, so the resolved window reaches past the admitted range.
+            let reservation = lease_registration(short_lease, short_allocation, 4, epoch);
+            let staging = LeaseRegistry::new();
+            staging
+                .import(
+                    StagedLease::new(reservation, vec![0x2a; 4])
+                        .expect("the staged copy matches the reservation it claims"),
+                )
+                .expect("the fixture import is accepted");
+            let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+            let mut resources = ResourceTableSnapshot::new();
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: short_allocation,
+                    owner_epoch: epoch,
+                    size: 16,
+                })
+                .expect("the fixture allocation is well formed");
+            resources
+                .insert_lease(reservation)
+                .expect("the fixture reservation is admitted");
+            (staging, borrowed, resources)
+        };
+        let short_leases = attachment_lease_context(
+            &short_staging,
+            &short_borrowed,
+            &short_resources,
+            DeviceEpoch::new(1),
+            4096,
+        );
+        let short_pass = stage_buffer_index_pass(BufferSource::StagedLease(short_lease), 6, 32, 3);
+        let refused = match prepare_render_request(
+            &stages,
+            &short_pass,
+            &[None],
+            Some(&short_leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a staged copy shorter than its view is refused"),
+        };
+        eprintln!("short staged window refusal: {refused:?}");
+        assert_eq!(refused.slug, "lease_range_out_of_bounds");
+        assert_eq!(refused.class, ProviderErrorClass::Resource);
+
+        // Reading three: the frame follows the index bytes. The owner's window
+        // is one staged import, so the second run re-imports it with the other
+        // triangle's indices.
+        let lower_left = execute_staged_index_frame(
+            &context,
+            &stages,
+            "000001000200",
+            index_lease,
+            index_allocation,
+            32,
+        );
+        let upper_right = execute_staged_index_frame(
+            &context,
+            &stages,
+            "010002000300",
+            index_lease,
+            index_allocation,
+            32,
+        );
+        eprintln!("indices [0,1,2] readback: {}", hex(&lower_left));
+        eprintln!("indices [1,2,3] readback: {}", hex(&upper_right));
+        assert_ne!(
+            lower_left, upper_right,
+            "the indices select which vertices the draw reads, so the two frames differ"
+        );
+        // The position view is 24 bytes and the bound the resolved indices state
+        // is 24 bytes, so every covered texel holds the colour the fragment
+        // stage stores and every uncovered one the clear sentinel: the coverage
+        // is exactly what the indices selected.
+        let stored_texel = EXPECTED_RGBA8_TEXELS;
+        let cleared_texel = [CLEAR_SENTINEL; 4];
+        for (name, frame) in [("[0,1,2]", &lower_left), ("[1,2,3]", &upper_right)] {
+            let drawn = frame
+                .chunks_exact(4)
+                .filter(|texel| *texel == stored_texel)
+                .count();
+            let cleared = frame
+                .chunks_exact(4)
+                .filter(|texel| *texel == cleared_texel)
+                .count();
+            assert!(
+                drawn > 0 && drawn + cleared == 4,
+                "{name}: every texel is the draw's tint or the clear sentinel: {}",
+                hex(frame)
+            );
+        }
     }
 
     /// One `OpEntryPoint` instruction as the module's own words, so the entry
