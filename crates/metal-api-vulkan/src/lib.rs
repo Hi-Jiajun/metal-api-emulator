@@ -969,12 +969,13 @@ pub(crate) struct VulkanContext {
     stencil_resolve_modes: vk::ResolveModeFlags,
     /// Whether the device lets the depth and stencil resolve modes differ
     /// (`research/docs/23` §3.3, v60): `independent_resolve` is the raw
-    /// property the render rail reads when a pass resolves only its stencil
-    /// surface, because a device that reports `false` requires both modes to
-    /// agree. The v60 fixtures resolve both faces, so the rail never needs to
-    /// branch on it; the probe record stays beside its sibling for the next
-    /// increment that reviews a stencil-only resolve.
-    #[allow(dead_code)]
+    /// property the render rail reads for the combined surface a stored pair
+    /// opens (`research/docs/23` §3.3, v60/v70): a device that reports `false`
+    /// requires both resolve modes to agree, so a pass whose two faces resolve
+    /// through two different filters is refused by name instead of being
+    /// submitted as a subpass description the device rejects. The v60 fixtures
+    /// resolve both faces through the same filter, which is why the reviewed
+    /// shape never reaches that branch.
     independent_resolve: bool,
     /// Whether the device lets one resolve mode be `NONE` while the other is
     /// not (`research/docs/23` §3.3, v60): a stencil-only resolve states

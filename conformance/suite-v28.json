@@ -2129,7 +2129,9 @@
       "capture_rails": [
         "native-metal",
         "vulkan",
-        "native-metal-provider"
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ],
       "multisample": {
         "sample_count": 4
@@ -2241,7 +2243,8 @@
       "expected_hex": "ff0000ffff0000ff88111aa211223445ff0000ffff0000ff88111aa211223445ff0000ffff0000ff88111aa211223445ff0000ffff0000ff88111aa211223445",
       "capture_rails": [
         "native-metal",
-        "native-metal-provider"
+        "native-metal-provider",
+        "native-metal-provider-objects"
       ],
       "multisample": {
         "sample_count": 4

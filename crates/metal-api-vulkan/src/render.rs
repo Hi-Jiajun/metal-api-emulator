@@ -3312,6 +3312,51 @@ fn narrow_four(bytes: &[u8]) -> [u8; 4] {
     four
 }
 
+/// The Vulkan resolve mode one admitted depth filter names
+/// (`research/docs/23` §3.3, v57/v70).
+///
+/// The three filters map one-to-one: Metal's `.sample0`, `.min` and `.max` are
+/// `SAMPLE_ZERO`, `MIN` and `MAX`. The mode is what the subpass description
+/// carries and what the agreement rule below compares, so both read it from
+/// here rather than spelling the match twice.
+fn depth_resolve_mode(filter: DepthResolveFilter) -> vk::ResolveModeFlags {
+    match filter {
+        DepthResolveFilter::Sample0 => vk::ResolveModeFlags::SAMPLE_ZERO,
+        DepthResolveFilter::Min => vk::ResolveModeFlags::MIN,
+        DepthResolveFilter::Max => vk::ResolveModeFlags::MAX,
+    }
+}
+
+/// The Vulkan resolve mode one admitted stencil filter names
+/// (`research/docs/23` §3.3, v60/v70).
+///
+/// Metal's `.sample0` — the one filter with a Vulkan counterpart — is
+/// `SAMPLE_ZERO`. `.depthResolvedSample` reduces the stencil of the sample the
+/// *depth* resolve picked; Vulkan's `MIN`/`MAX` reduce the stencil component
+/// itself, so no mode names it and the probe never admits its bit. The
+/// mapping answers `NONE` for it, and the per-filter mask check refuses that
+/// filter before any mode question is asked.
+fn stencil_resolve_mode(filter: StencilResolveFilter) -> vk::ResolveModeFlags {
+    match filter {
+        StencilResolveFilter::Sample0 => vk::ResolveModeFlags::SAMPLE_ZERO,
+        StencilResolveFilter::DepthResolvedSample => vk::ResolveModeFlags::NONE,
+    }
+}
+
+/// Whether a device that resolves depth and stencil with one shared mode
+/// (`independentResolve` is false) can execute this pair of filters
+/// (`research/docs/23` §3.3, v60/v70).
+///
+/// The Vulkan rule is that such a device requires `depthResolveMode` and
+/// `stencilResolveMode` to be equal, so a pair whose two filters name two
+/// different modes is a subpass description the device rejects. The reviewed
+/// stored pair resolves both faces through `sample0` — one shared mode — which
+/// is why the v60 fixtures never needed this question; the rule is what keeps a
+/// mismatched pair a named refusal instead of a driver error.
+fn shared_resolve_mode_admits(depth: DepthResolveFilter, stencil: StencilResolveFilter) -> bool {
+    depth_resolve_mode(depth) == stencil_resolve_mode(stencil)
+}
+
 /// The `VkFormatFeatureFlags` the selected device reports for one format and
 /// tiling.
 pub(crate) fn format_features(
@@ -3960,6 +4005,38 @@ fn execute_offscreen_render_with_retains(
                                 context.admitted_stencil_resolve_modes(),
                             )),
                         ));
+                    }
+                    // The other half of the same device property
+                    // (`research/docs/23` §3.3, v60/v70): a device whose
+                    // `independentResolve` is false resolves the two faces
+                    // with one shared mode, so a pass that names two different
+                    // resolve filters is refused here rather than submitted as
+                    // a subpass description the device rejects at creation.
+                    // The reviewed stored pair resolves both faces through
+                    // `sample0` — one shared mode — so no reviewed fixture
+                    // reaches this branch; a hand-built mismatched pair does.
+                    if let Some(depth_resolve) = request.depth_resolve {
+                        if !context.independent_resolve
+                            && !shared_resolve_mode_admits(depth_resolve.filter, resolve.filter)
+                        {
+                            return Err(capability_refusal(
+                                "render_stencil_resolve_independent_unsupported",
+                            )
+                            .with_field(
+                                "depth_filter",
+                                FieldValue::Unsigned(u64::from(depth_resolve.filter.code())),
+                            )
+                            .with_field(
+                                "stencil_filter",
+                                FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                            )
+                            .with_detail(
+                                "this device resolves the depth and stencil faces with \
+                                         one shared mode; a pass whose two faces resolve through \
+                                         two different filters needs a device whose \
+                                         independentResolve is true",
+                            ));
+                        }
                     }
                 }
                 None => {
@@ -6673,15 +6750,13 @@ impl<'a> OffscreenObjects<'a> {
         let mut depth_stencil_resolve = vk::SubpassDescriptionDepthStencilResolve::default();
         if let (Some(resolve), Some(depth_resolve_ref)) = (depth_resolve, &depth_resolve_ref) {
             depth_stencil_resolve = depth_stencil_resolve
-                .depth_resolve_mode(match resolve {
-                    DepthResolveFilter::Sample0 => vk::ResolveModeFlags::SAMPLE_ZERO,
-                    DepthResolveFilter::Min => vk::ResolveModeFlags::MIN,
-                    DepthResolveFilter::Max => vk::ResolveModeFlags::MAX,
-                })
+                .depth_resolve_mode(depth_resolve_mode(resolve))
                 .stencil_resolve_mode(vk::ResolveModeFlags::NONE)
                 .depth_stencil_resolve_attachment(depth_resolve_ref);
         }
-        if let (Some(_), Some(stencil_resolve_ref)) = (stencil_resolve, &stencil_resolve_ref) {
+        if let (Some(stencil_filter), Some(stencil_resolve_ref)) =
+            (stencil_resolve, &stencil_resolve_ref)
+        {
             depth_stencil_resolve = depth_stencil_resolve
                 // The combined shape resolves both faces into the one landing:
                 // the depth slot keeps its own filter, and the stencil slot
@@ -6690,15 +6765,15 @@ impl<'a> OffscreenObjects<'a> {
                 // depth face, so its depth slot is `NONE`
                 // (`research/docs/23` §3.3, v60).
                 .depth_resolve_mode(if let Some(resolve) = depth_resolve {
-                    match resolve {
-                        DepthResolveFilter::Sample0 => vk::ResolveModeFlags::SAMPLE_ZERO,
-                        DepthResolveFilter::Min => vk::ResolveModeFlags::MIN,
-                        DepthResolveFilter::Max => vk::ResolveModeFlags::MAX,
-                    }
+                    depth_resolve_mode(resolve)
                 } else {
                     vk::ResolveModeFlags::NONE
                 })
-                .stencil_resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                // The mask check above admitted this filter, and Sample0 is
+                // the only stencil filter with a Vulkan mode
+                // (`research/docs/23` §3.3, v60/v70): the mode comes from the
+                // one mapping the agreement rule reads.
+                .stencil_resolve_mode(stencil_resolve_mode(stencil_filter))
                 .depth_stencil_resolve_attachment(stencil_resolve_ref);
         }
         let mut subpass = vk::SubpassDescription2::default()
@@ -10624,6 +10699,41 @@ mod tests {
         assert_eq!(
             request.multisample.map(|state| state.sample_count),
             Some(SampleCount::Four)
+        );
+    }
+
+    /// The device property behind the combined surface's mode agreement
+    /// (`research/docs/23` §3.3, v60/v70): a device whose `independentResolve`
+    /// is false resolves depth and stencil with one shared mode, so only a pair
+    /// of filters that name the same Vulkan mode can be executed. The reviewed
+    /// stored pair resolves both faces through `sample0`; the other shapes are
+    /// the ones the rule refuses, and the `depthResolvedSample` filter has no
+    /// Vulkan mode at all (its bit never enters the mask, so the per-filter
+    /// check refuses it before this question is asked).
+    #[test]
+    fn a_shared_resolve_mode_admits_only_the_pairs_that_name_one_mode() {
+        assert!(shared_resolve_mode_admits(
+            DepthResolveFilter::Sample0,
+            StencilResolveFilter::Sample0
+        ));
+        assert!(!shared_resolve_mode_admits(
+            DepthResolveFilter::Min,
+            StencilResolveFilter::Sample0
+        ));
+        assert!(!shared_resolve_mode_admits(
+            DepthResolveFilter::Max,
+            StencilResolveFilter::Sample0
+        ));
+        assert!(!shared_resolve_mode_admits(
+            DepthResolveFilter::Sample0,
+            StencilResolveFilter::DepthResolvedSample
+        ));
+        // `ResolveModeFlags` has no `Debug`, so the bit is compared as a
+        // boolean: Metal's depth-following filter has no Vulkan counterpart and
+        // the mapping answers `NONE` for it.
+        assert!(
+            stencil_resolve_mode(StencilResolveFilter::DepthResolvedSample).is_empty(),
+            "Metal's depth-following filter maps to no Vulkan mode"
         );
     }
 
