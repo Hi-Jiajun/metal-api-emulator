@@ -212,6 +212,75 @@ def validate_mrt_selftest(report):
     return [first, second]
 
 
+def validate_stage_buffer_selftest(report):
+    """One stage-buffer self-test report is the reviewed module's observation
+    (`research/docs/23` §83, R9g): `shaders/render_stage_buffer_2x2.metal`
+    compiled and run three times, each run binding its two `[[buffer(0)]]`
+    arguments at the stages' own slots with `setVertexBuffer` and
+    `setFragmentBuffer`.
+
+    The three frames are the claim rather than decoration: the reviewed payload
+    pair lands `4080c0ff` in the covered top-left texel and the `fefefefe`
+    clear sentinel in the other three, a swapped tint moves that texel to
+    `00ff00ff`, and the full-screen positions move the reviewed tint into all
+    four texels. A rail that binds no buffer reads the sentinel everywhere, one
+    that binds the wrong stage's buffer reads the other argument's bytes, and
+    one that never reads the vertex stage cannot cover the frame — all three
+    read back a frame this function refuses. The writeback/allocation pair
+    repeats the first run's attachment in the shape every other self-test
+    reports, so a report without it cannot pass.
+
+    The comparison lives here instead of in the CI step's heredoc so
+    `test_run_native.py` exercises it on a host without Metal.
+    """
+    if not isinstance(report, dict):
+        raise NativeRunError("stage buffer selftest: report is not an object")
+    if report.get("id") != "stage_buffer_positions_2x2":
+        raise NativeRunError(
+            "stage buffer selftest: report id " + repr(report.get("id"))
+            + " is not the reviewed stage-buffer fixture"
+        )
+    if report.get("completion") != "CompletedVisible":
+        raise NativeRunError("stage buffer selftest: completion is not CompletedVisible")
+    sentinel = "fefefefe"
+    reviewed_frame = "4080c0ff" + sentinel * 3
+    swapped_frame = "00ff00ff" + sentinel * 3
+    full_frame = "4080c0ff" * 4
+    writebacks = report.get("writebacks", [])
+    allocations = report.get("allocations", [])
+    expected_writeback = {"allocation": 900, "view": 910, "offset": 0,
+                          "bytes_hex": reviewed_frame}
+    expected_allocations = [{"allocation": 900, "bytes_hex": reviewed_frame}]
+    if writebacks != [expected_writeback] or allocations != expected_allocations:
+        raise NativeRunError(
+            "stage buffer selftest: observations do not match the reviewed run, got "
+            + repr((writebacks, allocations))
+        )
+    observations = report.get("observations", [])
+    if len(observations) != 3:
+        raise NativeRunError(
+            "stage buffer selftest: expected three runs (reviewed, swapped tint, "
+            "full-screen positions), got " + repr(observations)
+        )
+    expected_attachments = [reviewed_frame, swapped_frame, full_frame]
+    for index, (observation, expected) in enumerate(zip(observations, expected_attachments)):
+        if not isinstance(observation, dict):
+            raise NativeRunError(
+                "stage buffer selftest: run " + str(index) + " is not an object"
+            )
+        if not observation.get("positions_hex") or not observation.get("tint_hex"):
+            raise NativeRunError(
+                "stage buffer selftest: run " + str(index)
+                + " does not name both payloads it bound, got " + repr(observation)
+            )
+        if observation.get("attachment_hex") != expected:
+            raise NativeRunError(
+                "stage buffer selftest: run " + str(index) + " landed "
+                + repr(observation.get("attachment_hex")) + " instead of " + repr(expected)
+            )
+    return " ".join(expected_attachments)
+
+
 def validate_store_dontcare_selftest(report):
     """One store-dontcare self-test report is the reviewed discard fixture's
     observation (`conformance/RENDER-CAPTURE.md` §11): the fixture id, one

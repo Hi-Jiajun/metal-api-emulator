@@ -597,5 +597,109 @@ class StoreDontCareSelftestValidationTests(unittest.TestCase):
             run_native.validate_store_dontcare_selftest([])
 
 
+class StageBufferSelftestValidationTests(unittest.TestCase):
+    """The stage-buffer self-test's byte comparison, exercised without Metal.
+
+    `run_native.validate_stage_buffer_selftest` is the function the CI step
+    reuses, so the three frames the fixture's own `[[buffer(0)]]` arguments
+    produce — the reviewed pair, a swapped tint and the full-screen positions —
+    are pinned here rather than only in an inline heredoc
+    (`research/docs/23` §83, R9g).
+    """
+
+    SENTINEL = "fefefefe"
+    REVIEWED_FRAME = "4080c0ff" + SENTINEL * 3
+    SWAPPED_FRAME = "00ff00ff" + SENTINEL * 3
+    FULL_FRAME = "4080c0ff" * 4
+    POSITIONS = "000080bf0000803f0000803e0000803f000080bf000080be"
+    FULL_POSITIONS = "000080bf000080bf00004040000080bf000080bf00004040"
+    TINT = "8180803e8180003fc1c0403f0000803f"
+    SWAPPED_TINT = "000000000000803f000000000000803f"
+
+    def reviewed_report(self, report_id="stage_buffer_positions_2x2",
+                        completion="CompletedVisible", writebacks=None,
+                        allocations=None, observations=None):
+        if writebacks is None:
+            writebacks = [{"allocation": 900, "view": 910, "offset": 0,
+                           "bytes_hex": self.REVIEWED_FRAME}]
+        if allocations is None:
+            allocations = [{"allocation": 900, "bytes_hex": self.REVIEWED_FRAME}]
+        if observations is None:
+            observations = [
+                {"positions_hex": self.POSITIONS, "tint_hex": self.TINT,
+                 "attachment_hex": self.REVIEWED_FRAME},
+                {"positions_hex": self.POSITIONS, "tint_hex": self.SWAPPED_TINT,
+                 "attachment_hex": self.SWAPPED_FRAME},
+                {"positions_hex": self.FULL_POSITIONS, "tint_hex": self.TINT,
+                 "attachment_hex": self.FULL_FRAME},
+            ]
+        return {"id": report_id, "completion": completion, "writebacks": writebacks,
+                "allocations": allocations, "observations": observations}
+
+    def test_accepts_the_reviewed_stage_buffer_runs(self):
+        report = self.reviewed_report()
+        self.assertEqual(
+            run_native.validate_stage_buffer_selftest(report),
+            " ".join([self.REVIEWED_FRAME, self.SWAPPED_FRAME, self.FULL_FRAME]))
+
+    def test_rejects_the_clear_sentinel_in_either_channel(self):
+        sentinel_frame = self.SENTINEL * 4
+        for writeback, allocation in (
+            (sentinel_frame, self.REVIEWED_FRAME),
+            (self.REVIEWED_FRAME, sentinel_frame),
+        ):
+            with self.subTest(writeback=writeback, allocation=allocation):
+                report = self.reviewed_report(
+                    writebacks=[{"allocation": 900, "view": 910, "offset": 0,
+                                 "bytes_hex": writeback}],
+                    allocations=[{"allocation": 900, "bytes_hex": allocation}])
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_selftest(report)
+
+    def test_rejects_a_run_that_landed_the_sentinel_or_a_foreign_frame(self):
+        # A sentinel frame means no binding arrived; the reviewed frame in the
+        # swapped run, or the swapped frame in the full-screen run, means the
+        # run's own bytes were not what the draw read.
+        for index, attachment in ((0, self.SENTINEL * 4), (1, self.REVIEWED_FRAME),
+                                  (2, self.SWAPPED_FRAME)):
+            with self.subTest(index=index, attachment=attachment):
+                observations = self.reviewed_report()["observations"]
+                observations[index]["attachment_hex"] = attachment
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_selftest(
+                        self.reviewed_report(observations=observations))
+
+    def test_rejects_a_run_that_names_no_payload(self):
+        for field in ("positions_hex", "tint_hex"):
+            with self.subTest(field=field):
+                observations = self.reviewed_report()["observations"]
+                observations[1][field] = ""
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_selftest(
+                        self.reviewed_report(observations=observations))
+
+    def test_rejects_a_missing_or_extra_run(self):
+        observations = self.reviewed_report()["observations"]
+        for runs in (observations[:2], observations + [observations[0]]):
+            with self.subTest(runs=len(runs)):
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_selftest(
+                        self.reviewed_report(observations=runs))
+
+    def test_rejects_the_plain_render_selftest_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_stage_buffer_selftest(
+                self.reviewed_report(report_id="render_offscreen_2x2"))
+
+    def test_rejects_a_non_visible_completion(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_stage_buffer_selftest(
+                self.reviewed_report(completion="Submitted"))
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_stage_buffer_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()

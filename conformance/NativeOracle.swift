@@ -1145,6 +1145,32 @@ private struct HeapSelfTestReport: Encodable {
     let platform: String
 }
 
+/// One stage-buffer run's observation (`research/docs/23` §83, R9g): the two
+/// `[[buffer(0)]]` payloads the pass bound and the attachment texels the draw
+/// landed from them.
+private struct StageBufferObservation: Encodable {
+    let positions_hex: String
+    let tint_hex: String
+    let attachment_hex: String
+}
+
+/// The one-device stage-buffer check's report (`research/docs/23` §83, R9g).
+///
+/// The reviewed run's observation travels in the same
+/// writeback/allocation shape every other report uses, and the three runs the
+/// self-test executed travel beside it so a reader can see both bindings moved
+/// the frame: the reviewed payload pair, a swapped tint and the full-screen
+/// positions.
+private struct StageBufferSelfTestReport: Encodable {
+    let id: String
+    let completion: String
+    let writebacks: [Writeback]
+    let allocations: [AllocationResult]
+    let observations: [StageBufferObservation]
+    let device: String
+    let platform: String
+}
+
 private struct DeviceProbe: Encodable {
     let schema_version: UInt64 = 1
     let kind = "metal-device-probe"
@@ -1186,6 +1212,10 @@ private struct Options {
     let heapSelfTest: Bool
     let depthResolveSelfTest: Bool
     let stencilResolveSelfTest: Bool
+    /// The stage-buffer self-test's flag (`research/docs/23` §83, R9g). It
+    /// carries a default so every existing call site keeps its argument list;
+    /// the parser below is the only caller that sets it.
+    var stageBufferSelfTest = false
 }
 
 private let usage = """
@@ -1199,6 +1229,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --heap-selftest
        native-metal-oracle --depth-resolve-selftest
        native-metal-oracle --stencil-resolve-selftest
+       native-metal-oracle --stage-buffer-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -1263,6 +1294,15 @@ every filter) and the key column distinguishes the depth-resolved sample
 (column 2 = 01 for min, 00 for max); sample0's column 2 is recorded but not
 judged because it depends on the rasterizer's sample positions. It cannot be
 combined with other options.
+--stage-buffer-selftest needs no suite: it compiles the reviewed
+shaders/render_stage_buffer_2x2.metal module and runs it three times against a
+fresh 2x2 rgba8_unorm attachment cleared to the fefefefe sentinel — the
+reviewed positions and tint, a swapped tint, and the full-screen positions —
+binding each stage's own [[buffer(0)]] argument with setVertexBuffer and
+setFragmentBuffer. It fails unless the covered top-left texel carries each
+run's own tint (40 80 c0 ff, then 00 ff 00 ff) instead of the sentinel, and the
+full-screen run moves the reviewed tint into all four texels. It cannot be
+combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -1278,6 +1318,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var heapSelfTest = false
     var depthResolveSelfTest = false
     var stencilResolveSelfTest = false
+    var stageBufferSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -1331,9 +1372,26 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!stencilResolveSelfTest, "Duplicate --stencil-resolve-selftest option")
             stencilResolveSelfTest = true
             index += 1
+        case "--stage-buffer-selftest":
+            try require(!stageBufferSelfTest, "Duplicate --stage-buffer-selftest option")
+            stageBufferSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
+    }
+    if stageBufferSelfTest {
+        // Checked before the other self-tests so a combination is refused here
+        // rather than silently dropping whichever flag the earlier block
+        // returned false for.
+        try require(suite == nil && output == nil && !validateOnly && !probe && !renderSelfTest
+                    && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest
+                    && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--stage-buffer-selftest cannot be combined with --suite, --output, --validate-suite, --probe, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false, stageBufferSelfTest: true)
     }
     if probe {
         try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest && !stencilResolveSelfTest,
@@ -2149,6 +2207,25 @@ private func reviewedSampledModule() -> ReviewedRenderModule {
         fragment_entry: "render_sampled_texel",
         metal: RenderSourcePin(path: "shaders/render_sampled_4x4.metal",
                                sha256: "4c5216ce5af3e1184f7dfd9f989aaf0de9f1ce1ffaad43906d23e6a92aae8813"),
+        buffers: nil)
+}
+
+/// The reviewed stage-buffer fixture (`research/docs/23` §83, R9g): the
+/// provider rail's own module (`crates/metal-api-native/src/render.rs`,
+/// `REVIEWED_STAGE_BUFFER_SOURCE`) written with the same pinned bytes, so the
+/// oracle executes exactly the source the Rust rail compiles.
+///
+/// Both stage entries read their bytes from their own `[[buffer(0)]]` argument
+/// — the vertex stage the three positions, the fragment stage one `float4`
+/// tint — which is why the module carries no `buffers` layout: the vertex
+/// stage's `vertex_id` selects the record inside its own buffer rather than a
+/// record assembled from an `[[stage_in]]` stream.
+private func reviewedStageBufferModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_stage_buffer_vertex",
+        fragment_entry: "render_stage_buffer_tint",
+        metal: RenderSourcePin(path: "shaders/render_stage_buffer_2x2.metal",
+                               sha256: "63c4d5ba60c187437d749d957033778f479bc9ecb3f0a408eeabe6095dba0de6"),
         buffers: nil)
 }
 
@@ -5614,6 +5691,208 @@ private func mrtSelfTest() throws -> CaseResult {
     return try runRenderCase(fixture, device: device, queue: queue)
 }
 
+/// One stage-buffer pass: a fresh 2x2 `rgba8Unorm` attachment the pass opens
+/// with the `fe` clear sentinel, the reviewed module's two `[[buffer(0)]]`
+/// arguments bound at their own stages' slots, one three-vertex draw and the
+/// attachment's texels read back (`research/docs/23` §83, R9g).
+///
+/// The texture is fresh per run and never preset with the tint, so a rail that
+/// binds no buffer — or binds the wrong stage's buffer — reads back the
+/// sentinel or the other argument's bytes instead of the frame the run states.
+@available(macOS 11.0, *)
+private func runStageBufferPass(device: MTLDevice, queue: MTLCommandQueue,
+                                pipeline: MTLRenderPipelineState,
+                                positions: Data, tint: Data,
+                                id: String) throws -> Data {
+    let width = 2
+    let height = 2
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: width,
+        height: height,
+        mipmapped: false)
+    descriptor.usage = .renderTarget
+    descriptor.storageMode = .shared
+    guard let target = device.makeTexture(descriptor: descriptor) else {
+        throw OracleError("\(id): cannot allocate the colour attachment")
+    }
+    target.label = "native oracle: \(id)"
+    let positionsBuffer = try makeStreamBuffer(device: device, id: id, offset: 0,
+                                               bytes: positions)
+    let tintBuffer = try makeStreamBuffer(device: device, id: id, offset: 0, bytes: tint)
+    let pass = MTLRenderPassDescriptor()
+    // `colorAttachments[i]` is an implicitly unwrapped optional on the Swift
+    // side of Metal; referencing a member before unwrapping is a compile error
+    // under `-warnings-as-errors`, so unwrap it explicitly.
+    guard let color = pass.colorAttachments[0] else {
+        throw OracleError("\(id): cannot reach colour attachment 0")
+    }
+    color.texture = target
+    color.loadAction = .clear
+    color.clearColor = MTLClearColor(red: Double(0xfe) / 255.0,
+                                     green: Double(0xfe) / 255.0,
+                                     blue: Double(0xfe) / 255.0,
+                                     alpha: Double(0xfe) / 255.0)
+    color.storeAction = .store
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("\(id): cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "\(id): command buffer does not retain resources")
+    commandBuffer.label = "native oracle: \(id)"
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        throw OracleError("\(id): cannot create a render encoder")
+    }
+    encoder.setRenderPipelineState(pipeline)
+    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: Double(width), height: Double(height),
+                                    znear: 0, zfar: 1))
+    // The two slots the reviewed module reads. Each stage's `[[buffer(N)]]`
+    // namespace is its own, exactly as `setVertexBuffer(_:offset:index:)` and
+    // `setFragmentBuffer(_:offset:index:)` state, so the two zeros below are
+    // two different slots — the fact the fixture's two byte sources make
+    // falsifiable one run at a time.
+    encoder.setVertexBuffer(positionsBuffer, offset: 0, index: 0)
+    encoder.setFragmentBuffer(tintBuffer, offset: 0, index: 0)
+    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        throw OracleError("\(id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "\(id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+    var observed = Data(count: width * height * 4)
+    observed.withUnsafeMutableBytes { bytes in
+        if let destination = bytes.baseAddress {
+            target.getBytes(destination,
+                            bytesPerRow: width * 4,
+                            from: MTLRegionMake2D(0, 0, width, height),
+                            mipmapLevel: 0)
+        }
+    }
+    return observed
+}
+
+/// The stage-buffer milestone's own fixture, constructed in code
+/// (`research/docs/23` §83, R9g).
+///
+/// This is the one-device check the native provider's stage-buffer bit points
+/// at: the reviewed module's vertex stage reads its three positions from its
+/// own `[[buffer(0)]]` and its fragment stage one `float4` tint from its own
+/// `[[buffer(0)]]`, and the three runs below prove both bindings arrived — the
+/// reviewed payload pair lands `40 80 c0 ff` in the covered top-left texel and
+/// the `fe` clear sentinel everywhere else, a swapped tint moves that texel to
+/// `00 ff 00 ff`, and the full-screen positions move the reviewed tint into
+/// all four texels. A rail that ignores either slot cannot report all three,
+/// and a green job whose log said `SKIP` is not that reading.
+@available(macOS 11.0, *)
+private func stageBufferSelfTest() throws -> StageBufferSelfTestReport {
+    let reviewed = reviewedStageBufferModule()
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let sourceBytes = try loadRenderSource(reviewed.metal, root: root)
+    guard let source = String(data: sourceBytes, encoding: .utf8) else {
+        throw OracleError("stage-buffer selftest: reviewed MSL source is not UTF-8")
+    }
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the stage-buffer self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native stage-buffer self-test: device=\(device.name) platform=\(eligibility.platform)")
+    let library = try device.makeLibrary(source: source, options: nil)
+    guard let vertexFunction = library.makeFunction(name: reviewed.vertex_entry) else {
+        throw OracleError("stage-buffer selftest: vertex entry \(reviewed.vertex_entry) was not found")
+    }
+    guard let fragmentFunction = library.makeFunction(name: reviewed.fragment_entry) else {
+        throw OracleError("stage-buffer selftest: fragment entry \(reviewed.fragment_entry) was not found")
+    }
+    let pipelineDescriptor = MTLRenderPipelineDescriptor()
+    pipelineDescriptor.label = "native oracle: stage-buffer selftest"
+    pipelineDescriptor.vertexFunction = vertexFunction
+    pipelineDescriptor.fragmentFunction = fragmentFunction
+    // Both arguments arrive through `[[buffer(N)]]`, so the pipeline carries no
+    // `MTLVertexDescriptor`: the vertex stage's `vertex_id` selects the record
+    // inside its own buffer rather than assembling one from a stream.
+    pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
+    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+
+    // (-1,1), (0.25,1), (-1,-0.25): the triangle whose pixels cover the 2x2
+    // attachment's top-left texel centre and no other texel centre.
+    let reviewedPositions = Data([
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0xbe,
+    ])
+    // (-1,-1), (3,-1), (-1,3): the oversize triangle that covers every texel
+    // centre, the shape the reviewed solids draw from `vertex_id` alone.
+    let fullScreenPositions = Data([
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x40, 0x40,
+    ])
+    // (64/255, 128/255, 192/255, 1) as `float32`: the same bytes the Rust
+    // fixture's tint view carries, which the attachment stores as `40 80 c0 ff`.
+    let reviewedTint = Data([
+        0x81, 0x80, 0x80, 0x3e, 0x81, 0x80, 0x00, 0x3f,
+        0xc1, 0xc0, 0x40, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+    ])
+    // (0,1,0,1): a second payload whose covered texel cannot be confused with
+    // the first run's.
+    let swappedTint = Data([
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+    ])
+
+    let sentinel = "fefefefe"
+    let reviewedFrame = "4080c0ff" + sentinel + sentinel + sentinel
+    let swappedFrame = "00ff00ff" + sentinel + sentinel + sentinel
+    let fullScreenFrame = String(repeating: "4080c0ff", count: 4)
+
+    let first = try runStageBufferPass(device: device, queue: queue, pipeline: pipeline,
+                                       positions: reviewedPositions, tint: reviewedTint,
+                                       id: "stage_buffer_positions_2x2")
+    try require(hex(first) == reviewedFrame,
+                "stage-buffer selftest: the reviewed payload pair landed \(hex(first)) instead of \(reviewedFrame)")
+    let second = try runStageBufferPass(device: device, queue: queue, pipeline: pipeline,
+                                        positions: reviewedPositions, tint: swappedTint,
+                                        id: "stage_buffer_positions_2x2 swapped tint")
+    try require(hex(second) == swappedFrame,
+                "stage-buffer selftest: the swapped tint landed \(hex(second)) instead of \(swappedFrame)")
+    let third = try runStageBufferPass(device: device, queue: queue, pipeline: pipeline,
+                                       positions: fullScreenPositions, tint: reviewedTint,
+                                       id: "stage_buffer_positions_2x2 full-screen positions")
+    try require(hex(third) == fullScreenFrame,
+                "stage-buffer selftest: the full-screen positions landed \(hex(third)) instead of \(fullScreenFrame)")
+    diagnostic("native stage-buffer self-test: reviewed=\(hex(first)) "
+               + "swapped=\(hex(second)) full=\(hex(third))")
+    return StageBufferSelfTestReport(
+        id: "stage_buffer_positions_2x2",
+        completion: "CompletedVisible",
+        writebacks: [Writeback(allocation: 900, view: 910, offset: 0,
+                               bytes_hex: hex(first))],
+        allocations: [AllocationResult(allocation: 900, image: first)],
+        observations: [
+            StageBufferObservation(positions_hex: hex(reviewedPositions),
+                                   tint_hex: hex(reviewedTint),
+                                   attachment_hex: hex(first)),
+            StageBufferObservation(positions_hex: hex(reviewedPositions),
+                                   tint_hex: hex(swappedTint),
+                                   attachment_hex: hex(second)),
+            StageBufferObservation(positions_hex: hex(fullScreenPositions),
+                                   tint_hex: hex(reviewedTint),
+                                   attachment_hex: hex(third)),
+        ],
+        device: device.name,
+        platform: eligibility.platform)
+}
+
 /// The heap milestone's own fixture, constructed in code.
 ///
 /// This is the one-device heap check (`research/docs/25` §6 Step 7a): two
@@ -6747,6 +7026,16 @@ do {
         // min-resolved from the max-resolved stencil (`research/docs/23` §3.3,
         // v59).
         try stencilResolveSelfTest()
+        exit(EXIT_SUCCESS)
+    }
+    if options.stageBufferSelfTest {
+        // The stage-buffer milestone's one-device check (`research/docs/23`
+        // §83, R9g): the reviewed module's two `[[buffer(0)]]` arguments bound
+        // with setVertexBuffer and setFragmentBuffer, three runs whose frames
+        // the report carries. The whole report is the evidence; the CI step's
+        // validator refuses anything but the reviewed texels.
+        let result = try stageBufferSelfTest()
+        try writeJSON(result)
         exit(EXIT_SUCCESS)
     }
     guard let suiteURL = options.suite else { throw OracleError("--suite is required") }

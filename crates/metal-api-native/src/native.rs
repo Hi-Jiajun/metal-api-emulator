@@ -310,17 +310,20 @@ impl NativeMetalProvider {
             // Apple GPU; they come from one spelling (`crate::icb`) so the
             // snapshot and the flip condition cannot drift.
             let icb_bits = icb::icb_capability_bits();
+            // The stage-buffer bits stay closed until the Apple device run
+            // lands (`--stage-buffer-selftest`); they come from one spelling
+            // (`crate::render`) so the snapshot and the flip condition cannot
+            // drift.
+            let stage_buffer_bits = render::stage_buffer_capability_bits();
             let capabilities = ProviderCapabilities {
-                // The stage-buffer face stays closed on this rail
-                // (`research/docs/23` §3.3, v83): the reviewed MSL modules
-                // carry no buffer argument, so a pass that binds one is
-                // refused by name in `render::plan_with_leases` (and a
-                // contract that declares one in `render::review_contract`)
-                // instead of being executed with the binding silently
-                // dropped. This is the boundary the increment records, not a
-                // device fact.
-                supports_render_stage_buffers: false,
-                max_render_stage_buffers: 0,
+                // The stage-buffer face's own window (`research/docs/23` §83,
+                // R9g): the reviewed module and the encoder's
+                // `setVertexBuffer`/`setFragmentBuffer` binding exist, but no
+                // Apple device reading has confirmed the frame yet, so the bit
+                // stays closed and core admission refuses the shape by name
+                // instead of executing it unmeasured.
+                supports_render_stage_buffers: stage_buffer_bits.supports_render_stage_buffers,
+                max_render_stage_buffers: stage_buffer_bits.max_render_stage_buffers,
                 max_passes: 8,
                 supports_threads_exact: true,
                 supports_threadgroups: false,
