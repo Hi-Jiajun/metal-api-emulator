@@ -1,0 +1,42 @@
+; stage buffer fixture 的片元着色器（research/docs/23 §3.3，v83）。
+; 与 solid_unorm8.frag.spvasm 的差别只有一处：颜色不是常量，而是 DescriptorSet 2 /
+; Binding 0 的 storage buffer 里的一个 vec4（GLSL 的 `readonly buffer Tint { vec4 value; }`）。
+; 绑定字节因此是落盘字节的唯一来源：换掉 buffer 里的 vec4，读回就变；忽略绑定的 rail 会
+; 读回 clear 色，两者都被 fixture 的断言区分。
+; 本文件是 stage_buffer_tint.frag.spv 的可读源，由渲染轨道 include_bytes! 内嵌。复现命令：
+;   spirv-as --target-env vulkan1.0 stage_buffer_tint.frag.spvasm -o stage_buffer_tint.frag.spv
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "stage_buffer_tint_main" %out
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "stage_buffer_tint_main"
+               OpName %out "out"
+               OpName %Tint "Tint"
+               OpMemberName %Tint 0 "value"
+               OpName %tint "tint"
+               OpDecorate %out Location 0
+               OpDecorate %Tint BufferBlock
+               OpMemberDecorate %Tint 0 Offset 0
+               OpDecorate %tint DescriptorSet 2
+               OpDecorate %tint Binding 0
+               OpDecorate %tint NonWritable
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+        %int_0 = OpConstant %int 0
+       %Tint = OpTypeStruct %v4float
+%_ptr_Uniform_Tint = OpTypePointer Uniform %Tint
+%_ptr_Uniform_v4float = OpTypePointer Uniform %v4float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+        %out = OpVariable %_ptr_Output_v4float Output
+       %tint = OpVariable %_ptr_Uniform_Tint Uniform
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %value = OpAccessChain %_ptr_Uniform_v4float %tint %int_0
+     %colour = OpLoad %v4float %value
+               OpStore %out %colour
+               OpReturn
+               OpFunctionEnd

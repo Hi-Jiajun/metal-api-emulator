@@ -1618,6 +1618,7 @@ fn get_render_pipeline_contract(
         _ => vec![get_attachment_format(decoder)?],
     };
     Ok(RenderPipelineContract {
+        stage_buffers: Vec::new(),
         vertex_entry,
         fragment_entry,
         color_formats,
@@ -2070,6 +2071,20 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     return Err(CodecError::ColorAttachmentCount {
                         count: pass.color_attachments.len(),
                         maximum: MAX_COLOR_ATTACHMENTS,
+                    });
+                }
+                // Stage buffer bindings (`research/docs/23` §3.3, v83) have
+                // no section in this frame's layout yet: the narrow feature
+                // byte and the wide feature word are both full, so carrying
+                // them needs a tag of its own — the increment after this one.
+                // Until then the encoder refuses a pass that binds one
+                // instead of shipping a frame whose decoder would read the
+                // block as the next pass, and the decoder's own
+                // `RenderPassDescriptor` keeps the empty list every pre-v83
+                // frame states.
+                if !pass.stage_buffers.is_empty() {
+                    return Err(CodecError::StageBufferUnsupported {
+                        bindings: pass.stage_buffers.len(),
                     });
                 }
                 // `tagged` is true whenever a render entry exists, so the tag
@@ -3114,6 +3129,7 @@ fn get_render_pass(
         None
     };
     Ok(RenderPassDescriptor {
+        stage_buffers: Vec::new(),
         blend: None,
         cull: None,
         // A frame without the wide multisample bit runs the single-sample
@@ -4349,6 +4365,8 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         storage_modes.push(get_storage_mode(decoder)?);
     }
     Ok(ProviderCapabilities {
+        supports_render_stage_buffers: false,
+        max_render_stage_buffers: 0,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,

@@ -1203,6 +1203,7 @@ fn register_render_pipeline(
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: vulkan_entries.0.to_owned(),
                 fragment_entry: vulkan_entries.1.to_owned(),
                 color_formats: formats.to_vec(),
@@ -1221,6 +1222,7 @@ fn register_render_pipeline(
             // fixture is refused.
             native.register_render_pipeline(NativeRenderPipelineRequest {
                 contract: RenderPipelineContract {
+                    stage_buffers: Vec::new(),
                     vertex_entry: msl_entries.0.to_owned(),
                     fragment_entry: msl_entries.1.to_owned(),
                     color_formats: formats.to_vec(),
@@ -8346,6 +8348,7 @@ fn run_render_case(
         .transpose()?
         .unwrap_or_default();
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
+        stage_buffers: Vec::new(),
         pipeline: render_pipeline.pipeline_id,
         color_attachments,
         viewport: [

@@ -956,6 +956,7 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             // The pass-wide multisample raster travels with the recording
             // (`research/docs/23` §3.3, v51/v52): the entry that names it is
             // the only one that sets this field, so every earlier recording

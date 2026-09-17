@@ -173,6 +173,8 @@ impl FakeProvider {
 impl ComputeProvider for FakeProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_stage_buffers: false,
+            max_render_stage_buffers: 0,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -1498,6 +1500,7 @@ fn render_metadata(provider: &FakeProvider) -> CompiledComputePipeline {
             translator_revision: None,
         },
         render: Some(RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: "vertex_main".into(),
             fragment_entry: "fragment_main".into(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -4471,6 +4474,7 @@ fn render_metadata_with_layout(
 ) -> CompiledComputePipeline {
     let mut metadata = render_metadata(provider);
     metadata.render = Some(RenderPipelineContract {
+        stage_buffers: Vec::new(),
         vertex_entry: "vertex_main".into(),
         fragment_entry: "fragment_main".into(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -4489,6 +4493,7 @@ fn render_metadata_multi(
 ) -> CompiledComputePipeline {
     let mut metadata = render_metadata(provider);
     metadata.render = Some(RenderPipelineContract {
+        stage_buffers: Vec::new(),
         vertex_entry: "vertex_main".into(),
         fragment_entry: "fragment_main".into(),
         color_formats: formats,
