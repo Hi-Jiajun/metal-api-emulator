@@ -922,6 +922,7 @@ impl VulkanComputeProvider {
         trace: &ComputeTrace,
         pool: &[BufferView],
         plan: &[PlannedRenderPass],
+        resources: &ResourceTableSnapshot,
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         // The render rail's indirect payload replays one draw or indexed draw
         // command into exactly one plain render pass (`research/docs/25` §6
@@ -973,6 +974,24 @@ impl VulkanComputeProvider {
         if plan.is_empty() {
             return Ok(Vec::new());
         }
+        // Both rails share one lease channel (`research/docs/23` §71, R3c): the
+        // same staged and no-copy registries this provider imports into, the
+        // admitted snapshot that is authoritative for every reservation, and
+        // the device's own host-import alignment. The render rail resolves its
+        // vertex and index inputs through it exactly as the compute rail
+        // resolves its pool bindings.
+        let host_import_alignment = self
+            .lock_executor()
+            .map_err(|_| registry_poisoned())?
+            .context
+            .external_memory_host_alignment();
+        let leases = render::RenderLeaseContext {
+            staging: &self.staging,
+            borrowed: &self.borrowed,
+            resources,
+            device_epoch: self.device_epoch(),
+            host_import_alignment,
+        };
         let host_readback = trace.completion_policy == CompletionPolicy::HostReadback;
         let mut writebacks = Vec::with_capacity(plan.len());
         for planned in plan {
@@ -1054,6 +1073,7 @@ impl VulkanComputeProvider {
                     &planned.pass,
                     &target,
                     previous,
+                    Some(&leases),
                 )?;
                 if let Some(view) = view {
                     writebacks.push(BufferWriteback {
@@ -1222,6 +1242,7 @@ impl VulkanComputeProvider {
                         &planned.pass,
                         &payload.command,
                         &previous,
+                        Some(&leases),
                     )?;
                     // Publish what was actually replayed: the command kind,
                     // the range and the one command the first increment
@@ -1239,6 +1260,7 @@ impl VulkanComputeProvider {
                     &planned.stages,
                     &planned.pass,
                     &previous,
+                    Some(&leases),
                 )?,
             };
             for (view, texels) in views.into_iter().zip(readback.attachments) {
@@ -2160,7 +2182,12 @@ impl ComputeProvider for VulkanComputeProvider {
             // (`AttachmentComputeConflict` / `RenderPassOrderUnsupported`)
             // rather than by a shared queue submission. Its bytes are merged
             // with the deferred pool readback at `wait`.
-            let render_writebacks = match self.execute_render_passes(trace, &pool, &render_plan) {
+            let render_writebacks = match self.execute_render_passes(
+                trace,
+                &pool,
+                &render_plan,
+                admitted.resources(),
+            ) {
                 Ok(writebacks) => writebacks,
                 Err(error) => {
                     self.retire(pending);
@@ -2226,10 +2253,9 @@ impl ComputeProvider for VulkanComputeProvider {
             // (`AttachmentComputeConflict`), and the render rail runs last, so
             // the map keeps the bytes a repeated attachment write ends with.
             let mut merged = BTreeMap::new();
-            for writeback in map_writebacks(&pool, updates, token)?
-                .into_iter()
-                .chain(self.execute_render_passes(trace, &pool, &render_plan)?)
-            {
+            for writeback in map_writebacks(&pool, updates, token)?.into_iter().chain(
+                self.execute_render_passes(trace, &pool, &render_plan, admitted.resources())?,
+            ) {
                 merged.insert((writeback.allocation_id, writeback.view_id), writeback);
             }
             let writebacks: Vec<BufferWriteback> = merged.into_values().collect();

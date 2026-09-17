@@ -27,17 +27,18 @@
 //! and one submission carries both rails' writebacks.
 
 use metal_api_core::provider::{
-    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
-    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
-    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
-    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId,
-    LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
-    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BorrowedLease, BufferAccess,
+    BufferLease, BufferSource, BufferView, ClearColor, CompiledComputePipeline,
+    CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
+    DispatchKind, DispatchType, FieldValue, IndexBufferBinding, IndexFormat,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
+    LeaseReservation, LoadOp, NoCopyLeaseImporter, OperationId, PipelineId, PresentDescriptor,
+    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    ProviderPhase, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, SemanticDigest, StagedLease, StoreOp, TextureAccess, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
@@ -1821,9 +1822,10 @@ fn vertex_input_refusals_name_the_stream_that_cannot_be_read() {
         return;
     };
 
-    // A stream whose source is not the trace's own bytes: the first increment
-    // does not upload a lease for a render input, so the rail refuses it by name
-    // instead of reading device memory the trace never provided.
+    // A lease-backed stream now resolves through the shared registry: a lease
+    // no owner ever imported is refused by name at resolve time, before any
+    // device object exists, instead of being read as if the trace owned it
+    // (`research/docs/23` §71, R3c).
     let mut leased = trace.clone();
     if let Some(TracePass::Render(pass)) = leased.passes.last_mut() {
         pass.vertex_buffers[0].source = BufferSource::StagedLease(LeaseId::new(7));
@@ -1834,10 +1836,11 @@ fn vertex_input_refusals_name_the_stream_that_cannot_be_read() {
         .expect("a staged lease is a well-formed declaration");
     let refused = provider
         .submit(admitted)
-        .expect_err("a lease-backed vertex stream is not executed in this increment");
-    eprintln!("lease-backed stream refused: {refused:?}");
-    assert_eq!(refused.slug, "render_vertex_buffer_unsupported");
-    assert_eq!(refused.class, ProviderErrorClass::Capability);
+        .expect_err("a lease no owner ever imported cannot be read");
+    eprintln!("unimported staged lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+    assert_eq!(refused.phase, ProviderPhase::Resolve);
 
     // An index view too short for the draw's index count: the rail proves the
     // footprint before touching the device.
@@ -1879,6 +1882,334 @@ fn vertex_input_refusals_name_the_stream_that_cannot_be_read() {
     eprintln!("out-of-range index refused: {refused:?}");
     assert_eq!(refused.slug, "render_vertex_buffer_footprint_unsupported");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+/// One owner allocation the provider imports without copying
+/// (`research/docs/23` §71, R3c).
+///
+/// The provider binds this address directly, so the allocation has to stay
+/// alive — and at this address — until the owner releases the import. The
+/// alignment is the device's own import alignment, which the caller reads from
+/// the provider before allocating.
+struct AlignedBuffer {
+    pointer: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize, alignment: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(len, alignment)
+            .expect("the import alignment is a valid allocation alignment");
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        let pointer = std::ptr::NonNull::new(pointer).expect("aligned allocation failed");
+        Self { pointer, layout }
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+    }
+}
+
+/// The staged half of the render-input lease channel (`research/docs/23` §71,
+/// R3c): the vertex and index bytes arrive as staged leases instead of
+/// trace-owned bytes, and the attachment is byte-for-byte the one the owned
+/// fixture lands.
+#[test]
+fn a_staged_lease_vertex_stream_renders_the_same_bytes_as_owned_bytes() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(quad_vertex_bytes(), quad_index_bytes())
+    else {
+        return;
+    };
+    let owned = readback(
+        &submit_vertex_input(&provider, &trace, &resources),
+        ATTACHMENT_VIEW,
+    );
+
+    let epoch = provider.device_epoch();
+    let vertex_lease = LeaseId::new(31);
+    let index_lease = LeaseId::new(32);
+    let vertex_reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: vertex_lease,
+            allocation_id: VERTEX_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 32,
+    };
+    let index_reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: index_lease,
+            allocation_id: INDEX_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 12,
+    };
+    provider
+        .import_staged_lease(
+            StagedLease::new(vertex_reservation, quad_vertex_bytes())
+                .expect("the staged stream carries one byte per declared byte"),
+        )
+        .expect("the provider stages the owner's vertex bytes");
+    provider
+        .import_staged_lease(
+            StagedLease::new(index_reservation, quad_index_bytes())
+                .expect("the staged stream carries one byte per declared byte"),
+        )
+        .expect("the provider stages the owner's index bytes");
+
+    let mut leased = trace.clone();
+    if let Some(TracePass::Render(pass)) = leased.passes.last_mut() {
+        pass.vertex_buffers[0].source = BufferSource::StagedLease(vertex_lease);
+        pass.indices
+            .as_mut()
+            .expect("the fixture is indexed")
+            .view
+            .source = BufferSource::StagedLease(index_lease);
+    }
+    let mut leased_resources = resources.clone();
+    leased_resources
+        .insert_lease(vertex_reservation)
+        .expect("the vertex reservation covers its view");
+    leased_resources
+        .insert_lease(index_reservation)
+        .expect("the index reservation covers its view");
+    let attachment = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!("staged lease attachment: {}", hex(&attachment));
+    assert_eq!(
+        attachment, owned,
+        "the staged lease channel uploads the same bytes the trace-owned fixture carries"
+    );
+
+    // The staged bytes are the provider's copy: releasing them is what the
+    // owner's ledger drives, and a submission after the release is refused by
+    // name instead of silently falling back to a copy of its own.
+    provider
+        .release_staged_lease(vertex_lease)
+        .expect("the staged vertex lease is released");
+    provider
+        .release_staged_lease(index_lease)
+        .expect("the staged index lease is released");
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources)
+        .expect("the declaration stays well formed after the release");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a released staged lease cannot be read");
+    eprintln!("released staged lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+}
+
+/// The no-copy half of the render-input lease channel (`research/docs/23` §71,
+/// R3c): the vertex and index bytes stay in the owner's own mapping, the device
+/// reads that mapping, and the registry's hold is retired once the pass's fence
+/// has signalled.
+///
+/// The falsifications are the point: a rail that snapshotted at import would
+/// still draw the original quad after the owner rewrites its pages, and a rail
+/// whose footprint proof read stale bytes would not see an index the owner
+/// wrote past the stream's coverage.
+#[test]
+fn a_borrowed_lease_vertex_stream_reads_the_owners_pages() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(quad_vertex_bytes(), quad_index_bytes())
+    else {
+        return;
+    };
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        eprintln!("SKIP: the device does not import host memory");
+        return;
+    }
+    let owned = readback(
+        &submit_vertex_input(&provider, &trace, &resources),
+        ATTACHMENT_VIEW,
+    );
+
+    let mut owner_vertices = AlignedBuffer::new(32, alignment as usize);
+    owner_vertices
+        .as_mut_slice()
+        .copy_from_slice(&quad_vertex_bytes());
+    let mut owner_indices = AlignedBuffer::new(12, alignment as usize);
+    owner_indices
+        .as_mut_slice()
+        .copy_from_slice(&quad_index_bytes());
+
+    let epoch = provider.device_epoch();
+    let vertex_lease = LeaseId::new(41);
+    let index_lease = LeaseId::new(42);
+    let vertex_reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: vertex_lease,
+            allocation_id: VERTEX_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 32,
+    };
+    let index_reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: index_lease,
+            allocation_id: INDEX_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 12,
+    };
+    // SAFETY: both owner allocations outlive every submission below and the
+    // provider's release of the two imports.
+    unsafe {
+        provider
+            .import_borrowed_lease(
+                BorrowedLease::new(vertex_reservation, owner_vertices.as_ptr() as usize)
+                    .expect("the owner's vertex window is a valid reservation"),
+            )
+            .expect("the provider imports the owner's vertex window");
+        provider
+            .import_borrowed_lease(
+                BorrowedLease::new(index_reservation, owner_indices.as_ptr() as usize)
+                    .expect("the owner's index window is a valid reservation"),
+            )
+            .expect("the provider imports the owner's index window");
+    }
+
+    let mut leased = trace.clone();
+    if let Some(TracePass::Render(pass)) = leased.passes.last_mut() {
+        pass.vertex_buffers[0].source = BufferSource::BorrowedNoCopy(vertex_lease);
+        pass.indices
+            .as_mut()
+            .expect("the fixture is indexed")
+            .view
+            .source = BufferSource::BorrowedNoCopy(index_lease);
+    }
+    let mut leased_resources = resources.clone();
+    leased_resources
+        .insert_lease(vertex_reservation)
+        .expect("the vertex reservation covers its view");
+    leased_resources
+        .insert_lease(index_reservation)
+        .expect("the index reservation covers its view");
+
+    let attachment = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!("borrowed lease attachment: {}", hex(&attachment));
+    assert_eq!(
+        attachment, owned,
+        "the no-copy channel binds the owner's window and lands the owned fixture's bytes"
+    );
+
+    // The pass is synchronous, so its fence is the retirement evidence: both
+    // holds are back to zero by the time this submission returns.
+    let registry = provider.borrowed_registry();
+    assert_eq!(
+        registry.outstanding(vertex_lease),
+        Some(0),
+        "the vertex hold is retired once the fence signals"
+    );
+    assert_eq!(
+        registry.outstanding(index_lease),
+        Some(0),
+        "the index hold is retired once the fence signals"
+    );
+
+    // A device that had snapshotted the owner's pages at import would still
+    // draw the original quad; collapsing the stream onto one corner changes
+    // every texel to the clear sentinel instead.
+    owner_vertices
+        .as_mut_slice()
+        .copy_from_slice(&collapsed_vertex_bytes());
+    let collapsed = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!(
+        "owner-rewritten vertex window readback: {}",
+        hex(&collapsed)
+    );
+    assert!(
+        collapsed
+            .chunks_exact(4)
+            .all(|texel| texel == CLEAR_SENTINEL),
+        "a write into the owner's mapping after the import reaches the draw: {}",
+        hex(&collapsed)
+    );
+
+    // The index half is read from the owner's pages as well: every index
+    // rewritten to vertex 0 degenerates both triangles, which leaves the clear
+    // sentinel everywhere the quad covered.
+    owner_vertices
+        .as_mut_slice()
+        .copy_from_slice(&quad_vertex_bytes());
+    owner_indices.as_mut_slice().fill(0);
+    let degenerated = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!(
+        "owner-rewritten index window readback: {}",
+        hex(&degenerated)
+    );
+    assert!(
+        degenerated
+            .chunks_exact(4)
+            .all(|texel| texel == CLEAR_SENTINEL),
+        "the draw follows the index values the owner wrote after the import: {}",
+        hex(&degenerated)
+    );
+
+    // The footprint proof reads the same window: an index the owner writes past
+    // the stream's coverage is refused by name before any device object exists.
+    owner_indices
+        .as_mut_slice()
+        .copy_from_slice(&quad_index_bytes());
+    owner_indices.as_mut_slice()[0..2].copy_from_slice(&4_u16.to_ne_bytes());
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources.clone())
+        .expect("the declaration stays well formed");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("index 4 names a vertex the owner's stream does not cover");
+    eprintln!("owner-written out-of-range index refused: {refused:?}");
+    assert_eq!(refused.slug, "render_vertex_buffer_footprint_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+    // Once the owner releases both imports, the same declaration is refused by
+    // name instead of being read through a mapping the provider no longer owns.
+    registry
+        .release(vertex_lease)
+        .expect("no retain is outstanding after the fence");
+    registry
+        .release(index_lease)
+        .expect("no retain is outstanding after the fence");
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources)
+        .expect("the declaration stays well formed after the release");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a released no-copy lease cannot be read");
+    eprintln!("released borrowed lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
 }
 
 /// The reviewed sampling pair (`research/docs/23` §3.3, v70): the full-screen
