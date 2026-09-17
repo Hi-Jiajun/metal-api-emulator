@@ -1,12 +1,12 @@
 use super::*;
 use crate::provider::{
     allocate_device_epoch, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
-    BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, ContractError,
+    BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, ContractError, FieldValue,
     FootprintProof, FunctionIdentity, FunctionSource, PipelineContract, PipelineId, PresentMode,
     ProviderErrorClass, ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability,
-    SemanticDigest, ShaderSource, StorageMode, SubmissionId, TextureFormat, TextureSource,
-    TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexLayout,
+    SemanticDigest, ShaderSource, StorageMode, SubmissionId, TextureAccess, TextureBindingContract,
+    TextureFormat, TextureSource, TracePass, ValidatedComputeTrace, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -73,6 +73,7 @@ struct FakeProvider {
     stencil_resolve: bool,
     heap: bool,
     icb: bool,
+    compute_textures: bool,
 }
 
 impl FakeProvider {
@@ -100,6 +101,7 @@ impl FakeProvider {
             stencil_resolve: false,
             heap: false,
             icb: false,
+            compute_textures: false,
         }
     }
     fn with_alias_mode(mut self, alias_mode: AliasMode) -> Self {
@@ -140,6 +142,14 @@ impl FakeProvider {
     }
     fn with_icb(mut self) -> Self {
         self.icb = true;
+        self
+    }
+    /// Declare the compute texture face the object rails execute
+    /// (`research/docs/26` §21.3–21.4): one sampled `R32Uint` texture and one
+    /// `R32Float` storage image, whose landing the fixture publishes through
+    /// the identity-keyed writeback channel.
+    fn with_compute_textures(mut self) -> Self {
+        self.compute_textures = true;
         self
     }
     /// The attachment load operation of the most recent trace, for the
@@ -212,9 +222,16 @@ impl ComputeProvider for FakeProvider {
             } else {
                 0
             },
-            supports_compute_texture_sampling: false,
-            max_compute_textures: 0,
-            supported_compute_texture_formats: Vec::new(),
+            // The object API's compute texture face (`research/docs/23` §3.3,
+            // v98): the fixture provider declares the sampled arm when a test
+            // asks for it.
+            supports_compute_texture_sampling: self.compute_textures,
+            max_compute_textures: u32::from(self.compute_textures),
+            supported_compute_texture_formats: if self.compute_textures {
+                vec![TextureFormat::R32Uint, TextureFormat::R32Float]
+            } else {
+                Vec::new()
+            },
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -456,6 +473,25 @@ impl ComputeProvider for FakeProvider {
                 });
             }
         }
+        // A storage image lands through the same identity-keyed channel a
+        // buffer view uses (`research/docs/26` §21.4, C2): one writeback per
+        // writable texture view, whole extent at offset zero. The fixture's
+        // transform is a deterministic byte bump, so a handle that skipped the
+        // landing cannot read as the landed bytes by accident.
+        for texture in trace.serial_texture_resources().unwrap() {
+            if texture.access != TextureAccess::Storage {
+                continue;
+            }
+            let TextureSource::OwnedBytes(bytes) = &texture.source else {
+                panic!("owned bytes required");
+            };
+            writebacks.push(BufferWriteback {
+                allocation_id: texture.allocation_id,
+                view_id: texture.view_id,
+                offset: 0,
+                bytes: bytes.iter().map(|byte| byte.wrapping_add(0x10)).collect(),
+            });
+        }
         writebacks.sort_by_key(|write| (write.allocation_id, write.view_id));
         if mode == BAD_LAST_WRITE {
             writebacks.last_mut().unwrap().offset += 1;
@@ -573,8 +609,18 @@ impl PipelineProvider for FakeProvider {
             (0..count.parse().unwrap())
                 .map(|slot| (slot, BufferAccess::ReadWrite))
                 .collect()
+        } else if request.entry_name == "sampled_texture" || request.entry_name == "storage_texture"
+        {
+            // The texture fixtures bind no buffers: the declaration is the
+            // whole shape, exactly as a texture-only compute module's is.
+            Vec::new()
         } else {
             vec![(request.entry_name.parse().unwrap(), BufferAccess::ReadWrite)]
+        };
+        let texture_bindings = match request.entry_name.as_str() {
+            "sampled_texture" => vec![TextureBindingContract::sampled_r32uint(0)],
+            "storage_texture" => vec![TextureBindingContract::storage(0, TextureFormat::R32Float)],
+            _ => Vec::new(),
         };
         let pipeline_id = PipelineId::new(self.next_pipeline.fetch_add(1, Ordering::SeqCst));
         self.pipelines.lock().unwrap().insert(pipeline_id);
@@ -600,7 +646,7 @@ impl PipelineProvider for FakeProvider {
                         footprint: FootprintProof::Static { max_bytes: 4 },
                     })
                     .collect(),
-                texture_bindings: Vec::new(),
+                texture_bindings,
                 shader_capabilities: vec![],
                 translator_revision: None,
             },
@@ -5655,4 +5701,119 @@ fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
         pass.vertex_buffers.is_empty() && pass.indices.is_none(),
         "the replay reads its input from the ICB payload, not from the pass"
     );
+}
+
+#[test]
+fn a_compute_texture_declaration_without_the_capability_is_refused_by_name() {
+    // C1's capability gate reached through the object rail: the declaration is
+    // the module's own, the binding is recorded, and admission still refuses
+    // the pass before the provider is asked for anything.
+    let (provider, device) = setup();
+    let pipeline = pipeline(&device, "sampled_texture");
+    let texture = device
+        .new_texture_with_bytes(TextureFormat::R32Uint, 2, 2, vec![7_u8; 16])
+        .unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&pipeline).unwrap();
+    encoder.set_texture(0, &texture).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.end_encoding().unwrap();
+    let refusal = command
+        .commit()
+        .expect_err("a provider without the compute texture bit refuses the pass");
+    let Error::Provider(refusal) = refusal else {
+        panic!("the capability gate reaches the caller as a provider refusal");
+    };
+    eprintln!("object rail compute texture capability refusal: {refusal:?}");
+    assert_eq!(refusal.slug, "compute_texture_input_unsupported");
+    assert_eq!(refusal.fields.get("pass"), Some(&FieldValue::Unsigned(0)));
+    assert_eq!(
+        refusal.fields.get("textures"),
+        Some(&FieldValue::Unsigned(1))
+    );
+    assert_eq!(
+        provider.traces.lock().unwrap().len(),
+        0,
+        "the refusal precedes submission"
+    );
+}
+
+#[test]
+fn a_storage_texture_lands_into_its_own_handle_on_both_object_rails() {
+    for (mode, deferred) in [(GOOD, false), (ASYNC_GOOD, true)] {
+        let provider = Arc::new(FakeProvider::new().with_compute_textures());
+        provider.mode.store(mode, Ordering::SeqCst);
+        let device = Device::new(provider.clone());
+        let pipeline = pipeline(&device, "storage_texture");
+        assert_eq!(
+            pipeline.metadata().contract.texture_bindings,
+            vec![TextureBindingContract::storage(0, TextureFormat::R32Float)]
+        );
+        let initial = (0..16_u8).collect::<Vec<_>>();
+        let texture = device
+            .new_storage_texture_with_bytes(TextureFormat::R32Float, 2, 2, initial.clone())
+            .unwrap();
+        assert_eq!(texture.access(), TextureAccess::Storage);
+        assert_eq!(texture.read().unwrap(), initial);
+        let expected = initial
+            .iter()
+            .map(|byte| byte.wrapping_add(0x10))
+            .collect::<Vec<_>>();
+        let command = device.new_command_queue().command_buffer();
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&pipeline).unwrap();
+        encoder.set_texture(0, &texture).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+        command.commit().unwrap();
+        if deferred {
+            assert_eq!(command.status().unwrap(), CommandBufferStatus::Committed);
+            assert!(matches!(
+                command.submission().unwrap().completion,
+                CompletionDisposition::Submitted { .. }
+            ));
+            assert!(
+                command.submission().unwrap().writebacks.is_empty(),
+                "a deferred commit publishes no landing yet"
+            );
+            // The handle's bytes are held in flight: a reader waits for the
+            // write's reservation exactly as a buffer reader waits for its
+            // range, and observes the landed bytes once the fence retires.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let reader = texture.clone();
+            let handle = std::thread::spawn(move || sender.send(reader.read()).unwrap());
+            assert!(
+                receiver.recv_timeout(Duration::from_millis(50)).is_err(),
+                "a texture read waits out the in-flight write"
+            );
+            command.wait_until_completed().unwrap();
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            handle.join().unwrap();
+        } else {
+            assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+            assert_eq!(texture.read().unwrap(), expected);
+        }
+        let submission = command.submission().unwrap();
+        let writeback = submission
+            .writebacks
+            .iter()
+            .find(|write| write.view_id == texture.view_id())
+            .expect("the storage image's landing is keyed by its own view");
+        assert_eq!(writeback.allocation_id, texture.allocation_id());
+        assert_eq!(writeback.offset, 0);
+        assert_eq!(writeback.bytes, expected);
+        eprintln!(
+            "object rail storage landing deferred={deferred}: {:?}",
+            texture.read().unwrap()
+        );
+        drop(command);
+        assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+    }
 }
