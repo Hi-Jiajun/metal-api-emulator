@@ -2161,18 +2161,24 @@ fn plan_stage_buffers<'a>(
     module: &ReviewedModule,
     leases: Option<&RenderLeaseContext<'_>>,
     indices: Option<&PlannedIndexStream<'a>>,
+    affine_counts: Option<[u64; 2]>,
 ) -> Result<Vec<PlannedStageBuffer<'a>>, ProviderError> {
     // The two invocation counts an affine reach is bounded by
     // (`render_affine_axis_counts`): the vertex indices the draw can name and
-    // its instances. A non-indexed draw names `0..vertices`; an indexed one
-    // names `base_vertex + index` for every index the pass's own buffer holds,
-    // which is the span [`plan_index_stream`] read out of the resolved bytes.
-    let counts = match indices {
-        None => Some([u64::from(pass.vertices), u64::from(pass.instance_count)]),
-        Some(indices) => indices
+    // its instances. `affine_counts` is the contract's own answer, stated by
+    // [`RenderPipelineContract::affine_axis_counts`] over the index bytes this
+    // rail resolved ([`resolve_affine_index_bytes`]), so the rail's proof and
+    // the contract's bound are one arithmetic. A pass whose declarations
+    // evaluate no index arithmetic falls back to the span
+    // [`plan_index_stream`] already measured — the same numbers, from the same
+    // bytes — and a pass with no index at all counts `vertices` itself.
+    let counts = match (affine_counts, indices) {
+        (Some(counts), _) => Some(counts),
+        (None, Some(indices)) => indices
             .base_vertex
             .checked_add(indices.vertex_span)
             .map(|vertices| [vertices, u64::from(pass.instance_count)]),
+        (None, None) => Some([u64::from(pass.vertices), u64::from(pass.instance_count)]),
     };
     let mut bindings = Vec::with_capacity(pass.stage_buffers.len());
     for binding in &pass.stage_buffers {
@@ -3121,6 +3127,69 @@ pub(crate) fn plan<'a>(
     plan_with_leases(request, None, depth_resolve_modes, stencil_resolve_modes)
 }
 
+/// One binding of `pipeline` whose affine declaration reads the draw's index
+/// axis, if any declares one.
+///
+/// The counts a pass states are the pass's own — the index bytes and the two
+/// fields are the same whichever binding is asked — so any binding of that
+/// shape answers the whole walk. A pipeline whose declarations all state a
+/// static footprint has none, and the bound then reads no index at all.
+fn affine_index_axis_binding(
+    pipeline: &RenderPipelineContract,
+) -> Option<(RenderPipelineStage, u32)> {
+    pipeline
+        .stage_buffers
+        .iter()
+        .find(|binding| {
+            matches!(
+                &binding.footprint,
+                FootprintProof::Affine { accesses }
+                    if accesses
+                        .iter()
+                        .any(|access| access.terms.iter().any(|term| term.axis == 0))
+            )
+        })
+        .map(|binding| (binding.stage, binding.index))
+}
+
+/// The pass's index bytes, resolved for the contract's affine bound when the
+/// pipeline needs them (`research/docs/23` §92, R9k).
+///
+/// An affine stage-buffer footprint is bounded by the draw's own
+/// `base_vertex + highest index + 1`, and that arithmetic reads the index
+/// buffer's bytes. A view the trace carries states them itself; a lease view
+/// does not, and the contract's default arm refuses that declaration by name.
+/// This rail owns the same registries its vertex and stage-buffer proofs read
+/// through, so it resolves the window here and lets the contract — the one
+/// place that states the count rule — evaluate the bound.
+///
+/// `None` is every other shape: a pipeline whose declarations state a static
+/// footprint evaluates no index arithmetic
+/// ([`RenderPipelineContract::stage_buffers`]), and a pass with no index buffer
+/// names its vertices by `vertices`. Resolving nothing is a decision of the
+/// declaration, not a fallback: the contract is never handed a guess in place
+/// of bytes.
+fn resolve_affine_index_bytes(
+    pipeline: &RenderPipelineContract,
+    pass: &RenderPassDescriptor,
+    leases: Option<&RenderLeaseContext<'_>>,
+) -> Result<Option<Vec<u8>>, ProviderError> {
+    let Some(binding) = pass.indices.as_ref() else {
+        return Ok(None);
+    };
+    // A view the trace carries states its own bytes: the contract reads them
+    // itself, and handing the same window over as if it had been resolved would
+    // be one measurement stated twice.
+    if matches!(binding.view.source, BufferSource::OwnedBytes(_)) {
+        return Ok(None);
+    }
+    if affine_index_axis_binding(pipeline).is_none() {
+        return Ok(None);
+    }
+    let source = resolve_render_input(&binding.view, leases, RenderInputRole::Index)?;
+    Ok(Some(source.proof_bytes().to_vec()))
+}
+
 /// Validate a render request against the contract and the rail's own allowlist,
 /// resolving the pass's vertex and index inputs through `leases`.
 ///
@@ -3158,10 +3227,38 @@ pub(crate) fn plan_with_leases<'a>(
     // belong to the contract (`research/docs/23` §3.1, §3.2), not to this
     // rail.
     request.pass.validate().map_err(contract_refusal)?;
+    // An affine stage-buffer footprint is bounded by the draw's own index
+    // values (`research/docs/23` §92, R9k), so the contract's pairing is asked
+    // with the index bytes this rail can read: a lease view is resolved through
+    // the same registries the vertex and stage-buffer proofs use, and the
+    // contract states the bound instead of refusing the declaration by name.
+    // A pass whose declarations evaluate no index arithmetic hands over `None`,
+    // which is the strict arm this rail published before the resolved entry
+    // existed.
+    let resolved_index = resolve_affine_index_bytes(request.pipeline, request.pass, leases)?;
     request
         .pipeline
-        .validate_against(request.pass)
+        .validate_against(request.pass, resolved_index.as_deref())
         .map_err(contract_refusal)?;
+    // The same entry states the counts the rail's own plan evaluates the affine
+    // reaches over, so the rail's proof and the contract's bound are one
+    // arithmetic rather than two that have to agree (`research/docs/23` §92,
+    // R9k). A pass whose declarations evaluate no index arithmetic hands over
+    // `None` and keeps the cheap span arithmetic
+    // [`plan_vertex_input`] already measured.
+    let affine_counts = match resolved_index.as_deref() {
+        None => None,
+        Some(bytes) => {
+            let (stage, index) = affine_index_axis_binding(request.pipeline)
+                .expect("resolved bytes are only read for an index-axis declaration");
+            Some(
+                request
+                    .pipeline
+                    .affine_axis_counts(request.pass, stage, index, Some(bytes))
+                    .map_err(contract_refusal)?,
+            )
+        }
+    };
     // The MRT contract admits `MAX_COLOR_ATTACHMENTS` attachments and a
     // matching format list, and this rail's reviewed modules cover one, two and
     // the full ceiling. A wider pass (reachable only through a
@@ -3687,7 +3784,13 @@ pub(crate) fn plan_with_leases<'a>(
     // own counts for an affine reach, read from the same resolved index stream
     // the vertex proof just took. Empty for every pass that declares none,
     // which is every pre-R9g plan.
-    let stage_buffers = plan_stage_buffers(request.pass, module, leases, indices.as_ref())?;
+    let stage_buffers = plan_stage_buffers(
+        request.pass,
+        module,
+        leases,
+        indices.as_ref(),
+        affine_counts,
+    )?;
     Ok(RenderPlan {
         source: module.source,
         module_path: module.path,
@@ -7534,23 +7637,22 @@ mod tests {
     }
 
     /// The affine bound over an *indexed draw whose index view is a lease* is
-    /// blocked in core (`research/docs/23` §92, R9k), and the block is one
-    /// missing evaluation rather than a missing resolution: the rail already
-    /// resolves lease index bytes — [`plan_index_stream`] reads the resolved
-    /// window and computes the very span an affine reach is bounded by — while
-    /// the core contract's `render_affine_axis_counts`
-    /// (`crates/metal-api-core/src/provider.rs`) accepts
-    /// `BufferSource::OwnedBytes` alone and refuses the lease arms by name.
+    /// three states (`research/docs/23` §92 R9k; §96 E-L1).
     ///
-    /// Both readings live in one test, because that is the pair a reader has to
-    /// see together: the rail half is measurable here, and the refusal below is
-    /// the exact function `DeviceCapabilities::admit_render_passes` calls
-    /// before any provider runs, which the rail re-runs in `plan_with_leases`.
-    /// Widening the rule therefore needs a core entry point that takes the
-    /// resolved index bytes; this increment stops at the rail's half and
-    /// records the boundary instead of restating the count rule on its own.
+    /// The contract's count rule (`render_affine_axis_counts`) reads index
+    /// bytes, and a lease view's bytes are not declared by the trace. The core's
+    /// default arm therefore refuses that pairing by name, which is the refusal
+    /// [`DeviceCapabilities::admit_render_passes`] still states before any
+    /// provider runs — a snapshot owns no registry, so it cannot resolve
+    /// anything. The rail owns the registries: [`resolve_affine_index_bytes`]
+    /// reads the lease's window and hands it to the contract's resolved entry,
+    /// which states the same bound the rail's own proof evaluates.
+    ///
+    /// The three states live in one test because they are one decision: the
+    /// rail's resolution, the count the resolved bytes state, and the by-name
+    /// refusal a caller with no lease channel keeps.
     #[test]
-    fn the_affine_bound_over_a_lease_index_view_is_blocked_in_core() {
+    fn the_affine_bound_over_a_lease_index_view_is_stated_from_resolved_bytes() {
         let epoch = DeviceEpoch::new(3);
         let lease_id = LeaseId::new(51);
         let index_allocation = AllocationId::new(86);
@@ -7624,7 +7726,7 @@ mod tests {
         pass.indices = Some(binding);
         pass.base_vertex = 1;
         let error = contract
-            .validate_against(&pass)
+            .validate_against(&pass, None)
             .expect_err("a lease index view leaves the affine bound unprovable");
         assert!(
             matches!(
@@ -7651,17 +7753,55 @@ mod tests {
             "the core pairing states the refused slot in its detail: {:?}",
             refused.detail
         );
-        // The rail's own plan re-runs the same pairing first, so the refusal is
-        // reachable from this side too — one evaluation, two callers.
+        // The rail's half, reading one: with the registries in hand the same
+        // request is admitted, and the counts it evaluates the reach over are
+        // the contract's own answer for the resolved window — `[4, 1]`, the same
+        // pair the span arithmetic above stated.
         let request = write_stage_buffer_request(&pass, &contract);
-        let refused = plan_pass(&request).expect_err("the rail asks the same contract");
+        let planned = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the rail resolves the lease index bytes and states the bound");
+        let resolved_counts = contract
+            .affine_axis_counts(
+                &pass,
+                RenderPipelineStage::Vertex,
+                0,
+                Some(&write_stage_buffer_indices()),
+            )
+            .expect("the resolved window states the draw's own counts");
+        eprintln!("native lease-index affine counts (core entry): {resolved_counts:?}");
+        assert_eq!(resolved_counts, counts);
+        assert_eq!(planned.stage_buffers[0].bytes, 32);
+
+        // The rail's half, reading two: without a lease channel nothing is
+        // resolved, and the refusal is the index view's own name — the window
+        // that could not be read is the fact a caller can act on.
+        let refused = plan_with_leases(&request, None, 0, 0)
+            .expect_err("a lease index view cannot be read without the registries");
         eprintln!("native lease-index affine plan refused: {refused:?}");
-        assert_eq!(refused.slug, "trace_contract_invalid");
-        let detail = refused.detail.clone().unwrap_or_default();
-        assert!(
-            detail.contains("does not evaluate"),
-            "the plan names the unprovable proof in the same words: {detail}"
+        assert_eq!(refused.slug, "render_index_buffer_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("staged_lease".to_owned()))
         );
+
+        // And the strict contract arm the snapshot states keeps its own name
+        // for a caller that resolved nothing: `None` is not a guess.
+        let refused = contract_refusal(
+            contract
+                .validate_against(&pass, None)
+                .expect_err("the strict arm refuses the lease view"),
+        );
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("does not evaluate")),
+            "the strict arm names the proof it cannot evaluate: {:?}",
+            refused.detail
+        );
+
         staging
             .release(lease_id)
             .expect("the fixture import is released");
