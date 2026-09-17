@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
-use crate::VulkanContext;
+use crate::{SpirvFeaturePolicy, VulkanContext};
 
 /// `VK_FORMAT_*` texel width shared by every format the render contract admits.
 ///
@@ -1062,6 +1062,38 @@ fn validate_translated_stage(
     }
 }
 
+/// The capability subset check every module this rail executes has to pass (R8).
+///
+/// The translation entry points ask the same gate while a module is decoded,
+/// with the device's own [`SpirvFeaturePolicy`]; this is the rail's half, asked
+/// again wherever a module is about to become a pipeline or a command buffer.
+/// It is asked of both arms — a reviewed module and a translated one — so the
+/// registration gate and the execution gate answer the same question, and a
+/// caller that translated a stage under another device's policy cannot hand
+/// this rail a module the device could not create.
+pub(crate) fn validate_module_capabilities(
+    stages: &RenderStages,
+    policy: SpirvFeaturePolicy,
+) -> Result<(), ProviderError> {
+    for (stage, entry, module) in [
+        (
+            RenderStage::Vertex,
+            stages.contract.vertex_entry.as_str(),
+            stages.vertex_spirv.as_slice(),
+        ),
+        (
+            RenderStage::Fragment,
+            stages.contract.fragment_entry.as_str(),
+            stages.fragment_spirv.as_slice(),
+        ),
+    ] {
+        crate::validate_spirv_capabilities(module, policy).map_err(|error| {
+            render_stage_capability_refusal(stage, entry).with_detail(error.message().to_owned())
+        })?;
+    }
+    Ok(())
+}
+
 /// The vertex half's own agreement with the contract.
 ///
 /// The raster pipeline needs a clip position, the contract's vertex layout is
@@ -1523,6 +1555,18 @@ fn render_stage_translation_unavailable_refusal(stage: RenderStage, entry: &str)
         )
 }
 
+/// The refusal for a module whose SPIR-V demands a capability this device did
+/// not enable (R8).
+///
+/// The detail carries the capability gate's own sentence, so the refusal a
+/// registration or an execution reports reads exactly like the one the
+/// translation reports for the same module on a device without the feature.
+fn render_stage_capability_refusal(stage: RenderStage, entry: &str) -> ProviderError {
+    capability_refusal("render_stage_capability_unavailable")
+        .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+        .with_field("entry", FieldValue::Text(entry.to_owned()))
+}
+
 /// The entry point name one stage's module declares, as the pipeline binds it.
 ///
 /// A reviewed module declares the entry the contract names; a translated module
@@ -1633,6 +1677,7 @@ pub(crate) fn execute_render_pass<'a>(
         leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
+        context.spirv_feature_policy(),
     )?;
     let retains = RenderInputRetains::retain(leases, &request)?;
     execute_offscreen_render_with_retains(context, &request, retains)
@@ -1653,7 +1698,12 @@ fn prepare_render_request<'a>(
     leases: Option<&RenderLeaseContext<'_>>,
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
+    policy: SpirvFeaturePolicy,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
+    // The device's capability subset is asked first (R8), in the order the
+    // translation entry point asks it: a module this device could not create is
+    // refused by name before the rail asks what the module or the pass is.
+    validate_module_capabilities(stages, policy)?;
     stages
         .contract
         .validate_against(pass)
@@ -2881,6 +2931,7 @@ pub(crate) fn execute_indirect_render_pass<'a>(
         leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
+        context.spirv_feature_policy(),
     )?;
     request.indirect = Some(replay);
     let retains = RenderInputRetains::retain(leases, &request)?;
@@ -4441,6 +4492,7 @@ pub(crate) fn execute_present_render<'a>(
         leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
+        context.spirv_feature_policy(),
     )?;
     let [attachment] = request.attachments.as_slice() else {
         return Err(contract_refusal(
@@ -8733,8 +8785,16 @@ mod tests {
             .expect("the reviewed sampling pair is executable");
         let pass = sampled_pass(4);
         let previous = vec![None];
-        let request = prepare_render_request(&stages, &pass, &previous, None, 0, 0)
-            .expect("the reviewed sampling shape is admitted");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the reviewed sampling shape is admitted");
         assert_eq!(request.textures.len(), 1);
         assert_eq!(request.textures[0].extent, [4, 4]);
         assert_eq!(request.textures[0].source.len(), 64);
@@ -8744,7 +8804,15 @@ mod tests {
         // covered.
         let mut other_extent = sampled_pass(4);
         other_extent.textures = vec![sampled_texture_view(2, 2)];
-        let refused = match prepare_render_request(&stages, &other_extent, &previous, None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &other_extent,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a texture of another extent"),
         };
@@ -8757,7 +8825,15 @@ mod tests {
         let mut view = sampled_texture_view(4, 4);
         view.format = TextureFormat::Bgra8Unorm;
         other_format.textures = vec![view];
-        let refused = match prepare_render_request(&stages, &other_format, &previous, None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &other_format,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a texture of another format"),
         };
@@ -8782,9 +8858,86 @@ mod tests {
         // descriptor.
         let mut unbound = sampled_pass(4);
         unbound.textures = Vec::new();
-        let request = prepare_render_request(&stages, &unbound, &previous, None, 0, 0)
-            .expect("the shape is admitted; the binding question is the execution's");
+        let request = prepare_render_request(
+            &stages,
+            &unbound,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the shape is admitted; the binding question is the execution's");
         assert!(request.textures.is_empty());
+    }
+
+    /// Append `OpCapability FloatControls2` + `OpExtension "SPV_KHR_float_controls2"`
+    /// to one module: the pair the translator emits for a float result that
+    /// withholds a fast-math permission (R8). Inserted after the five-word
+    /// header, which is where the capability stream starts.
+    fn with_float_controls2(module: &[u8]) -> Vec<u8> {
+        let mut words = module
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>();
+        let mut extension = Vec::new();
+        for chunk in "SPV_KHR_float_controls2\0".as_bytes().chunks(4) {
+            let mut word = [0_u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            extension.push(u32::from_le_bytes(word));
+        }
+        let mut injected = vec![
+            (2_u32 << 16) | spirv::Op::Capability as u32,
+            spirv::Capability::FloatControls2 as u32,
+            ((1 + extension.len()) as u32) << 16 | spirv::Op::Extension as u32,
+        ];
+        injected.extend_from_slice(&extension);
+        words.splice(5..5, injected);
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    /// R8: the rail re-asks the device's capability subset where a module
+    /// becomes a pipeline.
+    ///
+    /// A module that demands `FloatControls2` is refused by the capability gate
+    /// when the policy does not admit it. The second half of the test asks the
+    /// same module under an admitting policy and then asks the module
+    /// accounting: the two refusals have different names, so the first one
+    /// demonstrably came from the capability gate and not from the module's own
+    /// identity.
+    #[test]
+    fn registration_refuses_a_module_the_device_did_not_answer_for() {
+        let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        stages.vertex_spirv = with_float_controls2(&stages.vertex_spirv);
+        let refused = validate_module_capabilities(&stages, SpirvFeaturePolicy::PHASE1)
+            .expect_err("a module that demands FloatControls2 is refused without the feature");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_capability_unavailable");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("stage"),
+            Some(&FieldValue::Text("vertex".to_owned()))
+        );
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("capability 6029")),
+            "the gate's own sentence rides along: {:?}",
+            refused.detail
+        );
+
+        // The device's own policy admits the same module, so the refusal above
+        // was the capability gate's and not the module accounting's.
+        assert!(validate_module_capabilities(
+            &stages,
+            SpirvFeaturePolicy::PHASE1.with_float_controls2(true)
+        )
+        .is_ok());
+        let refused = stages
+            .validate()
+            .expect_err("the modified module is no longer the reviewed one");
+        assert_eq!(refused.slug, "render_stage_translation_unavailable");
     }
 
     /// One 2×2 render pass naming an attachment of `format`, holding the clear
@@ -9556,7 +9709,15 @@ mod tests {
             .expect("the fixture describes one format per location");
         let previous = vec![None; maximum + 1];
 
-        let refused = match prepare_render_request(&stages, &pass, &previous, None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a pass beyond the ceiling"),
         };
@@ -9609,8 +9770,16 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], None, 0b1, 0)
-            .expect("a stored multisampled depth resolve the device admits is well formed");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0b1,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("a stored multisampled depth resolve the device admits is well formed");
         assert_eq!(
             request.depth_resolve.map(|resolve| resolve.filter),
             Some(DepthResolveFilter::Sample0)
@@ -9621,7 +9790,15 @@ mod tests {
     fn prepare_render_request_refuses_a_depth_resolve_filter_the_device_does_not_report() {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let pass = depth_resolving_pass();
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0b10, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0b10,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
         };
@@ -9638,7 +9815,15 @@ mod tests {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let mut pass = depth_resolving_pass();
         pass.depth_resolve = None;
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0b1, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0b1,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
         };
@@ -9674,8 +9859,16 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], None, 0, 0)
-            .expect("a present action beside the raster is well formed");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("a present action beside the raster is well formed");
         assert_eq!(
             request.multisample.map(|state| state.sample_count),
             Some(SampleCount::Four)
@@ -9723,8 +9916,16 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], None, 0, 0b1)
-            .expect("a stored multisampled stencil resolve the device admits is well formed");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0b1,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("a stored multisampled stencil resolve the device admits is well formed");
         assert_eq!(
             request.stencil_resolve.map(|resolve| resolve.filter),
             Some(StencilResolveFilter::Sample0)
@@ -9735,7 +9936,15 @@ mod tests {
     fn prepare_render_request_refuses_a_stencil_resolve_filter_the_device_does_not_report() {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let pass = stencil_resolving_pass();
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0b10) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0b10,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
         };
@@ -9752,7 +9961,15 @@ mod tests {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let mut pass = stencil_resolving_pass();
         pass.stencil_resolve = None;
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0b1) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0b1,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
         };
@@ -9766,7 +9983,15 @@ mod tests {
         pass.stencil_resolve = Some(MultisampleStencilResolve {
             filter: StencilResolveFilter::DepthResolvedSample,
         });
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0b1) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0b1,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse the filter without the depth resolve it names"),
         };
@@ -9821,8 +10046,16 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], None, 0, 0)
-            .expect("the rail-owned combined pair is well formed");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the rail-owned combined pair is well formed");
         assert!(request.depth.is_some() && request.stencil.is_some());
         assert!(request.depth_resolve.is_none() && request.stencil_resolve.is_none());
     }
@@ -9849,7 +10082,15 @@ mod tests {
         pass.depth_resolve = Some(MultisampleDepthResolve {
             filter: DepthResolveFilter::Sample0,
         });
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0b1, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0b1,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a pair that keeps one face"),
         };
@@ -10334,7 +10575,15 @@ mod tests {
             .validate_against(&pass)
             .expect("the pipeline compiles one format per location");
 
-        let refused = match prepare_render_request(&stages, &pass, &[None, None], None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None, None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("attachments of one pass share one extent"),
         };
@@ -10464,13 +10713,29 @@ mod tests {
             .expect("the DontCare pass is a legal core shape now");
 
         // Without bytes the shape plans; with bytes it is refused by name.
-        prepare_render_request(&stages, &pass, &[None], None, 0, 0)
-            .expect("a DontCare attachment with no previous bytes plans");
+        prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("a DontCare attachment with no previous bytes plans");
         let declared = attachment_previous_view(
             BufferSource::OwnedBytes(vec![0x11; 16]),
             AllocationId::new(9),
         );
-        let refused = match prepare_render_request(&stages, &pass, &[Some(&declared)], None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&declared)],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("bytes carried for a DontCare attachment are refused"),
         };
@@ -11093,8 +11358,16 @@ mod tests {
         let pass = loading_pass();
         let view = attachment_previous_view(BufferSource::StagedLease(lease_id), allocation);
         let declared = [Some(&view)];
-        let request = prepare_render_request(&stages, &pass, &declared, Some(&leases), 0, 0)
-            .expect("the staged copy carries the attachment's previous contents");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &declared,
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the staged copy carries the attachment's previous contents");
         let [attachment] = request.attachments.as_slice() else {
             panic!("the milestone pass carries one colour attachment");
         };
@@ -11117,11 +11390,18 @@ mod tests {
         staged
             .release(lease_id)
             .expect("the staged copy is released");
-        let refused =
-            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
-                Err(error) => error,
-                Ok(_) => panic!("a released staged lease cannot be read"),
-            };
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a released staged lease cannot be read"),
+        };
         eprintln!("released staged lease refused: {refused:?}");
         assert_eq!(refused.slug, "lease_not_imported");
         assert_eq!(refused.class, ProviderErrorClass::Args);
@@ -11137,7 +11417,15 @@ mod tests {
         let pass = loading_pass();
         let view =
             attachment_previous_view(BufferSource::BorrowedNoCopy(LeaseId::new(22)), allocation);
-        let refused = match prepare_render_request(&stages, &pass, &[Some(&view)], None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a lease cannot be read without the registry that imported it"),
         };
@@ -11171,11 +11459,18 @@ mod tests {
             BufferSource::BorrowedNoCopy(LeaseId::new(23)),
             AllocationId::new(45),
         );
-        let refused =
-            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
-                Err(error) => error,
-                Ok(_) => panic!("a device without host import cannot read the owner's window"),
-            };
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a device without host import cannot read the owner's window"),
+        };
         eprintln!("no host import: {refused:?}");
         assert_eq!(refused.slug, "storage_mode_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
@@ -11223,11 +11518,18 @@ mod tests {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let pass = loading_pass();
         let view = attachment_previous_view(BufferSource::BorrowedNoCopy(lease_id), allocation);
-        let refused =
-            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
-                Err(error) => error,
-                Ok(_) => panic!("a pointer one byte past the alignment cannot be imported"),
-            };
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a pointer one byte past the alignment cannot be imported"),
+        };
         eprintln!("misaligned attachment window: {refused:?}");
         assert_eq!(refused.slug, "lease_alignment_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
@@ -11279,11 +11581,18 @@ mod tests {
             attribute_stride: None,
             source: BufferSource::StagedLease(lease_id),
         };
-        let refused =
-            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
-                Err(error) => error,
-                Ok(_) => panic!("a 2x2 attachment reads sixteen bytes, not thirty-two"),
-            };
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a 2x2 attachment reads sixteen bytes, not thirty-two"),
+        };
         eprintln!("over-wide window refused: {refused:?}");
         assert_eq!(refused.slug, "render_attachment_initial_mismatch");
         assert_eq!(refused.class, ProviderErrorClass::Args);
@@ -11353,8 +11662,16 @@ mod tests {
             TextureSource::StagedLease(lease_id),
             allocation,
         )];
-        let request = prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0)
-            .expect("the staged copy carries the texture's texels");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the staged copy carries the texture's texels");
         let [texture] = request.textures.as_slice() else {
             panic!("the sampled pass carries one texture");
         };
@@ -11381,7 +11698,15 @@ mod tests {
         staged
             .release(lease_id)
             .expect("the staged copy is released");
-        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a released staged lease cannot be read"),
         };
@@ -11402,7 +11727,15 @@ mod tests {
             TextureSource::BorrowedNoCopy(LeaseId::new(32)),
             allocation,
         )];
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a lease cannot be read without the registry that imported it"),
         };
@@ -11425,7 +11758,15 @@ mod tests {
             TextureSource::StagedLease(LeaseId::new(33)),
             allocation,
         )];
-        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a staged lease cannot be read without its registry"),
         };
@@ -11453,7 +11794,15 @@ mod tests {
             TextureSource::BorrowedNoCopy(LeaseId::new(34)),
             AllocationId::new(47),
         )];
-        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a device without host import cannot read the owner's window"),
         };
@@ -11510,7 +11859,15 @@ mod tests {
             TextureSource::BorrowedNoCopy(lease_id),
             allocation,
         )];
-        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a pointer one byte past the alignment cannot be imported"),
         };
@@ -11563,8 +11920,16 @@ mod tests {
             TextureSource::BorrowedNoCopy(lease_id),
             allocation,
         )];
-        let request = prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0)
-            .expect("the owner's window resolves");
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the owner's window resolves");
         let [texture] = request.textures.as_slice() else {
             panic!("the sampled pass carries one texture");
         };
@@ -11632,7 +11997,15 @@ mod tests {
             TextureSource::StagedLease(lease_id),
             allocation,
         )];
-        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("a 4x4 texture reads sixty-four bytes, not thirty-two"),
         };
