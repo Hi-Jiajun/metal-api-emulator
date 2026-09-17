@@ -4,7 +4,8 @@
 
 use crate::{
     bounded_contract, classify_command_buffer_error, device_lost_refusal, heap, icb,
-    lifecycle::NativeLifecycle, refusal, render, unknown_completion, CommandBufferFailure,
+    lifecycle::NativeLifecycle, refusal, render, resident, unknown_completion,
+    CommandBufferFailure,
 };
 use block::ConcreteBlock;
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -71,12 +72,61 @@ struct State {
     /// first present and reused across submissions until the allocation's
     /// lease is released (`research/docs/24` §6 Step 7).
     present_targets: BTreeMap<(AllocationId, ViewId), PresentTargetRef>,
+    /// Provider-resident render targets by the attachment's own
+    /// `(allocation, view)` identity (`research/docs/23` §76, R7): the image a
+    /// `StoreOp::Resident` pass keeps its frame in and a `LoadOp::Resident`
+    /// pass reads it back out of. The registry holds the budget, the
+    /// least-recently-used order and the tombstones behind every named refusal
+    /// (`crate::resident`); this state only gives it the device's texture
+    /// creation.
+    resident_targets: resident::ResidentRegistry<Texture>,
 }
 
 /// One present target's device-side texture. Held for the life of the
 /// allocation's lease, not one submission.
 struct PresentTargetRef {
     texture: Texture,
+}
+
+/// The provider-resolved resident targets of one render pass, in colour
+/// attachment order (`research/docs/23` §76, R7).
+///
+/// Resolved before the pass is planned, so a trace whose resident load has no
+/// live image is refused in the Resolve phase with nothing on the queue, and
+/// handed to the encoder after the plan exists: the plan says *which*
+/// attachments render into a provider image, and this value is the images
+/// themselves.
+struct ResolvedRenderResidents {
+    /// The provider's own image per attachment: `Some` exactly where the
+    /// attachment declares the resident target and the registry holds (or just
+    /// created) the identity.
+    textures: Vec<Option<Texture>>,
+    /// The identities the pass declares, in location order: the ones a
+    /// completed pass leaves defined, and the ones a refused or failed pass
+    /// leaves unloadable again.
+    identities: Vec<resident::ResidentIdentity>,
+}
+
+impl ResolvedRenderResidents {
+    /// The planning channel's view of the same decision
+    /// ([`render::plan_trace_with_leases`]): one bit per colour attachment,
+    /// `true` where the provider resolved an image for that attachment.
+    fn resolution(&self) -> Vec<bool> {
+        self.textures
+            .iter()
+            .map(|texture| texture.is_some())
+            .collect()
+    }
+}
+
+/// One render pass's execution outcome: a present action hands its one
+/// attachment's texels back through the writeback channel, while an offscreen
+/// pass hands every publishing attachment's own readback back — the resident
+/// ones excluded, because their bytes stay in the provider's images
+/// (`research/docs/23` §76, R7).
+enum PassOutcome {
+    Present(Vec<u8>),
+    Offscreen(render::RenderReadback),
 }
 
 #[derive(Clone)]
@@ -405,6 +455,7 @@ impl NativeMetalProvider {
                     next_pipeline: 1,
                     next_submission: 1,
                     present_targets: BTreeMap::new(),
+                    resident_targets: resident::ResidentRegistry::new(),
                 }),
                 render_pipelines: Mutex::new(BTreeMap::new()),
                 completions: Mutex::new(BTreeMap::new()),
@@ -1505,11 +1556,22 @@ impl NativeMetalProvider {
             device_epoch: self.epoch,
             host_import_alignment: self.no_copy_alignment(),
         };
+        // R7 (`research/docs/23` §76): every render pass's resident
+        // declarations are resolved against this provider's own registry before
+        // the plan exists, so the plan's answer and the encoder's textures are
+        // two views of one decision — and a trace whose resident load has no
+        // live image is refused with nothing on the queue.
+        let render_residents = self.resolve_render_residents(state, trace)?;
+        let resident_resolutions: Vec<Vec<bool>> = render_residents
+            .iter()
+            .map(ResolvedRenderResidents::resolution)
+            .collect();
         let render_plan = render::plan_trace_with_leases(
             trace,
             &pool,
             &render_contracts,
             Some(&render_leases),
+            Some(&resident_resolutions),
             self.capabilities.depth_resolve_modes,
             self.capabilities.stencil_resolve_modes,
         )?;
@@ -1526,6 +1588,13 @@ impl NativeMetalProvider {
                         (error_description(error), command_buffer_error_code(error))
                     };
                     if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
+                        // Every resident image belongs to the device that was
+                        // just lost, so the registry's whole content is retired
+                        // here (`research/docs/23` §76, R7). The identities
+                        // leave `resident_target_stale` tombstones, and the
+                        // lifecycle transition below is what seals the instance
+                        // for every later submission.
+                        state.resident_targets.clear();
                         self.lifecycle.mark_device_lost();
                         return Err(device_lost_error(token, detail));
                     }
@@ -1569,8 +1638,12 @@ impl NativeMetalProvider {
         // lands its texels: the attachment's view is already a written view of
         // the compute pool, so its pre-render bytes are replaced rather than
         // reported alongside.
-        let render_writebacks =
-            self.execute_render_passes(state, &render_plan, icb_replay.as_ref())?;
+        let render_writebacks = self.execute_render_passes(
+            state,
+            &render_plan,
+            &render_residents,
+            icb_replay.as_ref(),
+        )?;
         let writebacks = render::merge_writebacks(
             collect_writebacks(
                 &pool,
@@ -1699,6 +1772,37 @@ impl NativeMetalProvider {
         )
     }
 
+    /// Number of provider-owned resident render targets still alive
+    /// (`research/docs/23` §76, R7). Exposed for the cross-submission case that
+    /// proves a resident image is reused, not recreated, across the two passes
+    /// of a chain — the same accessor shape the Vulkan rail publishes.
+    #[doc(hidden)]
+    pub fn resident_target_count(&self) -> usize {
+        self.lock()
+            .map(|state| state.resident_targets.len())
+            .unwrap_or(0)
+    }
+
+    /// Cumulative resident targets retired before the device was lost: the
+    /// budget's evictions plus the retirements a lease release drives. The
+    /// device-loss teardown is not counted here; it is observable through the
+    /// tombstones every later load names (`resident_target_stale`).
+    #[doc(hidden)]
+    pub fn resident_target_evictions(&self) -> u64 {
+        self.lock()
+            .map(|state| state.resident_targets.evictions())
+            .unwrap_or(0)
+    }
+
+    /// Whether the provider currently holds a resident image for one
+    /// attachment identity (`research/docs/23` §76, R7).
+    #[doc(hidden)]
+    pub fn resident_target_is_live(&self, allocation_id: AllocationId, view_id: ViewId) -> bool {
+        self.lock()
+            .map(|state| state.resident_targets.is_live(allocation_id, view_id))
+            .unwrap_or(false)
+    }
+
     /// Heap placements the native provider most recently executed.
     ///
     /// Every successful heap-bearing submission replaces the previous vector
@@ -1775,8 +1879,93 @@ impl NativeMetalProvider {
             state
                 .present_targets
                 .retain(|(allocation, _), _| *allocation != allocation_id);
+            // The resident registry is retired by the same rule and for the
+            // same reason (`research/docs/23` §76, R7): the images a released
+            // allocation backed are gone, so a later `LoadOp::Resident` names
+            // the release (`resident_target_released`) instead of reading an
+            // image whose bytes the owner has taken back.
+            state.resident_targets.retire_allocation(allocation_id);
         }
         Ok(())
+    }
+
+    /// Resolve every render pass's resident declarations against this
+    /// provider's own registry (`research/docs/23` §76, R7).
+    ///
+    /// Runs before the plan exists and before any command buffer is committed,
+    /// so a trace whose resident load has no live image — or whose pass would
+    /// render into an image it never named — is refused in the Resolve phase
+    /// with nothing on the queue:
+    ///
+    /// - a pass that declares the resident target resolves its identity through
+    ///   the registry, which creates the image on a resident store and refuses
+    ///   a load of an identity that holds no *defined* bytes by name
+    ///   (`resident_target_unavailable` / `_undefined` / `_evicted` /
+    ///   `_released` / `_stale` / `_shape_changed`, `crate::resident`);
+    /// - a pass that renders into an identity the provider holds without
+    ///   declaring it is refused with `resident_target_undeclared`, because the
+    ///   provider's bytes would otherwise be overwritten by a pass that never
+    ///   named them.
+    ///
+    /// The image is created here rather than inside the encoder because the
+    /// plan has to know that the declaration was resolved before it admits the
+    /// pass — and because the texture lives past the pass that created it, in
+    /// the state this provider keeps across submissions.
+    fn resolve_render_residents(
+        &self,
+        state: &mut State,
+        trace: &ComputeTrace,
+    ) -> Result<Vec<ResolvedRenderResidents>, ProviderError> {
+        let mut resolved = Vec::with_capacity(trace.render_passes().count());
+        for pass in trace.render_passes() {
+            let mut textures = Vec::with_capacity(pass.color_attachments.len());
+            let mut identities = Vec::new();
+            for attachment in &pass.color_attachments {
+                if attachment.declares_resident_target() {
+                    let device = &state.device;
+                    let texture = state.resident_targets.resolve(
+                        attachment,
+                        attachment.loads_resident_target(),
+                        |format, width, height| {
+                            render::present_target_texture(
+                                device,
+                                render::pixel_format(format)?,
+                                resident_extent(width, height)?,
+                            )
+                        },
+                    )?;
+                    textures.push(Some(texture));
+                    identities.push((attachment.allocation_id, attachment.view_id));
+                } else {
+                    if state
+                        .resident_targets
+                        .is_live(attachment.allocation_id, attachment.view_id)
+                    {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "resident_target_undeclared",
+                        )
+                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                        .with_field(
+                            "allocation",
+                            FieldValue::Unsigned(attachment.allocation_id.get()),
+                        )
+                        .with_detail(
+                            "the provider holds this identity's image and the pass declares \
+                             neither `LoadOp::Resident` nor `StoreOp::Resident` for it, so the \
+                             trace would be reading or overwriting bytes it never named",
+                        ));
+                    }
+                    textures.push(None);
+                }
+            }
+            resolved.push(ResolvedRenderResidents {
+                textures,
+                identities,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Register one render pipeline: the trace-table entry a render pass names
@@ -1922,14 +2111,22 @@ impl NativeMetalProvider {
     /// declared, at the view's own offset inside the allocation — so resource
     /// admission, lease bookkeeping and readback consumers need no second path
     /// (`research/docs/23` §6 Step 7).
+    ///
+    /// A resident attachment's bytes do *not* leave through that channel
+    /// (`research/docs/23` §76, R7): the pass renders into the provider's own
+    /// image (`residents`, resolved before the plan existed) and publishes no
+    /// writeback for it. A completed pass is what defines those bytes, so this
+    /// is also where an identity becomes loadable again — and a refused or
+    /// failed pass is where it stops being so.
     fn execute_render_passes(
         &self,
         state: &mut State,
         plan: &[render::TraceRenderPlan<'_>],
+        residents: &[ResolvedRenderResidents],
         icb_replay: Option<&icb::IcbPlan>,
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         let mut writebacks = Vec::with_capacity(plan.len());
-        for planned in plan {
+        for (planned, resolved) in plan.iter().zip(residents) {
             // One copy-in per sampled texture the encoder uploads into its own
             // `MTLTexture` (`research/docs/23` §3.3, v70). A texture upload is
             // a copy-in like a buffer upload, so the v11 count contract sees
@@ -1944,33 +2141,52 @@ impl NativeMetalProvider {
             // call returned from its `waitUntilCompleted`. A pass with no
             // no-copy input retains nothing.
             let _retains = render::RenderInputRetains::retain(&self.borrowed, &planned.plan)?;
-            match &planned.present {
+            let outcome: Result<PassOutcome, ProviderError> = match &planned.present {
                 // A present action hands its one attachment on to the target
                 // texture, whose readback is the pass's single writeback.
-                Some(present) => {
-                    let texels = self.execute_present_render(state, planned, present)?;
-                    writebacks.push(planned.writeback(texels));
-                }
+                Some(present) => self
+                    .execute_present_render(state, planned, present)
+                    .map(PassOutcome::Present),
                 // An offscreen pass reads every attachment back, one writeback
                 // per landing view in location order, plus the stored depth
                 // and stencil surfaces' own when the pass has them (v43/v49).
-                None if icb_replay.is_some() => {
-                    let readback = render::encode_indirect_offscreen_render(
-                        &state.device,
-                        &state.queue,
-                        &planned.plan,
-                        icb_replay.expect("the indirect draw was planned"),
-                    )?;
-                    writebacks.extend(planned.writebacks(readback));
+                None if icb_replay.is_some() => render::encode_indirect_offscreen_render(
+                    &state.device,
+                    &state.queue,
+                    &planned.plan,
+                    icb_replay.expect("the indirect draw was planned"),
+                    &resolved.textures,
+                )
+                .map(PassOutcome::Offscreen),
+                None => render::encode_offscreen_render_with_resident(
+                    &state.device,
+                    &state.queue,
+                    &planned.plan,
+                    &resolved.textures,
+                )
+                .map(PassOutcome::Offscreen),
+            };
+            let outcome = match outcome {
+                Ok(outcome) => {
+                    // The pass completed, so the identities it named hold the
+                    // bytes this pass left there: a later `LoadOp::Resident` for
+                    // them resolves instead of being refused as undefined
+                    // (`research/docs/23` §76, R7).
+                    state.resident_targets.note(&resolved.identities, true);
+                    outcome
                 }
-                None => {
-                    let readback = render::encode_offscreen_render(
-                        &state.device,
-                        &state.queue,
-                        &planned.plan,
-                    )?;
-                    writebacks.extend(planned.writebacks(readback));
+                Err(error) => {
+                    // A pass that was refused or failed defines nothing: the
+                    // identities it named stay unloadable until a later pass
+                    // renders them again, rather than serving bytes of unknown
+                    // state (`research/docs/23` §76, R7).
+                    state.resident_targets.note(&resolved.identities, false);
+                    return Err(error);
                 }
+            };
+            match outcome {
+                PassOutcome::Present(texels) => writebacks.push(planned.writeback(texels)),
+                PassOutcome::Offscreen(readback) => writebacks.extend(planned.writebacks(readback)),
             }
         }
         Ok(writebacks)
@@ -2085,11 +2301,21 @@ impl NativeMetalProvider {
                 device_epoch: self.epoch,
                 host_import_alignment: self.no_copy_alignment(),
             };
+            // R7 (`research/docs/23` §76): the deferred path resolves the same
+            // resident registry the synchronous one does, before the plan as
+            // well — the render rail runs on the same queue either way, so the
+            // identities it keeps alive are the same identities.
+            let render_residents = self.resolve_render_residents(state, trace)?;
+            let resident_resolutions: Vec<Vec<bool>> = render_residents
+                .iter()
+                .map(ResolvedRenderResidents::resolution)
+                .collect();
             let render_plan = render::plan_trace_with_leases(
                 trace,
                 &pool,
                 &render_contracts,
                 Some(&render_leases),
+                Some(&resident_resolutions),
                 self.capabilities.depth_resolve_modes,
                 self.capabilities.stencil_resolve_modes,
             )?;
@@ -2105,8 +2331,12 @@ impl NativeMetalProvider {
             // leaking the whole bundle (the sync rail clears it before render
             // for the same reason).
             pending.submitted = false;
-            let render_writebacks =
-                self.execute_render_passes(state, &render_plan, icb_replay.as_ref())?;
+            let render_writebacks = self.execute_render_passes(
+                state,
+                &render_plan,
+                &render_residents,
+                icb_replay.as_ref(),
+            )?;
             // The render command buffer serialized after the compute command
             // buffer, so a completed render implies a terminal compute status.
             match resources.command.status() {
@@ -2117,6 +2347,16 @@ impl NativeMetalProvider {
                         (error_description(error), command_buffer_error_code(error))
                     };
                     if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
+                        // The deferred path's own device loss retires the same
+                        // registry the synchronous one does (`research/docs/23`
+                        // §76, R7). A device loss observed by an asynchronous
+                        // *completion handler* cannot reach this state — the
+                        // handler runs after `submit` returned and holds the
+                        // shared lifecycle instead — so that path seals the
+                        // instance and the images are released with it; every
+                        // later submission is refused by the lifecycle, never
+                        // served from a dead device's image.
+                        state.resident_targets.clear();
                         self.lifecycle.mark_device_lost();
                         return Err(device_lost_error(token, detail));
                     }
@@ -2392,6 +2632,33 @@ pub(crate) fn page_size() -> u64 {
     }
 }
 
+/// A resident target's declared extent as the `u32` Metal texture dimensions
+/// the provider creates its image with (`research/docs/23` §76, R7).
+///
+/// Core admission bounds an attachment by the device's own reported limit, so
+/// this conversion cannot lose a bit for an admitted trace. A hand-built value
+/// that reached the registry anyway is refused by name rather than truncated
+/// into a smaller image the trace never named.
+fn resident_extent(width: u64, height: u64) -> Result<[u32; 2], ProviderError> {
+    let dimension_refusal = || {
+        refusal(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "attachment_dimension_limit",
+        )
+        .with_field("width", FieldValue::Unsigned(width))
+        .with_field("height", FieldValue::Unsigned(height))
+        .with_detail(
+            "a resident target's image is created from the attachment's own extent, and this one \
+             does not fit a Metal texture dimension",
+        )
+    };
+    Ok([
+        u32::try_from(width).map_err(|_| dimension_refusal())?,
+        u32::try_from(height).map_err(|_| dimension_refusal())?,
+    ])
+}
+
 fn next_id(counter: &mut u64) -> Result<u64, ProviderError> {
     let value = *counter;
     *counter = counter.checked_add(1).ok_or_else(|| {
@@ -2487,4 +2754,720 @@ unsafe fn error_description(error: *mut Object) -> String {
         return "Metal returned no error description".into();
     }
     CStr::from_ptr(bytes).to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Device-only cases for the provider's cross-submission rails.
+    //!
+    //! A host whose default device is not the unified-memory Apple GPU the
+    //! provider admits prints the skip and returns; the macOS CI job's
+    //! `cargo test -p metal-api-native` is where these run, and no case ever
+    //! fakes a PASS. The resident chain below is the Rust provider's own
+    //! observation of `research/docs/23` §76 (R7): it is the same fixture the
+    //! Vulkan rail's `render_e2e.rs` runs on Lavapipe, executed through this
+    //! provider's registry, its plan and its Metal encoder.
+
+    use super::*;
+
+    /// The attachment identity every chain keeps its frame in: the pair the
+    /// resident target is keyed by (`research/docs/23` §76, R7).
+    const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(41);
+    const ATTACHMENT_VIEW: ViewId = ViewId::new(42);
+    /// The declaring compute pass's own output, which is what puts the
+    /// attachment view into the serial pool.
+    const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(43);
+    const SCRATCH_VIEW: ViewId = ViewId::new(44);
+    /// The caller-held stream and index buffer the quad draw reads.
+    const VERTEX_ALLOCATION: AllocationId = AllocationId::new(45);
+    const VERTEX_VIEW: ViewId = ViewId::new(46);
+    const INDEX_ALLOCATION: AllocationId = AllocationId::new(47);
+    const INDEX_VIEW: ViewId = ViewId::new(48);
+
+    /// The bytes the resident chain's seed carries: four bytes no reviewed
+    /// module writes and no clear sentinel spells, so "the chain read the
+    /// provider's image" is falsifiable per texel.
+    const RESIDENT_CLEAR: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+    /// The texel the reviewed fragment writes: `byte / 255` constants, so the
+    /// 8-bit UNORM rounding of a half-integer tie is not part of the case.
+    const DRAWN_TEXEL: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
+    /// The milestone's clear sentinel: a texel neither arm of the case writes,
+    /// so a skipped resident load cannot pass as "the frame stayed where it
+    /// was".
+    const CLEAR_SENTINEL: [u8; 4] = [0xfe, 0xfe, 0xfe, 0xfe];
+
+    /// The reviewed render pipeline every chain draws through: the indexed quad
+    /// module, whose vertex stage reads the caller's own stream.
+    fn register_quad_pipeline(provider: &NativeMetalProvider) -> CompiledComputePipeline {
+        provider
+            .register_render_pipeline(NativeRenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: render::QUAD_VERTEX_ENTRY.to_owned(),
+                    fragment_entry: render::FRAGMENT_ENTRY.to_owned(),
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                    vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                        stride: 8,
+                        step: VertexStep::PerVertex,
+                        attributes: vec![VertexAttribute {
+                            location: 0,
+                            offset: 0,
+                            format: VertexFormat::Float32x2,
+                        }],
+                    }]),
+                },
+                logical_digest: digest(b"native_resident_quad_pipeline"),
+            })
+            .expect("the reviewed indexed quad module registers")
+    }
+
+    /// The reviewed declaring pipeline: `copy_word` reads the attachment's own
+    /// view and writes the scratch word, which is what puts the attachment's
+    /// identity into the serial pool the landing resolves against
+    /// (`research/docs/23` §3.6).
+    fn declaration_pipeline(provider: &NativeMetalProvider) -> CompiledComputePipeline {
+        provider
+            .compile(PipelineCompileRequest {
+                entry_name: "copy_word".to_owned(),
+                logical_digest: digest(b"native_resident_declaration"),
+                source: ShaderSource::MetalSource(crate::COPY.to_owned()),
+            })
+            .expect("the reviewed copy_word fixture compiles")
+    }
+
+    fn digest(case: &[u8]) -> SemanticDigest {
+        SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest")
+    }
+
+    /// The four NDC corners of the reviewed quad (`(-1,-1)`, `(1,-1)`,
+    /// `(-1,1)`, `(1,1)`), or the left column's `(-1,-1)`, `(0,-1)`,
+    /// `(-1,1)`, `(0,1)`.
+    ///
+    /// The band is symmetric under the NDC y flip Metal and Vulkan disagree
+    /// about, so both rails cover the same texel pair and one byte expectation
+    /// describes them both.
+    fn quad_vertices(left_column: bool) -> Vec<u8> {
+        let corners: [[f32; 2]; 4] = if left_column {
+            [[-1.0, -1.0], [0.0, -1.0], [-1.0, 1.0], [0.0, 1.0]]
+        } else {
+            [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]]
+        };
+        let mut bytes = Vec::with_capacity(32);
+        for [x, y] in corners {
+            bytes.extend_from_slice(&x.to_ne_bytes());
+            bytes.extend_from_slice(&y.to_ne_bytes());
+        }
+        bytes
+    }
+
+    /// A degenerate quad: every corner is the same one, so the two reviewed
+    /// triangles cover no texel centre and the attachment keeps whatever the
+    /// pass loaded — the seeding shape's "draw nothing" arm.
+    fn collapsed_vertices() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        for _ in 0..4 {
+            bytes.extend_from_slice(&(-1.0_f32).to_ne_bytes());
+            bytes.extend_from_slice(&(-1.0_f32).to_ne_bytes());
+        }
+        bytes
+    }
+
+    /// The six `uint16` indices the reviewed quad draws: `(0,1,2)` and
+    /// `(2,1,3)`.
+    fn quad_indices() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(12);
+        for index in [0_u16, 1, 2, 2, 1, 3] {
+            bytes.extend_from_slice(&index.to_ne_bytes());
+        }
+        bytes
+    }
+
+    /// The declaring compute pass: one invocation of `copy_word` over the
+    /// attachment's own view and the scratch word.
+    fn declaration_pass(pipeline: PipelineId, attachment: BufferView) -> ComputePass {
+        ComputePass {
+            pipeline,
+            buffers: vec![
+                attachment,
+                BufferView {
+                    view_id: SCRATCH_VIEW,
+                    metal_binding: 1,
+                    allocation_id: SCRATCH_ALLOCATION,
+                    offset: 0,
+                    length: 4,
+                    access: BufferAccess::Write,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                },
+            ],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        }
+    }
+
+    /// The declared view the declaring pass reads: the attachment's identity
+    /// with the caller's own source, which is what a `LoadOp::Load` seed
+    /// uploads and what a resident arm never reads.
+    fn declared_attachment(length: u64, source: BufferSource) -> BufferView {
+        BufferView {
+            view_id: ATTACHMENT_VIEW,
+            metal_binding: 0,
+            allocation_id: ATTACHMENT_ALLOCATION,
+            offset: 0,
+            length,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source,
+        }
+    }
+
+    /// The caller's stream and index buffer, which the draw reads out of its
+    /// own views (`research/docs/23` §3.3, v21/v31).
+    fn vertex_stream(vertices: &[u8]) -> BufferView {
+        BufferView {
+            view_id: VERTEX_VIEW,
+            metal_binding: 0,
+            allocation_id: VERTEX_ALLOCATION,
+            offset: 0,
+            length: u64::try_from(vertices.len()).expect("stream length"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vertices.to_vec()),
+        }
+    }
+
+    fn index_buffer() -> IndexBufferBinding {
+        IndexBufferBinding {
+            view: BufferView {
+                view_id: INDEX_VIEW,
+                metal_binding: 0,
+                allocation_id: INDEX_ALLOCATION,
+                offset: 0,
+                length: 12,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(quad_indices()),
+            },
+            format: IndexFormat::Uint16,
+        }
+    }
+
+    /// The quad render pass: one 2x2 `rgba8_unorm` attachment with the caller's
+    /// own load and store decisions, drawn from the caller's stream.
+    fn quad_pass(
+        pipeline: PipelineId,
+        load: LoadOp,
+        store: StoreOp,
+        vertices: &[u8],
+    ) -> RenderPassDescriptor {
+        RenderPassDescriptor {
+            blend: None,
+            multisample: None,
+            depth_resolve: None,
+            stencil_resolve: None,
+            cull: None,
+            depth: None,
+            depth_test: None,
+            stencil: None,
+            stencil_test: None,
+            base_vertex: 0,
+            pipeline,
+            color_attachments: vec![RenderAttachment {
+                view_id: ATTACHMENT_VIEW,
+                allocation_id: ATTACHMENT_ALLOCATION,
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                load,
+                store,
+            }],
+            viewport: [0, 0, 2, 2],
+            scissor: None,
+            vertices: 6,
+            vertex_buffers: vec![vertex_stream(vertices)],
+            indices: Some(index_buffer()),
+            instance_count: 1,
+            textures: Vec::new(),
+            present: None,
+        }
+    }
+
+    /// The whole trace one submission submits: the declaring compute pass and
+    /// the caller's quad pass (or a shape the case names instead), with both
+    /// the registrations the trace names in its own pipeline table.
+    fn resident_trace(
+        provider: &NativeMetalProvider,
+        compute: &CompiledComputePipeline,
+        render: &CompiledComputePipeline,
+        pass: RenderPassDescriptor,
+        declared: BufferView,
+        attachment_size: u64,
+    ) -> (ComputeTrace, ResourceTableSnapshot) {
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: provider.device_epoch(),
+            operation_id: OperationId::new(12),
+            pipelines: vec![compute.clone(), render.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(declaration_pass(compute.pipeline_id, declared)),
+                TracePass::Render(pass),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let mut resources = ResourceTableSnapshot::new();
+        for (allocation, size) in [
+            (ATTACHMENT_ALLOCATION, attachment_size),
+            (SCRATCH_ALLOCATION, 8),
+            (VERTEX_ALLOCATION, 32),
+            (INDEX_ALLOCATION, 12),
+        ] {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: allocation,
+                    owner_epoch: provider.device_epoch(),
+                    size,
+                })
+                .expect("the fixture's allocation");
+        }
+        (trace, resources)
+    }
+
+    /// Submit one trace through core admission, or hand the refusal back.
+    fn submit(
+        provider: &NativeMetalProvider,
+        trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<ProviderSubmission, ProviderError> {
+        let admitted = provider
+            .capabilities()
+            .validate_trace(trace.clone(), resources.clone())
+            .expect("the resident fixture is admitted");
+        provider.submit(admitted)
+    }
+
+    /// The bytes one view landed in a submission, or `None` when the trace
+    /// declared no writeback for it — which is what a resident store has to
+    /// show (`research/docs/23` §76, R7).
+    fn readback(submission: &ProviderSubmission, view: ViewId) -> Option<Vec<u8>> {
+        submission
+            .writebacks
+            .iter()
+            .find(|writeback| writeback.view_id == view)
+            .map(|writeback| writeback.bytes.clone())
+    }
+
+    /// One hex string in the evidence log's own spelling.
+    fn hex(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The resident chain end to end (`research/docs/23` §76, R7): two
+    /// submissions on one provider, and the second one's bytes come from the
+    /// image the first left behind — no guest writeback, no re-declaration.
+    ///
+    /// The comparison is against the closest shape that already existed: one
+    /// submission whose loading attachment takes its previous bytes from the
+    /// trace's own view declaration. The two agree byte for byte, which is what
+    /// makes the claim falsifiable: a rail that skipped the load and cleared
+    /// instead lands the sentinel in the two texels the partial draw does not
+    /// cover, a rail that re-used a stale image lands the wrong four bytes, and
+    /// a rail that published a writeback for the resident store would show a
+    /// second attachment writeback where the trace declared none.
+    #[test]
+    fn a_resident_store_keeps_the_frame_a_later_pass_loads() {
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native resident chain test: no eligible Metal device");
+            return;
+        };
+        let compute = declaration_pipeline(&provider);
+        let quad = register_quad_pipeline(&provider);
+
+        // The baseline first: the trace's own declaration supplies the loaded
+        // bytes, which is the shape the chain is measured against.
+        let baseline = resident_trace(
+            &provider,
+            &compute,
+            &quad,
+            quad_pass(
+                quad.pipeline_id,
+                LoadOp::Load,
+                StoreOp::Store,
+                &quad_vertices(true),
+            ),
+            declared_attachment(16, BufferSource::OwnedBytes(RESIDENT_CLEAR.repeat(4))),
+            64,
+        );
+        let baseline = submit(&provider, &baseline.0, &baseline.1).expect("the baseline completes");
+        let baseline_bytes = readback(&baseline, ATTACHMENT_VIEW).expect("the baseline lands");
+        assert_eq!(
+            baseline_bytes,
+            expected_chain_bytes(),
+            "the baseline is the drawn left column beside the declared seed"
+        );
+        eprintln!("trace-owned baseline readback: {}", hex(&baseline_bytes));
+
+        // Both ways a resident image is defined: a clear the pass keeps
+        // resident, and the trace's own bytes uploaded into the provider's
+        // image. They produce the same chain, because what the second
+        // submission reads is in both cases the provider's image.
+        for seed_load in [LoadOp::Clear(ClearColor::new(RESIDENT_CLEAR)), LoadOp::Load] {
+            let Ok(provider) = NativeMetalProvider::new() else {
+                eprintln!("skipping native resident chain test: no eligible Metal device");
+                return;
+            };
+            let compute = declaration_pipeline(&provider);
+            let quad = register_quad_pipeline(&provider);
+
+            // 1. The seeding pass: define the attachment's bytes (a clear, or
+            //    the declaring view's own bytes uploaded), draw nothing, and
+            //    keep the raster in the provider's image. It publishes no
+            //    writeback at all.
+            let seed = resident_trace(
+                &provider,
+                &compute,
+                &quad,
+                quad_pass(
+                    quad.pipeline_id,
+                    seed_load,
+                    StoreOp::Resident,
+                    &collapsed_vertices(),
+                ),
+                declared_attachment(16, BufferSource::OwnedBytes(RESIDENT_CLEAR.repeat(4))),
+                64,
+            );
+            let seed = submit(&provider, &seed.0, &seed.1).expect("the seeding pass completes");
+            assert_eq!(
+                readback(&seed, ATTACHMENT_VIEW),
+                None,
+                "a resident store keeps the frame in the provider's image and publishes no \
+                 writeback (seed load {seed_load:?})"
+            );
+            assert_eq!(
+                provider.resident_target_count(),
+                1,
+                "the seeding pass leaves exactly the identity it named resident"
+            );
+            assert_eq!(provider.resident_target_evictions(), 0);
+            assert!(provider.resident_target_is_live(ATTACHMENT_ALLOCATION, ATTACHMENT_VIEW));
+
+            // 2. The second submission loads the provider's own bytes and
+            //    overwrites the left column of the 2x2 raster.
+            let chained = resident_trace(
+                &provider,
+                &compute,
+                &quad,
+                quad_pass(
+                    quad.pipeline_id,
+                    LoadOp::Resident,
+                    StoreOp::Store,
+                    &quad_vertices(true),
+                ),
+                declared_attachment(16, BufferSource::OwnedBytes(vec![0x5a; 16])),
+                64,
+            );
+            let chained =
+                submit(&provider, &chained.0, &chained.1).expect("the resident load resolves");
+            let chained_bytes = readback(&chained, ATTACHMENT_VIEW).expect("the chain lands");
+            eprintln!(
+                "resident chain readback after a {seed_load:?} seed: {} ({} bytes)",
+                hex(&chained_bytes),
+                chained_bytes.len()
+            );
+            assert_eq!(
+                chained_bytes, baseline_bytes,
+                "the resident load lands the same bytes the trace-declared previous contents do"
+            );
+            assert_eq!(
+                chained_bytes,
+                expected_chain_bytes(),
+                "the uncovered half keeps the resident image's own bytes"
+            );
+            assert!(
+                !chained_bytes
+                    .chunks_exact(4)
+                    .any(|texel| texel == CLEAR_SENTINEL),
+                "no texel keeps the clear sentinel: a skipped resident load cannot pass as a \
+                 kept frame"
+            );
+            assert_eq!(
+                provider.resident_target_count(),
+                1,
+                "the chain reuses one image"
+            );
+            assert_eq!(provider.resident_target_evictions(), 0);
+        }
+    }
+
+    /// The chain's expectation itself: the drawn left column beside the seeded
+    /// right one, in row-major order. Both rows are identical, which is why the
+    /// symmetric band makes one expectation describe both rails.
+    fn expected_chain_bytes() -> Vec<u8> {
+        let mut expected = Vec::with_capacity(16);
+        for _row in 0..2 {
+            expected.extend_from_slice(&DRAWN_TEXEL);
+            expected.extend_from_slice(&RESIDENT_CLEAR);
+        }
+        expected
+    }
+
+    /// The resident registry's budget and eviction order
+    /// (`research/docs/23` §76, R7), the R4a rule generalised to the render
+    /// rail: the provider bounds the identities it keeps, the victim is the
+    /// least recently used one, and a load of an identity the budget evicted is
+    /// refused by name instead of being served the bytes the image used to
+    /// hold.
+    #[test]
+    fn resident_targets_are_bounded_and_evicted_least_recently_used() {
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native resident budget test: no eligible Metal device");
+            return;
+        };
+        let compute = declaration_pipeline(&provider);
+        let quad = register_quad_pipeline(&provider);
+        let identities: Vec<(AllocationId, ViewId)> = (0..resident::RESIDENT_TARGET_BUDGET + 2)
+            .map(|index| {
+                (
+                    AllocationId::new(100 + index as u64),
+                    ViewId::new(200 + index as u64),
+                )
+            })
+            .collect();
+        for (allocation, view) in &identities {
+            let mut declared =
+                declared_attachment(16, BufferSource::OwnedBytes(RESIDENT_CLEAR.repeat(4)));
+            declared.view_id = *view;
+            declared.allocation_id = *allocation;
+            let mut pass = quad_pass(
+                quad.pipeline_id,
+                LoadOp::Clear(ClearColor::new(RESIDENT_CLEAR)),
+                StoreOp::Resident,
+                &collapsed_vertices(),
+            );
+            pass.color_attachments[0].view_id = *view;
+            pass.color_attachments[0].allocation_id = *allocation;
+            let (trace, resources) = resident_trace(&provider, &compute, &quad, pass, declared, 64);
+            submit(&provider, &trace, &resources)
+                .expect("every seeding pass keeps its bytes resident");
+        }
+        assert_eq!(
+            provider.resident_target_count(),
+            resident::RESIDENT_TARGET_BUDGET,
+            "the registry keeps at most the budget's worth of identities"
+        );
+        assert_eq!(
+            provider.resident_target_evictions(),
+            2,
+            "the two identities beyond the budget were evicted"
+        );
+
+        // The victim is the least recently used identity — the first one
+        // stored. Its load is refused by name, and the refusal names the rule
+        // that retired it.
+        let (oldest_allocation, oldest_view) = identities[0];
+        assert!(!provider.resident_target_is_live(oldest_allocation, oldest_view));
+        let mut declared = declared_attachment(16, BufferSource::OwnedBytes(vec![0x5a; 16]));
+        declared.view_id = oldest_view;
+        declared.allocation_id = oldest_allocation;
+        let mut pass = quad_pass(
+            quad.pipeline_id,
+            LoadOp::Resident,
+            StoreOp::Store,
+            &quad_vertices(true),
+        );
+        pass.color_attachments[0].view_id = oldest_view;
+        pass.color_attachments[0].allocation_id = oldest_allocation;
+        let (trace, resources) = resident_trace(&provider, &compute, &quad, pass, declared, 64);
+        let error = submit(&provider, &trace, &resources)
+            .expect_err("the budget evicted this identity's bytes");
+        assert_eq!(error.slug, "resident_target_evicted");
+        assert_eq!(
+            error.fields.get("retired_by"),
+            Some(&FieldValue::Text("budget".to_owned()))
+        );
+        assert_eq!(
+            provider.resident_target_count(),
+            resident::RESIDENT_TARGET_BUDGET,
+            "a refused load does not re-create the identity it could not read"
+        );
+
+        // The least recently used identity is the one the budget kept.
+        let (newest_allocation, newest_view) = identities[identities.len() - 1];
+        assert!(provider.resident_target_is_live(newest_allocation, newest_view));
+    }
+
+    /// A later pass that declares the same identity with a different shape is
+    /// refused by name, before the provider renders into an image of the wrong
+    /// format (`research/docs/23` §76, R7).
+    #[test]
+    fn a_resident_targets_shape_change_is_refused_by_name() {
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native resident shape test: no eligible Metal device");
+            return;
+        };
+        let compute = declaration_pipeline(&provider);
+        let quad = register_quad_pipeline(&provider);
+        let seed = resident_trace(
+            &provider,
+            &compute,
+            &quad,
+            quad_pass(
+                quad.pipeline_id,
+                LoadOp::Clear(ClearColor::new(RESIDENT_CLEAR)),
+                StoreOp::Resident,
+                &collapsed_vertices(),
+            ),
+            declared_attachment(16, BufferSource::OwnedBytes(RESIDENT_CLEAR.repeat(4))),
+            64,
+        );
+        submit(&provider, &seed.0, &seed.1).expect("the seeding pass keeps its bytes resident");
+
+        // The same identity, now declared as an eight-byte-per-texel
+        // `Rgba16Float` attachment: the image's own texel width is what the
+        // shape check compares, and the trace-level admission covers the wider
+        // declaration with the 64-byte view.
+        let wide = provider
+            .register_render_pipeline(NativeRenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: render::VERTEX_ENTRY.to_owned(),
+                    fragment_entry: render::FRAGMENT_ENTRY.to_owned(),
+                    color_formats: vec![AttachmentFormat::Rgba16Float],
+                    vertex_layout: VertexLayout::None,
+                },
+                logical_digest: digest(b"native_resident_wide_pipeline"),
+            })
+            .expect("the reviewed milestone module serves the four-component formats");
+        let mut pass = quad_pass(
+            wide.pipeline_id,
+            LoadOp::Resident,
+            StoreOp::Store,
+            &quad_vertices(true),
+        );
+        pass.color_attachments[0].format = AttachmentFormat::Rgba16Float;
+        pass.vertices = 3;
+        pass.vertex_buffers = Vec::new();
+        pass.indices = None;
+        let (trace, resources) = resident_trace(
+            &provider,
+            &compute,
+            &wide,
+            pass,
+            declared_attachment(32, BufferSource::OwnedBytes(vec![0x5a; 32])),
+            64,
+        );
+        let error = submit(&provider, &trace, &resources)
+            .expect_err("the identity is one image with one shape");
+        assert_eq!(error.slug, "resident_target_shape_changed");
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("expected_format"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::Rgba8Unorm.code()
+            )))
+        );
+        assert_eq!(
+            error.fields.get("format"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::Rgba16Float.code()
+            )))
+        );
+        // The refusal is not a retirement: the identity's own shape still
+        // loads, and the counter did not move.
+        assert!(provider.resident_target_is_live(ATTACHMENT_ALLOCATION, ATTACHMENT_VIEW));
+        assert_eq!(provider.resident_target_count(), 1);
+        assert_eq!(provider.resident_target_evictions(), 0);
+    }
+
+    /// Releasing the lease of one allocation retires that allocation's
+    /// resident target, and a load afterwards names the release
+    /// (`research/docs/23` §76, R7) instead of reading an image whose backing
+    /// the owner has taken back.
+    #[test]
+    fn releasing_a_staged_lease_retires_the_resident_target_of_its_allocation() {
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native resident lease test: no eligible Metal device");
+            return;
+        };
+        let compute = declaration_pipeline(&provider);
+        let quad = register_quad_pipeline(&provider);
+        let lease_id = LeaseId::new(97);
+        let reservation = LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: ATTACHMENT_ALLOCATION,
+                owner_epoch: provider.device_epoch(),
+            },
+            offset: 0,
+            length: 16,
+        };
+        provider
+            .import_staged_lease(StagedLease::new(reservation, RESIDENT_CLEAR.repeat(4)).unwrap())
+            .expect("the staged window imports");
+
+        let mut declared = declared_attachment(16, BufferSource::StagedLease(lease_id));
+        declared.view_id = ATTACHMENT_VIEW;
+        let (trace, mut resources) = resident_trace(
+            &provider,
+            &compute,
+            &quad,
+            quad_pass(
+                quad.pipeline_id,
+                LoadOp::Clear(ClearColor::new(RESIDENT_CLEAR)),
+                StoreOp::Resident,
+                &collapsed_vertices(),
+            ),
+            declared,
+            64,
+        );
+        resources
+            .insert_lease(reservation)
+            .expect("the lease is declared");
+        submit(&provider, &trace, &resources).expect("the leased seed keeps its bytes resident");
+        assert_eq!(provider.resident_target_count(), 1);
+        assert!(provider.resident_target_is_live(ATTACHMENT_ALLOCATION, ATTACHMENT_VIEW));
+
+        provider
+            .release_staged_lease(lease_id)
+            .expect("the staged window releases");
+        assert_eq!(
+            provider.resident_target_count(),
+            0,
+            "the release retires the allocation's resident image"
+        );
+        assert_eq!(provider.resident_target_evictions(), 1);
+        assert!(!provider.resident_target_is_live(ATTACHMENT_ALLOCATION, ATTACHMENT_VIEW));
+
+        // The identity is gone, and a later load says which rule retired it.
+        let (mut trace, resources) = resident_trace(
+            &provider,
+            &compute,
+            &quad,
+            quad_pass(
+                quad.pipeline_id,
+                LoadOp::Resident,
+                StoreOp::Store,
+                &quad_vertices(true),
+            ),
+            declared_attachment(16, BufferSource::OwnedBytes(vec![0x5a; 16])),
+            64,
+        );
+        trace.operation_id = OperationId::new(13);
+        let error = submit(&provider, &trace, &resources)
+            .expect_err("the released allocation holds no image");
+        assert_eq!(error.slug, "resident_target_released");
+        assert_eq!(
+            error.fields.get("retired_by"),
+            Some(&FieldValue::Text("lease_released".to_owned()))
+        );
+    }
 }

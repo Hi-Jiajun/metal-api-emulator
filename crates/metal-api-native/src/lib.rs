@@ -31,6 +31,16 @@ mod lifecycle;
 #[cfg(any(target_os = "macos", test))]
 mod render;
 
+// The provider-resident render target registry's policy (`research/docs/23`
+// §76, R7) is provider logic like the render rail beside it, and it is generic
+// over the image type the provider stores: the host-side tests exercise the
+// budget, the tombstones and every refusal name with a stand-in image, while
+// the macOS provider keeps its own `MTLTexture`s in the same registry. Only
+// the texture creation itself needs a device, and that is the closure
+// `native.rs` hands to `ResidentRegistry::resolve`.
+#[cfg(any(target_os = "macos", test))]
+mod resident;
+
 // The heap rail's capability spelling and placement planning are provider
 // logic too, so they are compiled for the macOS provider and for the unit
 // tests that pin them on a host without Metal. Only the slab encode body in
