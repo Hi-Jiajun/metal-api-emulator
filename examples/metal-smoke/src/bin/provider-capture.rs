@@ -5,18 +5,20 @@ use metal_api_core::provider::queue_priorities_for_device;
 use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment, BlendFactor,
-    BlendOperation, BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction,
-    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
-    CullMode, DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch,
-    Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
-    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
-    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LoadOp, MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve,
-    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
-    PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
-    RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
-    SampleCount, SemanticDigest, ShaderSource, StencilCompare, StencilFormat, StencilLoadOp,
+    BlendOperation, BufferAccess, BufferLease, BufferSource, BufferSourceKind, BufferView,
+    ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    ComputePass, ComputeTrace, CullMode, DepthFormat, DepthLoadOp, DepthResolveFilter,
+    DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, HostRegion,
+    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
+    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId,
+    LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
+    MultisampleStencilResolve, NoCopyLeaseImporter, OperationId, PipelineCompileRequest,
+    PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, QueuePriority,
+    QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SampleCount,
+    SemanticDigest, ShaderSource, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
     StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess,
     TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
     VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
@@ -336,7 +338,239 @@ type ProviderHandles = (
     String,
     CopyCounters,
     RenderRegistrar,
+    LeaseHandles,
 );
+
+/// The two lease import channels a case's `storage_mode` declarations source
+/// their bytes through (`research/docs/23` §90, R9i).
+///
+/// Importing an owner lease is a concrete-context entry point rather than a
+/// `PipelineProvider` method ([`LeaseImporter`], [`NoCopyLeaseImporter`]), so
+/// the tool keeps the two channels beside the provider it created. Both rails
+/// the suite runs on implement them; a case whose declaration needs one the
+/// provider does not support is refused by the provider's own
+/// `storage_mode_unsupported`, which is the same boundary the producer rails
+/// publish.
+struct LeaseHandles {
+    staged: Arc<dyn LeaseImporter>,
+    borrowed: Arc<dyn NoCopyLeaseImporter>,
+}
+
+/// The one source-arm name a buffer declaration may spell (`research/docs/23`
+/// §90, R9i). Kept in one place so the trace and object rails refuse the same
+/// vocabulary the comparator validates.
+fn buffer_storage_mode(buffer: &Buffer, case_id: &str) -> Result<BufferSourceKind> {
+    match buffer.storage_mode.as_deref() {
+        None | Some("owned_bytes") => Ok(BufferSourceKind::OwnedBytes),
+        Some("staged_lease") => Ok(BufferSourceKind::StagedLease),
+        Some("borrowed_no_copy") => Ok(BufferSourceKind::BorrowedNoCopy),
+        Some(other) => Err(format!("case {case_id}: unknown buffer storage mode {other:?}").into()),
+    }
+}
+
+/// The one wire spelling of a source arm: the name the suite declares, the
+/// capture reports and the comparator refuses on a mismatch.
+fn storage_mode_name(kind: BufferSourceKind) -> &'static str {
+    match kind {
+        BufferSourceKind::OwnedBytes => "owned_bytes",
+        BufferSourceKind::StagedLease => "staged_lease",
+        BufferSourceKind::BorrowedNoCopy => "borrowed_no_copy",
+    }
+}
+
+/// The page a value rounds up to, as the harness's owner windows need
+/// (`research/docs/23` §90): the provider's own host-import granularity, never
+/// an assumed page size.
+fn round_up_to_page(value: u64, page: u64) -> Result<u64> {
+    if page == 0 {
+        return Err("an owner window needs a non-zero page size".into());
+    }
+    value
+        .checked_add(page - 1)
+        .map(|sum| sum / page * page)
+        .ok_or_else(|| "rounding an owner window overflowed".into())
+}
+
+/// Where one case's lease imports ended up, so the run can admit them through
+/// the same snapshot the owned views use and release them once the case's
+/// submissions have been waited for.
+#[derive(Default)]
+struct CaseLeases {
+    reservations: Vec<LeaseReservation>,
+    staged: Vec<LeaseId>,
+    borrowed: Vec<LeaseId>,
+}
+
+/// One page-aligned owner allocation (`research/docs/23` §90, R9i): the
+/// harness's stand-in for the guest RAM a real owner registers, which the
+/// borrowed arm's provider imports without copying. Aligned with
+/// `std::alloc::alloc`, exactly as the smoke suite's own host-region case
+/// builds its mapping (`examples/metal-smoke/src/provider_suite.rs`).
+struct OwnerWindow {
+    pointer: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl OwnerWindow {
+    fn new(length: usize, alignment: usize) -> Result<Self> {
+        let layout = std::alloc::Layout::from_size_align(length, alignment)?;
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        let pointer = std::ptr::NonNull::new(pointer).ok_or("owner window allocation failed")?;
+        Ok(Self { pointer, layout })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for OwnerWindow {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+    }
+}
+
+/// One case view's bytes as the trace spells them (`research/docs/23` §90,
+/// R9i).
+///
+/// An owned view is read from the case's own image every time a command buffer
+/// is built, so a later command reads what an earlier one wrote — the pre-R9i
+/// behaviour, unchanged. A lease-armed view names the import the provider
+/// already holds, which is why only the owned arm is re-read.
+enum CaseSource {
+    Owned,
+    Lease(BufferSource),
+}
+
+/// One case's source arms, resolved into the `BufferSource` each view
+/// carries (`research/docs/23` §90, R9i).
+///
+/// The owned arm is what every pre-R9i fixture used: the view's own bytes,
+/// spelled in the suite. The two lease arms import the same bytes into the
+/// provider first — a staged lease stages the view's own window, a borrowed
+/// lease maps the allocation-sized owner window the harness allocates — and
+/// the trace then names the lease, exactly as the provider's registry and the
+/// admitted snapshot agree on it. The reservations travel back beside the
+/// sources so the caller can admit them; the pages the borrowed arm maps are
+/// owned by the returned windows and live as long as the case does.
+fn case_sources(
+    case: &Case,
+    allocations: &[(u64, Vec<u8>)],
+    provider: &dyn PipelineProvider,
+    leases: &LeaseHandles,
+    guard: u8,
+    imported: &mut CaseLeases,
+    windows: &mut Vec<OwnerWindow>,
+) -> Result<Vec<CaseSource>> {
+    let mut sources = Vec::with_capacity(case.buffers.len());
+    for buffer in &case.buffers {
+        let (_, backing) = allocations
+            .iter()
+            .find(|(allocation, _)| *allocation == buffer.allocation)
+            .ok_or("unknown fixture allocation")?;
+        let start = usize::try_from(buffer.offset)?;
+        let end = start + usize::try_from(buffer.length)?;
+        let source = match buffer_storage_mode(buffer, &case.id)? {
+            BufferSourceKind::OwnedBytes => CaseSource::Owned,
+            BufferSourceKind::StagedLease => {
+                let reservation = LeaseReservation {
+                    lease: BufferLease {
+                        // The harness picks the lease identity; the suite names
+                        // the bytes and the arm, exactly as the heap section
+                        // leaves the slab identity to the capture tool.
+                        lease_id: LeaseId::new(buffer.view),
+                        allocation_id: AllocationId::new(buffer.allocation),
+                        owner_epoch: provider.device_epoch(),
+                    },
+                    offset: buffer.offset,
+                    length: buffer.length,
+                };
+                let staged = StagedLease::new(reservation, backing[start..end].to_vec())?;
+                leases
+                    .staged
+                    .import_staged_lease(staged)
+                    .map_err(|error| format!("case {}: import staged lease: {error:?}", case.id))?;
+                imported.reservations.push(reservation);
+                imported.staged.push(reservation.lease.lease_id);
+                CaseSource::Lease(BufferSource::StagedLease(reservation.lease.lease_id))
+            }
+            BufferSourceKind::BorrowedNoCopy => {
+                let page = leases.borrowed.no_copy_alignment();
+                if page == 0 || !page.is_power_of_two() {
+                    return Err(format!(
+                        "case {}: view {} is borrowed_no_copy, and the provider reports host \
+                         import granularity {page}, so it publishes `storage_mode_unsupported` \
+                         for this arm",
+                        case.id, buffer.view
+                    )
+                    .into());
+                }
+                // The window is the owner's own mapping, so both its offset
+                // and its length have to sit on the host-import grid
+                // (`HostRegion::borrowed_window`). The fixture is what places
+                // the view; the harness refuses rather than rounding it, so a
+                // suite cannot ask for a window the owner type would not.
+                if !buffer.offset.is_multiple_of(page) {
+                    return Err(format!(
+                        "case {}: view {} starts at offset {} inside its allocation, which is \
+                         not a multiple of the {page} byte host-import granularity",
+                        case.id, buffer.view, buffer.offset
+                    )
+                    .into());
+                }
+                let window_length = round_up_to_page(buffer.length, page)?;
+                let region_length = round_up_to_page(buffer.allocation_size, page)?;
+                if buffer.offset + window_length > buffer.allocation_size {
+                    return Err(format!(
+                        "case {}: view {} needs a {window_length} byte window at offset {}, \
+                         which its {} byte allocation does not cover",
+                        case.id, buffer.view, buffer.offset, buffer.allocation_size
+                    )
+                    .into());
+                }
+                let mut window =
+                    OwnerWindow::new(usize::try_from(region_length)?, usize::try_from(page)?)?;
+                window.as_mut_slice().fill(guard);
+                window.as_mut_slice()[start..end].copy_from_slice(&backing[start..end]);
+                let region = HostRegion {
+                    lease_id: LeaseId::new(buffer.view),
+                    owner_epoch: provider.device_epoch(),
+                    host_pointer: window.as_ptr() as usize,
+                    length: region_length,
+                    page_size: page,
+                };
+                let borrowed = region.borrowed_window(
+                    AllocationId::new(buffer.allocation),
+                    buffer.offset,
+                    window_length,
+                )?;
+                // Safety: the window is page-aligned, lives until the case's
+                // last submission has been waited for (it is owned by
+                // `windows`), and covers the whole reservation.
+                unsafe {
+                    leases
+                        .borrowed
+                        .import_borrowed_lease(borrowed)
+                        .map_err(|error| {
+                            format!("case {}: import borrowed lease: {error:?}", case.id)
+                        })?
+                };
+                windows.push(window);
+                imported.reservations.push(borrowed.reservation);
+                imported.borrowed.push(borrowed.reservation.lease.lease_id);
+                CaseSource::Lease(BufferSource::BorrowedNoCopy(
+                    borrowed.reservation.lease.lease_id,
+                ))
+            }
+        };
+        sources.push(source);
+    }
+    Ok(sources)
+}
 
 impl CopyCounters {
     /// Cumulative (copy-in, copy-out) device-buffer operations.
@@ -1030,6 +1264,10 @@ fn create_provider(
             // The render rail is a concrete-context entry point
             // (`register_render_pipeline` is not part of `PipelineProvider`), so
             // the handle is kept beside the trait object.
+            let leases = LeaseHandles {
+                staged: Arc::clone(&provider) as Arc<dyn LeaseImporter>,
+                borrowed: Arc::clone(&provider) as Arc<dyn NoCopyLeaseImporter>,
+            };
             Ok((
                 Arc::clone(&provider) as Arc<dyn PipelineProvider>,
                 name,
@@ -1038,6 +1276,7 @@ fn create_provider(
                     provider: Arc::clone(&provider),
                 },
                 RenderRegistrar::Vulkan(provider),
+                leases,
             ))
         }
         Backend::NativeMetalProvider => {
@@ -1049,11 +1288,16 @@ fn create_provider(
                         .with_async_execution(async_execution),
                 );
                 let name = provider.device_name().to_owned();
+                let leases = LeaseHandles {
+                    staged: Arc::clone(&provider) as Arc<dyn LeaseImporter>,
+                    borrowed: Arc::clone(&provider) as Arc<dyn NoCopyLeaseImporter>,
+                };
                 Ok((
                     Arc::clone(&provider) as Arc<dyn PipelineProvider>,
                     name,
                     CopyCounters::Native(Arc::clone(&provider)),
                     RenderRegistrar::Native(provider),
+                    leases,
                 ))
             }
             #[cfg(not(target_os = "macos"))]
@@ -2079,6 +2323,15 @@ struct Buffer {
     /// The pattern's length has to divide the view length.
     #[serde(default)]
     initial_repeat_hex: Option<String>,
+    /// The source arm the provider rails have to source this view's bytes
+    /// through (`research/docs/23` §90, R9i): `owned_bytes` (the default),
+    /// `staged_lease` or `borrowed_no_copy`. The bytes themselves stay in
+    /// `initial_hex`/`initial_repeat_hex` for every arm — they are the owner's
+    /// own window — so the oracle and the expectation read exactly the fields
+    /// the pre-R9i fixtures carried, and the lease arms change only where the
+    /// bytes come *from* on a provider rail.
+    #[serde(default)]
+    storage_mode: Option<String>,
 }
 
 impl Buffer {
@@ -2514,6 +2767,20 @@ struct CaseResult {
     /// indirect command.
     #[serde(skip_serializing_if = "Option::is_none")]
     icb: Option<IcbSegment>,
+    /// The source arm each of this case's views ran with
+    /// (`research/docs/23` §90, R9i). Absent from cases whose suite declares no
+    /// lease arm, and from the Swift reference oracle, which is not a provider:
+    /// it places the same bytes in its own Metal buffer, so there is no arm for
+    /// it to execute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_modes: Option<Vec<StorageModeObservation>>,
+}
+
+/// One view's source arm as the run used it (`research/docs/23` §90, R9i).
+#[derive(Serialize)]
+struct StorageModeObservation {
+    view: u64,
+    mode: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2727,7 +2994,7 @@ fn main() -> Result<()> {
     // render entry point. A rail a render case's marker names therefore always
     // reports the case rather than omitting it.
     let identity = hex(&Sha256::digest(&raw));
-    let (provider, device_name, counters, render_registrar) =
+    let (provider, device_name, counters, render_registrar, leases) =
         create_provider(backend, async_execution, queue_priorities.as_deref())?;
     let object_device =
         (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
@@ -2877,6 +3144,7 @@ fn main() -> Result<()> {
                     index as u64 + 1,
                     suite.guard_byte,
                     &mut || counters.read(),
+                    &leases,
                 )?,
                 None,
             )
@@ -3207,6 +3475,9 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "sampled_cell_ascending_content",
             "sampled_cell_descending_content",
         ],
+        // The lease face (`research/docs/23` §90, R9i): the two source arms
+        // the providers execute beyond owned bytes, one case each.
+        (1, "compute-buffer-v30") => &["staged_lease_copy_word", "borrowed_lease_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -7096,6 +7367,9 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             ][..],
         ),
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
+        // v29: the lease cases bind the v1 kernel's own two slots; only the
+        // read view's source arm differs (`research/docs/23` §90, R9i).
+        "staged_lease_copy_word" | "borrowed_lease_copy_word" => copy,
         // v10: two disjoint views of one allocation. The reversed pair binds
         // the source above the destination so an offset mix-up cannot pass.
         "alias_disjoint_pair" | "alias_disjoint_pair_reversed" => copy,
@@ -8677,6 +8951,7 @@ fn run_render_case(
         present: None,
         heap: None,
         icb: None,
+        storage_modes: None,
     })
 }
 
@@ -8896,6 +9171,10 @@ fn run_object_case(
             present: None,
             heap: None,
             icb: None,
+            // The object API carries no lease channel yet
+            // (`research/docs/23` §90): a case that declares one is marked for
+            // the trace rails and never reaches this path.
+            storage_modes: None,
         },
         allocation_ids,
     ))
@@ -9920,6 +10199,7 @@ fn run_object_render_case(
         present: None,
         heap: None,
         icb: None,
+        storage_modes: None,
     })
 }
 
@@ -9930,6 +10210,7 @@ fn run_case(
     operation: u64,
     guard: u8,
     counters: &mut dyn FnMut() -> (usize, usize),
+    leases: &LeaseHandles,
 ) -> Result<CaseResult> {
     let mut resources = ResourceTableSnapshot::new();
     // One backing image and one AllocationRecord per allocation. A v10 fixture
@@ -9962,6 +10243,28 @@ fn run_case(
             })?;
         }
         allocations[position].1[start..start + initial.len()].copy_from_slice(&initial);
+    }
+    // The source arm every view declares (`research/docs/23` §90, R9i): an
+    // owned view reads the case's own image as the run rewrites it, while a
+    // lease-armed view names one import the provider already holds. The
+    // imports are made here, before the trace is built, because the snapshot
+    // the admission reads has to carry the same reservations the trace's
+    // `BufferSource` names; the owner windows a borrowed view maps are kept
+    // alive in `owner_windows` until this case's last submission has been
+    // waited for.
+    let mut case_leases = CaseLeases::default();
+    let mut owner_windows = Vec::new();
+    let view_sources = case_sources(
+        case,
+        &allocations,
+        provider,
+        leases,
+        guard,
+        &mut case_leases,
+        &mut owner_windows,
+    )?;
+    for reservation in &case_leases.reservations {
+        resources.insert_lease(*reservation)?;
     }
     // v11: sampled textures are their own allocations; the provider uploads
     // them once per submission (`research/docs/18` step 1).
@@ -10004,7 +10307,8 @@ fn run_case(
     let case_views = |allocations: &[(u64, Vec<u8>)]| -> Result<Vec<BufferView>> {
         case.buffers
             .iter()
-            .map(|buffer| {
+            .enumerate()
+            .map(|(index, buffer)| {
                 let access = match buffer.access.as_str() {
                     "read" => BufferAccess::Read,
                     "write" => BufferAccess::Write,
@@ -10025,7 +10329,10 @@ fn run_case(
                     length: buffer.length,
                     access,
                     attribute_stride: None,
-                    source: BufferSource::OwnedBytes(backing[start..end].to_vec()),
+                    source: match &view_sources[index] {
+                        CaseSource::Owned => BufferSource::OwnedBytes(backing[start..end].to_vec()),
+                        CaseSource::Lease(source) => source.clone(),
+                    },
                 })
             })
             .collect()
@@ -10186,6 +10493,45 @@ fn run_case(
     }
     let writebacks = merge_writebacks(case, reported)?;
     allocations.sort_by_key(|(id, _)| *id);
+    // The lease imports belong to this case alone: a later case may reuse a
+    // view id, and the registry refuses a duplicate import until the previous
+    // one is released. Every submission above has been waited for and its
+    // completion released, which is the point the no-copy registry's own
+    // retirement rule waits on (`research/docs/23` §90, R9i).
+    for lease_id in &case_leases.staged {
+        leases
+            .staged
+            .release_staged_lease(*lease_id)
+            .map_err(|error| format!("case {}: release staged lease: {error:?}", case.id))?;
+    }
+    for lease_id in &case_leases.borrowed {
+        leases
+            .borrowed
+            .release_borrowed_lease(*lease_id)
+            .map_err(|error| format!("case {}: release borrowed lease: {error:?}", case.id))?;
+    }
+    // The arms are reported from the declarations that were actually used, and
+    // only for a case that declares one: a capture of a pre-R9i fixture keeps
+    // the bytes it always had, while a lease case states which arm each view
+    // ran with — the observation the comparator checks instead of trusting the
+    // trace's own naming.
+    let declared_modes = case
+        .buffers
+        .iter()
+        .map(|buffer| Ok((buffer.view, buffer_storage_mode(buffer, &case.id)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let storage_modes = declared_modes
+        .iter()
+        .any(|(_, mode)| *mode != BufferSourceKind::OwnedBytes)
+        .then(|| {
+            declared_modes
+                .iter()
+                .map(|(view, mode)| StorageModeObservation {
+                    view: *view,
+                    mode: storage_mode_name(*mode),
+                })
+                .collect()
+        });
     Ok(CaseResult {
         id: case.id.clone(),
         completion: "CompletedVisible",
@@ -10200,6 +10546,7 @@ fn run_case(
         present: None,
         heap: None,
         icb: None,
+        storage_modes,
     })
 }
 

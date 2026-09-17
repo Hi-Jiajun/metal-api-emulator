@@ -4630,6 +4630,253 @@ fn a_translated_stage_reads_its_stage_buffer_and_lands_its_bytes() {
     );
 }
 
+/// R9i (E side): the present rail executes the reviewed stage-buffer pair.
+///
+/// Both rails render the same two modules into their own target, and the
+/// present rail's target bytes have to be the offscreen rail's bytes: the
+/// fragment stage's payload in the texel the positions buffer covers, the
+/// clear sentinel elsewhere. The counters are the present action's own
+/// bookkeeping, so a rail that presented the sentinel (or presented twice)
+/// cannot pass as the pair's readback.
+#[test]
+fn a_presenting_pass_reads_its_stage_buffers_and_lands_their_bytes() {
+    let Some((provider, compute, reviewed, _other)) = stage_buffer_fixture() else {
+        return;
+    };
+    let positions = stage_buffer_positions();
+    let tint = stage_buffer_tint();
+    let offscreen = stage_buffer_readback(&provider, &compute, &reviewed, &positions, &tint);
+
+    let (mut trace, resources) =
+        stage_buffer_trace(&provider, &compute, &reviewed, &positions, &tint);
+    attach_present(
+        &mut trace,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        AttachmentFormat::Rgba8Unorm,
+        PRESENT_SENTINEL,
+    );
+    let (acquires_before, presents_before) = provider.present_counts();
+    let presented = readback(
+        &submit_presenting_trace(&provider, &trace, &resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!("presented stage-buffer readback: {}", hex(&presented));
+    eprintln!("offscreen stage-buffer readback: {}", hex(&offscreen));
+    eprintln!("stage buffer payload: {}", hex(&tint));
+
+    assert_eq!(
+        presented, offscreen,
+        "the present rail lands the offscreen rail's own bytes for the same pass"
+    );
+    assert_eq!(
+        &presented[..4],
+        &[0x40, 0x80, 0xc0, 0xff],
+        "the covered texel is the fragment stage buffer's own payload"
+    );
+    assert!(
+        presented[4..]
+            .chunks_exact(4)
+            .all(|texel| texel == CLEAR_SENTINEL),
+        "the positions buffer's triangle covers exactly one texel: {}",
+        hex(&presented)
+    );
+    assert_ne!(
+        PRESENT_SENTINEL.as_slice(),
+        &presented[..4],
+        "a surviving present sentinel means the pass never rendered into the target"
+    );
+    assert_eq!(
+        provider.present_counts(),
+        (acquires_before + 1, presents_before + 1),
+        "one acquire and one present per present action"
+    );
+}
+
+/// R9i (E side): the present rail executes a **translated** stage's stage
+/// buffer.
+///
+/// This is the arm the R9 tail was about: a registration whose fragment half
+/// came out of metal2vulkan declares its `[[buffer(0)]]` slot, and the
+/// presenting pass binds it. The rail binds the set the reflection names
+/// (here the translator's default set 0) and the target lands the payload —
+/// byte for byte the offscreen rail's readback of the same pass.
+#[test]
+fn a_translated_presenting_pass_reads_its_stage_buffer_and_lands_its_bytes() {
+    let Some((provider, compute, render)) = translated_stage_buffer_fixture(0) else {
+        return;
+    };
+    let tint = stage_buffer_tint();
+    let offscreen = translated_stage_buffer_readback(&provider, &compute, &render, &tint);
+
+    let (mut trace, resources) = translated_stage_buffer_trace(&provider, &compute, &render, &tint);
+    attach_present(
+        &mut trace,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        AttachmentFormat::Rgba8Unorm,
+        PRESENT_SENTINEL,
+    );
+    let (acquires_before, presents_before) = provider.present_counts();
+    let presented = readback(
+        &submit_presenting_trace(&provider, &trace, &resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!(
+        "translated presenting stage-buffer readback: {}",
+        hex(&presented)
+    );
+    eprintln!(
+        "translated offscreen stage-buffer readback: {}",
+        hex(&offscreen)
+    );
+    eprintln!("stage buffer payload: {}", hex(&tint));
+    assert_eq!(
+        presented,
+        [0x40, 0x80, 0xc0, 0xff].repeat(4),
+        "every texel is the stage buffer's own payload: {}",
+        hex(&presented)
+    );
+    assert_eq!(
+        presented, offscreen,
+        "the present rail lands the offscreen rail's own bytes for the same pass"
+    );
+    assert_eq!(
+        provider.present_counts(),
+        (acquires_before + 1, presents_before + 1),
+        "one acquire and one present per present action"
+    );
+
+    // The mutation control: the same pass with another payload presents that
+    // payload's bytes, so the target is the buffer's content rather than a
+    // constant the module (or the format list) carries.
+    let green: Vec<u8> = [0.0_f32, 1.0, 0.0, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let (mut mutated, mutated_resources) =
+        translated_stage_buffer_trace(&provider, &compute, &render, &green);
+    attach_present(
+        &mut mutated,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        AttachmentFormat::Rgba8Unorm,
+        PRESENT_SENTINEL,
+    );
+    let mutated = readback(
+        &submit_presenting_trace(&provider, &mutated, &mutated_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!(
+        "mutated presenting stage-buffer readback: {}",
+        hex(&mutated)
+    );
+    assert_eq!(mutated, [0x00, 0xff, 0x00, 0xff].repeat(4));
+}
+
+/// R9i (E side): the present rail's refusal for a stage buffer its modules do
+/// not read keeps the offscreen rail's name and fields.
+///
+/// The milestone pair declares the two slots with modules that read no
+/// `[[buffer(n)]]` argument, so presenting that pass would drop the bindings.
+/// The refusal is the same slug and the same two fields the offscreen rail
+/// reports for the identical shape — a rail that refused with a different name
+/// (or with no field) would not be the same boundary.
+#[test]
+fn a_presenting_pass_beside_a_reviewed_stage_buffer_is_refused_by_name() {
+    let Some((provider, compute, _reviewed, other)) = stage_buffer_fixture() else {
+        return;
+    };
+    let positions = stage_buffer_positions();
+    let tint = stage_buffer_tint();
+    let (mut trace, resources) = stage_buffer_trace(&provider, &compute, &other, &positions, &tint);
+    attach_present(
+        &mut trace,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        AttachmentFormat::Rgba8Unorm,
+        PRESENT_SENTINEL,
+    );
+    let refused = match provider.capabilities().validate_trace(trace, resources) {
+        Ok(admitted) => provider
+            .submit(admitted)
+            .expect_err("the milestone pair reads no stage buffer"),
+        Err(error) => error,
+    };
+    eprintln!("stage buffers under the milestone pair beside a present refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_buffer_stage_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+    assert_eq!(
+        refused.fields.get("stage"),
+        Some(&FieldValue::Text("vertex".to_owned()))
+    );
+    assert_eq!(
+        refused.fields.get("binding"),
+        Some(&FieldValue::Unsigned(0))
+    );
+}
+
+/// R9i (E side): the reviewed stage-buffer pair needs both of its slots beside
+/// a present action too.
+///
+/// The registration declares no slot while its module reads one, so a
+/// presenting pass that binds nothing would draw from a descriptor nobody
+/// filled. The present rail refuses it with the offscreen rail's slug rather
+/// than presenting the shape.
+#[test]
+fn a_presenting_stage_buffer_pair_requires_its_two_bindings() {
+    let Some(executor) = executor() else {
+        return;
+    };
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let unbound = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "stage_buffer_positions_main".to_owned(),
+                fragment_entry: "stage_buffer_tint_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: Vec::new(),
+            },
+            vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
+            fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_present_stage_buffer_unbound"),
+        })
+        .expect("the pair registers: the contract declares no slot");
+    let function = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>)
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(
+            &function,
+            digest(b"render_e2e_present_stage_buffer_unbound_compute"),
+        )
+        .expect("the compute pipeline registers");
+    let pass = render_pass(unbound.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    let (mut trace, resources) = stage_buffer_trace_with_pass(&provider, &compute, &unbound, pass);
+    attach_present(
+        &mut trace,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        AttachmentFormat::Rgba8Unorm,
+        PRESENT_SENTINEL,
+    );
+    let refused = match provider.capabilities().validate_trace(trace, resources) {
+        Ok(admitted) => provider
+            .submit(admitted)
+            .expect_err("the reviewed pair needs its two bindings"),
+        Err(error) => error,
+    };
+    eprintln!("unbound stage-buffer pair beside a present refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_buffer_binding_required");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
 // ---------------------------------------------------------------------------
 // R9f (`research/docs/23` §3.3, v86): writable stage buffers and affine
 // footprints.

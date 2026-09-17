@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v30",
+  "guard_byte": 165,
+  "cases": [
+    {
+      "id": "staged_lease_copy_word",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 1000,
+          "view": 1010,
+          "offset": 8,
+          "length": 4,
+          "allocation_size": 32,
+          "access": "read",
+          "initial_hex": "01234567",
+          "storage_mode": "staged_lease"
+        },
+        {
+          "binding": 1,
+          "allocation": 1001,
+          "view": 1011,
+          "offset": 16,
+          "length": 4,
+          "allocation_size": 36,
+          "access": "write",
+          "initial_hex": "abababab"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 1001,
+          "view": 1011,
+          "offset": 16,
+          "bytes_hex": "01234567"
+        }
+      ],
+      "capture_rails": [
+        "vulkan",
+        "native-metal",
+        "native-metal-provider"
+      ]
+    },
+    {
+      "id": "borrowed_lease_copy_word",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 1002,
+          "view": 1012,
+          "offset": 65536,
+          "length": 4,
+          "allocation_size": 131072,
+          "access": "read",
+          "initial_hex": "89abcdef",
+          "storage_mode": "borrowed_no_copy"
+        },
+        {
+          "binding": 1,
+          "allocation": 1003,
+          "view": 1013,
+          "offset": 16,
+          "length": 4,
+          "allocation_size": 36,
+          "access": "write",
+          "initial_hex": "cdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 1003,
+          "view": 1013,
+          "offset": 16,
+          "bytes_hex": "89abcdef"
+        }
+      ],
+      "capture_rails": [
+        "vulkan",
+        "native-metal",
+        "native-metal-provider"
+      ]
+    }
+  ]
+}

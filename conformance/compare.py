@@ -48,6 +48,12 @@ ALLOCATION_OBSERVATIONS = {
     "vulkan-objects": "host-writeback-landing",
     "native-metal-provider-objects": "host-writeback-landing",
 }
+# The source arms one buffer view's bytes may come from (`research/docs/23`
+# §90, R9i). The fixture format could spell only owned bytes before this
+# increment, so the lease arms the provider rails execute had no case: the
+# declaration now names the arm beside the bytes, and every provider capture
+# owes the arm each view actually ran with.
+BUFFER_STORAGE_MODES = ("owned_bytes", "staged_lease", "borrowed_no_copy")
 
 # The reviewed per-texel rule of the wide attachment (R5a, `research/docs/23`
 # §73): texel `(x, y)` carries `x` and `y` as two little-endian `u16`s, i.e.
@@ -625,6 +631,35 @@ def _icb_observation(value, expectation, where):
              f"{where}.icb: the buffer holds fewer commands than were replayed")
 
 
+def _storage_modes_observation(value, declared, where):
+    """Check one case's reported source arms against its suite's declaration.
+
+    The report is the run's own statement of where each view's bytes came from
+    (`research/docs/23` §90, R9i): the owned arm reads the trace's own bytes,
+    the staged arm imports the owner's window into provider storage, and the
+    borrowed arm maps it without copying. A rail that fell back to owned bytes
+    — or that reported an arm the suite did not declare — is refused here, so
+    the bytes a lease case lands and the arm it claims stay one statement.
+    """
+    entries = _list(value, f"{where}.storage_modes")
+    _require(entries, f"{where}: storage_modes is empty")
+    observed = {}
+    for index, entry in enumerate(entries):
+        entry_where = f"{where}.storage_modes[{index}]"
+        _object(entry, ("view", "mode"), entry_where)
+        view = _integer(entry["view"], f"{entry_where}.view")
+        mode = entry["mode"]
+        _require(mode in BUFFER_STORAGE_MODES,
+                 f"{entry_where}: unknown buffer storage mode {mode!r}")
+        _require(view in declared,
+                 f"{entry_where}: view {view} is not a leased view of this case")
+        _require(view not in observed, f"{entry_where}: duplicate view {view}")
+        observed[view] = mode
+    _require(observed == dict(declared),
+             f"{where}: reported source arms {observed} are not the suite's "
+             f"{dict(declared)}")
+
+
 def _heap_observation(value, expectation, where):
     """Check one case's heap segment against the section its suite declares.
 
@@ -748,6 +783,12 @@ def _suite_plan(suite):
         _require(buffers, f"{where}: no buffers")
         _require(len(buffers) <= MAX_SERIAL_RESOURCES,
                  f"{where}: buffer pool exceeds {MAX_SERIAL_RESOURCES} resources")
+        # The source arm each view declares (`research/docs/23` §90, R9i). One
+        # allocation carries one arm: the lease window is the view's own range
+        # inside the owner's registration, so two views of one allocation
+        # cannot come from two different owners without a second window the
+        # format does not state.
+        view_modes, allocation_modes = {}, {}
         for buffer in buffers:
             _require(isinstance(buffer, dict), f"{where}: buffer must be an object")
             allocation = _integer(buffer.get("allocation"), f"{where}.allocation")
@@ -758,6 +799,16 @@ def _suite_plan(suite):
             size = _integer(buffer.get("allocation_size"), f"{where}.allocation_size", 1, MAX_ALLOCATION_BYTES)
             access = buffer.get("access")
             _require(access in ("read", "write", "read_write"), f"{where}: unknown buffer access")
+            mode = buffer.get("storage_mode", "owned_bytes")
+            _require(mode in BUFFER_STORAGE_MODES,
+                     f"{where}: unknown buffer storage mode {mode!r}")
+            if allocation in allocation_modes:
+                _require(allocation_modes[allocation] == mode,
+                         f"{where}: allocation {allocation} declares two source arms "
+                         f"({allocation_modes[allocation]} and {mode})")
+            else:
+                allocation_modes[allocation] = mode
+            view_modes[view] = mode
             _require(view not in views and binding not in bindings, f"{where}: duplicate view or binding")
             _require(offset + length <= size, f"{where}: buffer view outside allocation {allocation}")
             initial = _buffer_initial_bytes(buffer, where, allocation, view, length)
@@ -772,6 +823,19 @@ def _suite_plan(suite):
             allocations[allocation][offset:offset + length] = initial
             views[view] = (allocation, offset, length, access)
             bindings.add(binding)
+        lease_views = {view: mode for view, mode in view_modes.items()
+                       if mode != "owned_bytes"}
+        borrowed_allocations = frozenset(
+            allocation for allocation, mode in allocation_modes.items()
+            if mode == "borrowed_no_copy")
+        if lease_views:
+            # A lease-armed view names the window the owner registers for it,
+            # so the case states one view per allocation — the shape the
+            # provider's own lease range rule (`reservation` covers the view)
+            # and the harness's one-window-per-view import both assume.
+            _require(len(allocations) == len(buffers),
+                     f"{where}: a case that declares a lease arm declares one view "
+                     "per allocation")
         if len(allocations) != len(buffers):
             # Several buffers naming one allocation is the ranged-alias shape.
             # Overlap was refused above, so only disjoint views survive.
@@ -937,10 +1001,13 @@ def _suite_plan(suite):
                      and all(isinstance(rail, str)
                              and rail in ALLOCATION_OBSERVATIONS for rail in rails),
                      f"{where}: capture_rails has to name distinct known backends")
-        _require(((heap is None and icb is None) == (rails is None)),
-                 f"{where}: capture_rails and a heap or icb section are declared together")
+        _require(((heap is None and icb is None and not lease_views) == (rails is None)),
+                 f"{where}: capture_rails and a heap, icb or lease section are declared "
+                 "together")
         plan[case_id] = (writes, allocations, len(texture_allocations),
-                         group_expectations, heap, icb, rails)
+                         group_expectations, heap, icb, rails,
+                         view_modes if lease_views else None,
+                         borrowed_allocations if lease_views else None)
     return plan
 
 
@@ -1973,7 +2040,7 @@ def _render_plan(plan, suite):
         # A render case replays its declaring case's passes before the render
         # pass, so the declaring case has to be one submission with one
         # dispatch.
-        declaring_writes, _, _, group_expectations, _, _, _ = plan[declaring]
+        declaring_writes, _, _, group_expectations, _, _, _, _, _ = plan[declaring]
         _require(group_expectations is None,
                  f"{where}: the declaring case must be one submission")
         _require(not any(key in by_id[declaring] for key in ("programs", "dispatches",
@@ -3197,10 +3264,12 @@ def validate_capture(suite, digest, report, required_backend=None):
         base = {"id", "completion", "writebacks", "allocations"}
         counted = base | {"copy_in", "copy_out"}
         grouped = counted | {"group_counts"}
-        # The present and heap observations are the keys a suite may declare on
-        # top of an otherwise unchanged result shape: they replace no existing
-        # field and they do not relax the counter-pair rule below.
-        _require(set(result) - {"present", "heap", "icb"} in (base, counted, grouped),
+        # The present, heap, indirect and lease observations are the keys a
+        # suite may declare on top of an otherwise unchanged result shape: they
+        # replace no existing field and they do not relax the counter-pair rule
+        # below.
+        _require(set(result) - {"present", "heap", "icb", "storage_modes"}
+                 in (base, counted, grouped),
                  "capture result: expected fields "
                  + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
                  " plus the per-command-buffer group_counts")
@@ -3293,7 +3362,7 @@ def validate_capture(suite, digest, report, required_backend=None):
                 _icb_observation(result["icb"], expectation.icb, where)
         else:
             (expected_writes, expected_allocations, texture_count, group_expectations,
-             heap, icb, case_rails) = plan[case_id]
+             heap, icb, case_rails, declared_modes, borrowed_allocations) = plan[case_id]
             # A marked compute case (heap or indirect) is owed only by the
             # rails its marker names: a rail that is not named must not report
             # it at all, which this refuses before the per-observation checks
@@ -3304,6 +3373,26 @@ def validate_capture(suite, digest, report, required_backend=None):
             _compare_observation(result, expected_writes, expected_allocations, where)
             _require("present" not in result,
                      f"{where}: the suite declares no present observation for this case")
+            # The lease face (`research/docs/23` §90, R9i): a case whose suite
+            # declares a source arm other than owned bytes owes the arm each
+            # view ran with, and the borrowed arm's bytes are imported rather
+            # than copied in — so the provider's own copy-in count drops by one
+            # per borrowed allocation. The Swift reference oracle is not a
+            # provider: it places the same bytes in its own buffer and reports
+            # neither the arms nor the counters.
+            if declared_modes is None:
+                _require("storage_modes" not in result,
+                         f"{where}: the suite declares no lease arm for this case")
+            else:
+                if provider_backend:
+                    _require("storage_modes" in result,
+                             f"{where}: a case whose suite declares a lease arm has to "
+                             "report the source arm each view ran with")
+                    _storage_modes_observation(result["storage_modes"], declared_modes, where)
+                else:
+                    _require("storage_modes" not in result,
+                             f"{where}: {report['backend']} is not a provider, so it cannot "
+                             "report a source arm it did not execute")
             if heap is None:
                 _require("heap" not in result,
                          f"{where}: the suite declares no heap section for this case")
@@ -3380,7 +3469,13 @@ def validate_capture(suite, digest, report, required_backend=None):
         # A case with a single submission submits its whole sequence once, so
         # the derived expectation is the case-level one (research/docs/15 §5).
         if provider_backend and group_expectations is None and counts[0] is not None:
-            expected_in = len(expected_allocations) + texture_count
+            # A borrowed view's bytes are the owner's mapping, imported rather
+            # than copied in (`research/docs/23` §90, R9i), so its allocation
+            # is the one touched allocation the provider's copy-in count does
+            # not carry. The bytes still land byte for byte; only the arm they
+            # arrived through changes the counter.
+            expected_in = (len(expected_allocations) + texture_count
+                           - len(borrowed_allocations or ()))
             expected_out = len({identity[0] for identity, _ in expected_writes})
             _require(counts[0] == expected_in,
                      f"{where}: copy_in {counts[0]} does not match {expected_in} "

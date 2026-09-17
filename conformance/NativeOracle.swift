@@ -77,6 +77,16 @@ private struct BufferDefinition: Decodable {
     /// so spelling its fill out would put 32 MiB of hex in the fixture. The
     /// pattern's length has to divide the view length.
     let initial_repeat_hex: String?
+    /// The source arm the *provider* rails have to source these bytes through
+    /// (`research/docs/23` §85, R9i): `owned_bytes` (the default),
+    /// `staged_lease` or `borrowed_no_copy`. The bytes stay in
+    /// `initial_hex`/`initial_repeat_hex` for every arm — they are the owner's
+    /// own window — and this oracle is not a provider: it places those same
+    /// bytes in its own Metal buffer, which is what keeps it the reference the
+    /// four provider rails are compared against. The field is validated here
+    /// so a malformed suite is refused by every review surface, and read by no
+    /// execution path of this rail.
+    let storage_mode: String?
 
     /// The bytes this declaration pre-seeds its view with.
     func initialBytes(context: String) throws -> Data {
@@ -1960,6 +1970,15 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8,
         try require(buffer.allocation > 0 && buffer.view > 0, "\(context): zero resource identity")
         try require(buffer.access == "read" || buffer.access == "write" || buffer.access == "read_write",
                     "\(context): unsupported access")
+        // The source arm is the provider rails' own vocabulary
+        // (`research/docs/23` §85, R9i). This oracle executes the same bytes
+        // through its own buffer, so it validates the declaration instead of
+        // acting on it — a suite that spells an arm no rail publishes is still
+        // refused here rather than compared as if it were owned bytes.
+        if let mode = buffer.storage_mode {
+            try require(["owned_bytes", "staged_lease", "borrowed_no_copy"].contains(mode),
+                        "\(context): unsupported storage mode \(mode)")
+        }
         try require(buffer.length > 0 && buffer.allocation_size <= maximumAllocationBytes,
                     "\(context): allocation must be nonempty and at most "
                     + "\(maximumAllocationBytes) bytes")
@@ -2108,8 +2127,15 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
                        "render_declaring_attachment_2048x2048"]
     case "compute-buffer-v29":
         expectedIDs = ["sampled_cell_ascending_content", "sampled_cell_descending_content"]
+    // The lease face (`research/docs/23` §90, R9i): the fixture names the
+    // source arm the provider rails have to source these bytes through, and
+    // this oracle — not a provider — places the same owner bytes in its own
+    // Metal buffer, so the case's byte expectation stays the one every rail
+    // is compared against.
+    case "compute-buffer-v30":
+        expectedIDs = ["staged_lease_copy_word", "borrowed_lease_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v29 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v30 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

@@ -411,6 +411,62 @@ fn vertex_stage_uses_stage_buffers(vertex_entry: &str, vertex_spirv: &[u8]) -> b
         && vertex_spirv == STAGE_BUFFER_POSITIONS_VERT_SPV
 }
 
+/// The stage buffers one request's own modules read, judged once for both rails
+/// that execute them (`research/docs/23` §3.3, v83/v84; R9i).
+///
+/// The reviewed vertex stage reads set 1 binding 0 and the reviewed fragment
+/// stage reads set 2 binding 0, so a pass that names the pair without those
+/// slots would draw from descriptors nobody bound. A translated stage is the
+/// other arm: every stream it owns was resolved to the slot its own reflection
+/// names ([`stage_buffer_slot`]), and the registration gate paired that
+/// reflection with the contract field by field
+/// ([`validate_translated_stage_buffers`]) — so those streams are executable,
+/// while a stream whose slot belongs to a reviewed module under a pipeline that
+/// does not read it would be a binding silently dropped, which is refused by
+/// name. The core pair rules (`StageBufferBinding` ↔ `StageBufferView`) already
+/// saw the declared set, so what is left here is the *modules'* own slots.
+///
+/// Both execution rails ask this one question — the offscreen rail before it
+/// records a draw, the present rail before it opens the provider-owned target
+/// (R9i) — so one shape cannot be executable on one rail and refused on the
+/// other.
+fn admit_stage_buffer_slots(request: &OffscreenRenderRequest<'_>) -> Result<(), ProviderError> {
+    if vertex_stage_uses_stage_buffers(&request.vertex.entry, request.vertex.spirv) {
+        let bound = |stage: RenderPipelineStage, index: u32| {
+            request
+                .stage_buffers
+                .iter()
+                .any(|stream| stream.stage == stage && stream.index == index)
+        };
+        if !bound(RenderPipelineStage::Vertex, STAGE_BUFFER_VERTEX_BINDING)
+            || !bound(RenderPipelineStage::Fragment, STAGE_BUFFER_FRAGMENT_BINDING)
+        {
+            return Err(
+                capability_refusal("render_stage_buffer_binding_required").with_detail(
+                    "the reviewed stage-buffer pair reads the pass's own vertex and fragment \
+                     bindings; this pass does not bind both",
+                ),
+            );
+        }
+        return Ok(());
+    }
+    if let Some(stream) = request
+        .stage_buffers
+        .iter()
+        .find(|stream| stream.slot.is_reviewed())
+    {
+        return Err(capability_refusal("render_stage_buffer_stage_unsupported")
+            .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
+            .with_field("binding", FieldValue::Unsigned(u64::from(stream.index)))
+            .with_detail(
+                "the pass binds a stage buffer under a stage that is one of this rail's \
+                 reviewed modules and reads no `[[buffer(n)]]` argument; only a translated \
+                 stage carries the slots its reflection names",
+            ));
+    }
+    Ok(())
+}
+
 /// The depth fixture's reviewed fragment stage, when the request's vertex stage
 /// is the reviewed depth module.
 ///
@@ -4699,51 +4755,11 @@ fn execute_offscreen_render_with_retains(
             ),
         );
     }
-    // The stage buffers and the pass's bindings are one decision the same way
-    // (`research/docs/23` §3.3, v83/v84). The reviewed vertex stage reads set 1
-    // binding 0 and the reviewed fragment stage reads set 2 binding 0, so a
-    // pass that names the pair without those slots would draw from
-    // descriptors nobody bound. A translated stage is the other arm: every
-    // stream it owns was resolved to the slot its own reflection names
-    // (`stage_buffer_slot`), and the registration gate paired that reflection
-    // with the contract field by field
-    // (`validate_translated_stage_buffers`) — so those streams are executable,
-    // while a stream whose slot belongs to a reviewed module under a pipeline
-    // that does not read it would be a binding silently dropped, which is
-    // refused by name. The core pair rules (`StageBufferBinding` ↔
-    // `StageBufferView`) already saw the declared set, so what is left here is
-    // the *modules'* own slots.
-    if vertex_stage_uses_stage_buffers(&request.vertex.entry, request.vertex.spirv) {
-        let bound = |stage: RenderPipelineStage, index: u32| {
-            request
-                .stage_buffers
-                .iter()
-                .any(|stream| stream.stage == stage && stream.index == index)
-        };
-        if !bound(RenderPipelineStage::Vertex, STAGE_BUFFER_VERTEX_BINDING)
-            || !bound(RenderPipelineStage::Fragment, STAGE_BUFFER_FRAGMENT_BINDING)
-        {
-            return Err(
-                capability_refusal("render_stage_buffer_binding_required").with_detail(
-                    "the reviewed stage-buffer pair reads the pass's own vertex and fragment \
-                 bindings; this pass does not bind both",
-                ),
-            );
-        }
-    } else if let Some(stream) = request
-        .stage_buffers
-        .iter()
-        .find(|stream| stream.slot.is_reviewed())
-    {
-        return Err(capability_refusal("render_stage_buffer_stage_unsupported")
-            .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
-            .with_field("binding", FieldValue::Unsigned(u64::from(stream.index)))
-            .with_detail(
-                "the pass binds a stage buffer under a stage that is one of this rail's \
-                     reviewed modules and reads no `[[buffer(n)]]` argument; only a translated \
-                     stage carries the slots its reflection names",
-            ));
-    }
+    // The stage buffers and the pass's bindings are one decision
+    // (`research/docs/23` §3.3, v83/v84); the present rail asks the same
+    // question before it opens its target (R9i), so the judgement lives in one
+    // place.
+    admit_stage_buffer_slots(request)?;
     let tiling = vk::ImageTiling::OPTIMAL;
     let vk_formats = formats
         .iter()
@@ -5961,7 +5977,19 @@ pub(crate) fn execute_present_render<'a>(
     // same pair the offscreen rail binds (`research/docs/23` §3.3, R2/V70).
     let (fragment_spirv, fragment_entry_name): (&[u8], &str) = match &request.translated_fragment {
         Some(fragment) => (fragment.spirv, fragment.entry.as_str()),
-        None => solid_fragment_stage(&[attachment.format])?,
+        // The reviewed stage-buffer pair (`research/docs/23` §3.3, v83) is the
+        // same pair the offscreen rail selects, one arm earlier than the format
+        // list's solid module: its fragment stage reads the set 2 binding the
+        // pass declares, so presenting that shape lands the tint the module
+        // read rather than a colour the format list chose (R9i).
+        None => match stage_buffer_fragment_stage(
+            &request.vertex.entry,
+            request.vertex.spirv,
+            &[attachment.format],
+        )? {
+            Some(pair) => pair,
+            None => solid_fragment_stage(&[attachment.format])?,
+        },
     };
     // The reviewed sampling pair (`research/docs/23` §3.3, v70) is the
     // offscreen rail's own fragment selection; the present rail binds the
@@ -5994,20 +6022,14 @@ pub(crate) fn execute_present_render<'a>(
             ),
         );
     }
-    // The stage-buffer face (`research/docs/23` §3.3, v83) is the offscreen
-    // rail's: the present rail binds the format's solid module, which reads no
-    // buffer, so a presenting pass that binds a stage buffer is refused by
-    // name instead of presented with the binding silently dropped. The
-    // reviewed census shape is the resident offscreen chain, so this refusal
-    // is the boundary the increment records rather than a gap in its fixture.
-    if !request.stage_buffers.is_empty() {
-        return Err(
-            capability_refusal("render_stage_buffer_stage_unsupported").with_detail(
-                "the present rail binds the format's solid module; the reviewed stage-buffer \
-                 pair is executed by the offscreen rail",
-            ),
-        );
-    }
+    // The stage-buffer face (`research/docs/23` §3.3, v83) is executed here by
+    // the same modules the offscreen rail binds: the reviewed pair's two fixed
+    // slots, or the slots a translated stage's reflection names. The two rails
+    // therefore ask one question before either opens a target, and a shape they
+    // cannot carry — a reviewed module under a stage buffer it never reads — is
+    // still refused by name instead of presented with the binding silently
+    // dropped (R9i).
+    admit_stage_buffer_slots(&request)?;
     let vk_format = attachment_vk_format(attachment.format)?;
     // The multisample raster (`research/docs/23` §3.3, v51/v61) is executed
     // at the pass's own sample count. A present pass's n-sample surface is a
@@ -6072,6 +6094,11 @@ pub(crate) fn execute_present_render<'a>(
     objects.attach_present_target(target, *layout, samples, vk_format, width, height)?;
     objects.create_render_pass(&[vk_format], None, None, None, None)?;
     objects.create_framebuffer(width, height)?;
+    // The stage buffers are created before the pipeline for the offscreen
+    // rail's reason (`research/docs/23` §3.3, v83): the pipeline layout has to
+    // name the sets the modules read, and `record` binds each set at the number
+    // the module's own reflection named (R9i).
+    objects.create_stage_buffers(&request.stage_buffers)?;
     objects.create_pipeline(
         &vertex_words,
         &fragment_words,
