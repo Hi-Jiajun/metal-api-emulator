@@ -37,7 +37,8 @@ use metal_api_core::provider::{
     MultisampleState, MultisampleStencilResolve, ProviderError, ProviderErrorClass, ProviderPhase,
     RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
     SampleCount, StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
-    StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
+    StoreOp, TextureFormat, TextureSource, TextureType, VertexBufferLayout, VertexFormat,
+    VertexStep, Winding, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -244,6 +245,63 @@ const DEPTH_TINT_FRAGMENT_ENTRY: &str = "depth_pair_tint_main";
 const DEPTH_ONLY_FRAG_SPV: &[u8] = include_bytes!("render_spv/depth_only.frag.spv");
 /// Entry point [`DEPTH_ONLY_FRAG_SPV`] declares.
 const DEPTH_ONLY_FRAGMENT_ENTRY: &str = "depth_only_fragment_main";
+
+/// The reviewed vertex stage of the render-sampler fixture
+/// (`research/docs/23` §3.3, v70).
+///
+/// The milestone triangle's sibling: the same full-screen geometry with the
+/// same Metal-NDC y flip, plus one `float32x2` varying at `Location 0` holding
+/// the geometry's own normalised coordinate. Across a covering raster that
+/// varying lands on `(column + 0.5) / width` and `(row + 0.5) / height` per
+/// fragment — the texel centres of an attachment-sized texture — which is what
+/// makes the sampling expectation independent of the driver's boundary rules.
+const SAMPLED_QUAD_VERT_SPV: &[u8] = include_bytes!("render_spv/sampled_quad.vert.spv");
+/// Entry point [`SAMPLED_QUAD_VERT_SPV`] declares.
+const SAMPLED_QUAD_VERTEX_ENTRY: &str = "vertex_main";
+
+/// The reviewed fragment stage of the render-sampler fixture
+/// (`research/docs/23` §3.3, v70).
+///
+/// The solid 8-bit module's sibling: the same single `Location 0` store of a
+/// `vec4`, with the sample of the pass's `DescriptorSet 0 / Binding 0` combined
+/// image sampler as its value. The provider synthesises the nearest/clamp
+/// sampler the compute rail already uses, so a fragment standing on a texel
+/// centre reads that texel's own bytes back.
+const SAMPLED_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_sampled.frag.spv");
+
+/// The sampled pass's single texture binding: the fragment stage's
+/// `DescriptorSet 0 / Binding 0`.
+const SAMPLED_TEXTURE_BINDING: u32 = 0;
+
+/// The fragment stage this rail owns for the reviewed sampling pair
+/// (`research/docs/23` §3.3, v70).
+///
+/// `None` means the request's vertex stage is not the reviewed sampling module,
+/// so the fragment half stays the format list's solid module. The pair is
+/// reviewed for the single 8-bit UNORM attachment the fixture draws into; any
+/// other format list is refused rather than rendered with a store the review
+/// never covered — the same rule [`instanced_fragment_stage`] states.
+fn sampled_fragment_stage(
+    vertex_entry: &str,
+    vertex_spirv: &[u8],
+    formats: &[AttachmentFormat],
+) -> Result<Option<(&'static [u8], &'static str)>, ProviderError> {
+    if vertex_entry != SAMPLED_QUAD_VERTEX_ENTRY || vertex_spirv != SAMPLED_QUAD_VERT_SPV {
+        return Ok(None);
+    }
+    match formats {
+        [AttachmentFormat::Rgba8Unorm] => Ok(Some((SAMPLED_UNORM8_FRAG_SPV, SOLID_FRAGMENT_ENTRY))),
+        _ => Err(capability_refusal("render_texture_format_unsupported")
+            .with_field("attachments", FieldValue::Unsigned(formats.len() as u64))
+            .with_detail("the reviewed sampling module draws into one Rgba8Unorm attachment")),
+    }
+}
+
+/// Whether a request's vertex stage is the reviewed sampling module, and so
+/// requires the pass to bind the texture the module samples.
+fn vertex_stage_is_sampled(vertex_entry: &str, vertex_spirv: &[u8]) -> bool {
+    vertex_entry == SAMPLED_QUAD_VERTEX_ENTRY && vertex_spirv == SAMPLED_QUAD_VERT_SPV
+}
 
 /// The depth fixture's reviewed fragment stage, when the request's vertex stage
 /// is the reviewed depth module.
@@ -501,6 +559,28 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// `DrawIndexed` carries its index and instance counts and replays through
     /// the rail's own `[0, 1, 2]` index buffer.
     pub indirect: Option<IndirectReplay>,
+    /// The sampled textures the fragment stage reads, in binding order
+    /// (`research/docs/23` §3.3, v70). Empty for every pre-v70 pass, which is
+    /// the shape the pipeline layout and the descriptor bind below branch on.
+    pub textures: Vec<OffscreenRenderTexture<'a>>,
+}
+
+/// One sampled texture a render pass binds: the trace's own texel bytes plus
+/// the shape the rail executes them with (`research/docs/23` §3.3, v70).
+///
+/// The entry's position in [`OffscreenRenderRequest::textures`] is the binding
+/// index — the contract already held the view's own label to it — and the rail
+/// uploads these bytes into an image of its own, exactly as the compute rail
+/// uploads a pass's texture bindings. The first increment executes one
+/// `rgba8_unorm` 2D surface whose extent matches the render area, so every
+/// fragment stands on a texel centre and the nearest sample is an identity
+/// copy rather than a filtered or boundary-dependent read.
+pub(crate) struct OffscreenRenderTexture<'a> {
+    /// The texture's tightly packed, row-major texel bytes.
+    pub bytes: &'a [u8],
+    /// Extent in texels, which the pass requires to equal the render area
+    /// (`prepare_render_request` refuses the pass otherwise).
+    pub extent: [u32; 2],
 }
 
 /// The depth attachment one offscreen pass opens (`research/docs/23` §3.3,
@@ -838,6 +918,7 @@ fn reviewed_vertex_module(entry: &str, module: &[u8]) -> bool {
         (SINGLE_PIXEL_VERTEX_ENTRY, SINGLE_PIXEL_VERT_SPV),
         (INSTANCED_VERTEX_ENTRY, INSTANCED_VERTEX_SPV),
         (DEPTH_VERTEX_ENTRY, DEPTH_VERTEX_SPV),
+        (SAMPLED_QUAD_VERTEX_ENTRY, SAMPLED_QUAD_VERT_SPV),
     ]
     .into_iter()
     .any(|(reviewed_entry, reviewed_module)| entry == reviewed_entry && module == reviewed_module)
@@ -867,8 +948,16 @@ fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
             &stages.contract.color_formats,
         ) {
             Ok(Some(pair)) => pair,
-            Ok(None) => match solid_fragment_stage(&stages.contract.color_formats) {
-                Ok(stage) => stage,
+            Ok(None) => match sampled_fragment_stage(
+                &stages.contract.vertex_entry,
+                &stages.vertex_spirv,
+                &stages.contract.color_formats,
+            ) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => match solid_fragment_stage(&stages.contract.color_formats) {
+                    Ok(stage) => stage,
+                    Err(_) => return false,
+                },
                 Err(_) => return false,
             },
             Err(_) => return false,
@@ -1893,6 +1982,12 @@ fn prepare_render_request<'a>(
     // Vertex input (`research/docs/23` §3.3): every bound stream declares its
     // own bytes, so the rail proves the footprint the draw reads and refuses
     // anything the reviewed shape does not cover.
+    // The render sampler (`research/docs/23` §3.3, v70) is the same kind of
+    // question one dimension up: the reviewed fragment stage samples exactly
+    // one `rgba8_unorm` surface whose extent matches the render area, so a
+    // fragment standing on a texel centre reads that texel's own bytes rather
+    // than a filtered or boundary-rule-dependent neighbour.
+    let textures = resolve_render_textures(pass, extent)?;
     let streams = resolve_vertex_streams(stages, pass)?;
     // A per-instance stream's record count is the draw's instance count, so its
     // footprint is proved against that count instead of the vertex span
@@ -2041,6 +2136,10 @@ fn prepare_render_request<'a>(
         attachments,
         depth,
         stencil,
+        // The sampled textures travel with the request exactly as the trace
+        // stated them (`research/docs/23` §3.3, v70); the extent and format
+        // refusals above already ran.
+        textures,
         // The pass-wide raster decision travels with the request exactly as
         // the trace stated it (`research/docs/23` §3.3, v51); the load-op and
         // surface refusals above already ran.
@@ -2078,6 +2177,94 @@ fn prepare_render_request<'a>(
         indirect: None,
     };
     Ok(request)
+}
+
+/// Resolve one pass's sampled textures into the rail's own request shape
+/// (`research/docs/23` §3.3, v70).
+///
+/// The contract already holds the binding label, the read-only access and the
+/// single-sample requirement (`RenderPassDescriptor::validate`); this is the
+/// rail's own window, restated for a directly-constructed pass and narrowed to
+/// what the reviewed sampling module covers: one `rgba8_unorm` 2D surface,
+/// trace-owned bytes, whose extent equals the render area. The extent rule is
+/// what keeps the fixture's expectation driver-independent — a texture of
+/// another size puts some fragment's `(column + 0.5) / width` sample either on
+/// a texel boundary or inside a neighbour, which is a filtered read the review
+/// never covered, so the pass is refused by name instead of sampled.
+fn resolve_render_textures<'a>(
+    pass: &'a RenderPassDescriptor,
+    extent: [u32; 2],
+) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
+    if pass.textures.len() > MAX_RENDER_TEXTURES {
+        return Err(capability_refusal("render_texture_limit")
+            .with_field(
+                "requested",
+                FieldValue::Unsigned(pass.textures.len() as u64),
+            )
+            .with_field("maximum", FieldValue::Unsigned(MAX_RENDER_TEXTURES as u64)));
+    }
+    let mut textures = Vec::with_capacity(pass.textures.len());
+    for (index, view) in pass.textures.iter().enumerate() {
+        if view.format != TextureFormat::Rgba8Unorm {
+            return Err(capability_refusal("render_texture_format_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
+                .with_detail("the reviewed sampling module reads one rgba8_unorm surface"));
+        }
+        if view.texture_type != TextureType::D2
+            || view.sample_count != 1
+            || view.depth != 1
+            || view.array_length != 1
+        {
+            return Err(capability_refusal("render_texture_shape_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field(
+                    "texture_type",
+                    FieldValue::Text(format!("{:?}", view.texture_type)),
+                )
+                .with_field("sample_count", FieldValue::Unsigned(view.sample_count))
+                .with_field("depth", FieldValue::Unsigned(view.depth))
+                .with_field("array_length", FieldValue::Unsigned(view.array_length))
+                .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
+        }
+        let TextureSource::OwnedBytes(bytes) = &view.source else {
+            return Err(capability_refusal("render_texture_source_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_detail("the first render-sampler increment uploads trace-owned bytes only"));
+        };
+        let width = narrow_dimension(view.width)?;
+        let height = narrow_dimension(view.height)?;
+        if width == 0 || height == 0 {
+            return Err(contract_refusal("render texture has a zero dimension"));
+        }
+        if [width, height] != extent {
+            return Err(capability_refusal("render_texture_extent_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("width", FieldValue::Unsigned(u64::from(width)))
+                .with_field("height", FieldValue::Unsigned(u64::from(height)))
+                .with_field("render_width", FieldValue::Unsigned(u64::from(extent[0])))
+                .with_field("render_height", FieldValue::Unsigned(u64::from(extent[1])))
+                .with_detail(
+                    "the reviewed sampling shape samples a texture of the render area's own \
+                     extent, so every fragment stands on a texel centre",
+                ));
+        }
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
+            .ok_or_else(|| contract_refusal("render texture bytes overflow u64"))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
+            return Err(contract_refusal(&format!(
+                "render texture {index} carries {} bytes for a {width}x{height} surface",
+                bytes.len()
+            )));
+        }
+        textures.push(OffscreenRenderTexture {
+            bytes,
+            extent: [width, height],
+        });
+    }
+    Ok(textures)
 }
 
 /// Pair the pipeline's layout with the pass's bound streams.
@@ -2642,7 +2829,22 @@ pub(crate) fn execute_offscreen_render(
     // fragment module that stores the varying they forward, and every other
     // vertex stage keeps the format list's solid module.
     let (fragment_spirv, fragment_entry_name) = match &request.translated_fragment {
-        Some(fragment) => (fragment.spirv, fragment.entry.as_str()),
+        Some(fragment) => {
+            // A translated fragment stage describes the interface the
+            // translation produced, and the reviewed sampling module's
+            // descriptor binding is not part of that description yet: the two
+            // shapes are refused together instead of binding a descriptor the
+            // reflection never mentioned (`research/docs/23` §3.3, v70).
+            if !request.textures.is_empty() {
+                return Err(
+                    capability_refusal("render_texture_stage_unsupported").with_detail(
+                        "render texture sampling is executed by the reviewed sampling pair; a \
+                         translated fragment stage carries no image binding",
+                    ),
+                );
+            }
+            (fragment.spirv, fragment.entry.as_str())
+        }
         None => {
             match depth_fragment_stage(&request.vertex.entry, request.vertex.spirv, &formats)? {
                 Some(pair) => pair,
@@ -2652,11 +2854,43 @@ pub(crate) fn execute_offscreen_render(
                     &formats,
                 )? {
                     Some(pair) => pair,
-                    None => solid_fragment_stage(&formats)?,
+                    None => {
+                        match sampled_fragment_stage(
+                            &request.vertex.entry,
+                            request.vertex.spirv,
+                            &formats,
+                        )? {
+                            Some(pair) => pair,
+                            None => solid_fragment_stage(&formats)?,
+                        }
+                    }
                 },
             }
         }
     };
+    // The reviewed sampling pair and the pass's texture bindings are one
+    // decision (`research/docs/23` §3.3, v70): the module samples the pass's
+    // `DescriptorSet 0 / Binding 0`, so a pass that names the module without a
+    // texture would sample an unbound descriptor, and a pass that binds a
+    // texture with another fragment stage would ignore it. Both are refused by
+    // name instead of executed as the other shape.
+    if vertex_stage_is_sampled(&request.vertex.entry, request.vertex.spirv) {
+        if request.textures.is_empty() {
+            return Err(
+                capability_refusal("render_texture_binding_required").with_detail(
+                    "the reviewed sampling pair samples the pass's own texture binding; this \
+                     pass binds none",
+                ),
+            );
+        }
+    } else if !request.textures.is_empty() {
+        return Err(
+            capability_refusal("render_texture_stage_unsupported").with_detail(
+                "the pass binds a render texture but its fragment stage is not the reviewed \
+                 sampling module",
+            ),
+        );
+    }
     let tiling = vk::ImageTiling::OPTIMAL;
     let vk_formats = formats
         .iter()
@@ -3097,6 +3331,10 @@ pub(crate) fn execute_offscreen_render(
         request.stencil_resolve.map(|resolve| resolve.filter),
     )?;
     objects.create_framebuffer(width, height)?;
+    // The sampled textures are created before the pipeline, because the
+    // sampled pipeline's layout is built from the descriptor set layout they
+    // install (`research/docs/23` §3.3, v70).
+    objects.create_render_textures(&request.textures)?;
     objects.create_pipeline(
         &vertex_words,
         &fragment_words,
@@ -3813,6 +4051,19 @@ struct OffscreenObjects<'a> {
     pipeline: vk::Pipeline,
     /// One readback per attachment, in location order.
     readbacks: Vec<ReadbackObjects>,
+    /// The sampled textures the pass reads, in binding order
+    /// (`research/docs/23` §3.3, v70). Empty for every pre-v70 pass, which is
+    /// the shape the pipeline layout and the descriptor bind branch on.
+    textures: Vec<SampledTextureObjects>,
+    /// The descriptor set layout the sampled pipeline is built from, or null
+    /// for a pass that samples nothing.
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    /// The pool the descriptor set was allocated from, or null for a pass that
+    /// samples nothing.
+    descriptor_pool: vk::DescriptorPool,
+    /// The set `record` binds before the draw, or null for a pass that samples
+    /// nothing.
+    descriptor_set: vk::DescriptorSet,
     /// The host-visible `INDIRECT_BUFFER` an indirect draw replays from. Null
     /// for a direct draw.
     indirect_buffer: vk::Buffer,
@@ -3842,6 +4093,21 @@ struct OffscreenObjects<'a> {
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+}
+
+/// The Vulkan objects one sampled render texture owns
+/// (`research/docs/23` §3.3, v70).
+///
+/// The compute rail's sampled texture, scoped to the pass instead of to a
+/// dispatch: a host-visible `LINEAR` `R8G8B8A8_UNORM` image, its view and the
+/// provider-synthesised nearest/clamp sampler the descriptor binds. The bytes
+/// are written once, when the pass's objects are created, and the `record`
+/// step's barrier is what makes them visible to the fragment stage.
+struct SampledTextureObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
 }
 
 /// The Vulkan objects the rail-owned depth attachment owns
@@ -4040,6 +4306,10 @@ impl<'a> OffscreenObjects<'a> {
             fragment_module: vk::ShaderModule::null(),
             pipeline: vk::Pipeline::null(),
             readbacks: Vec::new(),
+            textures: Vec::new(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_set: vk::DescriptorSet::null(),
             indirect_buffer: vk::Buffer::null(),
             indirect_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
@@ -5298,10 +5568,231 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// Upload one pass's sampled textures and build the descriptor the fragment
+    /// stage reads them through (`research/docs/23` §3.3, v70).
+    ///
+    /// The rail mirrors the compute track's texture handling: a host-visible
+    /// `LINEAR` image per binding, written through the driver's own
+    /// `VkSubresourceLayout.row_pitch` (a linear image's rows are only *at
+    /// least* the tightly packed width apart), and a provider-synthesised
+    /// nearest/clamp sampler. The image stays in `PREINITIALIZED` until
+    /// [`Self::record`] transitions it, which is where the host writes become
+    /// visible to the fragment stage — the same two-step shape the compute
+    /// rail's own upload uses.
+    fn create_render_textures(
+        &mut self,
+        textures: &[OffscreenRenderTexture<'_>],
+    ) -> Result<(), ProviderError> {
+        if textures.is_empty() {
+            return Ok(());
+        }
+        let format = vk::Format::R8G8B8A8_UNORM;
+        for texture in textures {
+            let [width, height] = texture.extent;
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            let (image, memory, requirements) = crate::allocate_image_backing(
+                self.context,
+                &info,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                "render texture",
+            )
+            .map_err(|error| execution_refusal("create render texture image", &error.detail))?;
+            let mapped = unsafe {
+                self.context.device.map_memory(
+                    memory,
+                    0,
+                    requirements.size,
+                    vk::MemoryMapFlags::empty(),
+                )
+            }
+            .map_err(|error| {
+                unsafe {
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                execution_refusal("map render texture memory", &error.to_string())
+            })?;
+            // The owned bytes are tightly packed `width * 4` byte rows; the
+            // driver's `row_pitch` is where each row actually starts. Writing
+            // row `r` at `r * width * 4` would land every row after the first
+            // in bytes the driver never reads, the same trap the compute
+            // rail's upload documents.
+            let tight_row_bytes = usize::try_from(width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| contract_refusal("render texture row pitch overflows usize"))?;
+            let (base_offset, row_pitch) = if height == 1 {
+                (0, tight_row_bytes)
+            } else {
+                let layout = unsafe {
+                    self.context.device.get_image_subresource_layout(
+                        image,
+                        vk::ImageSubresource {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            array_layer: 0,
+                        },
+                    )
+                };
+                (
+                    usize::try_from(layout.offset)
+                        .map_err(|_| contract_refusal("render texture row offset overflows"))?,
+                    usize::try_from(layout.row_pitch)
+                        .map_err(|_| contract_refusal("render texture row pitch overflows"))?,
+                )
+            };
+            for (row, chunk) in texture.bytes.chunks(tight_row_bytes).enumerate() {
+                let destination = base_offset + row * row_pitch;
+                if destination + chunk.len() > usize::try_from(requirements.size).unwrap_or(0) {
+                    unsafe {
+                        self.context.device.unmap_memory(memory);
+                        self.context.device.destroy_image(image, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(contract_refusal(
+                        "render texture rows reach past the image's own allocation",
+                    ));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.as_ptr(),
+                        (mapped.cast::<u8>()).add(destination),
+                        chunk.len(),
+                    );
+                }
+            }
+            unsafe { self.context.device.unmap_memory(memory) };
+            let view =
+                crate::create_color_image_view(self.context, image, format, "render texture")
+                    .map_err(|error| {
+                        unsafe {
+                            self.context.device.destroy_image(image, None);
+                            self.context.device.free_memory(memory, None);
+                        }
+                        execution_refusal("create render texture view", &error.detail)
+                    })?;
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            let sampler = unsafe { self.context.device.create_sampler(&sampler_info, None) }
+                .map_err(|error| {
+                    unsafe {
+                        self.context.device.destroy_image_view(view, None);
+                        self.context.device.destroy_image(image, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    execution_refusal("create render texture sampler", &error.to_string())
+                })?;
+            self.context.record_buffer_upload();
+            self.context.record_buffer_upload_bytes(texture.bytes.len());
+            self.textures.push(SampledTextureObjects {
+                image,
+                memory,
+                view,
+                sampler,
+            });
+        }
+        // The descriptor set layout is the sampled pipeline's own: one
+        // fragment-stage combined image sampler per binding, in binding order
+        // (`research/docs/23` §3.3, v70).
+        let bindings = self
+            .textures
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(u32::try_from(index).unwrap_or(SAMPLED_TEXTURE_BINDING))
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            })
+            .collect::<Vec<_>>();
+        self.descriptor_set_layout = unsafe {
+            self.context.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .map_err(|error| execution_refusal("create descriptor set layout", &error.to_string()))?;
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(bindings.len() as u32)];
+        self.descriptor_pool = unsafe {
+            self.context.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .map_err(|error| execution_refusal("create descriptor pool", &error.to_string()))?;
+        let layouts = [self.descriptor_set_layout];
+        let sets = unsafe {
+            self.context.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(|error| execution_refusal("allocate descriptor set", &error.to_string()))?;
+        self.descriptor_set = sets.into_iter().next().ok_or_else(|| {
+            execution_refusal("allocate descriptor set", "driver returned no set")
+        })?;
+        let image_infos = self
+            .textures
+            .iter()
+            .map(|texture| {
+                vk::DescriptorImageInfo::default()
+                    .sampler(texture.sampler)
+                    .image_view(texture.view)
+                    // The upload lands the image in `GENERAL` before the draw
+                    // (`Self::record`), the same layout the compute rail binds
+                    // its sampled textures in.
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect::<Vec<_>>();
+        let writes = image_infos
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(u32::try_from(index).unwrap_or(SAMPLED_TEXTURE_BINDING))
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .image_info(std::slice::from_ref(info))
+            })
+            .collect::<Vec<_>>();
+        unsafe {
+            self.context.device.update_descriptor_sets(&writes, &[]);
+        }
+        Ok(())
+    }
+
     /// The graphics pipeline of the milestone: two stages, no vertex input, no
     /// dynamic state beyond the explicit viewport/scissor, no blend/cull/depth.
     /// Every absent state is expressed by not enabling it (`research/docs/23`
-    /// §3.2).
+    /// §3.2), and the sampled pipeline's one extra input is the descriptor set
+    /// layout `create_render_textures` installed (`research/docs/23` §3.3,
+    /// v70).
     #[allow(clippy::too_many_arguments)]
     fn create_pipeline(
         &mut self,
@@ -5452,10 +5943,22 @@ impl<'a> OffscreenObjects<'a> {
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        // The sampled pipeline's layout carries the descriptor set layout its
+        // fragment stage reads through, in binding order
+        // (`research/docs/23` §3.3, v70). A pass that samples nothing keeps the
+        // empty layout every earlier increment built.
+        let descriptor_set_layouts =
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                vec![self.descriptor_set_layout]
+            } else {
+                Vec::new()
+            };
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
         self.pipeline_layout = unsafe {
             self.context
                 .device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+                .create_pipeline_layout(&pipeline_layout_info, None)
         }
         .map_err(|error| execution_refusal("create pipeline layout", &error.to_string()))?;
 
@@ -6231,6 +6734,37 @@ impl<'a> OffscreenObjects<'a> {
                 );
             }
         }
+        // Host-visible linear textures are uploaded in `PREINITIALIZED` and
+        // the sampled descriptor binds them in `GENERAL`, so the first
+        // transition needs only the new layout, not an access scope — the same
+        // two-step shape the compute rail's own texture upload records
+        // (`research/docs/23` §3.3, v70).
+        for texture in &self.textures {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(texture.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        }
         unsafe {
             self.context.device.cmd_begin_render_pass(
                 self.command,
@@ -6248,6 +6782,19 @@ impl<'a> OffscreenObjects<'a> {
             self.context
                 .device
                 .cmd_set_scissor(self.command, 0, std::slice::from_ref(&scissor));
+            // The sampled textures are bound before the draw, in the one
+            // descriptor set the pipeline layout carries
+            // (`research/docs/23` §3.3, v70).
+            if self.descriptor_set != vk::DescriptorSet::null() {
+                self.context.device.cmd_bind_descriptor_sets(
+                    self.command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    std::slice::from_ref(&self.descriptor_set),
+                    &[],
+                );
+            }
             // Caller-held streams first (`research/docs/23` §3.3): they are the
             // shape this increment adds, and they cannot be combined with an
             // indirect replay (the pass's own bindings are the direct draw's).
@@ -6591,6 +7138,34 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 self.context
                     .device
                     .destroy_render_pass(self.render_pass, None);
+            }
+            // The sampled textures and the descriptor the fragment stage read
+            // them through are the pass's own (`research/docs/23` §3.3, v70):
+            // the pool owns the set, so destroying the pool releases both and
+            // the layout goes with it.
+            for texture in &self.textures {
+                if texture.sampler != vk::Sampler::null() {
+                    self.context.device.destroy_sampler(texture.sampler, None);
+                }
+                if texture.view != vk::ImageView::null() {
+                    self.context.device.destroy_image_view(texture.view, None);
+                }
+                if texture.image != vk::Image::null() {
+                    self.context.device.destroy_image(texture.image, None);
+                }
+                if texture.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(texture.memory, None);
+                }
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.context
+                    .device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             }
             if let Some(depth) = &self.depth {
                 // The depth resolve target is owned by the same pass scope
@@ -6937,7 +7512,8 @@ mod tests {
         AcquirePolicy, AllocationId, DepthFormat, DepthLoadOp, InitialState, PipelineId,
         PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment,
         RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity, StencilFormat,
-        StencilLoadOp, VertexLayout, ViewId,
+        StencilLoadOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+        VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -7053,6 +7629,123 @@ mod tests {
             vertex_translation: None,
             fragment_translation: None,
         }
+    }
+
+    /// The reviewed sampling pair (`research/docs/23` §3.3, v70): the
+    /// full-screen geometry with its uv varying and the fragment stage that
+    /// samples the pass's own texture binding.
+    fn reviewed_sampled_stages() -> RenderStages {
+        RenderStages {
+            contract: RenderPipelineContract {
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv: SAMPLED_UNORM8_FRAG_SPV.to_vec(),
+            vertex_translation: None,
+            fragment_translation: None,
+        }
+    }
+
+    /// The 4×4 texture the sampling fixtures bind, with one distinct texel per
+    /// position (`research/docs/23` §3.3, v70).
+    fn sampled_texture_view(width: u64, height: u64) -> TextureView {
+        let bytes = (0..height as u8)
+            .flat_map(|y| (0..width as u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect::<Vec<_>>();
+        TextureView {
+            view_id: ViewId::new(83),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(53),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width,
+            height,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(bytes),
+        }
+    }
+
+    /// One `size`×`size` render pass for the sampling fixtures.
+    fn sampled_pass(size: u64) -> RenderPassDescriptor {
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.color_attachments[0].width = size;
+        pass.color_attachments[0].height = size;
+        pass.viewport = [0, 0, size as u32, size as u32];
+        pass.textures = vec![sampled_texture_view(size, size)];
+        pass
+    }
+
+    /// The rail's own window for the sampling shape (`research/docs/23` §3.3,
+    /// v70): the reviewed pair is admitted only for one `rgba8_unorm` texture
+    /// of the render area's own extent, and a pass that names the pair without
+    /// binding that texture is refused by name rather than sampled through an
+    /// unbound descriptor. Host-side: `prepare_render_request` reads no device.
+    #[test]
+    fn prepare_render_request_admits_the_reviewed_sampling_shape_only() {
+        let stages = reviewed_sampled_stages();
+        stages
+            .validate_stage_pair()
+            .expect("the reviewed sampling pair is executable");
+        let pass = sampled_pass(4);
+        let previous = vec![None];
+        let request = prepare_render_request(&stages, &pass, &previous, 0, 0)
+            .expect("the reviewed sampling shape is admitted");
+        assert_eq!(request.textures.len(), 1);
+        assert_eq!(request.textures[0].extent, [4, 4]);
+        assert_eq!(request.textures[0].bytes.len(), 64);
+
+        // Another extent puts some fragment's sample on a texel boundary or
+        // inside a neighbour, which is a filtered read the review never
+        // covered.
+        let mut other_extent = sampled_pass(4);
+        other_extent.textures = vec![sampled_texture_view(2, 2)];
+        let refused = match prepare_render_request(&stages, &other_extent, &previous, 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a texture of another extent"),
+        };
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_extent_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+        // The reviewed stage reads one `rgba8_unorm` surface.
+        let mut other_format = sampled_pass(4);
+        let mut view = sampled_texture_view(4, 4);
+        view.format = TextureFormat::Bgra8Unorm;
+        other_format.textures = vec![view];
+        let refused = match prepare_render_request(&stages, &other_format, &previous, 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a texture of another format"),
+        };
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_format_unsupported");
+
+        // A registration that pairs one reviewed half with the other pair's
+        // half is refused at the gate, so it cannot reach the device.
+        let mismatched = RenderStages {
+            fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
+            ..reviewed_sampled_stages()
+        };
+        let refused = mismatched
+            .validate_stage_pair()
+            .expect_err("the sampling vertex stage needs its own fragment stage");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_fragment_stage_mismatch");
+
+        // The command buffer is where the pair and the binding meet, so the
+        // rail re-asks that question there too: a pass that names the pair
+        // without a texture is refused instead of sampling an unbound
+        // descriptor.
+        let mut unbound = sampled_pass(4);
+        unbound.textures = Vec::new();
+        let request = prepare_render_request(&stages, &unbound, &previous, 0, 0)
+            .expect("the shape is admitted; the binding question is the execution's");
+        assert!(request.textures.is_empty());
     }
 
     /// One 2×2 render pass naming an attachment of `format`, holding the clear
@@ -7203,6 +7896,7 @@ mod tests {
         let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
+                textures: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -7498,6 +8192,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            textures: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -7568,6 +8263,7 @@ mod tests {
             let mut blobs = execute_offscreen_render(
                 &context,
                 &OffscreenRenderRequest {
+                    textures: Vec::new(),
                     blend: None,
                     multisample: None,
                     depth_resolve: None,
@@ -7718,6 +8414,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            textures: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -8154,6 +8851,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                textures: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -8225,6 +8923,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                textures: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -8300,6 +8999,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                textures: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -8354,6 +9054,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            textures: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -8447,6 +9148,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            textures: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -8597,6 +9299,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                textures: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -8688,6 +9391,7 @@ mod tests {
             return;
         };
         let request = |store: Option<DepthStoreOp>| OffscreenRenderRequest {
+            textures: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -8773,6 +9477,7 @@ mod tests {
             return;
         };
         let request = |store: Option<StoreOp>| OffscreenRenderRequest {
+            textures: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
