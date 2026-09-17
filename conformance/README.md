@@ -422,3 +422,21 @@ reports the four-channel UNORM texel is refused, so the fixture pins the
 component shape rather than merely re-reading a familiar byte string.
 `conformance/test_suite_v22.py` pins the fixture, the plan, the marker gates and
 that counter-shape.
+
+## Gate 2 class parity (G2-f)
+
+Gate 2's G2-f asks for one A/B parity per API class. [narrow-class.json](narrow-class.json)
+declares the two classes and the fixtures whose parity the five rails already
+capture: the compute-buffer narrow class in `suite.json` (`copy_word`, the AIR
+file the reims production seam submits, plus `indexed_boundary`) and the render
+narrow class in [suite-v16.json](suite-v16.json) (its declaring compute pass and
+the indexed Clear quad). [narrow_class.py](narrow_class.py) holds each fixture to
+its class's covered rules, re-hashes the fixture's own sources, validates every
+rail with the ordinary comparator and then compares the fixtures' writebacks and
+allocation images rail to rail. It captures nothing, so a class adds no second
+observation of the same bytes; the `compare-captures` CI job derives both
+classes from the same artifacts its parity lines read. `--preview` runs the same
+checks over the rails a host has and prints `PREVIEW` instead of `PASS`, which is
+how a machine without Metal exercises the tool. [test_narrow_class.py](test_narrow_class.py)
+pins the declarations, the covered rules, the refusals of named out-of-class
+neighbours and the rail-to-rail comparison over synthetic captures.

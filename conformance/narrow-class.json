@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "title": "Gate 2 G2-f: per-API-class A/B parity declarations",
+  "note": "One entry per API class. A class names the fixtures whose parity the emulator's five rails already capture, and the suite file each fixture lives in, so conformance/narrow_class.py can hold the declaration to the suites' own bytes. The covered rules are the axes this declaration claims parity over; they are not the whole reims narrow class, and every widening of that class owes its own covered fixture here.",
+  "classes": [
+    {
+      "name": "compute-buffer-narrow",
+      "api": "compute",
+      "summary": "reims Gate 2's compute-buffer narrow class (research/docs/26 §2): one direct exact-thread dispatch over storage buffers, no images and no samplers.",
+      "suite": "suite.json",
+      "fixtures": ["copy_word", "indexed_boundary"],
+      "seam_fixture": "copy_word",
+      "seam": "the reims production seam's class gate (crates/reims-vgpu/src/backend/provider_compute.rs::narrow_class, submit_narrow) and its canonical entry test (crates/reims-vgpu/tests/canonical_provider_compute.rs) submit this same AIR file, examples/metal-smoke/shaders/kernel_copy_word.ll; the class gate itself is reviewed in the reims repository, this declaration only pins the fixture's bytes here",
+      "required_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ],
+      "bytes": "every writeback and every post-pass allocation image, byte for byte, keyed by (allocation, view, offset)",
+      "counts": "each rail's own copy-in/copy-out contract is checked against the suite by compare.py; the counters are not compared rail to rail, because the rails observe them through different mechanisms (compare.py ALLOCATION_OBSERVATIONS)",
+      "refusals": [
+        {
+          "suite": "suite-v3.json",
+          "case": "transform_twice",
+          "rule": "compute-covered-dispatch",
+          "why": "a serial chain is several dispatches, not the class's one direct dispatch"
+        },
+        {
+          "suite": "suite-v11.json",
+          "case": "sampled_texture_first_texel",
+          "rule": "compute-covered-bindings",
+          "why": "the class binds storage buffers and no images or samplers"
+        }
+      ]
+    },
+    {
+      "name": "render-narrow",
+      "api": "render",
+      "summary": "the render narrow class's first reviewed shape (research/docs/26 §10, R3): one offscreen colour attachment, Clear load, one indexed draw, the whole attachment read back.",
+      "suite": "suite-v16.json",
+      "fixtures": ["render_declaring_copy_word", "quad_indexed_clear_2x2"],
+      "seam_fixture": "quad_indexed_clear_2x2",
+      "seam": "the reims render seam (crates/reims-vgpu/src/backend/provider_render.rs) and its reviewed shape test (crates/reims-vgpu/tests/provider_render_rail.rs) carry the same [declaring compute pass, one colour pass] trace shape; the class's later widenings (W1 chain heads, R6 vertex streams and scissor, W3 wide texels) are not covered by this declaration and owe their own fixtures",
+      "required_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ],
+      "bytes": "every writeback and every post-pass allocation image, byte for byte, keyed by (allocation, view, offset)",
+      "counts": "each rail's own copy-in/copy-out contract is checked against the suite by compare.py; the counters are not compared rail to rail, because the rails observe them through different mechanisms (compare.py ALLOCATION_OBSERVATIONS)",
+      "refusals": [
+        {
+          "suite": "suite-v13.json",
+          "case": "offscreen_triangle_clear_2x2",
+          "rule": "render-covered-draw",
+          "why": "the class's one draw is indexed; the vertex-id triangle carries no index buffer"
+        },
+        {
+          "suite": "suite-v18.json",
+          "case": "mrt_dual_output_2x2",
+          "rule": "render-covered-attachment",
+          "why": "a second colour attachment is MRT, not the single-attachment class"
+        },
+        {
+          "suite": "suite-v20.json",
+          "case": "dontcare_load_quad_2x2",
+          "rule": "render-covered-attachment",
+          "why": "the first reviewed shape admits only a Clear load"
+        },
+        {
+          "suite": "suite-v22.json",
+          "case": "r32float_clear_2x2",
+          "rule": "render-covered-attachment",
+          "why": "the covered formats are the reviewed 8-bit colour formats; a wide texel is its own widening"
+        }
+      ]
+    }
+  ]
+}

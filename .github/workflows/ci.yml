@@ -806,6 +806,28 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v26.json --native /tmp/native-evidence/v26/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v26.json --metal-provider /tmp/native-evidence/rust-provider-v26.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v26.json --metal-objects /tmp/native-evidence/metal-objects-v26.json
           python3 conformance/compare.py --suite conformance/suite-v27.json --native /tmp/native-evidence/v27/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v27.json --metal-provider /tmp/native-evidence/rust-provider-v27.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v27.json --metal-objects /tmp/native-evidence/metal-objects-v27.json
           python3 conformance/compare.py --suite conformance/suite-v28.json --native /tmp/native-evidence/v28/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v28.json --metal-provider /tmp/native-evidence/rust-provider-v28.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v28.json --metal-objects /tmp/native-evidence/metal-objects-v28.json
+      # Gate 2's G2-f: the per-API-class A/B parity, derived from the captures
+      # the lines above already validated. The classes are declared in
+      # `conformance/narrow-class.json`; `narrow_class.py` holds each fixture to
+      # its class's covered rules and re-hashes the fixture's own sources, then
+      # names the rails of the one fixture set the class claims parity over. It
+      # captures nothing, so this step adds no second observation of the same
+      # bytes: a class fails here only if the five-rail parity above disagrees
+      # with the class's declaration.
+      - name: Derive the narrow classes' A/B parity from the same captures
+        run: |
+          python3 conformance/narrow_class.py --class compute-buffer-narrow \
+            --rail native-metal=/tmp/native-evidence/v1/native-metal.json \
+            --rail vulkan=/tmp/vulkan-evidence/vulkan-capture.json \
+            --rail native-metal-provider=/tmp/native-evidence/rust-provider-v1.json \
+            --rail vulkan-objects=/tmp/vulkan-evidence/vulkan-objects-v1.json \
+            --rail native-metal-provider-objects=/tmp/native-evidence/metal-objects-v1.json
+          python3 conformance/narrow_class.py --class render-narrow \
+            --rail native-metal=/tmp/native-evidence/v16/native-metal.json \
+            --rail vulkan=/tmp/vulkan-evidence/vulkan-capture-v16.json \
+            --rail native-metal-provider=/tmp/native-evidence/rust-provider-v16.json \
+            --rail vulkan-objects=/tmp/vulkan-evidence/vulkan-objects-v16.json \
+            --rail native-metal-provider-objects=/tmp/native-evidence/metal-objects-v16.json
 
   reims-integration:
     runs-on: ubuntu-24.04
