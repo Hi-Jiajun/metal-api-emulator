@@ -1851,8 +1851,15 @@ fn put_compute_texture_declarations(
         put_texture_access(encoder, binding.access);
         put_texture_type(encoder, binding.texture_type);
         put_texture_format(encoder, binding.format);
-        put_sampler_filter(encoder, binding.sampler.filter);
-        put_sampler_address(encoder, binding.sampler.address);
+        // The declaration block keeps its fixed 8-field layout for storage
+        // images too (`research/docs/23` §93): a storage binding has no
+        // sampler, so the two bytes carry the synthesized read state that the
+        // decoder drops once it has read the access. A `Sampled` binding
+        // always carries its own policy, so the bytes of every pre-§93 frame
+        // are unchanged.
+        let sampler = binding.sampler.unwrap_or(SamplerPolicy::synthesized_read());
+        put_sampler_filter(encoder, sampler.filter);
+        put_sampler_address(encoder, sampler.address);
         put_texture_footprint(encoder, binding.footprint);
     }
     Ok(())
@@ -1878,15 +1885,23 @@ fn get_compute_texture_declarations(
     }
     let mut bindings = Vec::with_capacity(count);
     for _ in 0..count {
+        let metal_binding = decoder.u32()?;
+        let access = get_texture_access(decoder)?;
+        let texture_type = get_texture_type(decoder)?;
+        let format = get_texture_format(decoder)?;
+        let filter = get_sampler_filter(decoder)?;
+        let address = get_sampler_address(decoder)?;
         bindings.push(TextureBindingContract {
-            metal_binding: decoder.u32()?,
-            access: get_texture_access(decoder)?,
-            texture_type: get_texture_type(decoder)?,
-            format: get_texture_format(decoder)?,
-            sampler: SamplerPolicy {
-                filter: get_sampler_filter(decoder)?,
-                address: get_sampler_address(decoder)?,
-            },
+            metal_binding,
+            access,
+            texture_type,
+            format,
+            // The access decides whether the two sampler bytes mean anything
+            // (`research/docs/23` §93): a storage image is decoded with no
+            // sampler, and its two bytes are the layout filler the encoder
+            // wrote above.
+            sampler: (access == TextureAccess::Sampled)
+                .then_some(SamplerPolicy { filter, address }),
             footprint: get_texture_footprint(decoder)?,
         });
     }
