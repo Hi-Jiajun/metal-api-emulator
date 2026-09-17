@@ -5749,6 +5749,8 @@ private func vertexSelfTest() throws -> CaseResult {
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
+        stage_buffers: nil,
+        translated_stages: nil,
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 2, 2],
@@ -5847,6 +5849,8 @@ private func mrtSelfTest() throws -> CaseResult {
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
+        stage_buffers: nil,
+        translated_stages: nil,
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 2, 2],
@@ -6748,6 +6752,8 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
+        stage_buffers: nil,
+        translated_stages: nil,
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 4, 4],
