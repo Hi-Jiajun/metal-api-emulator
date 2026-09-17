@@ -756,12 +756,32 @@ impl TextureBindingContract {
     /// rail from its reviewed module list — so the shape is stated once here
     /// instead of drifting between two hand-written literals.
     pub const fn sampled_r32uint(metal_binding: u32) -> Self {
+        Self::sampled(
+            metal_binding,
+            TextureFormat::R32Uint,
+            SamplerPolicy::synthesized_read(),
+        )
+    }
+
+    /// The reviewed compute sampling shape with an explicit format and state
+    /// (`research/docs/26` §21.3, C1b): a D2, single-sample texture read whole
+    /// through the sampler its module was lowered against.
+    ///
+    /// The Vulkan rail pairs an AIR-embedded constexpr sampler with the
+    /// sampled texture it belongs to, so the contract names the state the
+    /// module itself carries rather than a provider default. A caller that
+    /// declares another state is refused by name before execution.
+    pub const fn sampled(
+        metal_binding: u32,
+        format: TextureFormat,
+        sampler: SamplerPolicy,
+    ) -> Self {
         Self {
             metal_binding,
             access: TextureAccess::Sampled,
             texture_type: TextureType::D2,
-            format: TextureFormat::R32Uint,
-            sampler: SamplerPolicy::synthesized_read(),
+            format,
+            sampler,
             footprint: TextureFootprintProof::WholeView,
         }
     }

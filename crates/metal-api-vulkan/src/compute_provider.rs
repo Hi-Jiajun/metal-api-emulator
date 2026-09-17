@@ -18,8 +18,8 @@ use metal_api_core::provider::{
     PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-    SamplerPolicy, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId,
-    TerminalState, TracePass, ValidatedComputeTrace, ViewId,
+    SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TerminalState, TracePass,
+    ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -2590,14 +2590,6 @@ impl ComputeProvider for VulkanComputeProvider {
             .lock()
             .map_err(|_| registry_poisoned())?
             .admit(trace, admitted.resources())?;
-        // The compute texture sampler gate (`research/docs/26` §21.3): this
-        // rail creates one combined image sampler per texture binding, and the
-        // one state it can create is the translator's synthesized read
-        // sampler. A contract that declares another state is refused by name
-        // here — before any device object exists — instead of being executed
-        // with a sampler whose filtering would silently change which texels
-        // the module reads.
-        refuse_uncreatable_texture_samplers(trace)?;
         // The indirect dispatch the compute rail replays, resolved and shape
         // checked before any compute resource exists. The render rail owns the
         // draw half; `None` here means the compute sequence dispatches directly.
@@ -2622,6 +2614,13 @@ impl ComputeProvider for VulkanComputeProvider {
                     let registered = registry
                         .get(&pass.pipeline)
                         .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
+                    // A texture declaration states the sampler its module was
+                    // lowered against (`research/docs/26` §21.3, C1b). The
+                    // state the registered module carries is the declaration's
+                    // own source, so a request that names a different state is
+                    // refused by binding and both halves before the identity
+                    // walk reports it as a generic contract mismatch.
+                    refuse_foreign_texture_samplers(requested, &registered.metadata)?;
                     validate_pipeline_identity(requested, &registered.metadata)?;
                     Ok(registered.artifact.clone())
                 })
@@ -3347,45 +3346,57 @@ fn render_pipeline_table_contract() -> PipelineContract {
     }
 }
 
-/// Refuse a compute texture declaration whose sampler state this rail cannot
-/// create (`research/docs/26` §21.3, step 2).
+/// Refuse a compute texture declaration whose sampler state is not the state
+/// the registered module carries (`research/docs/26` §21.3, C1b).
 ///
-/// The rail binds each sampled texture as a combined image sampler, and the
-/// one state its synthesis carries is [`SamplerPolicy::synthesized_read`]:
-/// nearest filtering under a clamped address mode. A declaration that states
-/// anything else would be executed with different filtering than the module
-/// was lowered against — a difference that changes which texels a read returns
-/// without changing the request — so it is a capability refusal with the
-/// binding and both state halves in its fields rather than a silently
-/// substituted sampler.
-fn refuse_uncreatable_texture_samplers(trace: &ComputeTrace) -> Result<(), ProviderError> {
-    for pass in trace.compute_passes() {
-        let Ok(requested) = trace.pipeline(pass.pipeline) else {
-            // A missing table entry is the identity walk's refusal, not this
-            // gate's; skipping keeps the two from reporting the same defect
-            // under two names.
+/// From C1b on the rail creates one `VkSampler` per AIR-embedded constexpr
+/// sampler, with the state the module's own AIR was lowered against. The
+/// declaration's job is therefore to *restate* that state: a request naming
+/// another filtering or address mode would change which texels the module
+/// reads without changing the module, so it is a capability refusal carrying
+/// the binding, the declared state and the module's state rather than a
+/// silently substituted sampler.
+fn refuse_foreign_texture_samplers(
+    requested: &CompiledComputePipeline,
+    registered: &CompiledComputePipeline,
+) -> Result<(), ProviderError> {
+    for declared in &requested.contract.texture_bindings {
+        let Some(module) = registered
+            .contract
+            .texture_bindings
+            .iter()
+            .find(|candidate| candidate.metal_binding == declared.metal_binding)
+        else {
+            // A binding the module does not declare is the identity walk's
+            // refusal, not this gate's.
             continue;
         };
-        for declared in &requested.contract.texture_bindings {
-            if declared.sampler != SamplerPolicy::synthesized_read() {
-                return Err(refusal(
-                    ProviderPhase::Resolve,
-                    ProviderErrorClass::Capability,
-                    "compute_texture_sampler_unsupported",
-                )
-                .with_field(
-                    "binding",
-                    FieldValue::Unsigned(u64::from(declared.metal_binding)),
-                )
-                .with_field(
-                    "filter",
-                    FieldValue::Text(format!("{:?}", declared.sampler.filter)),
-                )
-                .with_field(
-                    "address",
-                    FieldValue::Text(format!("{:?}", declared.sampler.address)),
-                ));
-            }
+        if declared.sampler != module.sampler {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "compute_texture_sampler_unsupported",
+            )
+            .with_field(
+                "binding",
+                FieldValue::Unsigned(u64::from(declared.metal_binding)),
+            )
+            .with_field(
+                "filter",
+                FieldValue::Text(format!("{:?}", declared.sampler.filter)),
+            )
+            .with_field(
+                "address",
+                FieldValue::Text(format!("{:?}", declared.sampler.address)),
+            )
+            .with_field(
+                "module_filter",
+                FieldValue::Text(format!("{:?}", module.sampler.filter)),
+            )
+            .with_field(
+                "module_address",
+                FieldValue::Text(format!("{:?}", module.sampler.address)),
+            ));
         }
     }
     Ok(())
@@ -3417,8 +3428,8 @@ mod tests {
     use metal_api_core::provider::ComputePass;
     use metal_api_core::provider::{
         AllocationId, AttachmentFormat, BufferAccess, ClearColor, Dispatch, DispatchKind,
-        DispatchType, LoadOp, OperationId, ProviderLifecycle, RenderAttachment, StoreOp, ViewId,
-        PROVIDER_SCHEMA_VERSION,
+        DispatchType, LoadOp, OperationId, ProviderLifecycle, RenderAttachment, SamplerPolicy,
+        StoreOp, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// An admitted-shaped trace whose pass list is the only thing under test.
@@ -3583,28 +3594,28 @@ mod tests {
     }
 
     #[test]
-    fn a_texture_contract_states_the_one_sampler_this_rail_creates() {
+    fn a_texture_contract_must_restate_the_sampler_its_module_carries() {
         use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
 
-        // The declaration the rail's own synthesis carries is admitted.
-        refuse_uncreatable_texture_samplers(&texture_sampler_trace(
-            SamplerPolicy::synthesized_read(),
-        ))
-        .expect("the synthesized read sampler is what this rail creates");
+        // The registered module carries nearest+clamp; a request that restates
+        // exactly that state is the declaration the module was lowered
+        // against.
+        let mut module_trace = texture_sampler_trace(SamplerPolicy::synthesized_read());
+        let module = module_trace.pipelines.remove(0);
+        refuse_foreign_texture_samplers(&module, &module)
+            .expect("the module's own sampler state is the declaration");
 
-        // Either half of the state can move it away from that answer, and each
-        // refusal names the binding and both halves (`research/docs/26`
-        // §21.3).
+        // Either half of the state can move the request away from the module,
+        // and each refusal names the binding, the declared state and the
+        // module's own state (`research/docs/26` §21.3, C1b).
         for (filter, address) in [
             (SamplerFilter::Linear, SamplerAddressMode::ClampToEdge),
             (SamplerFilter::Nearest, SamplerAddressMode::Repeat),
         ] {
-            let refusal =
-                refuse_uncreatable_texture_samplers(&texture_sampler_trace(SamplerPolicy {
-                    filter,
-                    address,
-                }))
-                .expect_err("a state this rail cannot create is a refusal");
+            let mut requested_trace = texture_sampler_trace(SamplerPolicy { filter, address });
+            let requested = requested_trace.pipelines.remove(0);
+            let refusal = refuse_foreign_texture_samplers(&requested, &module)
+                .expect_err("a state the module was not lowered against is a refusal");
             eprintln!("compute texture sampler refusal: {refusal:?}");
             assert_eq!(refusal.slug, "compute_texture_sampler_unsupported");
             assert_eq!(refusal.class, ProviderErrorClass::Capability);
@@ -3619,6 +3630,14 @@ mod tests {
             assert_eq!(
                 refusal.fields.get("address"),
                 Some(&FieldValue::Text(format!("{address:?}")))
+            );
+            assert_eq!(
+                refusal.fields.get("module_filter"),
+                Some(&FieldValue::Text("Nearest".into()))
+            );
+            assert_eq!(
+                refusal.fields.get("module_address"),
+                Some(&FieldValue::Text("ClampToEdge".into()))
             );
         }
     }
