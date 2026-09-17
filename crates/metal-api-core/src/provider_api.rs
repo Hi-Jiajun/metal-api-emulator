@@ -21,12 +21,13 @@ use crate::provider::{
     Dispatch, DispatchKind, DispatchType, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
     HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
     IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineId, PipelineProvider,
-    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
-    ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
-    ResourceTableSnapshot, StorageMode, StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
-    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_RENDER_TEXTURES, MAX_SERIAL_RESOURCES,
-    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    InitialState, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineId,
+    PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities,
+    ProviderError, ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineStage, ResourceTableSnapshot, StageBufferView, StorageMode, StoreOp, ViewId,
+    FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX, MAX_RENDER_TEXTURES,
+    MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,6 +106,22 @@ pub enum Error {
     FragmentTextureIndexOutOfRange {
         index: u32,
         maximum: usize,
+    },
+    /// One stage-buffer slot already holds a binding, so a second one would
+    /// name two sources for one `[[buffer(N)]]` slot
+    /// (`research/docs/23` §3.3, v87).
+    StageBufferAlreadyBound {
+        stage: RenderPipelineStage,
+        index: u32,
+    },
+    /// A lease-bound slot the pipeline declares writable has no landing the
+    /// object API could publish (`research/docs/23` §3.3, v86): the writeback
+    /// channel lands in the bytes' own host image, and an imported lease has
+    /// none — its bytes live in the provider's staged copy or in the owner's
+    /// own mapping. A writable stage buffer is the caller-held arm's shape.
+    WritableStageBufferLeaseUnsupported {
+        stage: RenderPipelineStage,
+        index: u32,
     },
     /// A vertex-buffer draw has no stream bound. The `vertex_id`-only shape is
     /// [`RenderCommandEncoder::draw_render_pass`], which binds no input at all.
@@ -198,6 +215,16 @@ impl fmt::Display for Error {
             Self::FragmentTextureIndexOutOfRange { index, maximum } => write!(
                 f,
                 "fragment texture binding {index} is past the {maximum}-texture limit"
+            ),
+            Self::StageBufferAlreadyBound { stage, index } => {
+                write!(f, "stage buffer {}/{} is bound twice", stage.name(), index)
+            }
+            Self::WritableStageBufferLeaseUnsupported { stage, index } => write!(
+                f,
+                "the pipeline declares stage buffer {}/{} writable, and an imported lease has \
+                 no host landing the object API could publish",
+                stage.name(),
+                index
             ),
             Self::MissingVertexBuffer => f.write_str(
                 "a vertex-buffer draw needs a bound vertex stream; the vertex_id-only shape is \
@@ -589,6 +616,47 @@ pub enum RenderAttachmentLoad {
     DontCare,
 }
 
+/// Which lease arm one stage-buffer slot's bytes come from
+/// (`research/docs/23` §90, R9i).
+///
+/// The two arms are the ones the trace contract's `BufferSource` states for a
+/// lease: the provider's own staged copy of the owner's reservation
+/// (`staged_lease`), or the owner's own mapping imported without a copy
+/// (`borrowed_no_copy`). A caller-held view is the third arm and has its own
+/// entry point ([`RenderCommandEncoder::set_stage_buffer`]), because its bytes
+/// are the caller's host image rather than a provider registry's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageBufferLeaseArm {
+    /// The provider copied the owner's reservation into its own storage when
+    /// the lease was imported.
+    StagedLease,
+    /// The provider holds the owner's own mapping; the pass reads (or, on the
+    /// trace rail, writes) it where the owner registered it.
+    BorrowedNoCopy,
+}
+
+/// One imported lease bound to a stage-buffer slot
+/// (`research/docs/23` §3.3, v87; §90, R9i).
+///
+/// The caller imports the lease through the same channel a compute case's
+/// `storage_mode` uses ([`crate::provider::LeaseImporter`] or
+/// [`crate::provider::NoCopyLeaseImporter`]) and hands the reservation here;
+/// the object API never imports anything itself, exactly as it never uploads a
+/// texture. The reservation's allocation, offset and length are the view the
+/// pass states, and the lease's identity becomes the view's own id — the rule
+/// the trace rail's captured views follow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageBufferLease {
+    /// The provider-registry reservation the bytes come from.
+    pub reservation: LeaseReservation,
+    /// The owner allocation's registered byte length. The trace's resource
+    /// table states it, and a reservation reaching past it is refused by name
+    /// (`research/docs/23` §90).
+    pub allocation_size: u64,
+    /// Which import arm holds the bytes.
+    pub arm: StageBufferLeaseArm,
+}
+
 /// One colour attachment a multi-attachment draw records.
 ///
 /// The attachment list's position is the attachment's `location` — entry `i`
@@ -649,6 +717,43 @@ struct RenderTarget {
     /// bindings at record time; the bytes they carry are the snapshot the
     /// texture declaration took, exactly as a compute binding's are.
     textures: Vec<contract::TextureView>,
+    /// The stage buffers the pass's two stages read — and the writable ones
+    /// they land — in canonical order (`research/docs/23` §3.3, v83-v86): one
+    /// entry per `[[buffer(N)]]` slot, the pair of the pipeline's own
+    /// declaration and the bytes' source arm. Empty for every pre-v83
+    /// recording, which is the shape every other pass keeps.
+    stage_buffers: Vec<RenderStageSlot>,
+}
+
+/// One stage-buffer slot a recorded pass binds (`research/docs/23` §3.3, v87).
+///
+/// The stage and the index inside that stage's own Metal buffer namespace are
+/// the slot; `access` is the *pipeline's* answer, resolved when the pass is
+/// recorded from the declaration the recorded pipeline carries, because a
+/// Metal encoder's binding call states no access of its own. The source is
+/// where the bytes live: a caller-held view the commit snapshots, or an
+/// imported lease the provider already holds.
+#[derive(Clone)]
+struct RenderStageSlot {
+    stage: RenderPipelineStage,
+    index: u32,
+    access: BufferAccess,
+    source: RenderStageSource,
+}
+
+/// Where one recorded slot's bytes come from (`research/docs/23` §90, R9i).
+///
+/// The two arms a render pass can name: the caller's own host image, snapshotted
+/// at commit under the command's reservations, or a lease whose bytes the
+/// provider registry already holds. The borrowed arm's window stays the
+/// caller's to keep alive until the submission has been waited for, exactly as
+/// the compute rail's `BufferSource` does.
+#[derive(Clone)]
+enum RenderStageSource {
+    /// A caller-held buffer view.
+    View(BufferView),
+    /// An imported lease, staged or borrowed.
+    Lease(StageBufferLease),
 }
 
 /// One vertex stream a recorded draw reads: the encoder's own view plus the
@@ -956,7 +1061,56 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
-            stage_buffers: Vec::new(),
+            // The pass's own stage buffers (`research/docs/23` §3.3, v83-v87):
+            // one view per slot the encoder bound, in canonical order — the
+            // stage's own ordinal first, the binding inside it second, which is
+            // the order the contract's own binding walk states. A caller-held
+            // view's bytes are taken here, exactly as a draw input's are,
+            // while a lease names the import the provider already holds.
+            stage_buffers: self
+                .stage_buffers
+                .iter()
+                .map(|slot| StageBufferView {
+                    stage: slot.stage,
+                    view: match &slot.source {
+                        // A caller-held slot states the *declaration's* access,
+                        // not the draw inputs' read-only shape: a writable slot
+                        // is the landing the writeback channel publishes
+                        // (`research/docs/23` §3.3, v86).
+                        RenderStageSource::View(view) => contract::BufferView {
+                            view_id: view.view_id(),
+                            metal_binding: slot.index,
+                            allocation_id: view.allocation_id(),
+                            offset: view.offset as u64,
+                            length: view.length as u64,
+                            access: slot.access,
+                            attribute_stride: None,
+                            source: BufferSource::OwnedBytes(input_bytes(view)),
+                        },
+                        RenderStageSource::Lease(lease) => contract::BufferView {
+                            // The lease's own identity is the view's id, the
+                            // rule the trace rail's captured views follow: the
+                            // reservation names the bytes, so the view cannot
+                            // name a different set.
+                            view_id: ViewId::new(lease.reservation.lease.lease_id.get()),
+                            metal_binding: slot.index,
+                            allocation_id: lease.reservation.lease.allocation_id,
+                            offset: lease.reservation.offset,
+                            length: lease.reservation.length,
+                            access: slot.access,
+                            attribute_stride: None,
+                            source: match lease.arm {
+                                StageBufferLeaseArm::StagedLease => {
+                                    BufferSource::StagedLease(lease.reservation.lease.lease_id)
+                                }
+                                StageBufferLeaseArm::BorrowedNoCopy => {
+                                    BufferSource::BorrowedNoCopy(lease.reservation.lease.lease_id)
+                                }
+                            },
+                        },
+                    },
+                })
+                .collect(),
             // The pass-wide multisample raster travels with the recording
             // (`research/docs/23` §3.3, v51/v52): the entry that names it is
             // the only one that sets this field, so every earlier recording
@@ -1406,6 +1560,26 @@ fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Er
                         .entry((view.offset, view.offset + view.length))
                         .or_insert(false);
                 }
+                // A caller-held stage buffer is reserved like the inputs
+                // above, with one difference: the slot the pipeline declares
+                // writable is a *landing*, so its range is a write — the
+                // writeback channel copies the pass's bytes into this very
+                // image, and a CPU reader must wait the window out
+                // (`research/docs/23` §3.3, v86). A lease-bound slot owns no
+                // host image here: its bytes live in the provider's registry.
+                for slot in &target.stage_buffers {
+                    let RenderStageSource::View(view) = &slot.source else {
+                        continue;
+                    };
+                    let write = slot.access.is_writable();
+                    by_allocation
+                        .entry(view.allocation_id())
+                        .or_insert_with(|| (&view.buffer, BTreeMap::new()))
+                        .1
+                        .entry((view.offset, view.offset + view.length))
+                        .and_modify(|existing| *existing |= write)
+                        .or_insert(write);
+                }
             }
         }
     }
@@ -1805,6 +1979,7 @@ impl CommandBuffer {
             vertex_buffers: BTreeMap::new(),
             index_buffer: None,
             fragment_textures: BTreeMap::new(),
+            stage_buffers: BTreeMap::new(),
         })
     }
 
@@ -1957,6 +2132,34 @@ impl CommandBuffer {
                 owner_epoch: owner.epoch,
                 size: u64::try_from(texture.inner.bytes.len()).unwrap_or(u64::MAX),
             })?;
+        }
+        // A lease-bound stage buffer's allocation is the *owner's*
+        // registration, so the trace's own table has to carry it before the
+        // reservation can be admitted: `ResourceTableSnapshot::insert_lease`
+        // resolves the lease's allocation, and a snapshot without it refuses
+        // the reservation by name (`research/docs/23` §90, R9i). The owner's
+        // registered length is the caller's own statement, exactly as the
+        // suite's `allocation_size` is on the trace rail.
+        for pass in passes {
+            let RecordedPass::Render { target, .. } = pass else {
+                continue;
+            };
+            for slot in &target.stage_buffers {
+                let RenderStageSource::Lease(lease) = &slot.source else {
+                    continue;
+                };
+                let allocation = lease.reservation.lease.allocation_id;
+                if resources.allocation(allocation).is_none() {
+                    resources.insert_allocation(AllocationRecord {
+                        allocation_id: allocation,
+                        owner_epoch: owner.epoch,
+                        size: lease.allocation_size,
+                    })?;
+                }
+                if resources.lease(lease.reservation.lease.lease_id).is_none() {
+                    resources.insert_lease(lease.reservation)?;
+                }
+            }
         }
         // The host bytes must stay stable only while the trace snapshots them:
         // every view copies its bytes into the trace, so the provider never
@@ -2455,10 +2658,27 @@ pub struct RenderCommandEncoder {
     /// (`research/docs/23` §3.3, v70). Like the vertex streams, a binding is
     /// direct-draw state that travels with the pass the draw records.
     fragment_textures: BTreeMap<u32, Texture>,
+    /// The stage buffers the two stages read — and the writable ones they land
+    /// — by `(stage ordinal, index)` (`research/docs/23` §3.3, v87). The key's
+    /// first half is the stage's own ordinal, so the map's iteration order is
+    /// the contract's canonical one (vertex before fragment, ascending index)
+    /// without a second list that could disagree with it.
+    stage_buffers: BTreeMap<(u8, u32), RenderStageBinding>,
     /// The scissor rectangle every pass recorded afterwards clips to, or `None`
     /// for the whole attachment (`research/docs/23` §3.3, v29/v30). Like
     /// Metal's own encoder state it applies to the draws that follow the call.
     scissor: Option<[u32; 4]>,
+}
+
+/// One stage-buffer binding the encoder holds (`research/docs/23` §3.3, v87).
+///
+/// The stage is kept beside the source because the map's key carries its
+/// ordinal rather than the enum: the ordinal is what orders the map, and the
+/// enum is what the descriptor states.
+#[derive(Clone)]
+struct RenderStageBinding {
+    stage: RenderPipelineStage,
+    source: RenderStageSource,
 }
 impl RenderCommandEncoder {
     /// Clip every draw recorded afterwards to `rect` (`[x, y, width, height]`
@@ -2586,6 +2806,180 @@ impl RenderCommandEncoder {
         }
         self.fragment_textures.insert(index, texture.clone());
         Ok(())
+    }
+
+    /// Bind one caller-held view to `stage`'s `[[buffer(index)]]` slot
+    /// (`research/docs/23` §3.3, v83-v87).
+    ///
+    /// The encoder states the slot and the bytes; *how* the stage uses them —
+    /// a read, a write, or both — is the recorded pipeline's own declaration,
+    /// exactly as Metal's `setBuffer(_:offset:index:)` states no access and the
+    /// function's argument does. A slot the recorded pipeline does not declare
+    /// is refused when the pass is recorded, by the contract's own
+    /// [`ContractError::UndeclaredStageBufferBinding`].
+    ///
+    /// `index` is the binding inside that stage's own namespace — two stages'
+    /// index spaces overlap, which is why the stage is part of the slot — and
+    /// a view from another device is [`Error::ForeignBuffer`]. A repeated slot
+    /// is [`Error::StageBufferAlreadyBound`], an index at or past
+    /// [`MAX_RENDER_STAGE_BUFFER_INDEX`] is
+    /// [`ContractError::RenderStageBufferIndexExceeded`], and a binding past
+    /// the pass's own [`MAX_RENDER_STAGE_BUFFERS`] ceiling is the contract's
+    /// [`ContractError::RenderStageBufferLimitExceeded`].
+    ///
+    /// Like a vertex stream, the view's bytes are not copied here: a
+    /// caller-held slot's bytes are taken once at commit, under the command's
+    /// own reservations, so a host write between recording and commit is
+    /// refused by the same hazard rule every other binding follows. A binding
+    /// is direct-draw state, so it is refused once an indirect replay has been
+    /// recorded, exactly as [`Self::set_vertex_buffer`] is.
+    pub fn set_stage_buffer(
+        &mut self,
+        stage: RenderPipelineStage,
+        index: u32,
+        view: &BufferView,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if !Arc::ptr_eq(&self.shared.owner, &view.buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        self.reserve_stage_buffer_slot(stage, index)?;
+        self.stage_buffers.insert(
+            (stage.code(), index),
+            RenderStageBinding {
+                stage,
+                source: RenderStageSource::View(view.clone()),
+            },
+        );
+        Ok(())
+    }
+
+    /// Bind one imported lease to `stage`'s `[[buffer(index)]]` slot
+    /// (`research/docs/23` §3.3, v87; §90, R9i).
+    ///
+    /// The lease is the caller's own import: it goes through the same channel a
+    /// compute case's `storage_mode` uses, and the reservation the caller hands
+    /// here is the one the provider's registry resolved. The object API does
+    /// not import anything itself, and the owner's window — a borrowed lease's
+    /// mapping in particular — stays the caller's to keep alive until the
+    /// submission has been waited for.
+    ///
+    /// A reservation whose range is not inside the owner allocation the caller
+    /// states is refused by name ([`ContractError::LeaseRangeOutOfBounds`]),
+    /// exactly as the trace's own resource table refuses it. A slot the
+    /// pipeline declares *writable* is
+    /// [`Error::WritableStageBufferLeaseUnsupported`]: the writeback channel
+    /// lands in the bytes' own host image, and an imported lease has none.
+    pub fn set_stage_buffer_lease(
+        &mut self,
+        stage: RenderPipelineStage,
+        index: u32,
+        lease: StageBufferLease,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if lease.allocation_size == 0 {
+            return Err(ContractError::ZeroLength("lease allocation").into());
+        }
+        let lease_id = lease.reservation.lease.lease_id;
+        let end = lease.reservation.end()?;
+        if end > lease.allocation_size {
+            return Err(ContractError::LeaseRangeOutOfBounds {
+                lease: lease_id,
+                end,
+                allocation_size: lease.allocation_size,
+            }
+            .into());
+        }
+        self.reserve_stage_buffer_slot(stage, index)?;
+        self.stage_buffers.insert(
+            (stage.code(), index),
+            RenderStageBinding {
+                stage,
+                source: RenderStageSource::Lease(lease),
+            },
+        );
+        Ok(())
+    }
+
+    /// The two refusals every stage-buffer binding shares: one slot holds one
+    /// source, and an index has to be inside the contract's own ceiling.
+    fn reserve_stage_buffer_slot(
+        &self,
+        stage: RenderPipelineStage,
+        index: u32,
+    ) -> Result<(), Error> {
+        if self.stage_buffers.contains_key(&(stage.code(), index)) {
+            return Err(Error::StageBufferAlreadyBound { stage, index });
+        }
+        if index >= MAX_RENDER_STAGE_BUFFER_INDEX {
+            return Err(ContractError::RenderStageBufferIndexExceeded {
+                stage,
+                index,
+                maximum: MAX_RENDER_STAGE_BUFFER_INDEX,
+            }
+            .into());
+        }
+        if self.stage_buffers.len() >= MAX_RENDER_STAGE_BUFFERS {
+            return Err(ContractError::RenderStageBufferLimitExceeded {
+                requested: self.stage_buffers.len() + 1,
+                maximum: MAX_RENDER_STAGE_BUFFERS,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The bound stage buffers as the pass's own slots, in canonical order.
+    ///
+    /// The access of each slot is the recorded pipeline's own declaration —
+    /// the pair rule `RenderPipelineContract::validate_against` states is the
+    /// one the pass cannot answer by itself — so the resolution happens here,
+    /// where the pipeline is known. A slot the pipeline does not declare is
+    /// refused by name, and a lease-bound slot the pipeline declares writable
+    /// is [`Error::WritableStageBufferLeaseUnsupported`]: an imported lease has
+    /// no host image for the writeback channel to land in.
+    fn bound_stage_buffers(
+        &self,
+        pipeline: &RenderPipeline,
+    ) -> Result<Vec<RenderStageSlot>, Error> {
+        let render = pipeline
+            .metadata()
+            .render
+            .as_ref()
+            .ok_or(Error::InvalidPipelineMetadata)?;
+        self.stage_buffers
+            .iter()
+            .map(|((_, index), bound)| {
+                let declared = render
+                    .stage_buffers
+                    .iter()
+                    .find(|declared| declared.stage == bound.stage && declared.index == *index)
+                    .ok_or(ContractError::UndeclaredStageBufferBinding {
+                        stage: bound.stage,
+                        index: *index,
+                    })?;
+                if declared.access.is_writable()
+                    && matches!(bound.source, RenderStageSource::Lease(_))
+                {
+                    return Err(Error::WritableStageBufferLeaseUnsupported {
+                        stage: bound.stage,
+                        index: *index,
+                    });
+                }
+                Ok(RenderStageSlot {
+                    stage: bound.stage,
+                    index: *index,
+                    access: declared.access,
+                    source: bound.source.clone(),
+                })
+            })
+            .collect()
     }
 
     /// The bound streams as the pass's own inputs, in binding order.
@@ -4018,6 +4412,11 @@ impl RenderCommandEncoder {
                 .iter()
                 .map(|(binding, texture)| texture.view(*binding))
                 .collect(),
+            // The encoder's stage-buffer bindings travel with the pass it
+            // records (`research/docs/23` §3.3, v83-v87): the map's canonical
+            // order is the descriptor's own, and each slot's access is the
+            // recorded pipeline's declaration.
+            stage_buffers: self.bound_stage_buffers(&pipeline)?,
             present,
             draw,
         };

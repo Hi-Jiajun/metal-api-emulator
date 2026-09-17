@@ -2299,8 +2299,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     case "compute-buffer-v31":
         expectedIDs = ["render_declaring_stage_buffer_sink",
                        "render_declaring_stage_buffer_lease"]
+    // The object rail's half of the same face (`research/docs/23` §3.3, v87):
+    // the same two declaring passes, whose render cases now name the object
+    // rails beside the trace rail. This oracle still validates only their
+    // metadata — it compiles no AIR and publishes no stage-buffer capability,
+    // so the marker keeps every stage-buffer case off this rail — and executes
+    // the two declaring passes as ordinary compute cases.
+    case "compute-buffer-v32":
+        expectedIDs = ["render_declaring_stage_buffer_sink",
+                       "render_declaring_stage_buffer_lease"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v31 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v32 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

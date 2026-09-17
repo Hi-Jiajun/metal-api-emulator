@@ -1,0 +1,365 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v32",
+  "guard_byte": 165,
+  "cases": [
+    {
+      "id": "render_declaring_stage_buffer_sink",
+      "entry": "copy_word_with_witness",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word_with_witness.ll",
+        "sha256": "f24e33124da1c228bf4766d32496d8d7ede4fc29d8e6c582c889a36343dfc18e"
+      },
+      "metal": {
+        "path": "shaders/copy_word_with_witness.metal",
+        "sha256": "c116fec300f1369069fbcf19d5fbb95e8c5ad07475757c19930075a19ad4367a"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "fefefefefefefefefefefefefefefefe"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "cdcdcdcd"
+        },
+        {
+          "binding": 2,
+          "allocation": 940,
+          "view": 950,
+          "offset": 4,
+          "length": 16,
+          "allocation_size": 24,
+          "access": "read",
+          "initial_hex": "abababababababababababababababab"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "bytes_hex": "abababab"
+        }
+      ]
+    },
+    {
+      "id": "render_declaring_stage_buffer_lease",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "fefefefefefefefefefefefefefefefe"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "cdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "bytes_hex": "fefefefe"
+        }
+      ]
+    }
+  ],
+  "render_cases": [
+    {
+      "id": "stage_buffer_write_affine_2x2",
+      "declaring_case": "render_declaring_stage_buffer_sink",
+      "vertex_entry": "render_vertex_positions",
+      "fragment_entry": "render_stage_buffer_write_rgba8",
+      "translated_stages": {
+        "vertex": {
+          "path": "../crates/metal-api-vulkan/tests/fixtures/render_stage_buffer_positions.vert.ll",
+          "sha256": "9371ae8aa9c44da9b2bd59a156d4b516d758c2df7f68b7712432502786d8084f"
+        },
+        "fragment": {
+          "path": "../crates/metal-api-vulkan/tests/fixtures/render_stage_buffer_write.frag.ll",
+          "sha256": "d27692d1d23e448eefab183251536bb92b9d6ce28727cbc1bea69dd3b776ea5f"
+        }
+      },
+      "stage_buffers": [
+        {
+          "stage": "vertex",
+          "index": 0,
+          "access": "read",
+          "footprint": {
+            "affine": {
+              "accesses": [
+                {
+                  "base_offset": 0,
+                  "access_size": 4,
+                  "terms": [
+                    {
+                      "axis": 0,
+                      "stride": 8
+                    }
+                  ]
+                },
+                {
+                  "base_offset": 4,
+                  "access_size": 4,
+                  "terms": [
+                    {
+                      "axis": 0,
+                      "stride": 8
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "allocation": 1100,
+          "view": 1110,
+          "offset": 0,
+          "length": 24,
+          "initial_hex": "666666bf6666663f000000006666663f666666bf00000000"
+        },
+        {
+          "stage": "fragment",
+          "index": 0,
+          "access": "read",
+          "footprint": {
+            "static": {
+              "max_bytes": 16
+            }
+          },
+          "allocation": 1120,
+          "view": 1130,
+          "offset": 0,
+          "length": 16,
+          "initial_hex": "8180803e8180003fc1c0403f0000803f"
+        },
+        {
+          "stage": "fragment",
+          "index": 1,
+          "access": "write",
+          "footprint": {
+            "static": {
+              "max_bytes": 16
+            }
+          },
+          "allocation": 940,
+          "view": 950,
+          "offset": 4,
+          "length": 16,
+          "initial_hex": "abababababababababababababababab",
+          "expected_hex": "8180803e8180003fc1c0403f0000803f"
+        }
+      ],
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        2,
+        2
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 2,
+        "height": 2,
+        "load": "clear",
+        "clear_hex": "fefefefe",
+        "store": "store"
+      },
+      "expected_hex": "4080c0fffefefefefefefefefefefefe",
+      "coverage": "partial",
+      "capture_rails": [
+        "vulkan",
+        "vulkan-objects"
+      ]
+    },
+    {
+      "id": "stage_buffer_borrowed_tint_2x2",
+      "declaring_case": "render_declaring_stage_buffer_lease",
+      "vertex_entry": "render_stage_buffer_vertex",
+      "fragment_entry": "render_stage_buffer_tint",
+      "metal": {
+        "path": "shaders/render_stage_buffer_2x2.metal",
+        "sha256": "63c4d5ba60c187437d749d957033778f479bc9ecb3f0a408eeabe6095dba0de6"
+      },
+      "stage_buffers": [
+        {
+          "stage": "vertex",
+          "index": 0,
+          "access": "read",
+          "footprint": {
+            "static": {
+              "max_bytes": 24
+            }
+          },
+          "allocation": 1200,
+          "view": 1210,
+          "offset": 0,
+          "length": 24,
+          "initial_hex": "666666bf6666663f000000006666663f666666bf00000000"
+        },
+        {
+          "stage": "fragment",
+          "index": 0,
+          "access": "read",
+          "footprint": {
+            "static": {
+              "max_bytes": 16
+            }
+          },
+          "allocation": 1220,
+          "view": 1230,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 4096,
+          "storage_mode": "borrowed_no_copy",
+          "initial_hex": "8180803e8180003fc1c0403f0000803f"
+        }
+      ],
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        2,
+        2
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 2,
+        "height": 2,
+        "load": "clear",
+        "clear_hex": "fefefefe",
+        "store": "store"
+      },
+      "expected_hex": "4080c0fffefefefefefefefefefefefe",
+      "coverage": "partial",
+      "capture_rails": [
+        "vulkan",
+        "vulkan-objects"
+      ]
+    },
+    {
+      "id": "stage_buffer_staged_tint_2x2",
+      "declaring_case": "render_declaring_stage_buffer_lease",
+      "vertex_entry": "render_stage_buffer_vertex",
+      "fragment_entry": "render_stage_buffer_tint",
+      "metal": {
+        "path": "shaders/render_stage_buffer_2x2.metal",
+        "sha256": "63c4d5ba60c187437d749d957033778f479bc9ecb3f0a408eeabe6095dba0de6"
+      },
+      "stage_buffers": [
+        {
+          "stage": "vertex",
+          "index": 0,
+          "access": "read",
+          "footprint": {
+            "static": {
+              "max_bytes": 24
+            }
+          },
+          "allocation": 1400,
+          "view": 1410,
+          "offset": 0,
+          "length": 24,
+          "initial_hex": "666666bf6666663f000000006666663f666666bf00000000"
+        },
+        {
+          "stage": "fragment",
+          "index": 0,
+          "access": "read",
+          "footprint": {
+            "static": {
+              "max_bytes": 16
+            }
+          },
+          "allocation": 1420,
+          "view": 1430,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 4096,
+          "storage_mode": "staged_lease",
+          "initial_hex": "8180803e8180003fc1c0403f0000803f"
+        }
+      ],
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        2,
+        2
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 2,
+        "height": 2,
+        "load": "clear",
+        "clear_hex": "fefefefe",
+        "store": "store"
+      },
+      "expected_hex": "4080c0fffefefefefefefefefefefefe",
+      "coverage": "partial",
+      "capture_rails": [
+        "vulkan",
+        "vulkan-objects"
+      ]
+    }
+  ]
+}
