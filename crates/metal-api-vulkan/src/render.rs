@@ -4228,22 +4228,15 @@ pub(crate) fn execute_present_render(
             "the present rail executes exactly one colour attachment",
         ));
     };
-    // The present rail builds its fragment stage from the attachment format
-    // (`solid_fragment_spirv` below) rather than taking the registration's
-    // fragment module, so a translated registration would be executed with a
-    // stage the contract's reflection never described (its vertex half may be
-    // the registration's, its fragment half would not be). The offscreen rail
-    // is where a translated pipeline runs; a present pass beside one is refused
-    // by name instead (`research/docs/23`, R2 increment).
-    if request.translated_fragment.is_some() || stages.vertex_translation.is_some() {
-        return Err(
-            capability_refusal("render_present_translated_stage_unsupported").with_detail(
-                "the present rail binds the reviewed fragment stage of the attachment format, so \
-                 a translated pipeline is refused here instead of being executed with a stage \
-                 the registration did not name",
-            ),
-        );
-    }
+    // The present rail selects its fragment half by the same rule the
+    // offscreen executor states: a translated registration binds the module
+    // the translation produced (whose reflection the registration gate already
+    // checked against the contract), and a reviewed registration binds the
+    // format list's solid module. The registration gate itself
+    // (`RenderStages::validate_stage_pair`, re-asked by
+    // `prepare_render_request`) is what keeps a stage the rail has no account
+    // of out of both rails, so the present rail adds no second gate of its own
+    // (`research/docs/23` §3.3; R4a increment).
     // A present attachment is the pass's only observable landing point, so a
     // `StoreOp::DontCare` present pass is the all-discarded shape the rail
     // refuses for an offscreen request (`docs/23` §3.6, v19). Core admission
@@ -4310,7 +4303,44 @@ pub(crate) fn execute_present_render(
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
-    let fragment_spirv = solid_fragment_spirv(&[attachment.format])?;
+    // The fragment module is the registration's when the registration is a
+    // translation, and the format list's reviewed solid module otherwise — the
+    // same pair the offscreen rail binds (`research/docs/23` §3.3, R2/V70).
+    let (fragment_spirv, fragment_entry_name): (&[u8], &str) = match &request.translated_fragment {
+        Some(fragment) => (fragment.spirv, fragment.entry.as_str()),
+        None => solid_fragment_stage(&[attachment.format])?,
+    };
+    // The reviewed sampling pair (`research/docs/23` §3.3, v70) is the
+    // offscreen rail's own fragment selection; the present rail binds the
+    // format's solid module instead, and a translated fragment stage carries
+    // no image binding at all. A pass that names the sampling vertex stage or
+    // binds a render texture is therefore refused by the same slugs the
+    // offscreen rail uses, rather than executed with a module that silently
+    // ignores the binding.
+    if vertex_stage_is_sampled(&request.vertex.entry, request.vertex.spirv) {
+        if request.textures.is_empty() {
+            return Err(
+                capability_refusal("render_texture_binding_required").with_detail(
+                    "the reviewed sampling pair samples the pass's own texture binding; this \
+                 present pass binds none",
+                ),
+            );
+        }
+        return Err(
+            capability_refusal("render_texture_stage_unsupported").with_detail(
+                "the present rail binds the format's solid module; the reviewed sampling pair is \
+             executed by the offscreen rail",
+            ),
+        );
+    }
+    if !request.textures.is_empty() {
+        return Err(
+            capability_refusal("render_texture_stage_unsupported").with_detail(
+                "the pass binds a render texture but its fragment stage is not the reviewed \
+             sampling module",
+            ),
+        );
+    }
     let vk_format = attachment_vk_format(attachment.format)?;
     // The multisample raster (`research/docs/23` §3.3, v51/v61) is executed
     // at the pass's own sample count. A present pass's n-sample surface is a
@@ -4356,7 +4386,7 @@ pub(crate) fn execute_present_render(
     let fragment_words = spirv_words(fragment_spirv)
         .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
     let vertex_entry = stage_entry_cstring("vertex", &request.vertex.entry)?;
-    let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
+    let fragment_entry = stage_entry_cstring("fragment", fragment_entry_name)?;
 
     // The no-copy leases this pass reads are retained before the first import
     // and dropped once the fence below proves the GPU is done with them

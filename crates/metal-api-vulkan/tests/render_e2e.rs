@@ -41,7 +41,9 @@ use metal_api_core::provider::{
     VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
-use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
+use metal_api_vulkan::{
+    RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor, PRESENT_TARGET_BUDGET,
+};
 use std::sync::Arc;
 
 /// Vertex stage of the milestone: `spirv-as` output of the reviewed
@@ -1077,25 +1079,45 @@ const PRESENT_SENTINEL: [u8; 4] = [0xfe; 4];
 /// Attach the first increment's present action to a fixture's render pass: the
 /// target is the attachment's own allocation/view, handed on once in `Fifo`
 /// mode with a blocking acquire.
-fn presenting_fixture() -> Option<Fixture> {
-    let mut fixture = fixture(AttachmentFormat::Rgba8Unorm)?;
-    let Some(TracePass::Render(pass)) = fixture.trace.passes.last_mut() else {
+fn attach_present(
+    trace: &mut ComputeTrace,
+    view: ViewId,
+    allocation: AllocationId,
+    format: AttachmentFormat,
+    sentinel: [u8; 4],
+) {
+    let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
         panic!("the fixture ends in a render pass");
     };
+    // The target restates the attachment it presents, extent included
+    // (`PresentDescriptor::validate_against`).
+    let width = pass.color_attachments[0].width;
+    let height = pass.color_attachments[0].height;
     pass.present = Some(PresentDescriptor {
         target: PresentTarget {
-            allocation_id: ATTACHMENT_ALLOCATION,
-            view_id: ATTACHMENT_VIEW,
-            format: AttachmentFormat::Rgba8Unorm,
-            width: 2,
-            height: 2,
+            allocation_id: allocation,
+            view_id: view,
+            format,
+            width,
+            height,
             image_count: 1,
-            initial: InitialState::Sentinel(PRESENT_SENTINEL.to_vec()),
+            initial: InitialState::Sentinel(sentinel.to_vec()),
         },
-        source: ATTACHMENT_VIEW,
+        source: view,
         mode: PresentMode::Fifo,
         acquire: AcquirePolicy::Blocking,
     });
+}
+
+fn presenting_fixture() -> Option<Fixture> {
+    let mut fixture = fixture(AttachmentFormat::Rgba8Unorm)?;
+    attach_present(
+        &mut fixture.trace,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        fixture.format,
+        PRESENT_SENTINEL,
+    );
     Some(fixture)
 }
 
@@ -1437,6 +1459,265 @@ fn a_second_present_reuses_the_same_target_image() {
     // Two presents, one target: reuse is observable as a stable target count.
     assert_eq!(fixture.provider.present_target_count(), 1);
     assert_eq!(fixture.provider.present_counts(), (2, 2));
+}
+
+/// One presenting trace whose attachment (and therefore present target)
+/// identity is the caller's, so a registry-wide test can present many distinct
+/// targets through one provider.
+fn presenting_trace_for(
+    fixture: &Fixture,
+    view: ViewId,
+    allocation: AllocationId,
+    sentinel: [u8; 4],
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut trace = fixture.trace.clone();
+    if let Some(TracePass::Compute(pass)) = trace.passes.first_mut() {
+        pass.buffers[0].view_id = view;
+        pass.buffers[0].allocation_id = allocation;
+    } else {
+        panic!("the fixture opens with the declaring compute pass");
+    }
+    if let Some(TracePass::Render(pass)) = trace.passes.last_mut() {
+        pass.color_attachments[0].view_id = view;
+        pass.color_attachments[0].allocation_id = allocation;
+    } else {
+        panic!("the fixture ends in a render pass");
+    }
+    attach_present(&mut trace, view, allocation, fixture.format, sentinel);
+    let mut resources = fixture.resources.clone();
+    resources
+        .insert_allocation(AllocationRecord {
+            allocation_id: allocation,
+            owner_epoch: fixture.provider.device_epoch(),
+            size: 16,
+        })
+        .expect("the presenting attachment's allocation");
+    (trace, resources)
+}
+
+/// Submit one hand-built trace and return its writebacks, asserting admission
+/// and completion on the way so a registry case only measures the registry.
+fn submit_presenting_trace(
+    provider: &VulkanComputeProvider,
+    trace: &ComputeTrace,
+    resources: &ResourceTableSnapshot,
+) -> Vec<(ViewId, Vec<u8>)> {
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the presenting trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(trace)
+        .expect("the writebacks cover the trace");
+    submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect()
+}
+
+/// The present registry's budget and eviction order (`research/docs/24`
+/// §5.2): the contract bounds the targets one trace names, the provider bounds
+/// the identities it keeps resident, and the victim is the least recently used
+/// one — which the eviction counter makes observable, because re-presenting a
+/// live target evicts nothing while re-presenting an evicted one does.
+#[test]
+fn present_targets_are_bounded_and_evicted_least_recently_used() {
+    let Some(fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let provider = &fixture.provider;
+    let budget = PRESENT_TARGET_BUDGET;
+    assert!(
+        budget >= 2,
+        "the LRU case needs more than one resident target"
+    );
+
+    // `budget + 2` distinct identities: the registry has to evict exactly the
+    // two oldest ones, keeping its count at the budget.
+    let identities = (0..budget + 2)
+        .map(|index| {
+            (
+                ViewId::new(9000 + index as u64),
+                AllocationId::new(9500 + index as u64),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, (view, allocation)) in identities.iter().enumerate() {
+        let (trace, resources) =
+            presenting_trace_for(&fixture, *view, *allocation, PRESENT_SENTINEL);
+        let writebacks = submit_presenting_trace(provider, &trace, &resources);
+        assert_eq!(
+            readback(&writebacks, *view),
+            expected_texels(fixture.format).repeat(4),
+            "the presenting target at index {index} lands the drawn texels"
+        );
+    }
+
+    let over_budget = (identities.len() - budget) as u64;
+    assert_eq!(
+        provider.present_target_count(),
+        budget,
+        "the registry keeps at most the budget's worth of targets resident"
+    );
+    let evictions = provider.present_target_evictions();
+    assert_eq!(
+        evictions, over_budget,
+        "one eviction per identity beyond the budget"
+    );
+    eprintln!(
+        "present registry after {} distinct identities: count={} budget={} evictions={}",
+        identities.len(),
+        provider.present_target_count(),
+        budget,
+        evictions
+    );
+
+    // The two oldest identities were the victims: presenting them again has to
+    // recreate the target and evict the next least recently used entry, which
+    // is what makes the order — not just the count — observable.
+    for (view, allocation) in identities.iter().take(over_budget as usize) {
+        let (trace, resources) =
+            presenting_trace_for(&fixture, *view, *allocation, PRESENT_SENTINEL);
+        let writebacks = submit_presenting_trace(provider, &trace, &resources);
+        assert_eq!(
+            readback(&writebacks, *view),
+            expected_texels(fixture.format).repeat(4),
+            "the re-created target lands the drawn texels"
+        );
+    }
+    assert_eq!(
+        provider.present_target_count(),
+        budget,
+        "re-creating an evicted target evicts a live one instead of growing"
+    );
+    assert_eq!(
+        provider.present_target_evictions(),
+        evictions + over_budget,
+        "each re-created target evicts the least recently used live target"
+    );
+    eprintln!(
+        "present registry after re-presenting the {} evicted identities: count={} evictions={}",
+        over_budget,
+        provider.present_target_count(),
+        provider.present_target_evictions()
+    );
+}
+
+/// The normal-path retirement surface that pairs with the budget: a present
+/// target reserved for an allocation is retired when the staged lease that
+/// allocation was imported under is released — the same rule the native rail's
+/// `drop_present_targets_for` states (`research/docs/24` §6 Step 7).
+#[test]
+fn releasing_a_staged_lease_retires_the_present_target_of_its_allocation() {
+    let Some(mut fixture) = presenting_fixture() else {
+        return;
+    };
+    let provider = &fixture.provider;
+    let lease = LeaseId::new(11);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: lease,
+            allocation_id: ATTACHMENT_ALLOCATION,
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 16,
+    };
+    provider
+        .import_staged_lease(
+            StagedLease::new(reservation, ATTACHMENT_WORD.repeat(4))
+                .expect("the staged attachment carries one byte per declared byte"),
+        )
+        .expect("the provider stages the attachment's bytes");
+    if let Some(TracePass::Compute(pass)) = fixture.trace.passes.first_mut() {
+        pass.buffers[0].source = BufferSource::StagedLease(lease);
+    } else {
+        panic!("the fixture opens with the declaring compute pass");
+    }
+    let mut resources = fixture.resources.clone();
+    resources
+        .insert_lease(reservation)
+        .expect("the reservation covers the attachment view");
+
+    let writebacks = submit_presenting_trace(provider, &fixture.trace, &resources);
+    assert_eq!(
+        readback(&writebacks, ATTACHMENT_VIEW),
+        expected_texels(fixture.format).repeat(4)
+    );
+    assert_eq!(
+        provider.present_target_count(),
+        1,
+        "the present target of a leased allocation stays alive while the lease does"
+    );
+    let evictions = provider.present_target_evictions();
+    eprintln!(
+        "leased present: target count={} evictions={}",
+        provider.present_target_count(),
+        evictions
+    );
+
+    provider
+        .release_staged_lease(lease)
+        .expect("the staged lease is released");
+    assert_eq!(
+        provider.present_target_count(),
+        0,
+        "releasing the lease retires the allocation's present target in the same call"
+    );
+    assert_eq!(
+        provider.present_target_evictions(),
+        evictions + 1,
+        "a lease-driven retirement is the same observable as a budget eviction"
+    );
+    eprintln!(
+        "present target count after the lease release: {} evictions={}",
+        provider.present_target_count(),
+        provider.present_target_evictions()
+    );
+}
+
+/// A texture beside the reviewed solid pair is refused by the slug the
+/// offscreen rail states (`render_texture_stage_unsupported`) rather than
+/// executed by a present pass that drops the binding: the present rail's
+/// reviewed arm binds the format's solid module, which names no image binding
+/// at all (`research/docs/23` §3.3, v70; R4a increment).
+#[test]
+fn a_presenting_pass_with_a_render_texture_is_refused_by_name() {
+    let Some(fixture) = presenting_fixture() else {
+        return;
+    };
+    let mut trace = fixture.trace.clone();
+    let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+        panic!("the fixture ends in a render pass");
+    };
+    pass.textures = vec![TextureView {
+        view_id: SAMPLED_TEXTURE_VIEW,
+        metal_binding: 0,
+        allocation_id: SAMPLED_TEXTURE_ALLOCATION,
+        texture_type: TextureType::D2,
+        format: TextureFormat::Rgba8Unorm,
+        width: 2,
+        height: 2,
+        depth: 1,
+        array_length: 1,
+        sample_count: 1,
+        access: TextureAccess::Sampled,
+        source: TextureSource::OwnedBytes(sampled_texels()[..16].to_vec()),
+    }];
+    let admitted = fixture
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), fixture.resources.clone())
+        .expect("the declaration stays well formed");
+    let refused = fixture
+        .provider
+        .submit(admitted)
+        .expect_err("the present rail binds the format's solid module, which samples nothing");
+    eprintln!("texture beside a solid present pass refused: {refused:?}");
+    assert_eq!(refused.slug, "render_texture_stage_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
 }
 
 /// The typed refusal for an unsupported snapshot is unchanged by the execution
@@ -2231,16 +2512,16 @@ fn sampled_texels() -> Vec<u8> {
         .collect()
 }
 
-/// The whole chain for the render sampler: a 4×4 attachment, one texture the
-/// fragment stage samples at texel centres, and the bytes that land in the
-/// writeback channel. The falsification is the point: a rail that ignores the
-/// texture reads back the clear sentinel, one that filters reads a neighbour's
-/// texel, and one that flips or transposes the uv reads another row or column.
-#[test]
-fn a_render_pass_samples_its_texture_and_lands_the_texels() {
-    let Some(executor) = executor() else {
-        return;
-    };
+/// The render sampler's fixture: the reviewed sampling pair, a 4×4 attachment,
+/// and the 4×4 texture the fragment stage samples at texel centres. Shared by
+/// the milestone case and the present-rail refusal beside it.
+fn sampled_fixture() -> Option<(
+    VulkanComputeProvider,
+    ComputeTrace,
+    ResourceTableSnapshot,
+    Vec<u8>,
+)> {
+    let executor = executor()?;
     let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
     let provider =
         VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
@@ -2341,7 +2622,19 @@ fn a_render_pass_samples_its_texture_and_lands_the_texels() {
             })
             .expect("fixture allocation");
     }
+    Some((provider, trace, resources, texels))
+}
 
+/// The whole chain for the render sampler: a 4×4 attachment, one texture the
+/// fragment stage samples at texel centres, and the bytes that land in the
+/// writeback channel. The falsification is the point: a rail that ignores the
+/// texture reads back the clear sentinel, one that filters reads a neighbour's
+/// texel, and one that flips or transposes the uv reads another row or column.
+#[test]
+fn a_render_pass_samples_its_texture_and_lands_the_texels() {
+    let Some((provider, trace, resources, texels)) = sampled_fixture() else {
+        return;
+    };
     let admitted = provider
         .capabilities()
         .validate_trace(trace.clone(), resources.clone())
@@ -2393,6 +2686,57 @@ fn a_render_pass_samples_its_texture_and_lands_the_texels() {
         Err(error) => error,
     };
     eprintln!("sampling without a texture refused: {refused:?}");
+    assert_eq!(refused.slug, "render_texture_binding_required");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+/// The present rail binds the format's solid fragment module rather than the
+/// reviewed sampling pair, so a present tail beside a sampled pass is refused
+/// by the same slugs the offscreen rail states for that pair
+/// (`render_texture_stage_unsupported` for a bound texture,
+/// `render_texture_binding_required` for a missing one) instead of being
+/// executed with the binding silently dropped (`research/docs/23` §3.3, v70;
+/// R4a increment).
+#[test]
+fn a_presenting_pass_beside_the_sampling_pair_is_refused_by_name() {
+    let Some((provider, trace, resources, _texels)) = sampled_fixture() else {
+        return;
+    };
+    let mut presenting = trace.clone();
+    attach_present(
+        &mut presenting,
+        ATTACHMENT_VIEW,
+        ATTACHMENT_ALLOCATION,
+        AttachmentFormat::Rgba8Unorm,
+        PRESENT_SENTINEL,
+    );
+
+    // The bound-texture shape is the offscreen rail's, not the present rail's.
+    let admitted = provider
+        .capabilities()
+        .validate_trace(presenting.clone(), resources.clone())
+        .expect("the sampled declaration stays well formed");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("the present rail binds no descriptor set for the sampling pair");
+    eprintln!("texture beside a present pass refused: {refused:?}");
+    assert_eq!(refused.slug, "render_texture_stage_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+    // The same pass without its binding: the sampling pair needs its texture,
+    // and the present rail still refuses rather than sampling nothing.
+    let mut unbound = presenting.clone();
+    if let Some(TracePass::Render(pass)) = unbound.passes.last_mut() {
+        pass.textures = Vec::new();
+    }
+    let admitted = provider
+        .capabilities()
+        .validate_trace(unbound, resources)
+        .expect("the unbound declaration stays well formed");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("the sampling pair without its texture is not the present rail's shape");
+    eprintln!("sampling pair without a texture refused beside a present pass: {refused:?}");
     assert_eq!(refused.slug, "render_texture_binding_required");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 }
