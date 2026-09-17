@@ -78,6 +78,25 @@ const RENDER_FRAGMENT_ENTRY: &str = "fragment_main";
 const RENDER_MSL_VERTEX_ENTRY: &str = "render_fullscreen_triangle";
 const RENDER_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
 
+/// The reviewed render-sampler fixture (`research/docs/23` §3.3, v70): the
+/// milestone's `vertex_id` geometry with one `float32x2` varying holding the
+/// geometry's own normalised coordinate, and a fragment stage that samples the
+/// pass's own texture binding at that coordinate. The Vulkan rail compiles
+/// `sampled_quad.vert.spv` + `solid_unorm8_sampled.frag.spv` (entries
+/// `vertex_main` / `fragment_main`), the native rail
+/// `conformance/shaders/render_sampled_4x4.metal` (entries
+/// `render_sampled_quad_vertex` / `render_sampled_texel`), and a render case
+/// that carries a `fragment_textures` block has to name exactly this pair.
+const SAMPLED_QUAD_VERTEX_ENTRY: &str = "vertex_main";
+const SAMPLED_QUAD_FRAGMENT_ENTRY: &str = "fragment_main";
+const SAMPLED_QUAD_VERT_SPV: &[u8] =
+    include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/sampled_quad.vert.spv");
+const SAMPLED_UNORM8_FRAG_SPV: &[u8] = include_bytes!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/solid_unorm8_sampled.frag.spv"
+);
+const SAMPLED_MSL_VERTEX_ENTRY: &str = "render_sampled_quad_vertex";
+const SAMPLED_MSL_FRAGMENT_ENTRY: &str = "render_sampled_texel";
+
 /// The reviewed vertex-input fixture (`research/docs/23` §3.3): a caller-held
 /// `float32x2` position stream and six `uint16` indices over it. The Vulkan rail
 /// compiles `quad_indexed.vert.spv`, the native rail compiles
@@ -1147,6 +1166,17 @@ fn register_render_pipeline(
             (DEPTH_VERTEX_SPV, DEPTH_FRAGMENT_SPV),
             reviewed_depth_layout(),
         ),
+        // The render sampler owns a module pair of its own
+        // (`research/docs/23` §3.3, v70): the vertex stage carries the
+        // geometry's normalised coordinate and the fragment stage samples the
+        // pass's own texture binding, so neither the solid stage nor the
+        // milestone vertex stage can stand in for either half.
+        RenderGeometry::SampledTexture => (
+            (SAMPLED_QUAD_VERTEX_ENTRY, SAMPLED_QUAD_FRAGMENT_ENTRY),
+            (SAMPLED_MSL_VERTEX_ENTRY, SAMPLED_MSL_FRAGMENT_ENTRY),
+            (SAMPLED_QUAD_VERT_SPV, SAMPLED_UNORM8_FRAG_SPV),
+            VertexLayout::None,
+        ),
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
@@ -1380,6 +1410,13 @@ struct RenderCase {
     /// fragment output and the load's own colour in the attachment view.
     #[serde(default)]
     multisample: Option<MultisampleDefinition>,
+    /// The sampled textures the fragment stage reads, in binding order
+    /// (`research/docs/23` §3.3, v70), or absent for the pre-v70 pass that
+    /// samples nothing. The reviewed sampling shape is exactly one
+    /// `rgba8_unorm` surface whose extent equals the render area's own, so the
+    /// expectation is its own uploaded texels.
+    #[serde(default)]
+    fragment_textures: Option<Vec<FragmentTextureDefinition>>,
     /// The depth resolve a stored multisampled depth surface states
     /// (`research/docs/23` §3.3, v57), or absent for a pass that resolves
     /// nothing. Only legal beside a multisample raster whose depth attachment
@@ -2929,6 +2966,25 @@ enum RenderGeometry {
     /// module over one oversize triangle whose tint carries an alpha below one,
     /// so the pass's blend state is what the attachment's bytes measure.
     BlendTriangle,
+    /// The reviewed render sampler (`research/docs/23` §3.3, v70): the
+    /// milestone's `vertex_id` geometry whose fragment stage samples one
+    /// `rgba8_unorm` texture of the render area's own extent, so the attachment
+    /// reads back exactly the uploaded texels.
+    SampledTexture,
+}
+
+/// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
+/// view its texel bytes travel under, the extent the pass has to share with it,
+/// and the bytes themselves as hex.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentTextureDefinition {
+    allocation: u64,
+    view: u64,
+    format: String,
+    width: u64,
+    height: u64,
+    initial_hex: String,
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -4122,6 +4178,108 @@ fn reviewed_instanced_geometry(
     Ok(RenderGeometry::InstancedPair)
 }
 
+/// The reviewed render-sampler shape (`research/docs/23` §3.3, v70).
+///
+/// The case's own claim is the identity: exactly one `rgba8_unorm` texture
+/// whose extent equals the stored attachment's, and an expectation that *is*
+/// that texture's uploaded texels, byte for byte. The texels have to be
+/// pairwise distinct and differ from the clear colour, so a rail that ignores
+/// the binding (clear), filters it (a neighbour's texel), or flips/transposes
+/// the uv (another row or column) cannot pass.
+fn reviewed_sampled_geometry(
+    case: &RenderCase,
+    textures: &[FragmentTextureDefinition],
+    where_: &str,
+) -> Result<RenderGeometry> {
+    if textures.len() != 1 {
+        return Err(format!(
+            "{where_}: the reviewed render-sampler shape binds exactly one texture"
+        )
+        .into());
+    }
+    if case.vertex_layout.is_some() || !case.vertex_buffers.is_empty() || case.indices.is_some() {
+        return Err(format!(
+            "{where_}: the reviewed render-sampler shape is the vertex_id geometry and binds no \
+             vertex stream or index buffer"
+        )
+        .into());
+    }
+    if case.attachments.is_some() {
+        return Err(
+            format!("{where_}: the reviewed render-sampler shape stores one attachment").into(),
+        );
+    }
+    let attachment = case.attachment.as_ref().ok_or_else(|| {
+        format!("{where_}: the reviewed render-sampler shape needs its stored attachment")
+    })?;
+    if attachment.format != "rgba8_unorm" || attachment.store != "store" {
+        return Err(format!(
+            "{where_}: the reviewed render-sampler shape stores one rgba8_unorm attachment"
+        )
+        .into());
+    }
+    let texture = &textures[0];
+    if texture.format != "rgba8_unorm" {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: the reviewed sampling stage reads one rgba8_unorm \
+             surface"
+        )
+        .into());
+    }
+    if texture.width != attachment.width || texture.height != attachment.height {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: the sampled texture has to share the attachment's \
+             extent, so every fragment stands on a texel centre"
+        )
+        .into());
+    }
+    let texels = unhex(&texture.initial_hex)?;
+    let extent = usize::try_from(texture.width * texture.height * 4)?;
+    if texels.len() != extent {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: the uploaded texels do not match the extent"
+        )
+        .into());
+    }
+    let expected = unhex(case.expected_hex.as_deref().ok_or_else(|| {
+        format!("{where_}: the reviewed render-sampler shape needs its expectation")
+    })?)?;
+    if expected != texels {
+        return Err(format!(
+            "{where_}: the expectation has to be the uploaded texels: the sampling stage's \
+             sample at a texel centre is an identity copy"
+        )
+        .into());
+    }
+    let clear = unhex(attachment.clear_hex.as_deref().unwrap_or_default())?;
+    if attachment.load != "clear" || clear.len() != 4 {
+        return Err(format!(
+            "{where_}.attachment: the reviewed render-sampler shape clears its attachment, so a \
+             rail that ignores the texture is observable"
+        )
+        .into());
+    }
+    let unique = texels
+        .chunks_exact(4)
+        .map(|texel| texel.to_vec())
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != texels.len() / 4 {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: the uploaded texels have to be pairwise distinct, or \
+             a repeated read could pass"
+        )
+        .into());
+    }
+    if unique.contains(&clear) {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: an uploaded texel equals the clear colour, so \
+             ignoring the texture could pass"
+        )
+        .into());
+    }
+    Ok(RenderGeometry::SampledTexture)
+}
+
 /// Classify a render case's geometry and pin the reviewed shape.
 ///
 /// The checks are deliberately exact: the vertex-input case names one stream,
@@ -4129,6 +4287,13 @@ fn reviewed_instanced_geometry(
 /// draw the fixture claims, with every index naming one of the four reviewed
 /// vertices. Anything else is a case the reviewers have not seen.
 fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    // The render sampler is classified first: its shape is the milestone's
+    // vertex_id geometry plus one texture binding, so a case that carries the
+    // binding is the sampled shape and nothing else may be added to it
+    // (`research/docs/23` §3.3, v70).
+    if let Some(textures) = &case.fragment_textures {
+        return reviewed_sampled_geometry(case, textures, where_);
+    }
     let Some(layout) = &case.vertex_layout else {
         if !case.vertex_buffers.is_empty() || case.indices.is_some() {
             return Err(format!(
@@ -4253,7 +4418,12 @@ fn render_inputs(
     case: &RenderCase,
     where_: &str,
 ) -> Result<(Vec<BufferView>, Option<IndexBufferBinding>)> {
-    if render_geometry(case, where_)? == RenderGeometry::Milestone {
+    // The render sampler binds no stream either: its geometry is the
+    // milestone's `vertex_id` triangle (`research/docs/23` §3.3, v70).
+    if matches!(
+        render_geometry(case, where_)?,
+        RenderGeometry::Milestone | RenderGeometry::SampledTexture
+    ) {
         return Ok((Vec::new(), None));
     }
     // One pass view per bound stream, in binding order: the pass is positional
@@ -4430,6 +4600,20 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::SampledTexture => {
+            if case.vertices != 3 {
+                return Err(format!(
+                    "{where_}: the reviewed render sampler draws the full-screen triangle"
+                )
+                .into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a sampled case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
     }
     if let Some(present) = &case.present {
         if present.mode != "fifo" {
@@ -4474,6 +4658,9 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         RenderGeometry::DepthPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::CullPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::BlendTriangle => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
+        // The render sampler's MSL module carries its own entry pair
+        // (`research/docs/23` §3.3, v70).
+        RenderGeometry::SampledTexture => (SAMPLED_MSL_VERTEX_ENTRY, SAMPLED_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -5361,6 +5548,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                                     .into());
                                 }
                             }
+                        } else if case.fragment_textures.is_some() {
+                            // The render sampler's expectation is the uploaded
+                            // texture itself (`research/docs/23` §3.3, v70), and
+                            // `reviewed_sampled_geometry` already held it to
+                            // that byte for byte — including that the texels
+                            // are pairwise distinct and none is the clear
+                            // colour, which is what rules out a uniform store.
                         } else if !uniform_texel {
                             return Err(format!(
                                 "{where_}: every texel of a cleared attachment has to be the fragment output"
@@ -7462,6 +7656,37 @@ fn run_render_case(
     // every other count before this point, so the mapping is total over the
     // shapes that can reach it.
     let multisample = case_multisample(case)?;
+    // The sampled textures the reviewed sampling pair reads
+    // (`research/docs/23` §3.3, v70): each entry's position is its binding, and
+    // its bytes travel with the trace exactly as a compute binding's do. Every
+    // other case binds none, which is the shape every pre-v70 pass carries.
+    let textures = case
+        .fragment_textures
+        .as_ref()
+        .map(|definitions| {
+            definitions
+                .iter()
+                .enumerate()
+                .map(|(binding, definition)| {
+                    Ok(TextureView {
+                        view_id: ViewId::new(definition.view),
+                        metal_binding: u32::try_from(binding)?,
+                        allocation_id: AllocationId::new(definition.allocation),
+                        texture_type: TextureType::D2,
+                        format: TextureFormat::Rgba8Unorm,
+                        width: definition.width,
+                        height: definition.height,
+                        depth: 1,
+                        array_length: 1,
+                        sample_count: 1,
+                        access: TextureAccess::Sampled,
+                        source: TextureSource::OwnedBytes(unhex(&definition.initial_hex)?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         color_attachments,
@@ -7509,7 +7734,7 @@ fn run_render_case(
         // The reviewed render-sampler case binds its fragment texture here;
         // every other case leaves the list empty, which the rails execute as
         // "the fragment stage samples nothing" (`research/docs/23` §3.3, v70).
-        textures: Vec::new(),
+        textures,
         present,
     }));
 
@@ -8195,6 +8420,23 @@ fn run_object_render_case(
     // trace at commit. A vertex-input case is a direct indexed draw by
     // construction, so it never reaches the indirect arm.
     let (vertex_buffers, indices) = render_inputs(case, &format!("render case {}", case.id))?;
+    // The reviewed render-sampler case binds its texture through the object
+    // API's own entry (`research/docs/23` §3.3, v70): the encoder's binding is
+    // what the pass the command commits carries, exactly as a vertex stream's
+    // is. Every other case binds none.
+    let mut object_textures = Vec::new();
+    if let Some(definitions) = &case.fragment_textures {
+        for (index, definition) in definitions.iter().enumerate() {
+            let texture = device.new_texture_with_bytes(
+                TextureFormat::Rgba8Unorm,
+                definition.width,
+                definition.height,
+                unhex(&definition.initial_hex)?,
+            )?;
+            render.set_fragment_texture(u32::try_from(index)?, &texture)?;
+            object_textures.push(texture);
+        }
+    }
     let mut object_streams = Vec::with_capacity(vertex_buffers.len());
     for view in &vertex_buffers {
         let buffer = device.new_buffer_with_bytes(

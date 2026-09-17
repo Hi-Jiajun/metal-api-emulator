@@ -212,6 +212,12 @@ MSAA_DS_INDEX = 23
 # The v69 edge pair follows it, the 2x case first.
 MSAA_EDGE_2X_INDEX = 24
 MSAA_EDGE_8X_INDEX = 25
+# The v70 render sampler (`research/docs/23` §3.3, v70): one `rgba8_unorm`
+# texture of the attachment's own extent whose own texels are the expectation.
+SAMPLED_ID = "sampled_texel_4x4"
+SAMPLED_TEXTURE = (1060, 1070, 0, 64)
+SAMPLED_TEXELS = "".join(f"{x:02x}{y:02x}{x + y:02x}ff" for y in range(4) for x in range(4))
+SAMPLED_EXPECTED = SAMPLED_TEXELS
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
@@ -219,7 +225,7 @@ REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID
                   MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID,
                   MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID,
                   MSAA_UNIFORM_2X_ID, MSAA_UNIFORM_8X_ID, MSAA_DS_ID,
-                  MSAA_EDGE_2X_ID, MSAA_EDGE_8X_ID)
+                  MSAA_EDGE_2X_ID, MSAA_EDGE_8X_ID, SAMPLED_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -872,6 +878,27 @@ def msaa_edge_2x_result(provider_backend=True, copy_in=2, copy_out=2):
     return result
 
 
+def sampled_result(provider_backend=True, copy_in=3, copy_out=2):
+    """The v70 render sampler landing (`research/docs/23` §3.3, v70).
+
+    The expectation is the case's own uploaded texture, and the submission
+    carries one more copy-in than the declaring pass's touched allocations:
+    the rail uploads the pass's sampled texels exactly as it uploads the
+    declaring allocation, which the comparator counts through the plan's
+    `texture_uploads` (`conformance/compare.py`).
+    """
+    result = {
+        "id": SAMPLED_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": SAMPLED_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": SAMPLED_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
 def msaa_edge_8x_result(provider_backend=True, copy_in=2, copy_out=2):
     """The v69 8x landing: the 2x sibling with the wider raster's own gate."""
     result = {
@@ -1372,6 +1399,7 @@ class ScissorObservationTests(unittest.TestCase):
                 stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
                                        if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(render_result(rail != "native-metal"))
+            report["results"].append(sampled_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
@@ -1457,6 +1485,7 @@ class ScissorObservationTests(unittest.TestCase):
                 stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
                                        if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(instanced_result(rail != "native-metal"))
+            report["results"].append(sampled_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
                 report["results"].append(base_vertex_result(rail != "native-metal"))
@@ -1529,6 +1558,7 @@ class ScissorObservationTests(unittest.TestCase):
                 stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
                                        if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(render_result(rail != "native-metal"))
+            report["results"].append(sampled_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
@@ -1605,6 +1635,7 @@ class ScissorObservationTests(unittest.TestCase):
         report = counted_declaring(self.suite, digest, "vulkan",
                                    render_sample_counts=1 << 1 | 1 << 3)
         report["results"].append(render_result())
+        report["results"].append(sampled_result())
         report["results"].append(instanced_result())
         report["results"].append(wildcard_result())
         report["results"].append(base_vertex_result())
@@ -2722,6 +2753,7 @@ class ScissorObservationTests(unittest.TestCase):
             json.dumps(self.suite, sort_keys=True).encode("utf-8")).hexdigest()
         report = counted_declaring(self.suite, digest, "vulkan")
         report["results"].append(render_result())
+        report["results"].append(sampled_result())
         report["results"].append(instanced_result())
         report["results"].append(base_vertex_result())
         report["results"].append(depth_result())
@@ -2772,6 +2804,7 @@ class ScissorObservationTests(unittest.TestCase):
                 stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
                                        if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(instanced_result(rail != "native-metal"))
+            report["results"].append(sampled_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
                 report["results"].append(base_vertex_result(rail != "native-metal"))

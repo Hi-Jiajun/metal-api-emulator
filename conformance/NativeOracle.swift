@@ -123,6 +123,18 @@ private struct RenderSourcePin: Decodable, Equatable {
 /// format, extent and the load/store pair. `clear_hex` is the four-byte clear
 /// value the contract carries in memory order, and `initial_hex` is what a
 /// `load` case keeps from its previous contents.
+/// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
+/// view its texel bytes travel under, the extent the render area has to share
+/// with it, and the bytes themselves as hex.
+private struct FragmentTextureDefinition: Decodable, Equatable {
+    let allocation: UInt64
+    let view: UInt64
+    let format: String
+    let width: Int
+    let height: Int
+    let initial_hex: String
+}
+
 private struct RenderAttachmentDefinition: Decodable {
     let allocation: UInt64
     let view: UInt64
@@ -496,6 +508,14 @@ private struct RenderCaseDefinition: Decodable {
     /// exactly the mixtures those two colours produce. Only a `dontcare` load
     /// may name one, and an absent list means the case pins every texel.
     let wildcard_allowed_texels: [WildcardAllowedTexel]?
+    /// The sampled textures the fragment stage reads, in binding order
+    /// (`research/docs/23` §3.3, v70), or `nil` for the pre-v70 pass that
+    /// samples nothing. The reviewed sampling shape is exactly one
+    /// `rgba8_unorm` surface whose extent equals the render area's own, so the
+    /// expectation is its own uploaded texels: a rail that ignored the texture
+    /// reads back the clear, one that filtered it reads a neighbour, and one
+    /// that flipped or transposed the uv reads another row or column.
+    let fragment_textures: [FragmentTextureDefinition]?
     /// The rail-owned depth attachment the pass opens, or `nil` for no depth
     /// surface — the shape every case before v36 declares
     /// (`metal_api_core::provider::RenderPassDescriptor::depth`,
@@ -1776,6 +1796,22 @@ private func reviewedRenderModule() -> ReviewedRenderModule {
         buffers: nil)
 }
 
+/// The reviewed render-sampler fixture (`research/docs/23` §3.3, v70): the
+/// milestone's `vertex_id` geometry with one `float32x2` varying holding the
+/// geometry's own normalised coordinate, and a fragment stage that samples the
+/// pass's own texture binding at that coordinate through a `constexpr`
+/// nearest/clamp sampler. The module is the native rail's half of the same
+/// review the Vulkan pair carries; the case's `fragment_textures` block is the
+/// other half.
+private func reviewedSampledModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_sampled_quad_vertex",
+        fragment_entry: "render_sampled_texel",
+        metal: RenderSourcePin(path: "shaders/render_sampled_4x4.metal",
+                               sha256: "4c5216ce5af3e1184f7dfd9f989aaf0de9f1ce1ffaad43906d23e6a92aae8813"),
+        buffers: nil)
+}
+
 /// The reviewed indexed render fixture (`research/docs/23` §3.3): the same
 /// fragment entry, a vertex stage that reads `[[stage_in]]`, one `float32x2`
 /// position attribute at location 0, and an index buffer the draw selects
@@ -1967,6 +2003,13 @@ private func reviewedDepthOnlyModule() -> ReviewedRenderModule {
 /// layout names. A shape no module was reviewed for is refused instead of
 /// matched approximately.
 private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
+    // The reviewed render sampler (`research/docs/23` §3.3, v70) shares the
+    // milestone's shape — a `vertex_id` triangle and one `rgba8_unorm`
+    // attachment — so its `fragment_textures` block is what tells the two
+    // apart, exactly as the entry pair tells the two Rust rail modules apart.
+    if definition.fragment_textures != nil {
+        return reviewedSampledModule()
+    }
     let attachments = try colorAttachments(definition)
     // The 8-bit UNORM modules are layout-agnostic: the same store lands in
     // whichever channel order each attachment declares, so any mix of the two
@@ -2453,6 +2496,58 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         try require(definition.expected_hex == nil,
                     "\(definition.id): an attachment list carries its own expected_hex")
         expectedHexes = attachments.map { attachment in attachment.expected_hex }
+    }
+    // The render sampler (`research/docs/23` §3.3, v70): one `rgba8_unorm`
+    // texture whose extent is the attachment's own, and an expectation that is
+    // that texture's uploaded texels byte for byte — the identity the sampling
+    // stage's texel-centre sample produces. The texels have to be pairwise
+    // distinct and differ from the clear colour, so a rail that ignored the
+    // binding, filtered it, or flipped/transposed the uv cannot pass.
+    if let textures = definition.fragment_textures {
+        try require(textures.count == 1,
+                    "\(definition.id): the reviewed sampling shape binds exactly one texture")
+        try require(definition.vertex_layout == nil && definition.vertex_buffers == nil
+                    && definition.indices == nil,
+                    "\(definition.id): the reviewed sampling shape is the vertex_id geometry")
+        try require(definition.multisample == nil && definition.depth == nil
+                    && definition.depth_test == nil && definition.stencil == nil
+                    && definition.stencil_test == nil && definition.cull == nil
+                    && definition.blend == nil && definition.scissor == nil
+                    && definition.instance_count == nil && definition.base_vertex == nil
+                    && definition.wildcard_texels == nil
+                    && definition.wildcard_allowed_texels == nil
+                    && definition.coverage == nil,
+                    "\(definition.id): the reviewed sampling shape carries no other state")
+        try require(attachments.count == 1,
+                    "\(definition.id): the reviewed sampling shape stores one attachment")
+        try require(attachments[0].format == "rgba8_unorm" && attachments[0].store == "store",
+                    "\(definition.id): the reviewed sampling shape stores one rgba8_unorm "
+                    + "attachment")
+        let texture = textures[0]
+        try require(texture.format == "rgba8_unorm",
+                    "\(definition.id): the reviewed sampling stage reads one rgba8_unorm "
+                    + "surface")
+        try require(texture.width == attachments[0].width
+                    && texture.height == attachments[0].height,
+                    "\(definition.id): the sampled texture has to share the attachment's "
+                    + "extent, so every fragment stands on a texel centre")
+        try require(expectedHexes == [texture.initial_hex as String?],
+                    "\(definition.id): the expectation has to be the uploaded texels: the "
+                    + "sampling stage's sample at a texel centre is an identity copy")
+        let texels = try decodeHex(texture.initial_hex,
+                                   context: "\(definition.id).fragment_textures[0]")
+        let chunks = stride(from: 0, to: texels.count, by: 4).map { offset in
+            Data(texels[offset..<min(offset + 4, texels.count)])
+        }
+        try require(chunks.count == texture.width * texture.height,
+                    "\(definition.id): the uploaded texels do not match the extent")
+        try require(Set(chunks).count == chunks.count,
+                    "\(definition.id): the uploaded texels have to be pairwise distinct")
+        let clearHex = attachments[0].clear_hex ?? ""
+        let clear = try decodeHex(clearHex, context: "\(definition.id).attachment.clear_hex")
+        try require(clear.count == 4 && !chunks.contains(clear),
+                    "\(definition.id): an uploaded texel equals the clear colour, so a rail "
+                    + "that ignored the texture could pass")
     }
     // The coverage claim (`research/docs/23` §3.3, v38): only the
     // single-attachment shape may make it, and only the one spelling exists —
@@ -2956,6 +3051,16 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         try require(Data(texels[offset..<(offset + 4)]) == half,
                                     "\(definition.id): texel \(index) has to carry the "
                                     + "instance tint of its half")
+                        texelCount += 1
+                        continue
+                    }
+                    if definition.fragment_textures != nil {
+                        // The render sampler's expectation is the uploaded
+                        // texture itself (`research/docs/23` §3.3, v70): the
+                        // parse above already held it to that byte for byte,
+                        // including the pairwise-distinct and
+                        // differs-from-the-clear rules that rule out a uniform
+                        // store.
                         texelCount += 1
                         continue
                     }
@@ -4310,6 +4415,40 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                 offset: try hostOffset(stream.offset, id: definition.id),
                                 index: stream.binding)
     }
+    // The reviewed render sampler's own texture (`research/docs/23` §3.3,
+    // v70): shared storage, `shaderRead` usage and the case's uploaded texels,
+    // bound at the binding its position names. The local keeps it alive until
+    // the command buffer has completed.
+    var sampledTextures = [MTLTexture]()
+    for (index, texture) in (definition.fragment_textures ?? []).enumerated() {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: texture.width,
+            height: texture.height,
+            mipmapped: false)
+        descriptor.usage = .shaderRead
+        descriptor.storageMode = .shared
+        guard let sampled = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the sampled texture")
+        }
+        sampled.label = "native oracle: \(definition.id) sample \(index)"
+        let bytes = try decodeHex(texture.initial_hex,
+                                  context: "\(definition.id).fragment_textures[\(index)]")
+        bytes.withUnsafeBytes { raw in
+            if let source = raw.baseAddress {
+                sampled.replace(region: MTLRegionMake2D(0, 0, texture.width, texture.height),
+                                mipmapLevel: 0,
+                                withBytes: source,
+                                bytesPerRow: texture.width * 4)
+            }
+        }
+        encoder.setFragmentTexture(sampled, index: index)
+        sampledTextures.append(sampled)
+    }
+    // The sampled textures have to outlive the pass (`retainedReferences` is
+    // asserted above; this reference keeps the array itself alive to the end of
+    // the scope rather than leaving it as debug residue).
+    defer { _ = sampledTextures.count }
     if let indexStream = fixture.indexStream {
         // An indexed draw names its index buffer in the draw call, and the count
         // is the one the case declares for that shape
@@ -4576,6 +4715,7 @@ private func renderSelfTest() throws -> CaseResult {
         requires_sample_count: nil,
         wildcard_texels: nil,
         wildcard_allowed_texels: nil,
+        fragment_textures: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
         depth: nil,
@@ -4653,6 +4793,7 @@ private func presentSelfTest() throws -> CaseResult {
         requires_sample_count: nil,
         wildcard_texels: nil,
         wildcard_allowed_texels: nil,
+        fragment_textures: nil,
         depth: nil,
         depth_test: nil,
         cull: nil,
@@ -4752,6 +4893,7 @@ private func vertexSelfTest() throws -> CaseResult {
         requires_sample_count: nil,
         wildcard_texels: nil,
         wildcard_allowed_texels: nil,
+        fragment_textures: nil,
         depth: nil,
         depth_test: nil,
         cull: nil,
@@ -4855,6 +4997,7 @@ private func mrtSelfTest() throws -> CaseResult {
         requires_sample_count: nil,
         wildcard_texels: nil,
         wildcard_allowed_texels: nil,
+        fragment_textures: nil,
         depth: nil,
         depth_test: nil,
         cull: nil,
@@ -5296,6 +5439,7 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
         requires_sample_count: nil,
         wildcard_texels: nil,
         wildcard_allowed_texels: nil,
+        fragment_textures: nil,
         depth: DepthAttachmentDefinition(
             format: "depth32float", width: 4, height: 4, load: "clear",
             clear_depth: 1.0, store: "store", allocation: 980, view: 990,

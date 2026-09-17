@@ -2550,6 +2550,51 @@
         "vulkan-objects",
         "native-metal-provider-objects"
       ]
+    },
+    {
+      "id": "sampled_texel_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_sampled_quad_vertex",
+      "fragment_entry": "render_sampled_texel",
+      "metal": {
+        "path": "shaders/render_sampled_4x4.metal",
+        "sha256": "4c5216ce5af3e1184f7dfd9f989aaf0de9f1ce1ffaad43906d23e6a92aae8813"
+      },
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "fragment_textures": [
+        {
+          "allocation": 1060,
+          "view": 1070,
+          "format": "rgba8_unorm",
+          "width": 4,
+          "height": 4,
+          "initial_hex": "000000ff010001ff020002ff030003ff000101ff010102ff020103ff030104ff000202ff010203ff020204ff030205ff000303ff010304ff020305ff030306ff"
+        }
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "11223344",
+        "store": "store"
+      },
+      "expected_hex": "000000ff010001ff020002ff030003ff000101ff010102ff020103ff030104ff000202ff010203ff020204ff030205ff000303ff010304ff020305ff030306ff",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ]
     }
   ]
 }
