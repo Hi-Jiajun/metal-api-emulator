@@ -1719,8 +1719,14 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     && definition.buffers.contains { $0.binding == 3 && $0.access == "read" && $0.length == 16 },
                     "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1, "
                     + "a 64-byte read buffer at 2 and a 16-byte read buffer at 3")
+    // v30's lease arms copy the same 4-byte word through the same reviewed
+    // `copy_word` kernel; the `storage_mode` the suite carries describes how a
+    // provider imported the read view's owner bytes, which the native rail
+    // reaches through its own allocation, so the shape this validates is the
+    // copy_word shape.
     case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong",
-         "alias_disjoint_pair", "alias_disjoint_pair_reversed":
+         "alias_disjoint_pair", "alias_disjoint_pair_reversed",
+         "staged_lease_copy_word", "borrowed_lease_copy_word":
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "copy_word: unsupported entry or dispatch shape")
