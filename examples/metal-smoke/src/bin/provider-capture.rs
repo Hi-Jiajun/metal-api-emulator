@@ -3542,7 +3542,8 @@ fn main() -> Result<()> {
             // case says why out loud, because the omission is a boundary of
             // the shape rather than a device's answer: the object API has no
             // stage-buffer entry point yet (`research/docs/23` §3.3, v83), and
-            // the native rails carry no translator for it.
+            // a translated case's AIR pair is only executable on the rail whose
+            // translator mints its descriptor sets.
             if !case.stage_buffers.is_empty() {
                 println!(
                     "render case skipped: {} ({} binds no stage buffers; the case is marked for \
@@ -5558,17 +5559,33 @@ fn reviewed_stage_buffer_geometry(case: &RenderCase, where_: &str) -> Result<Ren
         )
         .into());
     }
-    // One rail executes the shape today, and the marker has to say so. The
-    // native rails compile no AIR and their render stage-buffer capability is
-    // off at this commit (`crates/metal-api-native/src/render.rs` publishes
-    // `supports_render_stage_buffers = false`), while the object API has no
-    // stage-buffer entry point at all (`crates/metal-api-core/src/provider_api.rs`):
-    // a case that named either would claim a capture that rail cannot report,
-    // so the marker is the Vulkan trace rail alone.
-    if case.capture_rails.as_slice() != ["vulkan"] {
+    // A stage-buffer case names the rails that bind its slots, and the two arms
+    // name different ones (`research/docs/23` §3.3, v83-v86). A *translated*
+    // case pins two AIR modules only the Vulkan trace rail translates, so its
+    // marker is that rail alone. A *reviewed* case pins the MSL module the two
+    // native faces compile — the Swift oracle through its own render encoder and
+    // the native provider through the same bytes the rail embeds — and both of
+    // those faces execute the shape now that the Apple device readings flipped
+    // `supports_render_stage_buffers` (`crates/metal-api-native/src/render.rs`),
+    // so the native trace rails may be named beside the Vulkan one. The object
+    // API binds no stage buffers at all
+    // (`crates/metal-api-core/src/provider_api.rs`), so no object rail may be
+    // named in either arm: a capture of that rail would drop the bindings.
+    let mut allowed = vec!["vulkan"];
+    if case.translated_stages.is_none() {
+        allowed.push("native-metal");
+        allowed.push("native-metal-provider");
+    }
+    if case.capture_rails.is_empty()
+        || case
+            .capture_rails
+            .iter()
+            .any(|rail| !allowed.contains(&rail.as_str()))
+    {
         return Err(format!(
-            "{where_}: a stage-buffer case runs on the Vulkan trace rail alone, so its \
-             capture_rails has to be [\"vulkan\"]"
+            "{where_}: a stage-buffer case runs on the rails that bind its slots ({}), so its \
+             capture_rails has to stay inside that list",
+            allowed.join(", ")
         )
         .into());
     }
@@ -11860,6 +11877,57 @@ mod tests {
             .into_iter()
             .find(|case| case.id == id)
             .expect("the reviewed case exists")
+    }
+
+    /// The stage-buffer marker rule the capability flip moved
+    /// (`research/docs/23` §83, R9g/R9k): the reviewed pair may name the two
+    /// native trace rails beside the Vulkan one, because both of them compile
+    /// and bind the module it pins, while the translated pair stays on the one
+    /// rail that translates its AIR. Neither arm may name an object rail, which
+    /// binds no stage buffer at all, and an unnamed rail would let a capture
+    /// drop the bindings rather than refuse the case.
+    #[test]
+    fn the_stage_buffer_marker_names_the_rails_that_bind_its_slots() {
+        let suite: Suite =
+            serde_json::from_str(include_str!("../../../../conformance/suite-v31.json")).unwrap();
+        let case = |id: &str| {
+            suite
+                .render_cases
+                .iter()
+                .find(|case| case.id == id)
+                .expect("the reviewed case exists")
+        };
+        // The reviewed pair names its three rails, and the translated pair the
+        // one rail whose translator mints its descriptor sets.
+        validate_render_case(&suite, case("stage_buffer_borrowed_tint_2x2"))
+            .expect("the reviewed pair's three rails bind its slots");
+        validate_render_case(&suite, case("stage_buffer_write_affine_2x2"))
+            .expect("the translated pair keeps the rail that translates its AIR");
+
+        // An object rail binds no stage buffer, so naming one is refused even
+        // beside the rails that do.
+        let mut object = case("stage_buffer_borrowed_tint_2x2").clone();
+        object.capture_rails = vec!["vulkan".to_owned(), "vulkan-objects".to_owned()];
+        let refused = validate_render_case(&suite, &object).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("runs on the rails that bind its slots"),
+            "unexpected refusal: {refused}"
+        );
+
+        // A translated pair's AIR is only executable on the rail that
+        // translates it, so a native rail named beside the Vulkan one is
+        // refused rather than executed with the stages dropped.
+        let mut translated = case("stage_buffer_write_affine_2x2").clone();
+        translated.capture_rails = vec!["vulkan".to_owned(), "native-metal-provider".to_owned()];
+        let refused = validate_render_case(&suite, &translated).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("a stage-buffer case runs on the rails"),
+            "unexpected refusal: {refused}"
+        );
     }
 
     /// The reviewed rule's own arithmetic (R5a, `research/docs/23` §73).

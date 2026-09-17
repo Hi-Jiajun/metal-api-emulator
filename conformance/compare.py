@@ -68,8 +68,15 @@ MAX_RENDER_STAGE_BUFFER_INDEX = 16
 # `1` the instance index.
 RENDER_AFFINE_AXES = 2
 # The Vulkan trace rail: the one rail that translates a stage-buffer case's AIR
-# stages and binds their slots today (`research/docs/23` §3.3, v83-v86).
+# stages (`research/docs/23` §3.3, v83-v86).
 VULKAN_TRACE_RAIL = "vulkan"
+# The rails that bind a *reviewed* stage-buffer case's slots (`research/docs/23`
+# §83, R9g): the Vulkan trace rail and the two native faces, which compile the
+# reviewed MSL module the case pins — the Swift oracle through its own render
+# encoder and the Rust native provider through the same module the rail
+# embeds. The object API binds no stage buffers at all, so neither object rail
+# can be named (`research/docs/23` §3.3, v83).
+STAGE_BUFFER_RAILS = (VULKAN_TRACE_RAIL, "native-metal", "native-metal-provider")
 
 # One stage-buffer slot a render case declares (`research/docs/23` §3.3,
 # v83-v86): the pipeline's declaration (`stage`, `index`, `access`, `footprint`)
@@ -3257,17 +3264,26 @@ def _render_plan(plan, suite):
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
-        # A stage-buffer case runs on the Vulkan trace rail alone in this
-        # increment (`research/docs/23` §3.3, v83-v86): the object API binds no
-        # stage buffers, the native rails translate no AIR and publish no
-        # render stage-buffer capability, and the Swift oracle compiles no AIR.
-        # Naming another rail would claim an observation that rail cannot
-        # report, so the marker is pinned here as well as in the two captures'
-        # own validators.
+        # A stage-buffer case names the rails that bind its slots
+        # (`research/docs/23` §3.3, v83-v86). The reviewed arm — a case that
+        # pins the reviewed MSL module — runs on the three rails that compile
+        # it: the Vulkan trace rail, the Swift oracle and the Rust native
+        # provider, whose stage-buffer capability the Apple device readings
+        # flipped (R9g/R9k, §83/§92). The object API binds no stage buffers at
+        # all, and a *translated* case pins AIR only the Vulkan trace rail
+        # compiles, so those markers are refused by name here as well as in the
+        # captures' own validators.
         if case.get("stage_buffers"):
-            _require(rails == [VULKAN_TRACE_RAIL],
-                     f"{where}: a stage-buffer case runs on the Vulkan trace rail alone, so its "
-                     "capture_rails has to be [\"vulkan\"]")
+            if case.get("translated_stages") is not None:
+                _require(rails == [VULKAN_TRACE_RAIL],
+                         f"{where}: a translated stage-buffer case runs on the Vulkan trace rail "
+                         "alone, because it is the only rail that compiles the AIR its stages "
+                         "pin, so its capture_rails has to be [\"vulkan\"]")
+            else:
+                _require(rails and all(rail in STAGE_BUFFER_RAILS for rail in rails),
+                         f"{where}: a reviewed stage-buffer case runs on the rails that compile the "
+                         "module it pins (" + ", ".join(STAGE_BUFFER_RAILS) + "), so its "
+                         "capture_rails has to name at least one of them")
 
         # Every attachment resolves against the declaring case's own table:
         # one of its declared views has to be the attachment, it has to be
