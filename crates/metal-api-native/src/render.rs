@@ -1183,11 +1183,15 @@ pub(crate) fn load_action(
         LoadOp::Load => Ok(RenderLoadAction::Load),
         LoadOp::DontCare => Ok(RenderLoadAction::DontCare),
         // The provider-resident load (`research/docs/23` §76, R7) keeps the
-        // bytes of an image this rail does not own; `plan_trace` refuses the
-        // whole trace by name before an encoder is built, so this arm is the
-        // value-level second line.
-        LoadOp::Resident => Err(capability_refusal("resident_target_unsupported")
-            .with_detail("this rail keeps no provider-owned render target across submissions")),
+        // bytes of the image the provider owns under the attachment's own
+        // identity, so the encoder opens it with `MTLStoreActionLoad` exactly
+        // as a trace-declared `Load` does. The difference between the two arms
+        // is where the bytes come from — a resident load uploads nothing,
+        // because they are already in the provider's texture — and that is
+        // decided by the plan, which refuses the whole trace by name unless the
+        // provider resolved a live image for the identity
+        // (`resident_target_undeclared` and the registry's own refusals).
+        LoadOp::Resident => Ok(RenderLoadAction::Load),
     }
 }
 
@@ -1202,14 +1206,14 @@ pub(crate) fn store_action(store: StoreOp) -> Result<RenderStoreAction, Provider
     Ok(match store {
         StoreOp::Store => RenderStoreAction::Store,
         StoreOp::DontCare => RenderStoreAction::DontCare,
-        // A resident store keeps the pass's bytes in an image this rail does
-        // not own (`research/docs/23` §76, R7); `plan_trace` refuses the trace
-        // by name, and this arm keeps a directly-built plan from encoding
-        // `Store` under a name the trace did not ask for.
-        StoreOp::Resident => {
-            return Err(capability_refusal("resident_target_unsupported")
-                .with_detail("this rail keeps no provider-owned render target across submissions"))
-        }
+        // A resident store keeps the pass's bytes in the provider's own image
+        // (`research/docs/23` §76, R7), which means the encoder still has to
+        // state `MTLStoreActionStore`: the texture is what has to keep them.
+        // What this arm does *not* do is publish a writeback — that is the
+        // plan's `publishes` bit, which the readback and the writeback channel
+        // both read, so "kept in the provider's image" cannot pass as "landed
+        // through the buffer channel" or the other way round.
+        StoreOp::Resident => RenderStoreAction::Store,
     })
 }
 
@@ -2108,6 +2112,16 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// channel) or, on the trace path, by [`plan_trace_with_leases`] from the
     /// attachment's declaring view (`research/docs/23` §74, R5b).
     pub(crate) initial: Vec<Option<PlannedInputSource<'a>>>,
+    /// The provider's answer for the attachment's resident declaration, one
+    /// entry per colour attachment in location order (`research/docs/23` §76,
+    /// R7): `true` where the provider resolved a live image for that
+    /// attachment's own `(allocation, view)` identity. The list is empty for
+    /// every caller with no resident registry — the shape every pre-R7 caller
+    /// states — and a pass that declares the resident target then is refused by
+    /// name, so the arm can never be executed as a fresh per-pass attachment
+    /// the trace did not ask for. A non-empty list has to carry one entry per
+    /// colour attachment, exactly as [`Self::initial`] does.
+    pub(crate) resident: Vec<bool>,
 }
 
 /// One sampled texture a render pass binds (`research/docs/23` §3.3, v70): the
@@ -2352,9 +2366,26 @@ pub(crate) struct PlannedAttachment<'a> {
     pub(crate) texel: TexelExtent,
     /// The clear value or previous contents the attachment starts from.
     pub(crate) load: RenderLoadAction,
-    /// The store action: `Store` makes the readback a landed observation;
-    /// `DontCare` discards the attachment and yields no readback.
+    /// The store action the encoder sets: `Store` keeps the attachment's texels
+    /// where they are — in a texture this rail created for a trace-declared
+    /// store, and in the provider's own image for a resident store
+    /// (`research/docs/23` §76, R7) — while `DontCare` discards the attachment.
     pub(crate) store: RenderStoreAction,
+    /// Whether the attachment's bytes leave through the buffer writeback
+    /// channel, which is exactly the trace-declared [`StoreOp::Store`]
+    /// (`research/docs/23` §3.6/§76): a resident store keeps them in the
+    /// provider's image and a discarded attachment drops them, so neither
+    /// produces a readback and neither lands a writeback. The encoder's
+    /// readback list and [`TraceRenderPlan::writebacks`] both read this bit, so
+    /// the two cannot disagree about which attachments left the pass.
+    pub(crate) publishes: bool,
+    /// Whether the attachment renders into the provider's resident image for
+    /// its own `(allocation, view)` identity rather than a fresh per-pass
+    /// texture (`research/docs/23` §76, R7). The provider hands that texture to
+    /// [`encode_offscreen_render_with_resident`]; a plan that declares one and
+    /// is encoded without it is refused by name instead of rendered into a
+    /// fresh image the trace never named.
+    pub(crate) resident: bool,
     /// The tightly packed texels a [`LoadOp::Load`] uploads before the pass
     /// opens, resolved to the window they come from (`research/docs/23` §74,
     /// R5b); `None` for a clear. A no-copy source keeps the owner's own
@@ -2436,6 +2467,27 @@ pub(crate) fn plan_with_leases<'a>(
     if attachments.len() > usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX) {
         return Err(mrt_attachment_count_refusal(attachments.len()));
     }
+    // The provider's answer for the pass's resident declarations
+    // (`research/docs/23` §76, R7). The registry itself lives in the provider
+    // — it owns the images and decides whether an identity holds bytes a load
+    // may read — so this rail is handed one bit per attachment: whether that
+    // attachment's identity resolved to a live image. An empty list is the
+    // shape every caller with no registry states, and the two ways the list and
+    // the trace can disagree are refused below, in both directions.
+    let residents = if request.resident.is_empty() {
+        None
+    } else if request.resident.len() == attachments.len() {
+        Some(request.resident.as_slice())
+    } else {
+        return Err(
+            capability_refusal("resident_target_undeclared").with_detail(format!(
+                "the resident-target list must carry one entry per colour attachment: {} \
+             attachments, {} entries",
+                attachments.len(),
+                request.resident.len()
+            )),
+        );
+    };
     // A present action hands exactly one attachment on to its target, and the
     // present encoder renders into that one texture: a present pass with a
     // second location would be dropped, so it is refused under the single-
@@ -2449,6 +2501,54 @@ pub(crate) fn plan_with_leases<'a>(
             )
             .with_field("maximum", FieldValue::Unsigned(1))
             .with_detail("a present pass hands exactly one colour attachment on to its target"));
+    }
+    // A present action keeps its own provider-owned target (the R4a registry's
+    // image, `research/docs/24` §6 Step 7), while the resident target *is* the
+    // provider's image for the attachment's identity (`research/docs/23` §76,
+    // R7). Two registries would own one identity, so a pass that declares both
+    // is refused by name before either image exists — the same slug, class and
+    // detail the Vulkan rail's present entry states.
+    if present {
+        if let Some(attachment) = attachments
+            .iter()
+            .find(|attachment| attachment.declares_resident_target())
+        {
+            return Err(capability_refusal("resident_target_present_unsupported")
+                .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(attachment.allocation_id.get()),
+                )
+                .with_detail(
+                    "the present action keeps its own provider-owned target; a pass that \
+                     declares the render rail's resident target beside it is outside this \
+                     increment",
+                ));
+        }
+    }
+    // A multisampled raster resolves into a single-sample landing the pass
+    // owns, while a resident target *is* the landing
+    // (`research/docs/23` §76, R7). The two shapes meet only through the
+    // present rail's resolve, which this increment does not widen: a pass that
+    // declares a resident target beside a multisample raster is refused by name
+    // before the first Metal object exists, instead of resolving into a texture
+    // the trace believes it named. The same slug, class and detail the Vulkan
+    // rail's multisample gate states.
+    if let Some(multisample) = request.pass.multisample {
+        if attachments
+            .iter()
+            .any(|attachment| attachment.declares_resident_target())
+        {
+            return Err(capability_refusal("resident_target_multisample_unsupported")
+                .with_field(
+                    "samples",
+                    FieldValue::Unsigned(u64::from(multisample.sample_count.samples())),
+                )
+                .with_detail(
+                    "a multisampled pass resolves into a single-sample landing of its own; the \
+                     resident target is the landing of a single-sample raster in this increment",
+                ));
+        }
     }
     // A present pass renders into the provider-owned target alone: it opens no
     // depth surface, so a trace that names one — stored or not — asks for a
@@ -2636,7 +2736,51 @@ pub(crate) fn plan_with_leases<'a>(
         );
     }
     let mut planned_attachments = Vec::with_capacity(attachments.len());
-    for (attachment, previous) in attachments.iter().zip(request.initial.iter().cloned()) {
+    for (index, (attachment, previous)) in attachments
+        .iter()
+        .zip(request.initial.iter().cloned())
+        .enumerate()
+    {
+        // The trace's own declaration and the provider's answer have to agree
+        // in both directions (`research/docs/23` §76, R7). A pass that declares
+        // the resident target and was handed no image for it would be executed
+        // as a per-pass attachment this rail created — a clear where the trace
+        // asked for the provider's own bytes — and an image resolved for an
+        // attachment that declares no residency would render the provider's
+        // image where the trace declared a per-pass one. Both are refused here,
+        // before any Metal object exists, rather than resolved into "whichever
+        // image came first".
+        let declares_resident = attachment.declares_resident_target();
+        let resident = residents.is_some_and(|list| list[index]);
+        match (declares_resident, resident) {
+            (true, false) => {
+                return Err(capability_refusal("resident_target_undeclared")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the pass declares the provider-resident target and the provider \
+                         resolved no image for it",
+                    ));
+            }
+            (false, true) => {
+                return Err(capability_refusal("resident_target_undeclared")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the provider resolved a resident target for this attachment and the \
+                         pass declares neither a resident load nor a resident store",
+                    ));
+            }
+            _ => {}
+        }
         let format = pixel_format(attachment.format)?;
         let load = load_action(attachment.load, format)?;
         let store = store_action(attachment.store)?;
@@ -2645,13 +2789,33 @@ pub(crate) fn plan_with_leases<'a>(
         // format's texels (`research/docs/23` §78).
         let texel = TexelExtent::flat(extent, attachment.format.bytes_per_texel())
             .ok_or_else(|| capability_refusal("attachment_dimension_limit"))?;
-        let initial = match (load, previous, present) {
-            (RenderLoadAction::Clear(_), None, _) => None,
-            (RenderLoadAction::DontCare, None, _) => None,
-            (RenderLoadAction::Load, Some(source), _) if source.len() == texel.bytes => {
+        // A resident *load*'s previous contents arrive in the provider's own
+        // image, so the trace declares none for it: a caller that hands bytes
+        // over anyway named two sources for one attachment
+        // (`research/docs/23` §76, R7), and the rail refuses instead of letting
+        // one of them silently win. A `LoadOp::Load` beside a *resident store*
+        // is the other way round — its bytes are the trace's own declaration,
+        // uploaded into the provider's image before the draw — so it keeps its
+        // `initial` source like any trace-declared load.
+        if attachment.loads_resident_target() && previous.is_some() {
+            return Err(capability_refusal("resident_target_undeclared")
+                .with_field("attachment", FieldValue::Unsigned(index as u64))
+                .with_field("load_op", FieldValue::Text("resident".to_owned()))
+                .with_detail(
+                    "a `LoadOp::Resident` attachment keeps the provider image's own contents; \
+                     the trace declares no previous bytes for it",
+                ));
+        }
+        let initial = match (load, previous, present, resident) {
+            // The resident load's bytes are the provider's image, which is the
+            // only arm that reaches the encoder with `.load` and no upload.
+            (RenderLoadAction::Load, None, _, true) => None,
+            (RenderLoadAction::Clear(_), None, _, _) => None,
+            (RenderLoadAction::DontCare, None, _, _) => None,
+            (RenderLoadAction::Load, Some(source), _, _) if source.len() == texel.bytes => {
                 Some(source)
             }
-            (RenderLoadAction::Load, Some(source), _) => {
+            (RenderLoadAction::Load, Some(source), _, _) => {
                 return Err(
                     args_refusal("render_attachment_initial_mismatch").with_detail(format!(
                         "LoadOp::Load needs {} tightly packed bytes of its own format, got {}",
@@ -2660,19 +2824,19 @@ pub(crate) fn plan_with_leases<'a>(
                     )),
                 );
             }
-            (RenderLoadAction::Load, None, true) => None,
-            (RenderLoadAction::Load, None, false) => {
+            (RenderLoadAction::Load, None, true, _) => None,
+            (RenderLoadAction::Load, None, false, false) => {
                 return Err(args_refusal("render_attachment_initial_mismatch")
                     .with_detail("LoadOp::Load needs the attachment's previous texels"));
             }
-            (RenderLoadAction::Clear(_), Some(_), _) => {
+            (RenderLoadAction::Clear(_), Some(_), _, _) => {
                 return Err(
                     args_refusal("render_attachment_initial_mismatch").with_detail(
                         "LoadOp::Clear writes every texel, so initial bytes are refused",
                     ),
                 );
             }
-            (RenderLoadAction::DontCare, Some(_), _) => {
+            (RenderLoadAction::DontCare, Some(_), _, _) => {
                 return Err(
                     args_refusal("render_attachment_initial_mismatch").with_detail(
                         "LoadOp::DontCare reads and presets no pre-pass bytes, so initial bytes \
@@ -2686,6 +2850,12 @@ pub(crate) fn plan_with_leases<'a>(
             texel,
             load,
             store,
+            // The landing the pass publishes is the trace-declared
+            // `StoreOp::Store` alone (`research/docs/23` §3.6/§76): a resident
+            // store keeps its bytes in the provider's image and a discarded
+            // attachment drops them, so neither one produces a readback.
+            publishes: attachment.store == StoreOp::Store,
+            resident: declares_resident,
             initial,
         });
     }
@@ -3129,15 +3299,14 @@ pub(crate) fn previous_source<'a>(
             }),
         LoadOp::Clear(_) | LoadOp::DontCare => Ok(None),
         // A resident load declares no view at all (`research/docs/23` §76, R7):
-        // the rail-level gate refuses the trace by name, and a caller that
-        // reached here anyway is refused rather than handed a per-pass image's
-        // bytes.
-        LoadOp::Resident => Err(capability_refusal("resident_target_unsupported")
-            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
-            .with_detail(
-                "a resident load keeps the provider image's own contents; this rail keeps no \
-                 provider-owned render target across submissions",
-            )),
+        // its bytes are the provider's own image for the attachment's identity,
+        // which the registry resolved before this plan existed, so there is
+        // nothing to resolve out of the trace's declaration. A caller that hands
+        // bytes over anyway is refused by name in
+        // [`plan_with_leases`], not silently resolved here. The `attachment`
+        // index stays part of the signature because the trace path's own
+        // refusals carry it.
+        LoadOp::Resident => Ok(None),
     }
 }
 
@@ -3309,10 +3478,15 @@ fn unknown_render_pipeline(id: PipelineId) -> ProviderError {
 pub(crate) struct TraceRenderPlan<'a> {
     pub(crate) pass: &'a RenderPassDescriptor,
     pub(crate) contract: &'a RenderPipelineContract,
-    /// One landing view per colour attachment, in location order: the pool
-    /// view whose identity covers the attachment, which is the writeback
-    /// channel each attachment's texels leave through.
-    pub(crate) landings: Vec<&'a BufferView>,
+    /// One entry per colour attachment, in location order: the pool view whose
+    /// identity covers the attachment, which is the writeback channel each
+    /// attachment's texels leave through. `None` is the one arm that publishes
+    /// no writeback *and* needs no declared view to read its previous bytes: a
+    /// resident store keeps its bytes in the provider's image
+    /// (`research/docs/23` §76, R7), so it needs no landing even when the trace
+    /// asks for a host readback. Every other attachment — stored, discarded or
+    /// loading — keeps the pre-R7 rule and resolves its view.
+    pub(crate) landings: Vec<Option<&'a BufferView>>,
     /// The landing view of a stored depth attachment, or `None` for every
     /// shape whose depth surface does not outlive its pass
     /// (`research/docs/23` §3.3, v43): the pool view whose identity is the
@@ -3374,20 +3548,41 @@ impl TraceRenderPlan<'_> {
     /// channel. The list they are appended to need not be in identity order
     /// itself: every caller folds it through [`merge_writebacks`], which is
     /// where the canonical order the core contract states is established.
+    ///
+    /// A *resident* store is the third arm that lands no writeback
+    /// (`research/docs/23` §76, R7): its bytes stay in the provider's own
+    /// image, where the pass that later loads them observes them, so it is
+    /// filtered out here exactly as a discarded attachment is — and the encoder
+    /// filters its readback by the same bit, which is what keeps the two lists
+    /// paired. The pairing is by *publishing* attachment in location order, not
+    /// by store action: both the stored and the resident arm state Metal's
+    /// `Store`, so pairing on the action would shift every later attachment's
+    /// bytes into the wrong writeback.
     pub(crate) fn writebacks(&self, readback: RenderReadback) -> Vec<BufferWriteback> {
-        let mut writebacks: Vec<BufferWriteback> = self
-            .landings
-            .iter()
-            .zip(&self.plan.attachments)
-            .filter(|(_, attachment)| attachment.store == RenderStoreAction::Store)
-            .zip(readback.attachments)
-            .map(|((landing, _), bytes)| BufferWriteback {
-                view_id: landing.view_id,
-                allocation_id: landing.allocation_id,
-                offset: landing.offset,
-                bytes,
-            })
-            .collect();
+        let mut writebacks: Vec<BufferWriteback> = Vec::new();
+        let mut readbacks = readback.attachments.into_iter();
+        for (landing, attachment) in self.landings.iter().zip(&self.plan.attachments) {
+            if !attachment.publishes {
+                continue;
+            }
+            // The plan resolves one landing view per publishing attachment, and
+            // the encoder reads back exactly those attachments in location
+            // order, so the two iterators advance together. The `debug_assert`
+            // keeps a hand-built plan from silently pairing bytes with the next
+            // attachment's view.
+            debug_assert!(
+                landing.is_some(),
+                "a publishing attachment is planned with its landing view"
+            );
+            if let (Some(landing), Some(bytes)) = (landing, readbacks.next()) {
+                writebacks.push(BufferWriteback {
+                    view_id: landing.view_id,
+                    allocation_id: landing.allocation_id,
+                    offset: landing.offset,
+                    bytes,
+                });
+            }
+        }
         // A discarded or absent depth surface has no readback, so it adds no
         // writeback: the bytes never left the pass (`research/docs/23` §3.3,
         // v43).
@@ -3414,7 +3609,11 @@ impl TraceRenderPlan<'_> {
 
     /// The single writeback a present pass's one attachment becomes.
     pub(crate) fn writeback(&self, texels: Vec<u8>) -> BufferWriteback {
-        let landing = self.landings[0];
+        // A present action hands its one attachment on through the writeback
+        // channel, and a resident target beside it is refused by name
+        // (`research/docs/23` §76, R7), so the one landing is always resolved
+        // here.
+        let landing = self.landings[0].expect("the present pass's one attachment lands");
         BufferWriteback {
             view_id: landing.view_id,
             allocation_id: landing.allocation_id,
@@ -3450,56 +3649,55 @@ pub(crate) fn plan_trace<'a>(
         pool,
         contracts,
         None,
+        None,
         depth_resolve_modes,
         stencil_resolve_modes,
     )
 }
 
 /// Plan every render pass of a trace, resolving lease-backed inputs through
-/// `leases` (`research/docs/23` §72, R3d).
+/// `leases` (`research/docs/23` §72, R3d) and the resident targets through
+/// `residents` (`research/docs/23` §76, R7).
 ///
 /// The trace path's entry point: `native.rs` hands the provider's own lease
 /// channel in, so a pass whose vertex or index view names a staged lease or an
-/// owner window is resolved before the first Metal object exists. [`plan_trace`]
-/// is the same plan with no channel, which refuses those two arms by name —
-/// the shape a caller with no registries gets.
+/// owner window is resolved before the first Metal object exists, and the
+/// provider's resident registry's answer per render pass, in trace order, one
+/// bit per colour attachment: whether that attachment's resident declaration
+/// resolved to a live provider image. [`plan_trace`] is the same plan with no
+/// channel, which refuses those arms by name — the shape a caller with no
+/// registries gets.
 pub(crate) fn plan_trace_with_leases<'a>(
     trace: &'a ComputeTrace,
     pool: &'a [BufferView],
     contracts: &'a BTreeMap<PipelineId, RenderPipelineContract>,
     leases: Option<&RenderLeaseContext<'_>>,
+    residents: Option<&[Vec<bool>]>,
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
 ) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
     if !trace.has_render_passes() {
         return Ok(Vec::new());
     }
-    // The provider-resident render target is the Vulkan rail's R7 increment
-    // (`research/docs/23` §76): this rail keeps no provider-owned image across
-    // submissions yet, so a pass that declares one is refused by name — before
-    // any other plan work — instead of being executed as a per-pass attachment
-    // the trace did not ask for, or as a load that reads bytes this rail never
-    // kept.
-    for attachment in trace
-        .render_passes()
-        .flat_map(|pass| pass.color_attachments.iter())
-    {
-        if attachment.declares_resident_target() {
-            return Err(capability_refusal("resident_target_unsupported")
-                .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
-                .with_field(
-                    "allocation",
-                    FieldValue::Unsigned(attachment.allocation_id.get()),
-                )
-                .with_detail(
-                    "this rail does not keep a provider-owned render target across submissions; \
-                     the resident target is the Vulkan rail's increment",
-                ));
+    // One resident list per render pass is the provider's answer for the whole
+    // trace, so a list that does not line up with the passes is refused before
+    // any of them is planned instead of being read as "the remaining passes
+    // declare nothing" (`research/docs/23` §76, R7).
+    if let Some(residents) = residents {
+        if residents.len() != trace.render_passes().count() {
+            return Err(
+                capability_refusal("resident_target_undeclared").with_detail(format!(
+                    "the resident-target list must carry one entry per render pass: {} passes, {} \
+                 entries",
+                    trace.render_passes().count(),
+                    residents.len()
+                )),
+            );
         }
     }
     refuse_reordered_render_reads(trace)?;
     let mut planned = Vec::with_capacity(trace.render_passes().count());
-    for pass in trace.render_passes() {
+    for (pass_index, pass) in trace.render_passes().enumerate() {
         let contract = contracts
             .get(&pass.pipeline)
             .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
@@ -3524,17 +3722,33 @@ pub(crate) fn plan_trace_with_leases<'a>(
         // texels would have nowhere to go, so the pass is refused instead of
         // being executed and dropped. Each declared view is resolved before its
         // load op because a loading pass reads its previous bytes from the same
-        // declaration (`research/docs/23` §3.3).
+        // declaration (`research/docs/23` §3.3). The one attachment that needs
+        // no declaration is a resident store (`research/docs/23` §76, R7): its
+        // bytes stay in the provider's own image and it publishes no writeback,
+        // so it neither lands through the pool nor uploads anything out of it.
+        // Every other arm — stored, discarded, or loading for its previous
+        // bytes — keeps the pre-R7 rule unchanged.
+        let resident = residents
+            .and_then(|passes| passes.get(pass_index))
+            .map(|list| list.as_slice());
         let mut landings = Vec::with_capacity(pass.color_attachments.len());
         let mut previous = Vec::with_capacity(pass.color_attachments.len());
         for (index, attachment) in pass.color_attachments.iter().enumerate() {
-            let landing = pool
-                .iter()
-                .find(|view| {
-                    view.view_id == attachment.view_id
-                        && view.allocation_id == attachment.allocation_id
-                })
-                .ok_or_else(|| {
+            let declared = pool.iter().find(|view| {
+                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
+            });
+            // A resident store is the arm that publishes no writeback, so it
+            // needs no landing view even when the trace asks for a host
+            // readback. A resident *load* beside a trace-declared store is the
+            // resident store's sibling one step earlier: it publishes, so it
+            // resolves its landing exactly as any storing attachment does — and
+            // a `LoadOp::Load` beside a resident store keeps the pre-R7 rule
+            // too, because its previous bytes come from that same declaration.
+            let landing_needed = !attachment.declares_resident_target()
+                || attachment.store == StoreOp::Store
+                || attachment.load == LoadOp::Load;
+            let landing = if landing_needed {
+                Some(declared.ok_or_else(|| {
                     capability_refusal("render_attachment_landing_unsupported")
                         .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
                         .with_field(
@@ -3545,17 +3759,26 @@ pub(crate) fn plan_trace_with_leases<'a>(
                             "attachment bytes land through the buffer writeback channel, \
                          and this trace declares no buffer view covering the attachment",
                         )
-                })?;
+                })?)
+            } else {
+                None
+            };
             // An offscreen `Load` uploads the contents the declaring view
             // carries before the pass opens — its own bytes, a staged lease's
             // copy, or the owner's mapping (`research/docs/23` §74, R5b). A
             // present pass's `Load` keeps the target's own initial state, which
             // the present path supplies, so it resolves no bytes
-            // (`research/docs/24` §3.1).
-            let source = if pass.present.is_none() {
-                previous_source(attachment.load, landing, leases, index)?
-            } else {
-                None
+            // (`research/docs/24` §3.1), and a resident load's bytes are the
+            // provider's image, which `previous_source` states as "nothing to
+            // resolve" (`research/docs/23` §76, R7).
+            let source = match (pass.present.is_none(), landing) {
+                (true, Some(declared)) => {
+                    previous_source(attachment.load, declared, leases, index)?
+                }
+                // The one arm with no landing view is a resident declaration
+                // that neither publishes nor loads trace-declared bytes, so
+                // there is no declaration to resolve anything out of.
+                _ => None,
             };
             landings.push(landing);
             previous.push(source);
@@ -3632,6 +3855,12 @@ pub(crate) fn plan_trace_with_leases<'a>(
                 pipeline: contract,
                 source: reviewed_module_for(contract).map_or("", |module| module.source),
                 initial: previous,
+                // The provider's own answer for this pass, in the same
+                // location order as the attachments (`research/docs/23` §76,
+                // R7). An absent list is "no resident registry", which
+                // `plan_with_leases` refuses a resident declaration with by
+                // name.
+                resident: resident.map(|list| list.to_vec()).unwrap_or_default(),
             },
             leases,
             depth_resolve_modes,
@@ -3800,10 +4029,90 @@ pub(crate) fn encode_offscreen_render(
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
 ) -> Result<RenderReadback, ProviderError> {
+    // The pre-R7 shape: every attachment is a fresh texture this rail creates
+    // and drops with the readbacks. A plan that declares a resident target has
+    // to arrive through [`encode_offscreen_render_with_resident`], which is
+    // where the provider hands its own images over; encoding it here would
+    // render the pass into a fresh attachment the trace never named, which is
+    // exactly the silent downgrade the arm exists to prevent
+    // (`research/docs/23` §76, R7).
+    refuse_unresolved_resident_targets(planned, &[])?;
     objc::rc::autoreleasepool(|| {
-        let attachments = attachment_textures(device, planned)?;
+        let attachments = attachment_textures(device, planned, &[])?;
         encode_into_and_readback(device, queue, planned, &attachments, None)
     })
+}
+
+/// Encode, commit and read back one already planned offscreen pass whose
+/// resident attachments render into the provider's own images
+/// (`research/docs/23` §76, R7).
+///
+/// `residents` is the provider's answer for the plan's colour attachments, in
+/// location order: `Some(texture)` exactly for the attachments the plan
+/// declares as resident, `None` for every attachment this rail creates itself.
+/// The provider resolved those images — and refused every way an identity can
+/// be gone — before the plan existed (`native.rs::resolve_render_residents`),
+/// so this call is the encoder half of the same decision: it renders the pass
+/// into those textures, reads back the publishing attachments, and leaves the
+/// resident ones' bytes in the provider's images.
+#[cfg(target_os = "macos")]
+pub(crate) fn encode_offscreen_render_with_resident(
+    device: &Device,
+    queue: &CommandQueue,
+    planned: &RenderPlan<'_>,
+    residents: &[Option<Texture>],
+) -> Result<RenderReadback, ProviderError> {
+    refuse_unresolved_resident_targets(planned, residents)?;
+    objc::rc::autoreleasepool(|| {
+        let attachments = attachment_textures(device, planned, residents)?;
+        encode_into_and_readback(device, queue, planned, &attachments, None)
+    })
+}
+
+/// Refuse a plan the encoder cannot match its resident images to.
+///
+/// Two ways the two lists can disagree, both refused by name before the first
+/// Metal object of this call exists (`research/docs/23` §76, R7): an attachment
+/// the plan declares resident without a provider image would be rendered into a
+/// fresh texture under the resident name, and an image handed over for an
+/// attachment the plan declares as a per-pass one would render the provider's
+/// bytes where the trace asked for a fresh attachment.
+#[cfg(target_os = "macos")]
+fn refuse_unresolved_resident_targets(
+    planned: &RenderPlan<'_>,
+    residents: &[Option<Texture>],
+) -> Result<(), ProviderError> {
+    if residents.is_empty() {
+        if let Some(attachment) = planned
+            .attachments
+            .iter()
+            .position(|attachment| attachment.resident)
+        {
+            return Err(capability_refusal("resident_target_undeclared")
+                .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+                .with_detail(
+                    "the plan declares the provider-resident target and the caller handed over no \
+                 provider image for it",
+                ));
+        }
+        return Ok(());
+    }
+    if residents.len() != planned.attachments.len()
+        || residents
+            .iter()
+            .zip(&planned.attachments)
+            .any(|(texture, attachment)| texture.is_some() != attachment.resident)
+    {
+        return Err(
+            capability_refusal("resident_target_undeclared").with_detail(format!(
+            "the provider's resident images must carry one entry per colour attachment, `Some` \
+             exactly where the plan declares one: {} attachments, {} entries",
+            planned.attachments.len(),
+            residents.len()
+        )),
+        );
+    }
+    Ok(())
 }
 
 /// Encode, commit and read back one already planned present pass into the
@@ -3847,6 +4156,7 @@ pub(crate) fn encode_indirect_offscreen_render(
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
     replay: &icb::IcbPlan,
+    residents: &[Option<Texture>],
 ) -> Result<RenderReadback, ProviderError> {
     // `plan_trace` refuses an indirect draw whose pass binds streams, because
     // the replay shape this rail builds carries the pipeline state and the draw
@@ -3859,8 +4169,12 @@ pub(crate) fn encode_indirect_offscreen_render(
              vertex or index streams is not part of the first indirect increment",
         ));
     }
+    // The replay renders into the same textures the direct draw does, so the
+    // resident images arrive through the same channel and are matched by the
+    // same rule (`research/docs/23` §76, R7).
+    refuse_unresolved_resident_targets(planned, residents)?;
     objc::rc::autoreleasepool(|| {
-        let attachments = attachment_textures(device, planned)?;
+        let attachments = attachment_textures(device, planned, residents)?;
         encode_into_and_readback(device, queue, planned, &attachments, Some(*replay))
     })
 }
@@ -4345,7 +4659,13 @@ fn encode_into_and_readback(
         .attachments
         .iter()
         .zip(targets)
-        .filter(|(attachment, _)| attachment.store == RenderStoreAction::Store)
+        // The readback is the *publishing* arm's, which is the trace-declared
+        // `StoreOp::Store` (`research/docs/23` §76, R7): a resident store keeps
+        // its bytes in the provider's image and a discarded attachment drops
+        // them, so neither one yields texels here — and the same bit filters
+        // `TraceRenderPlan::writebacks`, which is what keeps the two lists
+        // paired attachment by attachment.
+        .filter(|(attachment, _)| attachment.publishes)
         // Each attachment is read with its own format's texel width: a stored
         // `Rgba16Float` location lands eight bytes per texel where its
         // neighbours land four (`research/docs/23` §78).
@@ -4401,18 +4721,46 @@ fn encode_into_and_readback(
 /// mode is what makes the texels CPU-visible for the readback on the
 /// unified-memory device the provider admits — the same reason the sampled
 /// texture rail uses shared storage (`research/docs/16` §4.8).
+///
+/// `residents` is the provider's answer for the plan's attachments, in location
+/// order (`research/docs/23` §76, R7): a location the plan declares resident
+/// renders into the provider's own texture, which the encoder neither creates
+/// nor uploads into — its previous contents are the bytes the provider kept, and
+/// the plan resolved no `initial` source for it. Every other location is the
+/// fresh shared-storage texture this rail has always built.
 #[cfg(target_os = "macos")]
 fn attachment_textures(
     device: &Device,
     planned: &RenderPlan<'_>,
+    residents: &[Option<Texture>],
 ) -> Result<Vec<Texture>, ProviderError> {
     let mut textures = Vec::with_capacity(planned.attachments.len());
-    for attachment in &planned.attachments {
-        let texture = present_target_texture(device, attachment.format, planned.extent)?;
+    for (index, attachment) in planned.attachments.iter().enumerate() {
+        let texture = if attachment.resident {
+            residents
+                .get(index)
+                .and_then(|texture| texture.clone())
+                .ok_or_else(|| {
+                    capability_refusal("resident_target_undeclared")
+                        .with_field("attachment", FieldValue::Unsigned(index as u64))
+                        .with_detail(
+                            "the plan declares the provider-resident target and the caller \
+                             handed over no provider image for it",
+                        )
+                })?
+        } else {
+            present_target_texture(device, attachment.format, planned.extent)?
+        };
         // The upload reads the resolved window, which for a no-copy source is
         // the owner's own mapping: an owner that rewrites its pages after the
         // import changes what the preset uploads, exactly as it changes what a
         // bound stream reads (`research/docs/23` §74, R5b).
+        //
+        // A resident attachment's own bytes are the provider's image, and the
+        // one resident shape that still uploads is a `LoadOp::Load` beside a
+        // resident store: those declared previous bytes are what define the
+        // image before the draw, exactly as they define a fresh per-pass
+        // attachment (`research/docs/23` §76, R7).
         if let Some(source) = &attachment.initial {
             upload_texels(&texture, planned, attachment.texel, source.proof_bytes());
         }
@@ -5211,6 +5559,7 @@ mod tests {
             pipeline,
             source: REVIEWED_SOURCE,
             initial: vec![initial.map(PlannedInputSource::Declared)],
+            resident: Vec::new(),
         }
     }
 
@@ -5269,6 +5618,7 @@ mod tests {
             pipeline: &sampled,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         })
         .expect("the reviewed sampling shape is planned");
         assert_eq!(plan.textures.len(), 1);
@@ -5288,6 +5638,7 @@ mod tests {
             pipeline: &sampled,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         })
         .unwrap_err();
         eprintln!("unbound refused: {error:?}");
@@ -5297,6 +5648,7 @@ mod tests {
             pipeline: &milestone,
             source: REVIEWED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         })
         .unwrap_err();
         eprintln!("uncoupled refused: {error:?}");
@@ -5314,6 +5666,7 @@ mod tests {
             pipeline: &sampled,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         })
         .unwrap_err();
         eprintln!("extent refused: {error:?}");
@@ -5333,6 +5686,7 @@ mod tests {
             pipeline: &sampled,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         })
         .unwrap_err();
         assert_eq!(error.slug, "render_texture_format_unsupported");
@@ -5348,6 +5702,7 @@ mod tests {
             pipeline: &sampled,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         })
         .unwrap_err();
         assert_eq!(error.slug, "render_texture_source_unsupported");
@@ -5391,6 +5746,7 @@ mod tests {
             pipeline: &pipeline,
             source,
             initial: vec![None],
+            resident: Vec::new(),
         };
         plan_pass(&request).map(|_| ()).unwrap_err()
     }
@@ -5893,6 +6249,7 @@ mod tests {
             pipeline: &pipeline,
             source: REVIEWED_DEPTH_ONLY_SOURCE,
             initial: Vec::new(),
+            resident: Vec::new(),
         };
         let planned = plan(&request, 0, 0).expect("the zero-colour depth pass plans");
         assert!(
@@ -7106,6 +7463,7 @@ mod tests {
             pipeline,
             source: REVIEWED_VERTEX_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         }
     }
 
@@ -7367,6 +7725,7 @@ mod tests {
             pipeline,
             source: REVIEWED_DEPTH_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         }
     }
 
@@ -7527,6 +7886,7 @@ mod tests {
             pipeline,
             source: REVIEWED_DUAL_SOURCE,
             initial: vec![None, None],
+            resident: Vec::new(),
         }
     }
 
@@ -7931,8 +8291,16 @@ mod tests {
         // The landing view is the declaration's own identity and range, so the
         // writeback is the one the trace asked for and no second channel is
         // invented.
-        assert_eq!(planned.landings[0].view_id, ViewId::new(7));
-        assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
+        assert_eq!(
+            planned.landings[0].expect("the attachment lands").view_id,
+            ViewId::new(7)
+        );
+        assert_eq!(
+            planned.landings[0]
+                .expect("the attachment lands")
+                .allocation_id,
+            AllocationId::new(9)
+        );
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
@@ -8743,7 +9111,7 @@ mod tests {
         };
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = quad_contracts();
-        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect("the staged windows hold the reviewed quad");
         let [planned] = planned.as_slice() else {
             panic!("the vertex-input trace carries one render pass");
@@ -8771,7 +9139,7 @@ mod tests {
         staging
             .release(vertex_lease)
             .expect("the fixture import is released");
-        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect_err("a released staged lease cannot be read");
         eprintln!("released staged lease refused: {error:?}");
         assert_eq!(error.slug, "lease_not_imported");
@@ -9003,7 +9371,7 @@ mod tests {
         lease_the_milestone_attachment(&mut trace, BufferSource::StagedLease(lease_id));
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect("the staged copy carries the attachment's previous contents");
         let [planned] = planned.as_slice() else {
             panic!("the milestone trace carries one render pass");
@@ -9029,7 +9397,7 @@ mod tests {
         staging
             .release(lease_id)
             .expect("the fixture import is released");
-        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect_err("a released staged lease cannot be read");
         eprintln!("released staged attachment lease refused: {error:?}");
         assert_eq!(error.slug, "lease_not_imported");
@@ -9081,7 +9449,7 @@ mod tests {
         lease_the_milestone_attachment(&mut trace, BufferSource::BorrowedNoCopy(lease_id));
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect("the owner's pages hold the attachment's previous contents");
         let [planned] = planned.as_slice() else {
             panic!("the milestone trace carries one render pass");
@@ -9113,7 +9481,7 @@ mod tests {
         // preset reads those bytes instead of a copy taken at import time — the
         // same falsification the Vulkan rail's e2e states with a device.
         owner_attachment.write(&[0x37; 16]);
-        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect("the rewritten owner window still holds sixteen bytes");
         assert_eq!(
             planned[0].plan.attachments[0].initial_bytes(),
@@ -9142,8 +9510,9 @@ mod tests {
             device_epoch: epoch,
             host_import_alignment: 0,
         };
-        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&unmappable), 0, 0)
-            .expect_err("a device with no owner mapping cannot read the window");
+        let error =
+            plan_trace_with_leases(&trace, &pool, &contracts, Some(&unmappable), None, 0, 0)
+                .expect_err("a device with no owner mapping cannot read the window");
         eprintln!("no owner mapping refused: {error:?}");
         assert_eq!(error.slug, "storage_mode_unsupported");
         assert_eq!(
@@ -9197,6 +9566,7 @@ mod tests {
             pipeline,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
+            resident: Vec::new(),
         }
     }
 
@@ -9769,7 +10139,7 @@ mod tests {
         }
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = quad_contracts();
-        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect("the owner's pages hold the attachment's previous contents");
         let [planned] = planned.as_slice() else {
             panic!("the quad trace carries one render pass");
@@ -9861,7 +10231,7 @@ mod tests {
         borrowed
             .release(lease_id)
             .expect("the owner's attachment window is released");
-        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
             .expect_err("a released no-copy import cannot be resolved");
         assert_eq!(error.slug, "lease_not_imported");
     }
@@ -10327,8 +10697,16 @@ mod tests {
                 .map(|indices| indices.index_count),
             Some(6)
         );
-        assert_eq!(planned.landings[0].view_id, ViewId::new(7));
-        assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
+        assert_eq!(
+            planned.landings[0].expect("the attachment lands").view_id,
+            ViewId::new(7)
+        );
+        assert_eq!(
+            planned.landings[0]
+                .expect("the attachment lands")
+                .allocation_id,
+            AllocationId::new(9)
+        );
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
@@ -10357,10 +10735,26 @@ mod tests {
         };
         assert_eq!(planned.contract, &dual_pipeline());
         assert_eq!(planned.plan.attachments.len(), 2);
-        assert_eq!(planned.landings[0].view_id, ViewId::new(7));
-        assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
-        assert_eq!(planned.landings[1].view_id, ViewId::new(8));
-        assert_eq!(planned.landings[1].allocation_id, AllocationId::new(10));
+        assert_eq!(
+            planned.landings[0].expect("the attachment lands").view_id,
+            ViewId::new(7)
+        );
+        assert_eq!(
+            planned.landings[0]
+                .expect("the attachment lands")
+                .allocation_id,
+            AllocationId::new(9)
+        );
+        assert_eq!(
+            planned.landings[1].expect("the attachment lands").view_id,
+            ViewId::new(8)
+        );
+        assert_eq!(
+            planned.landings[1]
+                .expect("the attachment lands")
+                .allocation_id,
+            AllocationId::new(10)
+        );
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![
                 EXPECTED_TEXEL_BYTES.repeat(4),
@@ -10738,5 +11132,295 @@ mod tests {
             REVIEWED_MODULES[2].path,
             "conformance/shaders/quad_indexed_2x2_dual.metal"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The provider-resident render target's value-level half
+    // (`research/docs/23` §76, R7).
+    //
+    // The registry itself (`crate::resident`) owns the identities, the budget
+    // and every named refusal; these cases pin what this rail decides around
+    // it: how the two resident arms map onto Metal's actions, which arm
+    // publishes a writeback, which attachment needs a landing view, and the
+    // four ways a trace and its provider can disagree about the declaration.
+    // -----------------------------------------------------------------------
+
+    /// The bytes the resident chain's seed is measured against: four bytes no
+    /// reviewed module writes and no clear sentinel spells, so "the chain read
+    /// the provider's image" is falsifiable per texel (`research/docs/23` §76,
+    /// R7). The device case in `native.rs` uses the same word.
+    const RESIDENT_SEED_BYTES: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+    /// One request for a resident-bearing pass: the milestone's shape with the
+    /// provider's answer per attachment and, when the case hands one over, the
+    /// previous bytes a trace-declared load would upload.
+    fn resident_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+        resolved: &[bool],
+        previous: Option<PlannedInputSource<'a>>,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_SOURCE,
+            initial: vec![previous],
+            resident: resolved.to_vec(),
+        }
+    }
+
+    /// The two resident arms on the value level: a resident store keeps the
+    /// pass's bytes in the provider's image under Metal's `.store` while
+    /// publishing nothing, and a resident load opens that image with `.load`
+    /// and no upload of its own (`research/docs/23` §76, R7).
+    #[test]
+    fn the_resident_arms_map_onto_the_actions_they_need() {
+        let pipeline = milestone_pipeline();
+        let mut storing = milestone_pass(LoadOp::Clear(sentinel()));
+        storing.color_attachments[0].store = StoreOp::Resident;
+        let plan = plan_pass(&resident_request(&storing, &pipeline, &[true], None))
+            .expect("a resident store defines the provider's image");
+        let [attachment] = plan.attachments.as_slice() else {
+            panic!("the milestone pass carries one attachment");
+        };
+        assert!(
+            attachment.resident,
+            "the attachment renders into the provider's image"
+        );
+        assert_eq!(
+            attachment.store,
+            RenderStoreAction::Store,
+            "Metal has to keep the texels: the provider's image is what a later pass loads"
+        );
+        assert!(
+            !attachment.publishes,
+            "a resident store publishes no writeback: its bytes stay in the provider's image"
+        );
+        assert_eq!(attachment.initial_bytes(), None);
+
+        let loading = milestone_pass(LoadOp::Resident);
+        let plan = plan_pass(&resident_request(&loading, &pipeline, &[true], None))
+            .expect("a resident load keeps the provider image's own bytes");
+        let [attachment] = plan.attachments.as_slice() else {
+            panic!("the milestone pass carries one attachment");
+        };
+        assert!(attachment.resident);
+        assert_eq!(
+            attachment.load,
+            RenderLoadAction::Load,
+            "a resident load opens the provider's image exactly as a trace-declared load does"
+        );
+        assert!(
+            attachment.publishes,
+            "a trace-declared store beside it still lands"
+        );
+        assert_eq!(
+            attachment.initial_bytes(),
+            None,
+            "a resident load uploads nothing: the bytes are already in the provider's image"
+        );
+
+        // The third resident arm: a trace-declared `Load` beside a resident
+        // store. Its previous bytes are the trace's own, uploaded into the
+        // provider's image before the draw — the other way a resident image is
+        // defined (`research/docs/23` §76, R7).
+        let mut seeded = milestone_pass(LoadOp::Load);
+        seeded.color_attachments[0].store = StoreOp::Resident;
+        let previous = RESIDENT_SEED_BYTES.repeat(4);
+        let plan = plan_pass(&resident_request(
+            &seeded,
+            &pipeline,
+            &[true],
+            Some(PlannedInputSource::Declared(&previous)),
+        ))
+        .expect("a load beside a resident store keeps its declared bytes");
+        let [attachment] = plan.attachments.as_slice() else {
+            panic!("the milestone pass carries one attachment");
+        };
+        assert!(attachment.resident);
+        assert!(!attachment.publishes);
+        assert_eq!(attachment.load, RenderLoadAction::Load);
+        assert_eq!(
+            attachment.initial_bytes(),
+            Some(&previous[..]),
+            "the declared bytes are what the encoder uploads into the provider's image"
+        );
+    }
+
+    /// The two directions in which a trace and its provider can disagree about
+    /// the resident declaration are refused by name, before any Metal object
+    /// exists (`research/docs/23` §76, R7).
+    #[test]
+    fn resident_declarations_must_agree_with_the_providers_answers() {
+        let pipeline = milestone_pipeline();
+        // The trace declares the resident target and the caller resolved no
+        // image for it: the pass would be executed as a fresh per-pass
+        // attachment, which is the silent downgrade the arm exists to prevent.
+        let loading = milestone_pass(LoadOp::Resident);
+        let error = plan_pass(&resident_request(&loading, &pipeline, &[], None))
+            .expect_err("a resident load without the provider's image is refused");
+        assert_eq!(error.slug, "resident_target_undeclared");
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+
+        // The provider resolved an image for an attachment that declares no
+        // residency: the pass would render the provider's bytes where the trace
+        // declared its own.
+        let clearing = milestone_pass(LoadOp::Clear(sentinel()));
+        let error = plan_pass(&resident_request(&clearing, &pipeline, &[true], None))
+            .expect_err("an image for an undeclared attachment is refused");
+        assert_eq!(error.slug, "resident_target_undeclared");
+
+        // A `LoadOp::Resident` attachment that also carries previous bytes named
+        // two sources for one attachment, so neither may silently win.
+        let previous = EXPECTED_TEXEL_BYTES.repeat(4);
+        let error = plan_pass(&resident_request(
+            &loading,
+            &pipeline,
+            &[true],
+            Some(PlannedInputSource::Declared(&previous)),
+        ))
+        .expect_err("a resident load declares no previous bytes");
+        assert_eq!(error.slug, "resident_target_undeclared");
+        assert_eq!(
+            error.fields.get("load_op"),
+            Some(&FieldValue::Text("resident".to_owned()))
+        );
+
+        // The list is the provider's answer per attachment, so it has to carry
+        // one entry per colour attachment.
+        let error = plan_pass(&resident_request(&loading, &pipeline, &[true, false], None))
+            .expect_err("a list wider than the attachment list is refused");
+        assert_eq!(error.slug, "resident_target_undeclared");
+    }
+
+    /// A resident target beside a present action or a multisample raster is
+    /// refused by name, with the Vulkan rail's own slugs
+    /// (`research/docs/23` §76, R7).
+    #[test]
+    fn a_resident_target_beside_present_or_multisample_is_refused() {
+        let pipeline = milestone_pipeline();
+        let mut present = milestone_present_pass();
+        present.color_attachments[0].load = LoadOp::Resident;
+        let error = plan_pass(&resident_request(&present, &pipeline, &[true], None))
+            .expect_err("a present action keeps its own target");
+        assert_eq!(error.slug, "resident_target_present_unsupported");
+        assert_eq!(
+            error.fields.get("allocation"),
+            Some(&FieldValue::Unsigned(9))
+        );
+
+        let mut multisampled = milestone_pass(LoadOp::Clear(sentinel()));
+        multisampled.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        multisampled.color_attachments[0].store = StoreOp::Resident;
+        let error = plan_pass(&resident_request(&multisampled, &pipeline, &[true], None))
+            .expect_err("a multisampled raster resolves into its own landing");
+        assert_eq!(error.slug, "resident_target_multisample_unsupported");
+        assert_eq!(error.fields.get("samples"), Some(&FieldValue::Unsigned(4)));
+    }
+
+    /// A resident store needs no landing view, and the writeback channel pairs
+    /// by *publishing* attachment rather than by store action
+    /// (`research/docs/23` §76, R7).
+    ///
+    /// This is the falsifiable half of the R7 copy-out pairing: both attachment
+    /// arms state Metal's `Store`, so a rail that paired readbacks on the
+    /// action would hand the stored sibling's bytes to the resident one's
+    /// location — and one that dropped the publishing filter would pair them
+    /// across a gap.
+    #[test]
+    fn a_resident_store_needs_no_landing_and_pairs_its_siblings_bytes() {
+        let (mut trace, _resources) = dual_trace(LoadOp::Clear(sentinel()));
+        let pass = render_pass_mut(&mut trace);
+        // Location 0 keeps its frame in the provider's image, location 1 keeps
+        // publishing through the writeback channel.
+        pass.color_attachments[0].store = StoreOp::Resident;
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = dual_contracts();
+        let planned = plan_trace_with_leases(
+            &trace,
+            &pool,
+            &contracts,
+            None,
+            Some(&[vec![true, false]]),
+            0,
+            0,
+        )
+        .expect("the resident store beside a stored sibling plans");
+        let [planned] = planned.as_slice() else {
+            panic!("the dual trace carries one render pass");
+        };
+        assert!(planned.plan.attachments[0].resident);
+        assert!(!planned.plan.attachments[0].publishes);
+        assert!(!planned.plan.attachments[1].resident);
+        assert!(planned.plan.attachments[1].publishes);
+        assert!(
+            planned.landings[0].is_none(),
+            "a resident store neither lands nor loads trace-declared bytes, so it needs no \
+             declared view even though the trace has one"
+        );
+        let landing = planned.landings[1].expect("the stored sibling keeps its landing");
+        assert_eq!(landing.view_id, ViewId::new(8));
+        assert_eq!(landing.allocation_id, AllocationId::new(10));
+
+        // The encoder reads back the publishing attachment alone, so its one
+        // readback is the stored sibling's, and the writeback carries that
+        // sibling's own identity.
+        let stored_texels = EXPECTED_TEXEL_BYTES.repeat(4);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![stored_texels.clone()],
+            depth: None,
+            stencil: None,
+        });
+        let [only] = writebacks.as_slice() else {
+            panic!("one publishing attachment becomes one writeback");
+        };
+        assert_eq!(only.view_id, ViewId::new(8));
+        assert_eq!(only.allocation_id, AllocationId::new(10));
+        assert_eq!(only.bytes, stored_texels);
+    }
+
+    /// The trace path without a provider registry refuses a resident
+    /// declaration by name, and refuses a resident list that does not line up
+    /// with the passes (`research/docs/23` §76, R7).
+    #[test]
+    fn the_trace_path_without_a_registry_refuses_resident_declarations() {
+        let (mut trace, _resources) = milestone_trace(LoadOp::Clear(sentinel()));
+        render_pass_mut(&mut trace).color_attachments[0].store = StoreOp::Resident;
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let error = plan_trace(&trace, &pool, &milestone_contracts(), 0, 0)
+            .expect_err("no registry resolved this pass's resident declaration");
+        assert_eq!(error.slug, "resident_target_undeclared");
+
+        let error =
+            plan_trace_with_leases(&trace, &pool, &milestone_contracts(), None, Some(&[]), 0, 0)
+                .expect_err("the resident list has to carry one entry per render pass");
+        assert_eq!(error.slug, "resident_target_undeclared");
+
+        // The same trace plans once the provider resolved the identity, and the
+        // pass publishes no writeback: every byte of it stays in the provider's
+        // image.
+        let contracts = milestone_contracts();
+        let planned =
+            plan_trace_with_leases(&trace, &pool, &contracts, None, Some(&[vec![true]]), 0, 0)
+                .expect("the provider resolved the resident identity");
+        let [planned] = planned.as_slice() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        assert!(planned.plan.attachments[0].resident);
+        assert!(planned.landings[0].is_none());
+        assert!(planned
+            .writebacks(RenderReadback {
+                attachments: Vec::new(),
+                depth: None,
+                stencil: None,
+            })
+            .is_empty());
     }
 }
