@@ -3023,6 +3023,9 @@ mod tests {
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
             stage_buffers: Vec::new(),
+            // The quad fixtures sample nothing, so they state no runtime
+            // sampler (`research/docs/23` §3.3, v102).
+            samplers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,

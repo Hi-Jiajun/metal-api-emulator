@@ -209,6 +209,7 @@ fn render_pass(
     height: u64,
 ) -> RenderPassDescriptor {
     RenderPassDescriptor {
+        samplers: Vec::new(),
         stage_buffers: Vec::new(),
         blend: None,
         multisample: None,
@@ -904,6 +905,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 },
             }),
             TracePass::Render(RenderPassDescriptor {
+                samplers: Vec::new(),
                 stage_buffers: Vec::new(),
                 blend: None,
                 multisample: None,
@@ -1098,6 +1100,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 SECOND_SCRATCH_ALLOCATION,
             )),
             TracePass::Render(RenderPassDescriptor {
+                samplers: Vec::new(),
                 stage_buffers: Vec::new(),
                 blend: None,
                 multisample: None,

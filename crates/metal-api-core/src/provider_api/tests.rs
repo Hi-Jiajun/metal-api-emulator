@@ -185,17 +185,27 @@ impl FakeProvider {
     /// order, for the encoder-side stage-buffer tests
     /// (`research/docs/23` §3.3, v87).
     fn last_render_stage_buffers(&self) -> Vec<contract::StageBufferView> {
+        self.last_render_pass()
+            .map(|pass| pass.stage_buffers.clone())
+            .unwrap_or_default()
+    }
+
+    /// The runtime samplers the most recent render pass carried, in canonical
+    /// order, for the encoder-side runtime-sampler test
+    /// (`research/docs/23` §3.3, v102).
+    fn last_render_samplers(&self) -> Vec<contract::RenderSamplerBinding> {
+        self.last_render_pass()
+            .map(|pass| pass.samplers.clone())
+            .unwrap_or_default()
+    }
+
+    /// The most recent render pass the provider received.
+    fn last_render_pass(&self) -> Option<contract::RenderPassDescriptor> {
         self.traces
             .lock()
             .unwrap()
             .last()
-            .and_then(|trace| {
-                trace
-                    .render_passes()
-                    .next()
-                    .map(|pass| pass.stage_buffers.clone())
-            })
-            .unwrap_or_default()
+            .and_then(|trace| trace.render_passes().next().cloned())
     }
 
     fn error(&self, token: CompletionToken) -> ProviderError {
@@ -1625,6 +1635,102 @@ fn render_metadata_with_fragment_texture(provider: &FakeProvider) -> CompiledCom
     metadata
 }
 
+/// The render metadata one runtime-sampler case's pipeline carries
+/// (`research/docs/23` §3.3, v102): the reviewed sampling shape's entries, with
+/// a contract that pairs the one texture with the runtime `[[sampler(0)]]`
+/// argument the encoder states.
+fn render_metadata_with_runtime_sampler(provider: &FakeProvider) -> CompiledComputePipeline {
+    let mut metadata = render_metadata(provider);
+    if let Some(render) = metadata.render.as_mut() {
+        render.textures = vec![TextureBindingContract::sampled_runtime(
+            0,
+            TextureFormat::Rgba8Unorm,
+            0,
+        )];
+    }
+    metadata
+}
+
+#[test]
+fn a_recording_states_the_runtime_samplers_it_bound() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
+    let device = Device::new(provider.clone());
+    let render_metadata = render_metadata_with_runtime_sampler(&provider);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+    let texels: Vec<u8> = (0..4u8)
+        .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+        .collect();
+    let sampled = device
+        .new_texture_with_bytes(TextureFormat::Rgba8Unorm, 4, 4, texels)
+        .unwrap();
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+
+    // The declaring compute pass is what puts the attachment's allocation into
+    // the trace, exactly as the texture test's setup does
+    // (`research/docs/23` §3.6).
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        // The encoder states the Metal state the `[[sampler(0)]]` argument
+        // executes with, exactly as `setFragmentSamplerState(_:index:)` does
+        // (`research/docs/23` §3.3, v102).
+        let policy = contract::SamplerPolicy {
+            filter: contract::SamplerFilter::Linear,
+            address: contract::SamplerAddressMode::Repeat,
+        };
+        encoder.set_fragment_sampler_state(0, policy).unwrap();
+        assert!(matches!(
+            encoder.set_fragment_sampler_state(0, policy),
+            Err(Error::FragmentSamplerAlreadyBound { index: 0 })
+        ));
+        assert!(matches!(
+            encoder.set_fragment_sampler_state(MAX_RENDER_SAMPLERS as u32, policy),
+            Err(Error::FragmentSamplerIndexOutOfRange { index, maximum: 16 })
+                if index == MAX_RENDER_SAMPLERS as u32
+        ));
+        encoder.set_fragment_texture(0, &sampled).unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .expect("the runtime sampler pairing records");
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    // The state reaches the trace as the request's own declaration: exactly the
+    // pair the registration names, in canonical order.
+    let samplers = provider.last_render_samplers();
+    assert_eq!(samplers.len(), 1, "one runtime sampler reaches the trace");
+    assert_eq!(samplers[0].metal_binding, 0);
+    assert_eq!(samplers[0].policy.filter, contract::SamplerFilter::Linear);
+    assert_eq!(
+        samplers[0].policy.address,
+        contract::SamplerAddressMode::Repeat
+    );
+}
+
 #[test]
 fn render_pipeline_wraps_render_metadata_and_refuses_compute_only() {
     let (provider, device) = setup();
@@ -1760,12 +1866,15 @@ fn a_recording_binds_one_fragment_texture_in_binding_order() {
             encoder.set_fragment_texture(0, &sampled),
             Err(Error::FragmentTextureAlreadyBound { index: 0 })
         ));
+        // The binding space is the contract's ceiling (`v102`): the entry at or
+        // past [`MAX_RENDER_TEXTURES`] is the one refused by name, and the
+        // indexes below it are the ones the wider contract admits.
         assert!(matches!(
-            encoder.set_fragment_texture(1, &sampled),
+            encoder.set_fragment_texture(MAX_RENDER_TEXTURES as u32, &sampled),
             Err(Error::FragmentTextureIndexOutOfRange {
-                index: 1,
-                maximum: 1,
-            })
+                index,
+                maximum: 8,
+            }) if index == MAX_RENDER_TEXTURES as u32
         ));
         encoder
             .draw_render_pass(
@@ -5677,6 +5786,7 @@ fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
                 vertex_buffers: 1,
                 index_buffer: false,
                 fragment_textures: 0,
+                fragment_samplers: 0,
             })
         );
     }

@@ -3630,6 +3630,7 @@ mod tests {
 
     fn ordering_render_pass(view: u64) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            samplers: Vec::new(),
             stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
@@ -3850,6 +3851,7 @@ mod tests {
                     texture_type: TextureType::D2,
                     format: TextureFormat::R32Uint,
                     sampler: Some(sampler),
+                    runtime_sampler: None,
                     footprint: TextureFootprintProof::WholeView,
                 }],
                 shader_capabilities: Vec::new(),

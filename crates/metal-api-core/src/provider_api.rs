@@ -24,10 +24,10 @@ use crate::provider::{
     InitialState, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineId,
     PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities,
     ProviderError, ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineStage, ResourceTableSnapshot, StageBufferView, StorageMode, StoreOp, ViewId,
-    FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX, MAX_RENDER_TEXTURES,
-    MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    RenderPipelineStage, ResourceTableSnapshot, SamplerPolicy, StageBufferView, StorageMode,
+    StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX,
+    MAX_RENDER_TEXTURES, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -107,6 +107,18 @@ pub enum Error {
         index: u32,
         maximum: usize,
     },
+    /// One runtime sampler index holds two states, so the pass's canonical
+    /// sampler order would name two states for one `[[sampler(n)]]` argument
+    /// (`research/docs/23` §3.3, v102).
+    FragmentSamplerAlreadyBound {
+        index: u32,
+    },
+    /// A runtime sampler index is at or past [`MAX_RENDER_SAMPLERS`], which is
+    /// the Metal sampler argument table's own size.
+    FragmentSamplerIndexOutOfRange {
+        index: u32,
+        maximum: usize,
+    },
     /// One stage-buffer slot already holds a binding, so a second one would
     /// name two sources for one `[[buffer(N)]]` slot
     /// (`research/docs/23` §3.3, v87).
@@ -130,11 +142,13 @@ pub enum Error {
     /// it selects through.
     MissingIndexBuffer,
     /// An indirect replay supplies its own draw input, but the encoder bound
-    /// streams, an index buffer or a sampled texture for a direct draw.
+    /// streams, an index buffer, a sampled texture or a runtime sampler state
+    /// for a direct draw.
     IndirectReplayInputConflict {
         vertex_buffers: usize,
         index_buffer: bool,
         fragment_textures: usize,
+        fragment_samplers: usize,
     },
     /// A multi-attachment draw recorded no colour attachments, so the pass it
     /// would become has no target for any fragment output to land in — and no
@@ -216,6 +230,13 @@ impl fmt::Display for Error {
                 f,
                 "fragment texture binding {index} is past the {maximum}-texture limit"
             ),
+            Self::FragmentSamplerAlreadyBound { index } => {
+                write!(f, "runtime sampler {index} is bound twice")
+            }
+            Self::FragmentSamplerIndexOutOfRange { index, maximum } => write!(
+                f,
+                "runtime sampler binding {index} is past the {maximum}-sampler limit"
+            ),
             Self::StageBufferAlreadyBound { stage, index } => {
                 write!(f, "stage buffer {}/{} is bound twice", stage.name(), index)
             }
@@ -237,6 +258,7 @@ impl fmt::Display for Error {
                 vertex_buffers,
                 index_buffer,
                 fragment_textures,
+                fragment_samplers,
             } => {
                 write!(
                     f,
@@ -248,6 +270,9 @@ impl fmt::Display for Error {
                 }
                 if *fragment_textures != 0 {
                     write!(f, " and {fragment_textures} sampled texture(s)")?;
+                }
+                if *fragment_samplers != 0 {
+                    write!(f, " and {fragment_samplers} runtime sampler state(s)")?;
                 }
                 Ok(())
             }
@@ -762,6 +787,12 @@ struct RenderTarget {
     /// bindings at record time; the bytes they carry are the snapshot the
     /// texture declaration took, exactly as a compute binding's are.
     textures: Vec<contract::TextureView>,
+    /// The runtime samplers the pass's fragment stage executes with, in
+    /// canonical order (`research/docs/23` §3.3, v102). The recording takes the
+    /// encoder's own states at record time, exactly as it takes the textures:
+    /// Metal binds the sampler object when the draw is encoded, so the state is
+    /// a request fact and the encoder is where the request states it.
+    samplers: Vec<contract::RenderSamplerBinding>,
     /// The stage buffers the pass's two stages read — and the writable ones
     /// they land — in canonical order (`research/docs/23` §3.3, v83-v86): one
     /// entry per `[[buffer(N)]]` slot, the pair of the pipeline's own
@@ -1257,6 +1288,7 @@ impl RenderTarget {
             // ascending binding order, each carrying the bytes its declaration
             // snapshotted.
             textures: self.textures.clone(),
+            samplers: self.samplers.clone(),
             present,
         };
         descriptor.validate()?;
@@ -2208,6 +2240,7 @@ impl CommandBuffer {
             vertex_buffers: BTreeMap::new(),
             index_buffer: None,
             fragment_textures: BTreeMap::new(),
+            fragment_samplers: BTreeMap::new(),
             stage_buffers: BTreeMap::new(),
         })
     }
@@ -2945,6 +2978,11 @@ pub struct RenderCommandEncoder {
     /// (`research/docs/23` §3.3, v70). Like the vertex streams, a binding is
     /// direct-draw state that travels with the pass the draw records.
     fragment_textures: BTreeMap<u32, Texture>,
+    /// The runtime sampler states the fragment stage executes with, by Metal
+    /// `[[sampler(n)]]` index (`research/docs/23` §3.3, v102). Like the
+    /// textures, a state is direct-draw state that travels with the pass the
+    /// draw records; the map's ascending keys are its canonical order.
+    fragment_samplers: BTreeMap<u32, SamplerPolicy>,
     /// The stage buffers the two stages read — and the writable ones they land
     /// — by `(stage ordinal, index)` (`research/docs/23` §3.3, v87). The key's
     /// first half is the stage's own ordinal, so the map's iteration order is
@@ -3092,6 +3130,45 @@ impl RenderCommandEncoder {
             });
         }
         self.fragment_textures.insert(index, texture.clone());
+        Ok(())
+    }
+
+    /// Bind one runtime sampler state the fragment stage executes with at
+    /// `index` (`research/docs/23` §3.3, v102).
+    ///
+    /// This is Metal's `setFragmentSamplerState(_:index:)`: the state a
+    /// `[[sampler(index)]]` argument of the recorded pipeline's fragment stage
+    /// is executed with. The value travels into the pass's sampler list, which
+    /// the pipeline contract's own declarations pair with their textures — a
+    /// state no declaration pairs with, or a declared runtime sampler left
+    /// unbound, is refused when the pass is recorded by the contract's
+    /// [`ContractError::UnpairedRuntimeSamplerBinding`] /
+    /// [`ContractError::MissingRuntimeSamplerBinding`].
+    ///
+    /// A repeated index is [`Error::FragmentSamplerAlreadyBound`] and an index
+    /// at or past [`MAX_RENDER_SAMPLERS`] is
+    /// [`Error::FragmentSamplerIndexOutOfRange`], exactly as the texture
+    /// binding's two refusals spell their own binding. A binding is direct-draw
+    /// state, so it is refused once an indirect replay has been recorded.
+    pub fn set_fragment_sampler_state(
+        &mut self,
+        index: u32,
+        policy: SamplerPolicy,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.fragment_samplers.contains_key(&index) {
+            return Err(Error::FragmentSamplerAlreadyBound { index });
+        }
+        if usize::try_from(index).unwrap_or(usize::MAX) >= MAX_RENDER_SAMPLERS {
+            return Err(Error::FragmentSamplerIndexOutOfRange {
+                index,
+                maximum: MAX_RENDER_SAMPLERS,
+            });
+        }
+        self.fragment_samplers.insert(index, policy);
         Ok(())
     }
 
@@ -4699,6 +4776,16 @@ impl RenderCommandEncoder {
                 .iter()
                 .map(|(binding, texture)| texture.view(*binding))
                 .collect::<Result<Vec<_>, _>>()?,
+            // The encoder's runtime sampler states travel with the pass the
+            // same way its textures do (`research/docs/23` §3.3, v102): the
+            // map's ascending keys are the canonical order the descriptor
+            // states, and each entry is the state the descriptor's sampler is
+            // created with.
+            samplers: self
+                .fragment_samplers
+                .iter()
+                .map(|(binding, policy)| contract::RenderSamplerBinding::new(*binding, *policy))
+                .collect(),
             // The encoder's stage-buffer bindings travel with the pass it
             // records (`research/docs/23` §3.3, v83-v87): the map's canonical
             // order is the descriptor's own, and each slot's access is the
@@ -4858,11 +4945,13 @@ impl RenderCommandEncoder {
         if !self.vertex_buffers.is_empty()
             || self.index_buffer.is_some()
             || !self.fragment_textures.is_empty()
+            || !self.fragment_samplers.is_empty()
         {
             return Err(Error::IndirectReplayInputConflict {
                 vertex_buffers: self.vertex_buffers.len(),
                 index_buffer: self.index_buffer.is_some(),
                 fragment_textures: self.fragment_textures.len(),
+                fragment_samplers: self.fragment_samplers.len(),
             });
         }
         if self.draw_count > 0 || self.indirect {
