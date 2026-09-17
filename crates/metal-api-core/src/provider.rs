@@ -568,6 +568,17 @@ pub enum TextureFormat {
     R32Float,
     Rgba8Unorm,
     Bgra8Unorm,
+    /// `VK_FORMAT_R16G16B16A16_SFLOAT` / `MTLPixelFormat::RGBA16Float`.
+    ///
+    /// The first eight-byte texel the texture list admits
+    /// (`research/docs/23` §78): the format table states it so
+    /// [`AttachmentFormat::as_texture_format`] stays total and a
+    /// `rgba16_float` attachment can be declared as its own texture view, not
+    /// so the reviewed sampling rail samples it. That rail's own capability
+    /// list (`supported_render_texture_formats`) still names exactly the
+    /// reviewed `rgba8_unorm` sample, so an unsampled `rgba16_float` binding is
+    /// refused by name rather than sampled with a module no review covered.
+    Rgba16Float,
 }
 
 impl TextureFormat {
@@ -578,6 +589,7 @@ impl TextureFormat {
         match self {
             Self::R32Uint | Self::R32Float => 4,
             Self::Rgba8Unorm | Self::Bgra8Unorm => 4,
+            Self::Rgba16Float => 8,
         }
     }
 }
@@ -1147,13 +1159,35 @@ pub enum AttachmentFormat {
     /// attachment needs a value domain the first increment does not model. The
     /// code stays stable so Step 2 can enable it deliberately.
     R32Uint,
+    /// `VK_FORMAT_R16G16B16A16_SFLOAT` / `MTLPixelFormat::RGBA16Float`.
+    ///
+    /// The first admitted format whose texel is **wider than four bytes**
+    /// (`research/docs/23` §78): the real desktop census
+    /// (`evidence/gate3-census-2026-09-17/`) measured `0x73`/`RGBA16Float`
+    /// draw shapes on the seam, so the render contract, the Vulkan rail and the
+    /// native rail each carry the mapping. Eight bytes per texel is what makes
+    /// the clear payload [`ClearColor::MAX_BYTES`] wide and what makes the
+    /// rail's readback extent a per-format question instead of one constant.
+    ///
+    /// This is **not** the sRGB variant §7.4 defers: an fp16 attachment holds
+    /// the shader's own values, so a byte comparison stays bit-stable. The
+    /// value is device-gated, not contract-gated: both rails probe the device
+    /// (Vulkan through `vkGetPhysicalDeviceImageFormatProperties`) and refuse
+    /// the shape by name when the device answers no.
+    Rgba16Float,
 }
 
 impl AttachmentFormat {
-    /// Formats the first render increment admits as colour attachments. All
-    /// three are 4-byte texel formats, which is what makes the fixed 4-byte
-    /// [`ClearColor`] well formed.
-    pub const ADMITTED: [Self; 3] = [Self::Rgba8Unorm, Self::Bgra8Unorm, Self::R32Float];
+    /// Formats the render contract admits as colour attachments. Every entry
+    /// has a reviewed module pair on the Rails that declare it, and each
+    /// entry's texel is at most [`ClearColor::MAX_BYTES`] wide, which is what
+    /// keeps the inline clear payload well formed for all of them.
+    pub const ADMITTED: [Self; 4] = [
+        Self::Rgba8Unorm,
+        Self::Bgra8Unorm,
+        Self::R32Float,
+        Self::Rgba16Float,
+    ];
 
     /// Tightly packed bytes one texel occupies in this format. `rowPitch` and
     /// readback alignment stay provider concerns, exactly as they are for
@@ -1161,6 +1195,7 @@ impl AttachmentFormat {
     pub const fn bytes_per_texel(self) -> u64 {
         match self {
             Self::Rgba8Unorm | Self::Bgra8Unorm | Self::R32Float | Self::R32Uint => 4,
+            Self::Rgba16Float => 8,
         }
     }
 
@@ -1171,6 +1206,7 @@ impl AttachmentFormat {
             Self::R32Float => 1,
             Self::Rgba8Unorm => 2,
             Self::Bgra8Unorm => 3,
+            Self::Rgba16Float => 4,
         }
     }
 
@@ -1182,6 +1218,7 @@ impl AttachmentFormat {
             1 => Some(Self::R32Float),
             2 => Some(Self::Rgba8Unorm),
             3 => Some(Self::Bgra8Unorm),
+            4 => Some(Self::Rgba16Float),
             _ => None,
         }
     }
@@ -1194,17 +1231,21 @@ impl AttachmentFormat {
             Self::Bgra8Unorm => TextureFormat::Bgra8Unorm,
             Self::R32Float => TextureFormat::R32Float,
             Self::R32Uint => TextureFormat::R32Uint,
+            Self::Rgba16Float => TextureFormat::Rgba16Float,
         }
     }
 
     /// Whether the first render increment admits this format as a colour
     /// attachment. See [`AttachmentFormat::R32Uint`] for the one refusal.
     pub const fn is_admitted_for_color_attachment(self) -> bool {
-        matches!(self, Self::Rgba8Unorm | Self::Bgra8Unorm | Self::R32Float)
+        matches!(
+            self,
+            Self::Rgba8Unorm | Self::Bgra8Unorm | Self::R32Float | Self::Rgba16Float
+        )
     }
 }
 
-/// The four tightly packed texel bytes a [`LoadOp::Clear`] writes into a colour
+/// The tightly packed texel bytes a [`LoadOp::Clear`] writes into a colour
 /// attachment.
 ///
 /// The value is carried as bytes rather than as a `u32` or a float: `docs/23`
@@ -1212,19 +1253,141 @@ impl AttachmentFormat {
 /// float clear such as `0.5` converts to `0x80` on Lavapipe but `0x7f` on
 /// NVIDIA and dzn, so a float clear is not parity-stable. Bytes in memory order
 /// also remove any endianness question from the contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The payload is **one texel wide**: exactly `format.bytes_per_texel()` bytes
+/// for the attachment that carries it, which [`RenderAttachment::validate_shape`]
+/// enforces with [`ContractError::AttachmentClearLengthMismatch`]. The
+/// four-byte spelling every pre-v78 trace carries is the narrow case of that
+/// rule, and `rgba16_float` (`research/docs/23` §78) is the first admitted
+/// format whose texel is wider than four bytes — so the value keeps up to
+/// [`ClearColor::MAX_BYTES`] bytes inline instead of fixing the payload at
+/// four. `PresentTarget`'s sentinel widening (`docs/24` §3.1) is the same rule
+/// one channel over, and keeping the buffer inline is what lets [`LoadOp`] and
+/// [`RenderAttachment`] stay `Copy`.
+#[derive(Clone, Copy)]
 pub struct ClearColor {
-    pub bytes: [u8; 4],
+    bytes: [u8; ClearColor::MAX_BYTES],
+    len: u8,
 }
 
 impl ClearColor {
-    /// Bytes per clear value. Every admitted attachment format is exactly four
-    /// bytes per texel ([`AttachmentFormat::bytes_per_texel`]); admitting a
-    /// wider format requires widening this payload first.
+    /// The narrow payload every pre-v78 trace carries: one four-byte texel.
+    ///
+    /// Kept as the name of the fixed width the wire's legacy clear tag encodes,
+    /// so a reader can tell "the payload this arm always carried" from "the
+    /// widest texel the format table admits".
     pub const BYTES: usize = 4;
 
-    pub const fn new(bytes: [u8; 4]) -> Self {
-        Self { bytes }
+    /// The widest texel an admitted attachment format has
+    /// ([`AttachmentFormat::Rgba16Float`]).
+    pub const MAX_BYTES: usize = 8;
+
+    /// A four-byte clear, byte-for-byte what the pre-v78 contract carried.
+    pub const fn new(bytes: [u8; Self::BYTES]) -> Self {
+        let mut inline = [0_u8; Self::MAX_BYTES];
+        let mut index = 0;
+        while index < Self::BYTES {
+            inline[index] = bytes[index];
+            index += 1;
+        }
+        Self {
+            bytes: inline,
+            len: Self::BYTES as u8,
+        }
+    }
+
+    /// A clear of `bytes.len()` texel bytes, or `None` when the payload is
+    /// empty or wider than the widest admitted format.
+    ///
+    /// The length is checked against the carrying attachment's own texel width
+    /// by [`RenderAttachment::validate_shape`]; this constructor only refuses
+    /// payloads no admitted format could ever hold.
+    pub const fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > Self::MAX_BYTES {
+            return None;
+        }
+        let mut inline = [0_u8; Self::MAX_BYTES];
+        let mut index = 0;
+        while index < bytes.len() {
+            inline[index] = bytes[index];
+            index += 1;
+        }
+        Some(Self {
+            bytes: inline,
+            len: bytes.len() as u8,
+        })
+    }
+
+    /// The clear's texel bytes, in the format's memory order.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// Bytes this clear carries. Equal to the carrying attachment format's
+    /// [`AttachmentFormat::bytes_per_texel`] once the pass is validated.
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the payload is empty. Always `false` for a constructed value;
+    /// the predicate exists so the type is not a bare `len` accessor.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl PartialEq for ClearColor {
+    /// Compares the *used* texel bytes: the inline buffer's tail is padding,
+    /// so a derived comparison would make two equal clears disagree about
+    /// bytes no format carries.
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ClearColor {}
+
+impl std::fmt::Debug for ClearColor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ClearColor")
+            .field(&self.as_bytes())
+            .finish()
+    }
+}
+
+/// Widen one IEEE-754 binary16 value to `f32`.
+///
+/// The two rails decode a clear payload's components with it: the contract
+/// carries an attachment format's **memory-order** bytes, a
+/// `Rgba16Float` clear's eight bytes are therefore four little-endian half
+/// values, and the driver-facing clear value (`VkClearColorValue::float32`,
+/// `MTLClearColor`) takes those components widened
+/// (`research/docs/23` §78).
+///
+/// The widening is exact for every finite half — a half has at most eleven
+/// significant bits and lies between `2^-24` and `65504`, both well inside
+/// `f32`'s precision and range — which is what makes it usable as the *decode*
+/// half of a byte comparison: a rounded intermediate would perturb exactly the
+/// bytes the caller declared. Infinities keep their sign and every NaN payload
+/// widens to a quiet NaN; the contract has no use for a half NaN's payload.
+pub fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 {
+        1.0_f64
+    } else {
+        -1.0_f64
+    };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = f64::from(bits & 0x03ff);
+    match exponent {
+        // Zero and the subnormals: the mantissa is the value's own scale, at
+        // `2^-24` per unit rather than an implicit leading one.
+        0 => (sign * mantissa * 2.0_f64.powi(-24)) as f32,
+        // Infinity keeps the sign; every non-zero mantissa is a NaN.
+        0x1f if mantissa == 0.0 => sign as f32 * f32::INFINITY,
+        0x1f => f32::NAN,
+        // A normal half: `(1 + mantissa / 1024) * 2^(exponent - 15)`.
+        _ => (sign * (1.0 + mantissa / 1024.0) * 2.0_f64.powi(i32::from(exponent) - 15)) as f32,
     }
 }
 
@@ -1755,6 +1918,26 @@ impl RenderAttachment {
         self.expected_bytes()?;
         if !self.format.is_admitted_for_color_attachment() {
             return Err(ContractError::UnsupportedAttachmentFormat(self.format));
+        }
+        // A clear payload is one texel wide (`research/docs/23` §78): the
+        // contract compares texel bytes, so a payload shorter or wider than the
+        // attachment's own texel would either leave texels the clear never
+        // reached or carry bytes no texel could hold. The check lives here, on
+        // the attachment that carries the payload, because the format is the
+        // half that says how wide a texel is — a `LoadOp::Clear` alone cannot
+        // answer it. Four-byte textures keep the bytes the pre-v78 contract
+        // always wrote; `rgba16_float` is the first format this rule admits at
+        // eight.
+        if let LoadOp::Clear(clear) = self.load {
+            let expected = self.format.bytes_per_texel();
+            let actual = clear.len() as u64;
+            if actual != expected {
+                return Err(ContractError::AttachmentClearLengthMismatch {
+                    format: self.format,
+                    expected,
+                    actual,
+                });
+            }
         }
         // The two resident arms (`research/docs/23` §76, R7) are a load and a
         // store decision about *one* image the provider owns, so the pair has
@@ -7900,6 +8083,12 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::AttachmentExtentMismatch { .. } | E::AttachmentTextureShapeMismatch { .. } => {
             (ProviderErrorClass::Args, "attachment_extent_mismatch")
         }
+        // The clear payload is the same caller-fixable argument shape one
+        // channel over: the trace declared a colour the attachment's own texel
+        // cannot hold (`research/docs/23` §78).
+        E::AttachmentClearLengthMismatch { .. } => {
+            (ProviderErrorClass::Args, "attachment_clear_length_mismatch")
+        }
         E::AttachmentComputeConflict { .. } => {
             (ProviderErrorClass::Args, "attachment_resource_conflict")
         }
@@ -9694,6 +9883,21 @@ pub enum ContractError {
         declared_format: TextureFormat,
         declared_bytes: u64,
     },
+    /// A [`LoadOp::Clear`] payload is not one texel of its attachment's format.
+    ///
+    /// The clear is a byte comparison's own starting point
+    /// (`research/docs/23` §3.5), so the payload has to be exactly
+    /// `format.bytes_per_texel()` bytes: shorter leaves texels the clear never
+    /// reached and wider carries bytes no texel of that format holds. Kept
+    /// distinct from [`Self::PresentSentinelLengthMismatch`] because the
+    /// carrying shape differs — a present target's sentinel versus a colour
+    /// attachment's clear — and a caller fixes whichever one it declared
+    /// (`research/docs/23` §78).
+    AttachmentClearLengthMismatch {
+        format: AttachmentFormat,
+        expected: u64,
+        actual: u64,
+    },
     AttachmentComputeConflict {
         pass_index: usize,
         /// The attachment the render pass stores into.
@@ -10349,6 +10553,14 @@ impl fmt::Display for ContractError {
                 height = attachment_extent[1],
                 declared_width = declared_extent[0],
                 declared_height = declared_extent[1],
+            ),
+            Self::AttachmentClearLengthMismatch {
+                format,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "attachment clear is {actual} bytes, but format {format:?} has {expected}-byte texels"
             ),
             Self::AttachmentComputeConflict {
                 pass_index,
@@ -14725,6 +14937,18 @@ mod tests {
         }
     }
 
+    /// A clear payload of exactly one texel of `format`, in the format's memory
+    /// order.
+    ///
+    /// The wide formats' payloads are not four-byte widenings of the narrow
+    /// one, so a clear the rail read with another format's width cannot pass as
+    /// the same value (`research/docs/23` §78).
+    fn one_texel_clear(format: AttachmentFormat) -> ClearColor {
+        let mut bytes = vec![0x40, 0x80, 0xc0, 0xff];
+        bytes.resize(format.bytes_per_texel() as usize, 0x5a);
+        ClearColor::from_bytes(&bytes).expect("one texel fits the inline payload")
+    }
+
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
             blend: None,
@@ -14764,14 +14988,35 @@ mod tests {
         assert_eq!(MAX_COLOR_ATTACHMENTS, 4);
         assert_eq!(FULL_SCREEN_TRIANGLE_VERTICES, 3);
 
-        // Every admitted format carries one 4-byte texel, which is what makes
-        // the fixed 4-byte clear payload well formed.
+        // Every admitted format's texel fits the inline clear payload, and the
+        // payload a pass carries has to be exactly one texel of that format:
+        // the four-byte spelling is the narrow case of the rule and
+        // `Rgba16Float` is the first admitted format wider than it
+        // (`research/docs/23` §78).
         for format in AttachmentFormat::ADMITTED {
             assert!(format.is_admitted_for_color_attachment());
-            assert_eq!(format.bytes_per_texel(), ClearColor::BYTES as u64);
+            assert!(format.bytes_per_texel() <= ClearColor::MAX_BYTES as u64);
             let mut adopted = pass.clone();
             adopted.color_attachments[0].format = format;
+            adopted.color_attachments[0].load = LoadOp::Clear(one_texel_clear(format));
             adopted.validate().expect("an admitted format renders");
+
+            // The narrow payload stays correct for the narrow formats and is
+            // refused by name for a wider one: a four-byte clear cannot state
+            // the bytes of an eight-byte texel, and the refusal names the
+            // format it was measured against.
+            if format.bytes_per_texel() > ClearColor::BYTES as u64 {
+                let mut narrow = pass.clone();
+                narrow.color_attachments[0].format = format;
+                assert_eq!(
+                    narrow.validate(),
+                    Err(ContractError::AttachmentClearLengthMismatch {
+                        format,
+                        expected: format.bytes_per_texel(),
+                        actual: ClearColor::BYTES as u64,
+                    })
+                );
+            }
         }
     }
 
@@ -15386,6 +15631,12 @@ mod tests {
                 TextureFormat::Bgra8Unorm,
                 true,
             ),
+            (
+                AttachmentFormat::Rgba16Float,
+                4,
+                TextureFormat::Rgba16Float,
+                true,
+            ),
         ];
         for (format, code, texture_format, admitted) in cases {
             assert_eq!(format.code(), code);
@@ -15398,8 +15649,114 @@ mod tests {
             );
             assert_eq!(format.is_admitted_for_color_attachment(), admitted);
         }
-        assert_eq!(AttachmentFormat::from_code(4), None);
-        assert_eq!(AttachmentFormat::ADMITTED.len(), 3);
+        assert_eq!(AttachmentFormat::from_code(5), None);
+        assert_eq!(AttachmentFormat::ADMITTED.len(), 4);
+    }
+
+    #[test]
+    fn the_clear_payload_is_one_texel_wide_in_both_directions() {
+        // The narrow spelling every pre-v78 trace carries stays byte-for-byte
+        // what it was: four bytes, in memory order, with no padding visible
+        // through `as_bytes` (`research/docs/23` §78).
+        let narrow = ClearColor::new([0x40, 0x80, 0xc0, 0xff]);
+        assert_eq!(narrow.as_bytes(), [0x40, 0x80, 0xc0, 0xff]);
+        assert_eq!(narrow.len(), ClearColor::BYTES);
+        assert!(!narrow.is_empty());
+
+        // Two clears built the narrow way are equal and carry the same bytes:
+        // the inline buffer's tail is padding, so a comparison that read it
+        // would make equal clears disagree.
+        let narrow_again = ClearColor::new([0x40, 0x80, 0xc0, 0xff]);
+        assert_eq!(narrow, narrow_again);
+        let wide = ClearColor::from_bytes(&[0x40, 0x80, 0xc0, 0xff, 0x5a, 0x5a, 0x5a, 0x5a])
+            .expect("eight bytes is the widest inline payload");
+        assert_eq!(wide.len(), ClearColor::MAX_BYTES);
+        assert_eq!(
+            wide.as_bytes(),
+            [0x40, 0x80, 0xc0, 0xff, 0x5a, 0x5a, 0x5a, 0x5a]
+        );
+        assert_ne!(wide, narrow, "the wide payload carries four more bytes");
+
+        // A payload no admitted format could hold is refused at construction,
+        // so the value cannot carry a length the format table has no answer
+        // for.
+        assert_eq!(ClearColor::from_bytes(&[]), None);
+        assert_eq!(
+            ClearColor::from_bytes(&[0; ClearColor::MAX_BYTES + 1]),
+            None
+        );
+    }
+
+    /// Widen a half from its bit fields, for the exactness control below.
+    ///
+    /// Deliberately a different computation from [`half_to_f32`]: this one
+    /// assembles an f32 from sign/exponent/mantissa, normalising a subnormal by
+    /// shifting its mantissa left until the implicit leading one is in place.
+    fn widen_by_bit_fields(bits: u16) -> f32 {
+        let sign = u32::from(bits >> 15) << 31;
+        let exponent = u32::from((bits >> 10) & 0x1f);
+        let mantissa = u32::from(bits & 0x03ff);
+        let fields = match exponent {
+            0 if mantissa == 0 => sign,
+            0 => {
+                let mut value = mantissa;
+                let mut shift = 0u32;
+                while value & 0x0400 == 0 {
+                    value <<= 1;
+                    shift += 1;
+                }
+                // `mantissa * 2^-24` normalised: `value` is the mantissa
+                // shifted so its leading one sits at bit 10, so the value is
+                // `(1 + frac) * 2^(-14 - shift)`.
+                sign | ((127 - 14 - shift) << 23) | ((value & 0x03ff) << 13)
+            }
+            0x1f => sign | 0x7f80_0000 | (mantissa << 13),
+            _ => sign | ((exponent + 127 - 15) << 23) | (mantissa << 13),
+        };
+        f32::from_bits(fields)
+    }
+
+    #[test]
+    fn half_precision_components_widen_exactly() {
+        // The table pins the encodings the rail fixtures use, plus one value of
+        // each class: signed zero, a subnormal, the smallest normal, the
+        // largest subnormal, an infinity and a NaN.
+        for (bits, expected) in [
+            (0x0000_u16, 0.0_f32),
+            (0x8000, -0.0),
+            (0x3c00, 1.0),
+            (0xbc00, -1.0),
+            (0x3800, 0.5),
+            (0x3400, 0.25),
+            // The half nearest `0.1`: the f32 of `0.1` is a different value,
+            // which is the rounding a 16-bit float attachment observes.
+            (0x2e66, 0.099975_586),
+            (0x0001, 5.960_464_5e-8),
+            // The largest subnormal: `1023 * 2^-24`.
+            (0x03ff, 6.097_555e-5),
+            (0x0400, 6.103_515_6e-5),
+        ] {
+            let widened = half_to_f32(bits);
+            assert_eq!(widened.to_bits(), expected.to_bits(), "{bits:#06x}");
+        }
+        assert_eq!(half_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(half_to_f32(0xfc00), f32::NEG_INFINITY);
+        assert!(half_to_f32(0x7e00).is_nan());
+
+        // Exhaustive control: every one of the 65536 patterns is widened
+        // exactly, checked against the bit-field computation above.
+        for bits in 0..=u16::MAX {
+            let widened = half_to_f32(bits);
+            if (bits >> 10) & 0x1f == 0x1f && bits & 0x03ff != 0 {
+                assert!(widened.is_nan(), "{bits:#06x} is a half NaN");
+                continue;
+            }
+            assert_eq!(
+                widened.to_bits(),
+                widen_by_bit_fields(bits).to_bits(),
+                "{bits:#06x} widened two ways"
+            );
+        }
     }
 
     #[test]
@@ -17767,6 +18124,7 @@ mod tests {
             contract.color_formats = vec![format];
             let mut pass = render_pass();
             pass.color_attachments[0].format = format;
+            pass.color_attachments[0].load = LoadOp::Clear(one_texel_clear(format));
             contract
                 .validate_against(&pass)
                 .expect("a pipeline compiles for the attachment it renders into");
@@ -17888,7 +18246,12 @@ mod tests {
             width: 2,
             height: 2,
             image_count: MAX_PRESENT_IMAGE_COUNT,
-            initial: InitialState::Sentinel(vec![0x40, 0x80, 0xc0, 0xff]),
+            // The sentinel is one tightly packed texel of the target's own
+            // format (`research/docs/24` §3.1), so the helper builds it at the
+            // format's width: a four-byte sentinel would be the narrow case
+            // only, and `Rgba16Float`'s texel is eight bytes
+            // (`research/docs/23` §78).
+            initial: InitialState::Sentinel(vec![0x40; format.bytes_per_texel() as usize]),
         }
     }
 
@@ -17920,12 +18283,15 @@ mod tests {
         for format in AttachmentFormat::ADMITTED {
             let mut adopted = present.clone();
             adopted.target.format = format;
+            adopted.target.initial =
+                InitialState::Sentinel(vec![0x40; format.bytes_per_texel() as usize]);
             let mut pass = render_pass();
             pass.color_attachments[0].format = format;
+            pass.color_attachments[0].load = LoadOp::Clear(one_texel_clear(format));
             adopted
                 .validate_against(&pass)
                 .expect("an admitted format presents");
-            assert_eq!(adopted.target.format.bytes_per_texel(), 4);
+            assert!(adopted.target.format.bytes_per_texel() <= ClearColor::MAX_BYTES as u64);
         }
 
         // A target that declares no pre-pass contents is expressible and
@@ -18088,10 +18454,11 @@ mod tests {
                 InitialState::Sentinel(vec![0x11; format.bytes_per_texel() as usize]);
             assert_eq!(
                 present.target.initial.sentinel().map(|bytes| bytes.len()),
-                Some(4)
+                Some(format.bytes_per_texel() as usize)
             );
             let mut pass = render_pass();
             pass.color_attachments[0].format = format;
+            pass.color_attachments[0].load = LoadOp::Clear(one_texel_clear(format));
             present.validate_against(&pass).unwrap();
         }
     }

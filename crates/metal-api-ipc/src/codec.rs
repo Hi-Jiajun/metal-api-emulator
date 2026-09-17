@@ -137,6 +137,18 @@ pub enum CodecError {
         length: usize,
         maximum: usize,
     },
+    /// A render attachment's clear payload is not one texel of its own format
+    /// (`research/docs/23` §78).
+    ///
+    /// The width is carried by the attachment's format rather than by a length
+    /// prefix, so a payload of another width cannot be framed: the sender
+    /// refuses it here instead of writing a frame the receiver would have to
+    /// desync on.
+    ClearLength {
+        format: u8,
+        expected: usize,
+        actual: usize,
+    },
     HeapPlacementCount {
         count: usize,
         maximum: usize,
@@ -276,6 +288,15 @@ impl fmt::Display for CodecError {
             Self::PresentSentinelLength { length, maximum } => write!(
                 formatter,
                 "present target sentinel carries {length} bytes, maximum {maximum}"
+            ),
+            Self::ClearLength {
+                format,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "attachment clear for format code {format} carries {actual} bytes, but its texel \
+                 is {expected} bytes"
             ),
             Self::HeapPlacementCount { count, maximum } => write!(
                 formatter,

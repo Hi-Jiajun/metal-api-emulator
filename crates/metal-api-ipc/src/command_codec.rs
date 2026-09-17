@@ -1881,6 +1881,7 @@ fn put_texture_format(encoder: &mut Encoder, format: TextureFormat) {
         TextureFormat::R32Float => 1,
         TextureFormat::Rgba8Unorm => 2,
         TextureFormat::Bgra8Unorm => 3,
+        TextureFormat::Rgba16Float => 4,
     });
 }
 
@@ -1890,6 +1891,7 @@ fn get_texture_format(decoder: &mut Decoder<'_>) -> Result<TextureFormat, CodecE
         1 => Ok(TextureFormat::R32Float),
         2 => Ok(TextureFormat::Rgba8Unorm),
         3 => Ok(TextureFormat::Bgra8Unorm),
+        4 => Ok(TextureFormat::Rgba16Float),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture format",
             value,
@@ -2377,7 +2379,7 @@ fn put_render_pass(
     encoder.u64(pass.pipeline.get());
     encoder.u64(pass.color_attachments.len() as u64);
     for attachment in &pass.color_attachments {
-        put_render_attachment(encoder, attachment);
+        put_render_attachment(encoder, attachment)?;
     }
     for dimension in pass.viewport {
         encoder.u32(dimension);
@@ -2466,27 +2468,51 @@ fn put_present_descriptor(
     Ok(())
 }
 
-fn put_render_attachment(encoder: &mut Encoder, attachment: &RenderAttachment) {
+fn put_render_attachment(
+    encoder: &mut Encoder,
+    attachment: &RenderAttachment,
+) -> Result<(), CodecError> {
     encoder.u64(attachment.view_id.get());
     encoder.u64(attachment.allocation_id.get());
     put_attachment_format(encoder, attachment.format);
     encoder.u64(attachment.width);
     encoder.u64(attachment.height);
-    put_load_op(encoder, attachment.load);
+    put_load_op(encoder, attachment.load, attachment.format)?;
     put_store_op(encoder, attachment.store);
+    Ok(())
 }
 
 fn put_attachment_format(encoder: &mut Encoder, format: AttachmentFormat) {
     encoder.u8(format.code());
 }
 
-fn put_load_op(encoder: &mut Encoder, load: LoadOp) {
+/// Encode one attachment's load operation behind the format it loads into.
+///
+/// The clear payload is **one texel of the attachment's own format**
+/// (`research/docs/23` §78): exactly `format.bytes_per_texel()` bytes, in
+/// memory order. The width is carried by the attachment's own format rather
+/// than by a length prefix — the format byte is written before the load
+/// operation, so a malformed length cannot separate the clear value from its
+/// tag, and a decoder that does not know the format refuses the whole
+/// attachment instead of reading a payload of the wrong width.
+fn put_load_op(
+    encoder: &mut Encoder,
+    load: LoadOp,
+    format: AttachmentFormat,
+) -> Result<(), CodecError> {
     match load {
         LoadOp::Clear(color) => {
             encoder.u8(0);
-            // Fixed four-byte payload: no length prefix, so the clear value
-            // cannot be separated from its tag by a malformed length.
-            encoder.bytes.extend_from_slice(&color.bytes);
+            let bytes = color.as_bytes();
+            let expected = format.bytes_per_texel() as usize;
+            if bytes.len() != expected {
+                return Err(CodecError::ClearLength {
+                    format: format.code(),
+                    expected,
+                    actual: bytes.len(),
+                });
+            }
+            encoder.bytes.extend_from_slice(bytes);
         }
         LoadOp::Load => encoder.u8(1),
         LoadOp::DontCare => encoder.u8(2),
@@ -2495,6 +2521,7 @@ fn put_load_op(encoder: &mut Encoder, load: LoadOp) {
         // declaration, exactly like `Load`'s.
         LoadOp::Resident => encoder.u8(3),
     }
+    Ok(())
 }
 
 fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
@@ -3590,7 +3617,7 @@ fn get_render_attachment(decoder: &mut Decoder<'_>) -> Result<RenderAttachment, 
     let format = get_attachment_format(decoder)?;
     let width = decoder.u64()?;
     let height = decoder.u64()?;
-    let load = get_load_op(decoder)?;
+    let load = get_load_op(decoder, format)?;
     let store = get_store_op(decoder)?;
     Ok(RenderAttachment {
         view_id,
@@ -3611,12 +3638,27 @@ fn get_attachment_format(decoder: &mut Decoder<'_>) -> Result<AttachmentFormat, 
     })
 }
 
-fn get_load_op(decoder: &mut Decoder<'_>) -> Result<LoadOp, CodecError> {
+/// Decode one attachment's load operation behind the format it loads into.
+///
+/// The clear payload's width is the attachment format's own texel width
+/// (`research/docs/23` §78); a payload that is not exactly one texel is a
+/// codec error rather than a silently truncated or padded value, because the
+/// byte comparison downstream would otherwise compare bytes no texel holds.
+fn get_load_op(decoder: &mut Decoder<'_>, format: AttachmentFormat) -> Result<LoadOp, CodecError> {
     match decoder.u8()? {
         0 => {
-            let mut bytes = [0_u8; ClearColor::BYTES];
-            bytes.copy_from_slice(decoder.take(ClearColor::BYTES)?);
-            Ok(LoadOp::Clear(ClearColor::new(bytes)))
+            let length = usize::try_from(format.bytes_per_texel()).map_err(|_| {
+                CodecError::UnknownEnumValue {
+                    field: "attachment format texel width",
+                    value: format.code(),
+                }
+            })?;
+            let bytes = decoder.take(length)?;
+            let clear = ClearColor::from_bytes(bytes).ok_or(CodecError::UnknownEnumValue {
+                field: "attachment clear length",
+                value: format.code(),
+            })?;
+            Ok(LoadOp::Clear(clear))
         }
         1 => Ok(LoadOp::Load),
         2 => Ok(LoadOp::DontCare),

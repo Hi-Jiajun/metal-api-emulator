@@ -49,12 +49,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::{SpirvFeaturePolicy, VulkanContext};
 
-/// `VK_FORMAT_*` texel width shared by every format the render contract admits.
+/// The four-byte texel the pre-v78 rail computed every readback extent with.
 ///
-/// `AttachmentFormat::bytes_per_texel` fixes this at the contract layer; the
-/// rail restates it so the readback extent is computed without a second
-/// format-to-width mapping.
-const BYTES_PER_TEXEL: u64 = 4;
+/// `AttachmentFormat::bytes_per_texel` fixes each attachment's own width at the
+/// contract layer, and a colour readback asks *that* (`research/docs/23` §78).
+/// This constant is the depth surface's own `VK_FORMAT_D32_SFLOAT` width — and
+/// the name the narrow colour class goes by — so the two numbers stay
+/// distinguishable at the call sites that mean one and not the other.
+const NARROW_BYTES_PER_TEXEL: u64 = 4;
 
 /// The stencil surface's texel width (`research/docs/23` §3.3, v49).
 ///
@@ -159,15 +161,18 @@ const SINGLE_PIXEL_VERT_SPV: &[u8] = include_bytes!("render_spv/single_pixel.ver
 /// Entry point [`SINGLE_PIXEL_VERT_SPV`] declares.
 const SINGLE_PIXEL_VERTEX_ENTRY: &str = "single_pixel";
 
-/// The reviewed solid fragment module for an 8-bit UNORM attachment.
+/// The reviewed solid fragment module for a four-component colour attachment.
 ///
-/// One module serves both `VK_FORMAT_R8G8B8A8_UNORM` and
-/// `VK_FORMAT_B8G8R8A8_UNORM`, because which channel lands in which byte is the
-/// *image format's* decision rather than the shader's: the stage stores
-/// `(64/255, 128/255, 192/255, 1)` either way, so an R,G,B,A layout reads back
-/// `40 80 c0 ff` per texel and a B,G,R,A layout reads back `c0 80 40 ff`.
-/// Swizzling the store as well would undo the format's own reordering twice and
-/// land the other colour in those same bytes.
+/// One module serves every admitted format with four components — the two 8-bit
+/// UNORM layouts and (from `research/docs/23` §78) the eight-byte
+/// `VK_FORMAT_R16G16B16A16_SFLOAT`. Which channel lands in which byte, and
+/// whether each channel lands as 8-bit UNORM or as a half float, are the *image
+/// format's* decisions rather than the shader's: the stage stores
+/// `(64/255, 128/255, 192/255, 1)` as a `vec4` of `float`s either way, so an
+/// R,G,B,A layout reads back `40 80 c0 ff` per texel, a B,G,R,A layout
+/// `c0 80 40 ff`, and the float layout the same colour rounded to four halves.
+/// Swizzling or pre-quantising the store would do the format's job twice and
+/// land another value in those same bytes.
 const SOLID_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8.frag.spv");
 
 /// The reviewed solid fragment module for a single-channel float attachment
@@ -382,12 +387,23 @@ fn instanced_fragment_stage(
 pub(crate) fn solid_fragment_spirv(
     formats: &[AttachmentFormat],
 ) -> Result<&'static [u8], ProviderError> {
-    // The reviewed 8-bit UNORM modules are layout-agnostic: the same store
-    // lands in whichever channel order each attachment declares, so any mix of
-    // the two 8-bit formats is served by the module of its attachment count
-    // (`research/docs/23` §3.3, v26). The single-channel float module is the
-    // one format-specific stage, and an empty or over-long list is refused as
-    // a count question.
+    // The reviewed four-component modules are layout- and storage-class-
+    // agnostic: the same `vec4` store lands in whichever channel order *and*
+    // storage width each attachment declares, because both are the `VkFormat`'s
+    // and not the module's. The single-location module therefore serves every
+    // admitted four-component format — the two 8-bit UNORM layouts and the
+    // eight-byte `Rgba16Float` (`research/docs/23` §3.3 v26, §78) — while the
+    // MRT modules stay reviewed for their own 8-bit format lists and the
+    // single-channel float module stays the one format-specific stage. An empty
+    // or over-long list is refused as a count question.
+    let colour4 = |format: AttachmentFormat| {
+        matches!(
+            format,
+            AttachmentFormat::Rgba8Unorm
+                | AttachmentFormat::Bgra8Unorm
+                | AttachmentFormat::Rgba16Float
+        )
+    };
     let unorm8 = |format: AttachmentFormat| {
         matches!(
             format,
@@ -401,7 +417,10 @@ pub(crate) fn solid_fragment_spirv(
         // operations still test and write depth.
         [] => DEPTH_ONLY_FRAG_SPV,
         [AttachmentFormat::R32Float] => SOLID_R32F_FRAG_SPV,
-        [format] if unorm8(*format) => SOLID_UNORM8_FRAG_SPV,
+        // The single-component arm above is the format-specific one; every
+        // four-component format shares the `vec4` module, whose store the
+        // attachment's own `VkFormat` converts (`research/docs/23` §78).
+        [format] if colour4(*format) => SOLID_UNORM8_FRAG_SPV,
         [format] => {
             return Err(attachment_format_refusal().with_field(
                 "format_code",
@@ -1459,10 +1478,15 @@ fn air_type_name_names_vertex_format(type_name: Option<&str>, format: VertexForm
 /// The component *count* is what this asks about: an attachment format stores
 /// one channel per component, so a `float4` store into an 8-bit RGBA attachment
 /// is the reviewed shape, while a one-component store into the same attachment
-/// would leave three channels to a `StoreOp` nothing wrote.
+/// would leave three channels to a `StoreOp` nothing wrote. The storage *width*
+/// is not part of the question — `float4`/`half4` are the same interface to a
+/// 16-bit float attachment as to an 8-bit UNORM one (`research/docs/23` §78),
+/// and the `AIR` type name is the same spelling either way.
 fn air_type_name_names_attachment(type_name: Option<&str>, format: AttachmentFormat) -> bool {
     match format {
-        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => {
+        AttachmentFormat::Rgba8Unorm
+        | AttachmentFormat::Bgra8Unorm
+        | AttachmentFormat::Rgba16Float => {
             matches!(type_name, Some("float4" | "half4"))
         }
         AttachmentFormat::R32Float => matches!(type_name, Some("float" | "float1" | "half")),
@@ -3161,6 +3185,24 @@ pub(crate) fn refuse_attachment_extent(
     Ok(())
 }
 
+/// The tightly packed bytes one stored attachment's readback occupies.
+///
+/// The render area's texel count times the attachment's **own** format width
+/// (`research/docs/23` §78). A two-location pass whose formats differ in width —
+/// every shape `Rgba16Float` can appear in — therefore lands two different byte
+/// extents from one copy-out per location, and a direct
+/// `attachment.format.bytes_per_texel()` at each of them is what keeps the
+/// staging buffers honest.
+pub(crate) fn attachment_readback_bytes(
+    extent: [u32; 2],
+    format: AttachmentFormat,
+) -> Result<u64, ProviderError> {
+    u64::from(extent[0])
+        .checked_mul(u64::from(extent[1]))
+        .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
+        .ok_or_else(|| contract_refusal("render attachment bytes overflow u64"))
+}
+
 /// The `VkFormat` a render-contract attachment format names.
 ///
 /// `AttachmentFormat::R32Uint` is expressible in the contract for symmetry with
@@ -3180,6 +3222,10 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
         AttachmentFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         AttachmentFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
         AttachmentFormat::R32Float => vk::Format::R32_SFLOAT,
+        // The census's `0x73` shape (`research/docs/23` §78): the first admitted
+        // format whose texel is eight bytes, and the reason a colour readback
+        // asks the attachment's own width instead of one rail-wide constant.
+        AttachmentFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         // Refused above; the arm keeps the match exhaustive so adding a
         // contract format forces a decision here.
         AttachmentFormat::R32Uint => vk::Format::R32_UINT,
@@ -3199,32 +3245,71 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
 /// exists to keep the match exhaustive; the format is refused long before a
 /// clear value is built.
 pub(crate) fn clear_value_for(format: AttachmentFormat, clear: ClearColor) -> vk::ClearColorValue {
-    let bytes = clear.bytes;
+    let bytes = clear.as_bytes();
+    let four = narrow_four(bytes);
     let unorm = |byte: u8| f32::from(byte) / 255.0;
     match format {
         AttachmentFormat::Rgba8Unorm => vk::ClearColorValue {
             float32: [
-                unorm(bytes[0]),
-                unorm(bytes[1]),
-                unorm(bytes[2]),
-                unorm(bytes[3]),
+                unorm(four[0]),
+                unorm(four[1]),
+                unorm(four[2]),
+                unorm(four[3]),
             ],
         },
         AttachmentFormat::Bgra8Unorm => vk::ClearColorValue {
             float32: [
-                unorm(bytes[2]),
-                unorm(bytes[1]),
-                unorm(bytes[0]),
-                unorm(bytes[3]),
+                unorm(four[2]),
+                unorm(four[1]),
+                unorm(four[0]),
+                unorm(four[3]),
             ],
         },
         AttachmentFormat::R32Float => vk::ClearColorValue {
-            float32: [f32::from_le_bytes(bytes), 0.0, 0.0, 0.0],
+            float32: [f32::from_le_bytes(four), 0.0, 0.0, 0.0],
+        },
+        // Four half floats, in the format's memory order (R, G, B, A
+        // little-endian halves). The widening is exact
+        // (`metal_api_core::provider::half_to_f32`), so the components the
+        // driver clears with are the very values the contract's bytes name, and
+        // the attachment stores them back as the bytes the readback compares
+        // (`research/docs/23` §78).
+        AttachmentFormat::Rgba16Float => vk::ClearColorValue {
+            float32: [
+                half_from_memory_order(bytes, 0),
+                half_from_memory_order(bytes, 1),
+                half_from_memory_order(bytes, 2),
+                half_from_memory_order(bytes, 3),
+            ],
         },
         AttachmentFormat::R32Uint => vk::ClearColorValue {
-            uint32: [u32::from_le_bytes(bytes), 0, 0, 0],
+            uint32: [u32::from_le_bytes(four), 0, 0, 0],
         },
     }
+}
+
+/// One half-precision component of an `Rgba16Float` clear, from its
+/// little-endian pair of bytes.
+///
+/// A payload shorter than four halves cannot reach a driver call — admission and
+/// the rail's own admission compare the clear's length with its attachment's
+/// texel width — so a hand-built value that somehow got past both reads zero
+/// rather than panicking inside a clear value.
+fn half_from_memory_order(bytes: &[u8], index: usize) -> f32 {
+    let offset = index * 2;
+    let pair = bytes.get(offset..offset + 2).unwrap_or(&[0, 0]);
+    metal_api_core::provider::half_to_f32(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+/// The first four bytes of a clear payload, or four zeros for a value no
+/// admission could have built: the same total-decode rule as
+/// [`half_from_memory_order`], for the four-byte class.
+fn narrow_four(bytes: &[u8]) -> [u8; 4] {
+    let mut four = [0_u8; 4];
+    if let Some(pair) = bytes.get(..4) {
+        four.copy_from_slice(pair);
+    }
+    four
 }
 
 /// The `VkFormatFeatureFlags` the selected device reports for one format and
@@ -3284,15 +3369,20 @@ pub(crate) fn admit_color_attachment(
 }
 
 /// Whether the selected device can use `format` as a colour attachment with
-/// `tiling` at the requested `samples` (`research/docs/23` §3.3, v51/v61).
+/// `tiling` at the requested `samples` (`research/docs/23` §3.3, v51/v61;
+/// §78).
 ///
 /// `vkGetPhysicalDeviceFormatProperties` answers the single-sample
-/// `COLOR_ATTACHMENT` bit but carries no sample count; the multisample question
-/// is `vkGetPhysicalDeviceImageFormatProperties`'s own `sampleCounts` field,
-/// which is why this rail asks a second question before the first multisampled
-/// image exists. A format the device refuses, and a format whose requested
-/// combination the driver rejects outright, both answer `false`.
-pub(crate) fn format_supports_multisample_color_attachment(
+/// `COLOR_ATTACHMENT` bit but carries no sample count; the combination question
+/// — one format, one usage, one sample count — is
+/// `vkGetPhysicalDeviceImageFormatProperties`'s own `sampleCounts` field, which
+/// is why this rail asks it before the first image exists. Both the
+/// multisampled rasters and the wide-texel class ask it: the first because the
+/// bit cannot answer their sample count, the second because a driver may answer
+/// the bit while refusing the image. A format the device refuses, and a format
+/// whose requested combination the driver rejects outright, both answer
+/// `false`.
+pub(crate) fn format_supports_color_attachment_samples(
     context: &VulkanContext,
     format: vk::Format,
     tiling: vk::ImageTiling,
@@ -3734,6 +3824,36 @@ fn execute_offscreen_render_with_retains(
         }
         None => vk::SampleCountFlags::TYPE_1,
     };
+    // The wide-texel class is device-gated at the pass's own sample count
+    // (`research/docs/23` §78): `vkGetPhysicalDeviceImageFormatProperties` is
+    // the question that names one format/usage/sample-count combination, and a
+    // driver may answer the single-sample `COLOR_ATTACHMENT` bit while refusing
+    // this format's own image — the bit-only admission is exactly what the
+    // 2026-09-14 review filed after dzn answered it with a late
+    // `VK_ERROR_OUT_OF_HOST_MEMORY`. The single-sample rasters ask it here; a
+    // multisampled one asks the same question in the per-format loop below, so
+    // no format is asked twice.
+    if samples == vk::SampleCountFlags::TYPE_1 {
+        for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
+            if attachment.format.bytes_per_texel() <= NARROW_BYTES_PER_TEXEL {
+                continue;
+            }
+            if !format_supports_color_attachment_samples(context, *vk_format, tiling, samples) {
+                return Err(attachment_format_refusal()
+                    .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
+                    .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                    .with_field(
+                        "missing_feature",
+                        FieldValue::Text(format!("color_attachment_samples_{}", samples.as_raw())),
+                    )
+                    .with_detail(
+                        "vkGetPhysicalDeviceImageFormatProperties reports no COLOR_ATTACHMENT \
+                         combination at this raster's sample count for a format wider than the \
+                         four-byte class",
+                    ));
+            }
+        }
+    }
     // A multisampled raster resolves into a single-sample landing the pass
     // owns, while a resident target *is* the landing (`research/docs/23` §76,
     // R7). The two shapes meet only through the present rail's v62 resolve
@@ -3854,7 +3974,7 @@ fn execute_offscreen_render_with_retains(
             }
         }
         for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
-            if !format_supports_multisample_color_attachment(context, *vk_format, tiling, samples) {
+            if !format_supports_color_attachment_samples(context, *vk_format, tiling, samples) {
                 return Err(attachment_format_refusal()
                     .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
                     .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
@@ -3998,6 +4118,28 @@ fn execute_offscreen_render_with_retains(
     }
     for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
         admit_color_attachment(context, *vk_format, tiling)?;
+        // A clear is exactly one texel of its own attachment's format
+        // (`research/docs/23` §78), which is the same rule and the same name
+        // core admission states: the rail reads the payload at the format's
+        // width, so a short payload would otherwise be read past its own end
+        // and a long one would carry bytes no texel holds.
+        if let LoadOp::Clear(clear) = attachment.load {
+            let expected = attachment.format.bytes_per_texel();
+            let actual = clear.len() as u64;
+            if actual != expected {
+                return Err(args_refusal("attachment_clear_length_mismatch")
+                    .with_field(
+                        "format_code",
+                        FieldValue::Unsigned(u64::from(attachment.format.code())),
+                    )
+                    .with_field("expected", FieldValue::Unsigned(expected))
+                    .with_field("actual", FieldValue::Unsigned(actual))
+                    .with_detail(
+                        "a clear payload is exactly one tightly packed texel of its attachment's \
+                         format",
+                    ));
+            }
+        }
         // Only a stored attachment is read back, so `TRANSFER_SRC` is asked of
         // stored attachments alone (`docs/23` §3.6, v19): a discarded
         // attachment is not copied out and must not be refused for a feature
@@ -4043,9 +4185,12 @@ fn execute_offscreen_render_with_retains(
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
     }
-    let byte_length = u64::from(width)
+    // The depth surface's own extent: `depth32float` is four bytes per texel
+    // (`DEPTH_BYTES_PER_TEXEL`), which the colour attachments' widths no longer
+    // imply (`research/docs/23` §78).
+    let depth_byte_length = u64::from(width)
         .checked_mul(u64::from(height))
-        .and_then(|texels| texels.checked_mul(BYTES_PER_TEXEL))
+        .and_then(|texels| texels.checked_mul(NARROW_BYTES_PER_TEXEL))
         .ok_or_else(|| contract_refusal("render attachment bytes overflow u64"))?;
     // The stencil surface's readback extent is the same render area one byte
     // wide, which is what both its staging buffer and its copy state
@@ -4133,7 +4278,7 @@ fn execute_offscreen_render_with_retains(
             request.depth_resolve.is_some() && request.stencil_resolve.is_some(),
         )?;
         if depth.storing() {
-            objects.create_depth_readback(byte_length)?;
+            objects.create_depth_readback(depth_byte_length)?;
         }
         if stencil.storing() {
             objects.create_stencil_readback(stencil_byte_length)?;
@@ -4155,7 +4300,7 @@ fn execute_offscreen_render_with_retains(
             request.depth_resolve.map(|resolve| resolve.filter),
         )?;
         if depth.storing() {
-            objects.create_depth_readback(byte_length)?;
+            objects.create_depth_readback(depth_byte_length)?;
         }
     } else if let Some(stencil) = &request.stencil {
         // The stencil image is created before the render pass that names it,
@@ -4210,7 +4355,13 @@ fn execute_offscreen_render_with_retains(
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
     for attachment in &request.attachments {
         if attachment.store == StoreOp::Store {
-            readback_mappings.push(objects.create_readback(byte_length)?);
+            // Each stored attachment lands `width * height * its own texel
+            // width` bytes (`research/docs/23` §78), so a two-location pass
+            // whose formats differ in width still reads both back whole.
+            readback_mappings.push(objects.create_readback(attachment_readback_bytes(
+                request.extent,
+                attachment.format,
+            )?)?);
         }
     }
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
@@ -4294,8 +4445,9 @@ fn execute_offscreen_render_with_retains(
     for attachment in &request.attachments {
         if attachment.store == StoreOp::Store {
             let mapping = mappings.next().expect("one readback per stored attachment");
+            let bytes = attachment_readback_bytes(request.extent, attachment.format)?;
             let texels = unsafe {
-                std::slice::from_raw_parts(mapping as *const u8, byte_length as usize).to_vec()
+                std::slice::from_raw_parts(mapping as *const u8, bytes as usize).to_vec()
             };
             context.record_buffer_readback();
             context.record_buffer_readback_bytes(texels.len());
@@ -4304,7 +4456,7 @@ fn execute_offscreen_render_with_retains(
             results.push(None);
         }
     }
-    let depth = objects.depth_readback_bytes(byte_length as usize, context)?;
+    let depth = objects.depth_readback_bytes(depth_byte_length as usize, context)?;
     // The stored stencil surface follows the depth one through the same
     // copy-out channel; its byte extent is one per texel, not the colour
     // attachments' four (`research/docs/23` §3.3, v49).
@@ -4779,10 +4931,11 @@ pub(crate) fn execute_present_render<'a>(
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
     }
-    let byte_length = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|texels| texels.checked_mul(BYTES_PER_TEXEL))
-        .ok_or_else(|| contract_refusal("render attachment bytes overflow u64"))?;
+    // The present target inherits its one attachment's format
+    // (`research/docs/24` §3.2), so its readback is that format's own texel
+    // width over the pass extent — eight bytes per texel for the census's
+    // `Rgba16Float` shape (`research/docs/23` §78).
+    let byte_length = attachment_readback_bytes(request.extent, attachment.format)?;
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
@@ -4841,7 +4994,7 @@ pub(crate) fn execute_present_render<'a>(
         None => vk::SampleCountFlags::TYPE_1,
     };
     if samples != vk::SampleCountFlags::TYPE_1
-        && !format_supports_multisample_color_attachment(
+        && !format_supports_color_attachment_samples(
             context,
             vk_format,
             vk::ImageTiling::OPTIMAL,
@@ -9041,6 +9194,20 @@ mod tests {
     /// same four bytes, because a float attachment quantises nothing.
     const EXPECTED_R32F_TEXEL: [u8; 4] = [0x81, 0x80, 0x80, 0x3e];
 
+    /// One texel of an `R16G16B16A16_SFLOAT` attachment (`research/docs/23`
+    /// §78): the same `(64/255, 128/255, 192/255, 1)` the `vec4` stage stores,
+    /// rounded by the driver to four half floats. None of the three colour
+    /// constants is on the half grid, so the rounding is the evidence: the
+    /// halves are `0x3404`, `0x3804`, `0x3a06` and the exact `0x3c00`, in
+    /// little-endian memory order.
+    const EXPECTED_RGBA16F_TEXEL: [u8; 8] = [0x04, 0x34, 0x04, 0x38, 0x06, 0x3a, 0x00, 0x3c];
+
+    /// The clear a 16-bit float attachment test uses: four halves, each the
+    /// value `0.99609375` (`0x3bf8`, the half nearest `254/255`), so no half of
+    /// the clear coincides with any half the draw stores and a clear read with
+    /// the wrong width cannot land these bytes.
+    const RGBA16F_CLEAR: [u8; 8] = [0xf8, 0x3b, 0xf8, 0x3b, 0xf8, 0x3b, 0xf8, 0x3b];
+
     /// The `LoadOp::Clear` sentinel (`research/docs/23` §1.3): a texel that
     /// still holds it proves the draw did not cover that pixel.
     const CLEAR_SENTINEL: u8 = 0xfe;
@@ -9474,6 +9641,17 @@ mod tests {
     /// readback, printing the raw bytes so the run's log carries the evidence the
     /// assertions below are about.
     fn offscreen_readback(context: &VulkanContext, format: AttachmentFormat) -> Vec<u8> {
+        // The clear is one texel of the format under test (`research/docs/23`
+        // §78): the four-byte sentinel for the four-byte class, four sentinel
+        // halves for the eight-byte one. A four-byte payload on the wide format
+        // is refused by name, which is the admission rule this helper's caller
+        // relies on.
+        let clear = match format {
+            AttachmentFormat::Rgba16Float => {
+                ClearColor::from_bytes(&RGBA16F_CLEAR).expect("one eight-byte texel")
+            }
+            _ => ClearColor::new([CLEAR_SENTINEL; 4]),
+        };
         let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
@@ -9490,7 +9668,7 @@ mod tests {
                 attachments: vec![OffscreenColorAttachment {
                     format,
                     store: StoreOp::Store,
-                    load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
+                    load: LoadOp::Clear(clear),
                     previous: None,
                     resident: None,
                 }],
@@ -9560,6 +9738,28 @@ mod tests {
         let expected = f32::from_le_bytes(DISTINCT_CLEAR);
         assert_eq!(r32f[0].to_bits(), expected.to_bits());
         assert_eq!(r32f[1..], [0.0, 0.0, 0.0]);
+
+        // Four halves, one per component, in the format's memory order: the
+        // clear's eight bytes are four little-endian half values and the driver
+        // is handed those components (`research/docs/23` §78). A rail that read
+        // the payload as four bytes would put two payload bytes per component
+        // and land four other values.
+        let wide = ClearColor::from_bytes(&RGBA16F_CLEAR).expect("one eight-byte texel");
+        let rgba16f = unsafe { clear_value_for(AttachmentFormat::Rgba16Float, wide).float32 };
+        assert_eq!(rgba16f, [0.996_093_75; 4]);
+        assert_ne!(
+            rgba16f[0],
+            254.0_f32 / 255.0,
+            "the half's value is not the f32 of 254/255, so the decode is visible"
+        );
+        // The remaining byte pairs are free: the same clear with only the last
+        // two bytes changed moves the alpha component alone.
+        let mut other = RGBA16F_CLEAR;
+        other[6..].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let other = ClearColor::from_bytes(&other).expect("one eight-byte texel");
+        let moved = unsafe { clear_value_for(AttachmentFormat::Rgba16Float, other).float32 };
+        assert_eq!(moved[..3], rgba16f[..3]);
+        assert_eq!(moved[3], 1.0);
     }
 
     /// The rail's structural guarantee, stated without a device: the format list
@@ -9592,6 +9792,14 @@ mod tests {
         assert_eq!(
             solid_fragment_spirv(&[AttachmentFormat::R32Float]).expect("admitted"),
             SOLID_R32F_FRAG_SPV
+        );
+        // The eight-byte format is a four-component colour attachment, so the
+        // same `vec4` module serves it: the store's channel count is the
+        // module's fact and the storage width is the `VkFormat`'s
+        // (`research/docs/23` §78).
+        assert_eq!(
+            solid_fragment_spirv(&[AttachmentFormat::Rgba16Float]).expect("admitted"),
+            SOLID_UNORM8_FRAG_SPV
         );
         // ... and the float stage is a different module: a one-component
         // attachment cannot take the 8-bit module's `vec4` store.
@@ -9722,6 +9930,10 @@ mod tests {
         assert_eq!(
             attachment_vk_format(AttachmentFormat::R32Float).map(vk::Format::as_raw),
             Ok(vk::Format::R32_SFLOAT.as_raw())
+        );
+        assert_eq!(
+            attachment_vk_format(AttachmentFormat::Rgba16Float).map(vk::Format::as_raw),
+            Ok(vk::Format::R16G16B16A16_SFLOAT.as_raw())
         );
     }
 
@@ -9990,6 +10202,153 @@ mod tests {
             "a surviving clear sentinel means the triangle did not cover every texel: {}",
             hex(&texels)
         );
+    }
+
+    /// The wide-texel class's device question (`research/docs/23` §78): the
+    /// rail asks `vkGetPhysicalDeviceImageFormatProperties` for the exact
+    /// format/usage/sample-count combination before the first image exists, and
+    /// this records the answer the running device gives for the census's
+    /// `0x73` shape. The readback tests below execute the same shape, so a
+    /// device that answered `false` here would refuse it by name instead.
+    #[test]
+    fn the_wide_texel_format_answers_the_image_format_probe() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        for format in [vk::Format::R16G16B16A16_SFLOAT, vk::Format::R8G8B8A8_UNORM] {
+            let answered = format_supports_color_attachment_samples(
+                &context,
+                format,
+                vk::ImageTiling::OPTIMAL,
+                vk::SampleCountFlags::TYPE_1,
+            );
+            eprintln!(
+                "vk_format raw={} COLOR_ATTACHMENT at 1x: {answered}",
+                format.as_raw()
+            );
+            assert!(
+                answered,
+                "the device must admit raw={} as a single-sample colour attachment for the \
+                 rail's readback fixtures to mean anything",
+                format.as_raw()
+            );
+        }
+    }
+
+    /// The census's `0x73` shape, end to end on the offscreen rail
+    /// (`research/docs/23` §78): a 2×2 `R16G16B16A16_SFLOAT` attachment,
+    /// cleared, covered by the reviewed `vec4` stage, and read back at eight
+    /// bytes per texel.
+    ///
+    /// This is the case a four-byte-class rail cannot pass: the byte extent is
+    /// twice what the pre-v78 formats land, and the bytes are the driver's half
+    /// rounding of the stage's own colour constants rather than their `f32`
+    /// bits (`0x3e808081`…) or their 8-bit quantisation (`40 80 c0 ff`).
+    #[test]
+    fn offscreen_rgba16float_attachment_lands_half_rounded_texels() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let (uploads_before, readbacks_before) = context.buffer_copy_counts();
+        let texels = offscreen_readback(&context, AttachmentFormat::Rgba16Float);
+        let (uploads_after, readbacks_after) = context.buffer_copy_counts();
+
+        assert_eq!(texels.len(), 32, "2x2 texels of eight bytes are 32 bytes");
+        assert_eq!(texels, EXPECTED_RGBA16F_TEXEL.repeat(4));
+        // The first half is the rounding, not the stored float: the stage's
+        // `64/255` has f32 bits `0x3e808081` and the attachment holds `0x3404`.
+        assert_eq!(
+            texels[..2],
+            EXPECTED_RGBA16F_TEXEL[..2],
+            "the first component is the rounded half"
+        );
+        assert_eq!((64.0_f32 / 255.0).to_le_bytes(), [0x81, 0x80, 0x80, 0x3e]);
+        assert_ne!(
+            texels[..4],
+            [0x81, 0x80, 0x80, 0x3e],
+            "the attachment cannot read back the stored f32's own bytes"
+        );
+        assert_ne!(
+            texels[..4],
+            EXPECTED_RGBA8_TEXELS,
+            "nor the 8-bit quantisation of the same colour"
+        );
+        assert!(
+            !texels.chunks_exact(8).any(|texel| texel == RGBA16F_CLEAR),
+            "a surviving clear means the triangle did not cover every texel: {}",
+            hex(&texels)
+        );
+        // `LoadOp::Clear` needs no staging upload, and the attachment leaves
+        // through exactly one image→buffer copy (`research/docs/23` §5.3).
+        assert_eq!(uploads_after, uploads_before);
+        assert_eq!(readbacks_after, readbacks_before + 1);
+    }
+
+    /// Partial coverage of the eight-byte format: one texel keeps the fragment
+    /// output, the other three keep the `LoadOp::Clear` bytes.
+    ///
+    /// A wrong clear decode is observable only where the draw does not reach,
+    /// so this is the sibling the full-coverage case cannot replace: the clear
+    /// payload is four half floats in memory order, and a rail that read it as
+    /// four bytes (or as two `u32`s) would land four other texels here
+    /// (`research/docs/23` §78).
+    #[test]
+    fn a_partial_rgba16float_attachment_shows_the_clear_bytes_in_half_order() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let mut blobs = execute_offscreen_render(
+            &context,
+            &OffscreenRenderRequest {
+                textures: Vec::new(),
+                blend: None,
+                multisample: None,
+                depth_resolve: None,
+                stencil_resolve: None,
+                cull: None,
+                depth: None,
+                base_vertex: 0,
+                stencil: None,
+                scissor: None,
+                attachments: vec![OffscreenColorAttachment {
+                    format: AttachmentFormat::Rgba16Float,
+                    store: StoreOp::Store,
+                    load: LoadOp::Clear(
+                        ClearColor::from_bytes(&RGBA16F_CLEAR).expect("one eight-byte texel"),
+                    ),
+                    previous: None,
+                    resident: None,
+                }],
+                extent: [2, 2],
+                vertex: single_pixel_vertex(),
+                translated_fragment: None,
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                instance_count: 1,
+                index_stream: None,
+                indirect: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("the partial Rgba16Float pass executes: {error:?}"));
+        let texels = blobs
+            .attachments
+            .remove(0)
+            .expect("a stored attachment reads back");
+        eprintln!("Rgba16Float partial readback: {}", hex(&texels));
+        assert_eq!(texels.len(), 32);
+        assert_eq!(
+            texels[..8],
+            EXPECTED_RGBA16F_TEXEL,
+            "the covered texel holds the fragment stage's rounded halves"
+        );
+        for (index, texel) in texels[8..].chunks(8).enumerate() {
+            assert_eq!(
+                texel,
+                RGBA16F_CLEAR,
+                "uncovered texel {} holds the clear's own eight bytes",
+                index + 1
+            );
+        }
     }
 
     #[test]

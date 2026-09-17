@@ -90,7 +90,7 @@ const SECOND_SCRATCH_VIEW: ViewId = ViewId::new(704);
 const SECOND_SCRATCH_ALLOCATION: AllocationId = AllocationId::new(804);
 
 /// The colour formats this file measures: the contract's admitted set.
-const ADMITTED_FORMATS: [AttachmentFormat; 3] = AttachmentFormat::ADMITTED;
+const ADMITTED_FORMATS: [AttachmentFormat; 4] = AttachmentFormat::ADMITTED;
 
 fn hex(bytes: &[u8]) -> String {
     bytes
@@ -109,7 +109,12 @@ fn hex(bytes: &[u8]) -> String {
 /// from the outside.
 fn reviewed_fragment_spirv(format: AttachmentFormat) -> &'static [u8] {
     match format {
-        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => SOLID_UNORM8_FRAG_SPV,
+        // The rail's own map: one `vec4` module for the four-component formats
+        // (both 8-bit UNORM layouts and the eight-byte float format,
+        // `research/docs/23` §78), the single-component module for `R32Float`.
+        AttachmentFormat::Rgba8Unorm
+        | AttachmentFormat::Bgra8Unorm
+        | AttachmentFormat::Rgba16Float => SOLID_UNORM8_FRAG_SPV,
         AttachmentFormat::R32Float => SOLID_R32F_FRAG_SPV,
         AttachmentFormat::R32Uint => panic!("R32Uint is outside the first render increment"),
     }
@@ -117,16 +122,34 @@ fn reviewed_fragment_spirv(format: AttachmentFormat) -> &'static [u8] {
 
 /// The bytes one texel holds when the fragment stage stores
 /// `(64/255, 128/255, 192/255, 1)` into an attachment of `format`.
-fn expected_texels(format: AttachmentFormat) -> [u8; 4] {
+///
+/// One texel is the format's own width (`research/docs/23` §78): four bytes for
+/// the 8-bit UNORM and single-channel formats, eight for `Rgba16Float`.
+fn expected_texels(format: AttachmentFormat) -> Vec<u8> {
     match format {
         // The stage's components in the order it writes them.
-        AttachmentFormat::Rgba8Unorm => [0x40, 0x80, 0xc0, 0xff],
+        AttachmentFormat::Rgba8Unorm => vec![0x40, 0x80, 0xc0, 0xff],
         // The same colour with that layout's blue/red exchange applied: the
         // stored red `0x40` lands third, behind the stored blue `0xc0`.
-        AttachmentFormat::Bgra8Unorm => [0xc0, 0x80, 0x40, 0xff],
+        AttachmentFormat::Bgra8Unorm => vec![0xc0, 0x80, 0x40, 0xff],
         // A float attachment quantises nothing, so the texel is the stage's
         // `float 64/255` (`0x3e808081`) in little-endian byte order.
-        AttachmentFormat::R32Float => [0x81, 0x80, 0x80, 0x3e],
+        AttachmentFormat::R32Float => vec![0x81, 0x80, 0x80, 0x3e],
+        // The eight-byte format rounds each stored `float` to its nearest half
+        // (round-to-nearest-even). Not one of the stage's three colour
+        // constants is on the half grid, so the rounding is visible in the
+        // bytes: `64/255 = 0x3e808081` → `0x3404` (up), `128/255` → `0x3804`
+        // (up), `192/255 = 0x3f40c0c1` → `0x3a06` (down), and `1.0` stays
+        // exactly `0x3c00`. That is the point of this case: a rail that stored
+        // the four `f32` values, quantised them as 8-bit UNORM, or read the
+        // texel as four bytes cannot land these bytes
+        // (`research/docs/23` §78).
+        AttachmentFormat::Rgba16Float => vec![
+            0x04, 0x34, // red: half(64/255) = 0.2509765625
+            0x04, 0x38, // green: half(128/255) = 0.501953125
+            0x06, 0x3a, // blue: half(192/255) = 0.7529296875
+            0x00, 0x3c, // alpha: 1.0 is exact in half
+        ],
         AttachmentFormat::R32Uint => panic!("R32Uint is outside the first render increment"),
     }
 }
@@ -136,12 +159,31 @@ fn expected_texels(format: AttachmentFormat) -> [u8; 4] {
 /// The rail's clear components are `byte/255` as floats at every format, so the
 /// single-channel float attachment's sentinel is the float `254/255` rather than
 /// the four sentinel bytes themselves.
-fn clear_bytes(format: AttachmentFormat) -> [u8; 4] {
+fn clear_bytes(format: AttachmentFormat) -> Vec<u8> {
     match format {
-        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => CLEAR_SENTINEL,
-        AttachmentFormat::R32Float => (f32::from(CLEAR_SENTINEL[0]) / 255.0).to_le_bytes(),
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => CLEAR_SENTINEL.to_vec(),
+        AttachmentFormat::R32Float => (f32::from(CLEAR_SENTINEL[0]) / 255.0)
+            .to_le_bytes()
+            .to_vec(),
+        // The eight-byte format's sentinel is four half floats, each the half
+        // nearest `254/255 = 0.996078431` — `0x3bf8`, whose value is
+        // `0.99609375`. The readback must be those very bytes: the four
+        // sentinel bytes *widened* would be a different payload, and four `f32`
+        // components would be eight bytes per channel (`research/docs/23` §78).
+        AttachmentFormat::Rgba16Float => [0xf8, 0x3b].repeat(4),
         AttachmentFormat::R32Uint => panic!("R32Uint is outside the first render increment"),
     }
+}
+
+/// The clear one attachment of `format` is opened with: the four sentinel bytes
+/// for the four-byte class, four sentinel halves for the eight-byte one.
+fn attachment_clear(format: AttachmentFormat) -> ClearColor {
+    ClearColor::from_bytes(&clear_bytes(format)).expect("a clear is one texel of its format")
+}
+
+/// The attachment view's declared length in bytes: 2×2 texels of `format`.
+fn attachment_length(format: AttachmentFormat) -> usize {
+    4 * usize::try_from(format.bytes_per_texel()).expect("a texel width fits a host usize")
 }
 
 /// One provider context with both pipelines registered and one render-bearing
@@ -178,7 +220,7 @@ fn render_pass(
             format,
             width,
             height,
-            load: LoadOp::Clear(ClearColor::new(CLEAR_SENTINEL)),
+            load: LoadOp::Clear(attachment_clear(format)),
             store: StoreOp::Store,
         }],
         viewport: [0, 0, width as u32, height as u32],
@@ -266,13 +308,16 @@ fn fixture_with_stage(format: AttachmentFormat, fragment_spirv: &[u8]) -> Option
                         metal_binding: 0,
                         allocation_id: ATTACHMENT_ALLOCATION,
                         offset: 0,
-                        // 2×2 texels of four bytes: exactly the extent the
-                        // render attachment restates, so the declaration covers
-                        // it whatever the compute kernel reads out of it.
-                        length: 16,
+                        // 2×2 texels of the format under test: exactly the
+                        // extent the render attachment restates, so the
+                        // declaration covers it whatever the compute kernel
+                        // reads out of it.
+                        length: attachment_length(format) as u64,
                         access: BufferAccess::Read,
                         attribute_stride: None,
-                        source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                        source: BufferSource::OwnedBytes(
+                            ATTACHMENT_WORD.repeat(attachment_length(format) / 4),
+                        ),
                     },
                     BufferView {
                         view_id: SCRATCH_VIEW,
@@ -304,7 +349,7 @@ fn fixture_with_stage(format: AttachmentFormat, fragment_spirv: &[u8]) -> Option
         .insert_allocation(AllocationRecord {
             allocation_id: ATTACHMENT_ALLOCATION,
             owner_epoch: provider.device_epoch(),
-            size: 16,
+            size: attachment_length(format) as u64,
         })
         .expect("attachment allocation");
     resources
@@ -364,17 +409,18 @@ fn readback(writebacks: &[(ViewId, Vec<u8>)], view: ViewId) -> Vec<u8> {
 /// printed so the run's log carries the evidence the assertions are about.
 fn attachment_readback(fixture: &Fixture, writebacks: &[(ViewId, Vec<u8>)]) -> Vec<u8> {
     let attachment = readback(writebacks, ATTACHMENT_VIEW);
+    let expected = expected_texels(fixture.format);
     eprintln!(
         "{:?} attachment readback: {} ({} bytes, first texel: {})",
         fixture.format,
         hex(&attachment),
         attachment.len(),
-        hex(&attachment[..4])
+        hex(&attachment[..expected.len()])
     );
     eprintln!(
         "{:?} expected: [{}] x4, clear sentinel: [{}]",
         fixture.format,
-        hex(&expected_texels(fixture.format)),
+        hex(&expected),
         hex(&clear_bytes(fixture.format))
     );
     attachment
@@ -441,17 +487,21 @@ fn every_admitted_colour_format_lands_its_own_attachment_bytes() {
         let writebacks = submit_fixture(&fixture);
         let attachment = attachment_readback(&fixture, &writebacks);
 
-        assert_eq!(attachment.len(), 16);
-        assert_eq!(attachment, expected_texels(format).repeat(4));
+        let texel = expected_texels(format);
+        // The extent is the format's own: four texels of four bytes, or of
+        // eight (`research/docs/23` §78). A rail that sized the readback from
+        // one rail-wide constant would truncate this one to half its bytes.
+        assert_eq!(attachment.len(), texel.len() * 4);
+        assert_eq!(attachment, texel.repeat(4));
         assert!(
             !attachment
-                .chunks_exact(4)
+                .chunks_exact(texel.len())
                 .any(|texel| texel == clear_bytes(format).as_slice()),
             "a surviving clear sentinel means the triangle did not cover every texel, so the \
              {format:?} readback would be the ClearColor: {}",
             hex(&attachment)
         );
-        assert_ne!(clear_bytes(format), expected_texels(format));
+        assert_ne!(clear_bytes(format), texel);
         // The two UNORM layouts must not land the same bytes: a rail that wrote
         // the same byte order at both formats would pass an R,G,B,A-only check
         // and still be wrong about one of them.
@@ -1136,16 +1186,17 @@ fn present_target_lands_rendered_bytes_and_counts_one_acquire_one_present() {
     let writebacks = submit_fixture(&fixture);
     let attachment = attachment_readback(&fixture, &writebacks);
 
-    assert_eq!(attachment.len(), 16);
-    assert_eq!(attachment, expected_texels(fixture.format).repeat(4));
+    let texel = expected_texels(fixture.format);
+    assert_eq!(attachment.len(), texel.len() * 4);
+    assert_eq!(attachment, texel.repeat(4));
     assert!(
         !attachment
-            .chunks_exact(4)
+            .chunks_exact(texel.len())
             .any(|texel| texel == PRESENT_SENTINEL),
         "a surviving present sentinel means the present never overwrote the target: {}",
         hex(&attachment)
     );
-    assert_ne!(PRESENT_SENTINEL, expected_texels(fixture.format));
+    assert_ne!(PRESENT_SENTINEL.as_slice(), texel.as_slice());
 
     // Exactly one acquire and one present for the single present action
     // (`docs/24` §5.3).

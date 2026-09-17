@@ -356,12 +356,24 @@ pub(crate) fn reviewed_module(
     layout: &VertexLayout,
     color_formats: &[AttachmentFormat],
 ) -> Option<&'static ReviewedModule> {
-    // The 8-bit UNORM modules are layout-agnostic — the same store lands in
-    // whichever channel order each attachment declares — so any mix of the two
-    // 8-bit formats is served by the module of its attachment count
-    // (`research/docs/23` §3.3, v26). The single-channel float module is the one
-    // format-specific stage; every shape that fits no reviewed module is
-    // refused rather than matched approximately.
+    // The four-component colour modules are layout- and storage-class-agnostic:
+    // the same `float4` store lands in whichever channel order *and* storage
+    // width each attachment declares, because both are the `MTLPixelFormat`'s
+    // and not the module's. One module therefore serves every admitted
+    // four-component format — the two 8-bit UNORM layouts and the eight-byte
+    // `Rgba16Float` (`research/docs/23` §3.3 v26, §78) — while the
+    // single-channel float module stays the one format-specific stage and the
+    // MRT modules stay reviewed for their own 8-bit format lists. Every shape
+    // that fits no reviewed module is refused rather than matched
+    // approximately.
+    let colour4 = |format: &AttachmentFormat| {
+        matches!(
+            format,
+            AttachmentFormat::Rgba8Unorm
+                | AttachmentFormat::Bgra8Unorm
+                | AttachmentFormat::Rgba16Float
+        )
+    };
     let unorm8 = |format: &AttachmentFormat| {
         matches!(
             format,
@@ -369,9 +381,12 @@ pub(crate) fn reviewed_module(
         )
     };
     match (layout, color_formats) {
-        (VertexLayout::None, [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
-            Some(&REVIEWED_MODULES[0])
-        }
+        // The `vertex_id` module stores one `float4`, so the shape it serves is
+        // the four-component class: a single-channel `R32Float` attachment next
+        // to this module would read back bytes the store's shape never
+        // described, which is the pairing both rails refuse by name instead of
+        // executing.
+        (VertexLayout::None, [single]) if colour4(single) => Some(&REVIEWED_MODULES[0]),
         // The depth module is selected by the layout's own shape: one stream
         // with two attributes — a `float32x3` position and a `float32x4` tint —
         // is the shape its vertex stage reads, so it is matched before the
@@ -404,7 +419,7 @@ pub(crate) fn reviewed_module(
             Some(&REVIEWED_MODULES[6])
         }
         (VertexLayout::Buffers(_), [AttachmentFormat::R32Float]) => Some(&REVIEWED_MODULES[3]),
-        (VertexLayout::Buffers(_), [single]) if unorm8(single) => Some(&REVIEWED_MODULES[1]),
+        (VertexLayout::Buffers(_), [single]) if colour4(single) => Some(&REVIEWED_MODULES[1]),
         (VertexLayout::Buffers(_), [first, second]) if unorm8(first) && unorm8(second) => {
             Some(&REVIEWED_MODULES[2])
         }
@@ -510,7 +525,14 @@ pub(crate) const APPLE_2D_TEXTURE_CEILING: u64 = 16_384;
 /// Colour formats this rail can build an `MTLTexture` and a pipeline state from
 /// — the core contract's admitted set, without `R32Uint` ([`pixel_format`]
 /// refuses that one).
-pub(crate) const SUPPORTED_COLOR_FORMATS: [AttachmentFormat; 3] = AttachmentFormat::ADMITTED;
+///
+/// `Rgba16Float` arrived with the gate-3 census (`research/docs/23` §78): the
+/// desktop load's `MTLPixelFormatRGBA16Float` attachments are the same
+/// four-component class the reviewed single-output modules store, and the
+/// device side is Metal itself — `MTLPixelFormat::RGBA16Float` is core Metal 2,
+/// so there is no per-device probe to ask, unlike the Vulkan rail's
+/// `vkGetPhysicalDeviceImageFormatProperties` question.
+pub(crate) const SUPPORTED_COLOR_FORMATS: [AttachmentFormat; 4] = AttachmentFormat::ADMITTED;
 
 /// The render bits the provider declares, in one value so the macOS capability
 /// snapshot (`native.rs`) and the host-side unit tests cannot drift.
@@ -999,6 +1021,15 @@ pub(crate) enum RenderPixelFormat {
     Rgba8Unorm,
     Bgra8Unorm,
     R32Float,
+    /// `MTLPixelFormat::RGBA16Float` / `VK_FORMAT_R16G16B16A16_SFLOAT`
+    /// (`research/docs/23` §78).
+    ///
+    /// The four-component class's second storage width: the reviewed
+    /// single-output modules all store a `float4`, and the attachment's own
+    /// format decides whether that store lands as four `UNORM8` channels or as
+    /// four half floats. Eight bytes per texel is what makes this rail's
+    /// readback extent and `Load` upload an attachment's own fact.
+    Rgba16Float,
 }
 
 impl RenderPixelFormat {
@@ -1008,6 +1039,7 @@ impl RenderPixelFormat {
             Self::Rgba8Unorm => "rgba8_unorm",
             Self::Bgra8Unorm => "bgra8_unorm",
             Self::R32Float => "r32_float",
+            Self::Rgba16Float => "rgba16_float",
         }
     }
 }
@@ -1048,6 +1080,7 @@ pub(crate) fn pixel_format(format: AttachmentFormat) -> Result<RenderPixelFormat
         AttachmentFormat::Rgba8Unorm => Ok(RenderPixelFormat::Rgba8Unorm),
         AttachmentFormat::Bgra8Unorm => Ok(RenderPixelFormat::Bgra8Unorm),
         AttachmentFormat::R32Float => Ok(RenderPixelFormat::R32Float),
+        AttachmentFormat::Rgba16Float => Ok(RenderPixelFormat::Rgba16Float),
         // Expressible in the contract for symmetry with the sampled-texture
         // rail, refused by the first render increment: its texels are integers
         // while `LoadOp::Clear` and the fragment output carry colour bytes
@@ -1067,7 +1100,7 @@ pub(crate) fn pixel_format(format: AttachmentFormat) -> Result<RenderPixelFormat
 /// attachment is the driver's job; this only fixes which component each byte
 /// means (`research/docs/23` §3.5).
 pub(crate) fn clear_components(clear: ClearColor, format: RenderPixelFormat) -> [f64; 4] {
-    let bytes = clear.bytes;
+    let bytes = clear.as_bytes();
     match format {
         // Memory order is R, G, B, A.
         RenderPixelFormat::Rgba8Unorm => [
@@ -1088,8 +1121,52 @@ pub(crate) fn clear_components(clear: ClearColor, format: RenderPixelFormat) -> 
         // One channel: the four bytes are the little-endian IEEE-754 bits of the
         // red component. Green and blue stay zero and alpha is unused, which is
         // what a single-channel attachment stores.
-        RenderPixelFormat::R32Float => [f64::from(f32::from_le_bytes(bytes)), 0.0, 0.0, 1.0],
+        RenderPixelFormat::R32Float => [
+            f64::from(f32::from_le_bytes(narrow_four(bytes))),
+            0.0,
+            0.0,
+            1.0,
+        ],
+        // Four half floats, in the format's memory order (R, G, B, A
+        // little-endian halves). The widening is exact, so the components the
+        // encoder hands `MTLClearColor` are the very values the clear's bytes
+        // name and the driver rounds each of them into the half the readback
+        // compares (`research/docs/23` §78,
+        // `metal_api_core::provider::half_to_f32`).
+        RenderPixelFormat::Rgba16Float => [
+            f64::from(half_from_memory_order(bytes, 0)),
+            f64::from(half_from_memory_order(bytes, 1)),
+            f64::from(half_from_memory_order(bytes, 2)),
+            f64::from(half_from_memory_order(bytes, 3)),
+        ],
     }
+}
+
+/// One half-precision component of a `Rgba16Float` clear, from its
+/// little-endian pair of bytes.
+///
+/// A payload shorter than four halves cannot reach here — admission and the
+/// plan both compare the clear's length with its attachment's own texel width —
+/// so a hand-built value that somehow got past them reads zero rather than
+/// panicking inside an encoder call.
+fn half_from_memory_order(bytes: &[u8], index: usize) -> f32 {
+    let offset = index * 2;
+    let pair = bytes.get(offset..offset + 2).unwrap_or(&[0, 0]);
+    metal_api_core::provider::half_to_f32(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+/// The first four bytes of a clear payload, or four zeros for a value no
+/// admission could have built.
+///
+/// The same fail-closed-to-zero rule as [`half_from_memory_order`]: the four
+/// byte formats' payloads are checked against their attachment's texel width
+/// before an encoder exists, and this keeps the decode total anyway.
+fn narrow_four(bytes: &[u8]) -> [u8; 4] {
+    let mut four = [0_u8; 4];
+    if let Some(pair) = bytes.get(..4) {
+        four.copy_from_slice(pair);
+    }
+    four
 }
 
 fn unorm8(byte: u8) -> f64 {
@@ -2110,14 +2187,15 @@ pub(crate) struct RenderPlan<'a> {
     pub(crate) vertex_streams: Vec<PlannedVertexStream<'a>>,
     /// The index buffer of an indexed draw, resolved from the pass's own view.
     pub(crate) indices: Option<PlannedIndexStream<'a>>,
-    /// Readback length in bytes of one attachment: the tightly packed texel
-    /// extent. Every admitted colour format stores four bytes per texel and
-    /// every attachment of one pass shares an extent (checked in [`plan`]), so
-    /// one length serves every attachment.
-    pub(crate) texel_bytes: usize,
-    /// Bytes per attachment row of the same shared shape (`research/docs/23`
-    /// §3.5).
-    pub(crate) row_pitch: usize,
+    /// The flat byte shape of the **depth** surface this plan reads back, if
+    /// any: `depth32float` is four bytes per texel over the pass extent
+    /// (`metal_api_core::provider::DEPTH_BYTES_PER_TEXEL`).
+    ///
+    /// The colour attachments carry their own [`TexelExtent`] beside their
+    /// format (`research/docs/23` §78), because a pass may mix widths; this one
+    /// is the depth surface's and the depth resolve target's, which share the
+    /// depth format.
+    pub(crate) depth_texel: TexelExtent,
 }
 
 impl RenderPlan<'_> {
@@ -2229,6 +2307,34 @@ impl PlannedStencil {
     }
 }
 
+/// The flat byte shape of one texture this rail reads back, uploads through
+/// `replaceRegion` or hands to `getBytes`.
+///
+/// Per format, not per rail: a pass's attachments do not have to share a texel
+/// width — `Rgba16Float` stores eight bytes per texel beside the four-byte
+/// formats (`research/docs/23` §78) — so the byte extent and the row pitch are
+/// answered from the format that carries them. The pass extent is shared, so
+/// the two numbers are pure functions of `(extent, bytes per texel)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TexelExtent {
+    /// Tightly packed bytes over the whole extent.
+    pub(crate) bytes: usize,
+    /// Bytes of one texture row.
+    pub(crate) row_pitch: usize,
+}
+
+impl TexelExtent {
+    /// The flat extent of one `extent`-sized surface of `bytes_per_texel`-byte
+    /// texels, or `None` when the arithmetic leaves the host's `usize`.
+    pub(crate) fn flat(extent: [u32; 2], bytes_per_texel: u64) -> Option<Self> {
+        let texels = u64::from(extent[0]).checked_mul(u64::from(extent[1]))?;
+        Some(Self {
+            bytes: usize::try_from(texels.checked_mul(bytes_per_texel)?).ok()?,
+            row_pitch: usize::try_from(u64::from(extent[0]).checked_mul(bytes_per_texel)?).ok()?,
+        })
+    }
+}
+
 /// One colour attachment of a planned pass, resolved before any Metal object
 /// exists.
 #[derive(Debug)]
@@ -2236,6 +2342,14 @@ pub(crate) struct PlannedAttachment<'a> {
     /// The pixel format this rail builds the attachment's texture and pipeline
     /// state with.
     pub(crate) format: RenderPixelFormat,
+    /// The flat byte shape of this attachment's own texture: its format's texel
+    /// width times the pass extent, and one row of it (`research/docs/23` §78).
+    ///
+    /// Per attachment rather than per plan, because a pass may carry an
+    /// eight-byte `Rgba16Float` location beside four-byte ones: the readback,
+    /// the `Load` upload and the row pitch `getBytes`/`replaceRegion` take are
+    /// all facts of the attachment's own format.
+    pub(crate) texel: TexelExtent,
     /// The clear value or previous contents the attachment starts from.
     pub(crate) load: RenderLoadAction,
     /// The store action: `Store` makes the readback a landed observation;
@@ -2499,23 +2613,15 @@ pub(crate) fn plan_with_leases<'a>(
             }
             resolve_render_textures(request.pass, extent, leases)?
         };
-    // Every admitted colour format and `depth32float` alike store four bytes per
-    // texel, so one texel-byte count serves the colour attachments and the
-    // depth-only pass's readback (`crates/metal-api-core`:
-    // `AttachmentFormat::bytes_per_texel` and `DEPTH_BYTES_PER_TEXEL`). The
-    // stencil surface is the one surface these two counts do not describe: one
-    // byte per texel it is (`STENCIL_BYTES_PER_TEXEL`), so its own readback
-    // computes the flat byte extent and the row width from the pass extent
-    // beside the store it serves ([`read_stencil_texels`],
+    // The pass extent is shared, but the texel width is not: `depth32float`
+    // stores four bytes per texel, the colour attachments store their own
+    // format's width — `Rgba16Float` eight where the UNORM layouts store four
+    // (`research/docs/23` §78) — and the stencil surface is the third width,
+    // one byte per texel (`STENCIL_BYTES_PER_TEXEL`), whose readback computes
+    // its own extent beside the store it serves ([`read_stencil_texels`],
     // `research/docs/23` §3.3, v49).
-    let texel_bytes = usize::try_from(
-        u64::from(extent[0])
-            .saturating_mul(u64::from(extent[1]))
-            .saturating_mul(4),
-    )
-    .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
-    let row_pitch = usize::try_from(u64::from(extent[0]).saturating_mul(4))
-        .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
+    let depth_texel = TexelExtent::flat(extent, metal_api_core::provider::DEPTH_BYTES_PER_TEXEL)
+        .ok_or_else(|| capability_refusal("attachment_dimension_limit"))?;
     // The vertex-input half: the streams with their bytes and their footprints.
     // Planned after the attachment because a stream is the draw's own input,
     // exactly as the attachment is its output.
@@ -2534,17 +2640,23 @@ pub(crate) fn plan_with_leases<'a>(
         let format = pixel_format(attachment.format)?;
         let load = load_action(attachment.load, format)?;
         let store = store_action(attachment.store)?;
+        // The attachment's own texel width, not the pass's: the `Load` window
+        // it uploads and the readback it lands are both measured in this
+        // format's texels (`research/docs/23` §78).
+        let texel = TexelExtent::flat(extent, attachment.format.bytes_per_texel())
+            .ok_or_else(|| capability_refusal("attachment_dimension_limit"))?;
         let initial = match (load, previous, present) {
             (RenderLoadAction::Clear(_), None, _) => None,
             (RenderLoadAction::DontCare, None, _) => None,
-            (RenderLoadAction::Load, Some(source), _) if source.len() == texel_bytes => {
+            (RenderLoadAction::Load, Some(source), _) if source.len() == texel.bytes => {
                 Some(source)
             }
             (RenderLoadAction::Load, Some(source), _) => {
                 return Err(
                     args_refusal("render_attachment_initial_mismatch").with_detail(format!(
-                        "LoadOp::Load needs {texel_bytes} tightly packed bytes, got {}",
-                        source.len()
+                        "LoadOp::Load needs {} tightly packed bytes of its own format, got {}",
+                        texel.bytes,
+                        source.len(),
                     )),
                 );
             }
@@ -2571,6 +2683,7 @@ pub(crate) fn plan_with_leases<'a>(
         };
         planned_attachments.push(PlannedAttachment {
             format,
+            texel,
             load,
             store,
             initial,
@@ -2830,8 +2943,7 @@ pub(crate) fn plan_with_leases<'a>(
         instance_count: request.pass.instance_count,
         vertex_streams,
         indices,
-        texel_bytes,
-        row_pitch,
+        depth_texel,
     })
 }
 
@@ -4234,7 +4346,10 @@ fn encode_into_and_readback(
         .iter()
         .zip(targets)
         .filter(|(attachment, _)| attachment.store == RenderStoreAction::Store)
-        .map(|(_, target)| read_texels(target, planned))
+        // Each attachment is read with its own format's texel width: a stored
+        // `Rgba16Float` location lands eight bytes per texel where its
+        // neighbours land four (`research/docs/23` §78).
+        .map(|(attachment, target)| read_texels(target, planned, attachment.texel))
         .collect::<Result<Vec<Vec<u8>>, ProviderError>>()?;
     // The stored depth surface's texels leave through the same `getBytes` shape
     // the colour attachments use (`research/docs/23` §3.3, v43): the texture is
@@ -4246,9 +4361,11 @@ fn encode_into_and_readback(
     // `depth_resolve_target` holds — while every non-resolving stored surface
     // is read back from its own texture (`research/docs/23` §3.3, v43/v57c).
     let depth = match (&planned.depth, &depth_target, &depth_resolve_target) {
-        (Some(depth), _, Some(landing)) if depth.storing() => Some(read_texels(landing, planned)?),
+        (Some(depth), _, Some(landing)) if depth.storing() => {
+            Some(read_texels(landing, planned, planned.depth_texel)?)
+        }
         (Some(depth), Some(texture), None) if depth.storing() => {
-            Some(read_texels(texture, planned)?)
+            Some(read_texels(texture, planned, planned.depth_texel)?)
         }
         _ => None,
     };
@@ -4297,7 +4414,7 @@ fn attachment_textures(
         // import changes what the preset uploads, exactly as it changes what a
         // bound stream reads (`research/docs/23` §74, R5b).
         if let Some(source) = &attachment.initial {
-            upload_texels(&texture, planned, source.proof_bytes());
+            upload_texels(&texture, planned, attachment.texel, source.proof_bytes());
         }
         textures.push(texture);
     }
@@ -4661,12 +4778,17 @@ fn upload_stream_buffer(
 /// sentinel preset that makes "the present never happened" falsifiable
 /// (`research/docs/24` §3.1).
 #[cfg(target_os = "macos")]
-pub(crate) fn upload_texels(texture: &Texture, planned: &RenderPlan<'_>, bytes: &[u8]) {
+pub(crate) fn upload_texels(
+    texture: &Texture,
+    planned: &RenderPlan<'_>,
+    texel: TexelExtent,
+    bytes: &[u8],
+) {
     texture.replace_region(
         region(planned),
         0,
         bytes.as_ptr().cast(),
-        NSUInteger::try_from(planned.row_pitch).unwrap_or(NSUInteger::MAX),
+        NSUInteger::try_from(texel.row_pitch).unwrap_or(NSUInteger::MAX),
     );
 }
 
@@ -4803,13 +4925,23 @@ fn render_pipeline_state(
         .map_err(|error| compile_refusal("metal_render_pipeline_compile_failed").with_detail(error))
 }
 
-/// Read the attachment's texels back into host memory, tightly packed.
+/// Read one texture's texels back into host memory, tightly packed.
+///
+/// `texel` is the read source's own format width (`research/docs/23` §78): a
+/// colour attachment carries its [`PlannedAttachment::texel`], the depth surface
+/// and its resolve target carry the plan's `depth32float` extent, and the
+/// region is the pass's extent in both cases — the contract holds every
+/// surface to the colour attachments' extent.
 #[cfg(target_os = "macos")]
-fn read_texels(texture: &Texture, planned: &RenderPlan<'_>) -> Result<Vec<u8>, ProviderError> {
-    let mut texels = vec![0_u8; planned.texel_bytes];
+fn read_texels(
+    texture: &Texture,
+    planned: &RenderPlan<'_>,
+    texel: TexelExtent,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut texels = vec![0_u8; texel.bytes];
     texture.get_bytes(
         texels.as_mut_ptr().cast(),
-        NSUInteger::try_from(planned.row_pitch).unwrap_or(NSUInteger::MAX),
+        NSUInteger::try_from(texel.row_pitch).unwrap_or(NSUInteger::MAX),
         region(planned),
         0,
     );
@@ -4913,6 +5045,7 @@ const fn metal_pixel_format(format: RenderPixelFormat) -> MTLPixelFormat {
         RenderPixelFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         RenderPixelFormat::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
         RenderPixelFormat::R32Float => MTLPixelFormat::R32Float,
+        RenderPixelFormat::Rgba16Float => MTLPixelFormat::RGBA16Float,
     }
 }
 
@@ -5277,14 +5410,89 @@ mod tests {
         };
         assert_eq!(attachment.format, RenderPixelFormat::Rgba8Unorm);
         assert_eq!(attachment.store, RenderStoreAction::Store);
-        // 2x2 texels of a 4-byte format: 16 bytes, two rows of 8.
-        assert_eq!(planned.texel_bytes, 16);
-        assert_eq!(planned.row_pitch, 8);
+        // 2x2 texels of a 4-byte format: 16 bytes, two rows of 8. The extent
+        // is the attachment's own (`research/docs/23` §78).
+        assert_eq!(attachment.texel.bytes, 16);
+        assert_eq!(attachment.texel.row_pitch, 8);
+        assert_eq!(planned.depth_texel.bytes, 16);
+        assert_eq!(planned.depth_texel.row_pitch, 8);
         assert_eq!(attachment.initial_bytes(), None);
         let RenderLoadAction::Clear(components) = attachment.load else {
             panic!("the milestone clears its attachment");
         };
         assert_eq!(components, [254.0 / 255.0; 4]);
+    }
+
+    /// The clear payload of the eight-byte format the census named: four
+    /// little-endian halves, in the format's memory order (`research/docs/23`
+    /// §78).
+    fn rgba16float_clear() -> ClearColor {
+        ClearColor::from_bytes(&[0x00, 0x3c, 0x00, 0x38, 0x66, 0x2e, 0x00, 0x30])
+            .expect("one eight-byte texel")
+    }
+
+    /// `Rgba16Float`'s own plan facts (`research/docs/23` §78): the reviewed
+    /// single-output module serves it, the readback extent is the attachment's
+    /// own width rather than the pass's, and a `Load` of the same attachment is
+    /// held to that width.
+    #[test]
+    fn plan_reads_an_rgba16float_attachment_at_its_own_texel_width() {
+        let mut pass = milestone_pass(LoadOp::Clear(rgba16float_clear()));
+        pass.color_attachments[0].format = AttachmentFormat::Rgba16Float;
+        let mut pipeline = milestone_pipeline();
+        pipeline.color_formats = vec![AttachmentFormat::Rgba16Float];
+        let planned = plan_pass(&milestone_request(&pass, &pipeline, None))
+            .expect("the reviewed single-output module serves the four-component float format");
+        assert_eq!(planned.source, REVIEWED_SOURCE);
+        let [attachment] = planned.attachments.as_slice() else {
+            panic!("the milestone renders one attachment");
+        };
+        assert_eq!(attachment.format, RenderPixelFormat::Rgba16Float);
+        // 2x2 texels of an eight-byte format: 32 bytes, two rows of 16 — twice
+        // the four-byte class's extent for the same raster.
+        assert_eq!(attachment.texel.bytes, 32);
+        assert_eq!(attachment.texel.row_pitch, 16);
+        // The depth surface keeps its own four-byte width beside it.
+        assert_eq!(planned.depth_texel.bytes, 16);
+        assert_eq!(planned.depth_texel.row_pitch, 8);
+        let RenderLoadAction::Clear(components) = attachment.load else {
+            panic!("the fixture clears its attachment");
+        };
+        assert_eq!(components, [1.0, 0.5, f64::from(0.099_975_586_f32), 0.125]);
+
+        // A `Load` uploads the attachment's own texels: the eight-byte payload
+        // lands, and a four-byte one is refused by name with the width it was
+        // measured against, exactly as core admission measures it.
+        let mut loading = milestone_pass(LoadOp::Load);
+        loading.color_attachments[0].format = AttachmentFormat::Rgba16Float;
+        let previous = vec![0x5a; 32];
+        let planned = plan_pass(&milestone_request(&loading, &pipeline, Some(&previous)))
+            .expect("a 2x2 Rgba16Float attachment loads 32 bytes");
+        assert_eq!(planned.attachments[0].initial_bytes(), Some(&previous[..]));
+        let short = vec![0x5a; 16];
+        let refused = plan_pass(&milestone_request(&loading, &pipeline, Some(&short)))
+            .expect_err("a four-byte payload cannot state an eight-byte format's texels");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_attachment_initial_mismatch");
+    }
+
+    /// The four-component modules are exactly the ones that serve 16-bit float:
+    /// the single-channel format's reviewed stage is the indexed one, so a
+    /// `vertex_id` pipeline that names `R32Float` is refused instead of
+    /// compiled with a `float4` store (`research/docs/23` §78).
+    #[test]
+    fn the_vertex_id_module_serves_the_four_component_formats_only() {
+        assert!(reviewed_module(&VertexLayout::None, &[AttachmentFormat::Rgba16Float]).is_some());
+        assert!(reviewed_module(&VertexLayout::None, &[AttachmentFormat::R32Float]).is_none());
+
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.color_attachments[0].format = AttachmentFormat::R32Float;
+        let mut pipeline = milestone_pipeline();
+        pipeline.color_formats = vec![AttachmentFormat::R32Float];
+        let refused = plan_pass(&milestone_request(&pass, &pipeline, None))
+            .expect_err("the milestone module stores a float4 and this format has one channel");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "native_render_source_not_reviewed");
     }
 
     #[test]
@@ -5336,6 +5544,10 @@ mod tests {
             (AttachmentFormat::Rgba8Unorm, RenderPixelFormat::Rgba8Unorm),
             (AttachmentFormat::Bgra8Unorm, RenderPixelFormat::Bgra8Unorm),
             (AttachmentFormat::R32Float, RenderPixelFormat::R32Float),
+            (
+                AttachmentFormat::Rgba16Float,
+                RenderPixelFormat::Rgba16Float,
+            ),
         ] {
             assert_eq!(pixel_format(format).unwrap(), expected);
             assert!(SUPPORTED_COLOR_FORMATS.contains(&format));
@@ -5343,6 +5555,7 @@ mod tests {
         assert_eq!(RenderPixelFormat::Rgba8Unorm.name(), "rgba8_unorm");
         assert_eq!(RenderPixelFormat::Bgra8Unorm.name(), "bgra8_unorm");
         assert_eq!(RenderPixelFormat::R32Float.name(), "r32_float");
+        assert_eq!(RenderPixelFormat::Rgba16Float.name(), "rgba16_float");
     }
 
     #[test]
@@ -5379,6 +5592,19 @@ mod tests {
                 RenderPixelFormat::R32Float
             ),
             [0.5, 0.0, 0.0, 1.0]
+        );
+        // The eight-byte format's payload is four little-endian halves, and the
+        // components are the values they name: `0x3c00` is 1.0, `0x3800` is
+        // 0.5, and `0x2e66` is the half nearest 0.1 — a value the f32 of 0.1 is
+        // *not*, which is the rounding a 16-bit float attachment observes
+        // (`research/docs/23` §78).
+        assert_eq!(
+            clear_components(
+                ClearColor::from_bytes(&[0x00, 0x3c, 0x00, 0x38, 0x66, 0x2e, 0x00, 0x30])
+                    .expect("one eight-byte texel"),
+                RenderPixelFormat::Rgba16Float
+            ),
+            [1.0, 0.5, f64::from(0.099_975_586_f32), f64::from(0.125_f32),]
         );
     }
 
@@ -5449,7 +5675,7 @@ mod tests {
         let plan = plan_pass(&milestone_request(&pass, &pipeline, None))
             .expect("a four-by-four attachment is within the declared extent");
         assert_eq!(plan.extent, [4, 4]);
-        assert_eq!(plan.texel_bytes, 64);
+        assert_eq!(plan.attachments[0].texel.bytes, 64);
     }
 
     #[test]
@@ -5479,7 +5705,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan.texel_bytes,
+            plan.attachments[0].texel.bytes,
             usize::try_from(REVIEWED_ATTACHMENT_CEILING[0] * REVIEWED_ATTACHMENT_CEILING[1] * 4)
                 .expect("the reviewed window's texel bytes fit a host usize")
         );
@@ -5574,8 +5800,9 @@ mod tests {
         assert_eq!(second.store, RenderStoreAction::Store);
         assert_eq!(first.initial_bytes(), None);
         assert_eq!(second.initial_bytes(), None);
-        assert_eq!(planned.texel_bytes, 16);
-        assert_eq!(planned.row_pitch, 8);
+        assert_eq!(first.texel.bytes, 16);
+        assert_eq!(first.texel.row_pitch, 8);
+        assert_eq!(second.texel, first.texel);
     }
 
     /// The v19 store increment: the same dual shape with location 1 discarded
@@ -7693,8 +7920,8 @@ mod tests {
         assert_eq!(planned.pass.color_attachments[0].view_id, ViewId::new(7));
         assert_eq!(planned.contract, &milestone_pipeline());
         assert_eq!(planned.plan.extent, [2, 2]);
-        assert_eq!(planned.plan.texel_bytes, 16);
-        assert_eq!(planned.plan.row_pitch, 8);
+        assert_eq!(planned.plan.attachments[0].texel.bytes, 16);
+        assert_eq!(planned.plan.attachments[0].texel.row_pitch, 8);
         assert_eq!(
             planned.plan.attachments[0].format,
             RenderPixelFormat::Rgba8Unorm
