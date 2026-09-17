@@ -46,14 +46,29 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const MAX_BYTES: usize = 1024 * 1024;
-/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70): the
-/// window every render rail's fixture is checked against. The rails declare the
-/// smaller of this ceiling and their device's own framebuffer limit, so a
-/// fixture at the ceiling is inside every conformant device's window (Vulkan's
-/// minimum `maxFramebufferWidth` is 4096). Widening it is a deliberate change
-/// that owes a boundary fixture at the new value, in all three review surfaces.
-const REVIEWED_ATTACHMENT_CEILING: u64 = 64;
+/// The largest source file the capture tool reads (an AIR or SPIR-V module).
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70; R5a,
+/// §73): the window every render rail's fixture is checked against. The rails
+/// declare the smaller of this ceiling and their device's own framebuffer
+/// limit, so a fixture at the ceiling is inside every conformant device's
+/// window (Vulkan's minimum `maxFramebufferWidth` is 4096). Widening it is a
+/// deliberate change that owes a boundary fixture at the new value, in all
+/// three review surfaces.
+const REVIEWED_ATTACHMENT_CEILING: u64 = 2048;
+/// The largest byte extent one declared view may carry (R5a, `research/docs/23`
+/// §73): the reviewed window's own attachment, four bytes per texel. The guard
+/// keeps an unchecked suite from asking the tool for more bytes than the review
+/// measured, while the wide case's 2048² declaring view is inside it.
+const MAX_DECLARED_BYTES: usize =
+    (REVIEWED_ATTACHMENT_CEILING * REVIEWED_ATTACHMENT_CEILING * 4) as usize;
+/// The largest allocation image a capture spells out as hex (R5a,
+/// `research/docs/23` §73). A wider image is reported as its digest: the wide
+/// attachment's declaring view is 16 MiB, so its image would be 32 MiB of hex
+/// in every capture of the suite, and the comparator can recompute the digest
+/// from the suite's own declarations. Narrower images keep their bytes, so the
+/// review of every pre-R5a case is unchanged.
+const MAX_VERBATIM_ALLOCATION_BYTES: usize = 1024 * 1024;
 
 /// The Vulkan rail's half of the reviewed render fixture
 /// (`research/docs/23` §1.2). A render case pins the MSL module the canonical
@@ -1273,7 +1288,7 @@ struct Case {
     /// `research/docs/18` step 1.
     #[serde(default)]
     textures: Vec<Texture>,
-    expected_writebacks: Vec<Writeback>,
+    expected_writebacks: Vec<ExpectedWriteback>,
     dispatches: Option<Vec<CaseDispatch>>,
     programs: Option<Vec<CaseProgram>>,
     command_buffers: Option<Vec<Vec<usize>>>,
@@ -1357,6 +1372,21 @@ struct RenderCase {
     /// absent and spells the expectation on each attachment entry instead.
     #[serde(default)]
     expected_hex: Option<String>,
+    /// The rule the single attachment's own bytes follow, when the case cannot
+    /// spell them (R5a, `research/docs/23` §73). It is the reviewed sampling
+    /// shape's identity rule restated: the fragment stage copies the bound
+    /// texture texel for texel, so the expectation is the same rule the texture
+    /// carries, and the case has to name it here rather than leave the
+    /// attachment's expectation implicit.
+    #[serde(default)]
+    expected_rule: Option<String>,
+    /// The rectangles of a rule-expected attachment the capture reports
+    /// verbatim (R5a, `research/docs/23` §73), in the order the comparator
+    /// checks them. Required exactly when `expected_rule` is present: the
+    /// digest covers the whole plane, and these windows are where the bytes
+    /// themselves stay checkable.
+    #[serde(default)]
+    readback_windows: Option<Vec<ReadbackWindowDefinition>>,
     /// The capture backends this case is executable on. A rail in this list has
     /// to report the case; a rail outside it has to omit it.
     capture_rails: Vec<String>,
@@ -1917,6 +1947,46 @@ fn default_attachment_store() -> String {
     "store".to_owned()
 }
 
+/// One rectangle of a rule-expected attachment the suite asks the capture to
+/// report verbatim (R5a, `research/docs/23` §73).
+///
+/// The rule covers the whole plane; the windows are where the comparator checks
+/// the bytes itself, because a digest alone would leave the per-texel rule
+/// unobservable in the capture. The rectangle is in texels, its origin inside
+/// the plane, and the check refuses a window that leaves it.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadbackWindowDefinition {
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
+}
+
+impl ReadbackWindowDefinition {
+    /// The window's own bytes, tightly packed rows, out of one row-major plane.
+    fn observe(&self, plane: &[u8], plane_width: u64) -> Result<ObservedWindow> {
+        let row_bytes = usize::try_from(self.width)? * 4;
+        let mut bytes = Vec::with_capacity(row_bytes * usize::try_from(self.height)?);
+        for row in 0..self.height {
+            let start = usize::try_from((self.y + row) * plane_width + self.x)? * 4;
+            let end = start + row_bytes;
+            bytes.extend_from_slice(
+                plane
+                    .get(start..end)
+                    .ok_or("a readback window leaves the attachment plane")?,
+            );
+        }
+        Ok(ObservedWindow {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            bytes_hex: hex(&bytes),
+        })
+    }
+}
+
 /// The suite-side shape of a render case's present action (the capture suite's
 /// present input contract, shared with the compare rail). `initial_hex`
 /// defaults to absent, i.e. `InitialState::Undefined`.
@@ -1983,22 +2053,326 @@ struct Buffer {
     length: u64,
     allocation_size: u64,
     access: String,
-    initial_hex: String,
+    /// The view's initial bytes, spelled as hex: the form every pre-R5a buffer
+    /// carries. Exactly one of this field and [`Buffer::initial_repeat_hex`] is
+    /// present.
+    #[serde(default)]
+    initial_hex: Option<String>,
+    /// The view's initial bytes as one short pattern repeated to `length` (R5a,
+    /// `research/docs/23` §73): the wide attachment's declaring view is 16 MiB,
+    /// so spelling its `cd` fill out would put 32 MiB of hex in the fixture.
+    /// The pattern's length has to divide the view length.
+    #[serde(default)]
+    initial_repeat_hex: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+impl Buffer {
+    /// The bytes this declaration pre-seeds its view with.
+    fn initial_bytes(&self) -> Result<Vec<u8>> {
+        match (&self.initial_hex, &self.initial_repeat_hex) {
+            (Some(hex_), None) => {
+                let bytes = unhex(hex_)?;
+                if bytes.len() as u64 != self.length {
+                    return Err("initial data length differs from declared view length".into());
+                }
+                Ok(bytes)
+            }
+            (None, Some(pattern)) => {
+                let unit = unhex(pattern)?;
+                if unit.is_empty() {
+                    return Err("an initial repeat pattern is at least one byte".into());
+                }
+                if !self.length.is_multiple_of(unit.len() as u64) {
+                    return Err(format!(
+                        "the initial repeat pattern of {} bytes does not divide the {} byte view",
+                        unit.len(),
+                        self.length
+                    )
+                    .into());
+                }
+                let mut bytes = Vec::with_capacity(usize::try_from(self.length)?);
+                for _ in 0..self.length / unit.len() as u64 {
+                    bytes.extend_from_slice(&unit);
+                }
+                Ok(bytes)
+            }
+            (Some(_), Some(_)) => {
+                Err("a view carries either initial_hex or initial_repeat_hex, not both".into())
+            }
+            (None, None) => Err("a view needs its initial bytes: initial_hex or \
+                                 initial_repeat_hex"
+                .into()),
+        }
+    }
+}
+
+/// The reviewed per-texel rule of the wide attachment (R5a, `research/docs/23`
+/// §73): texel `(x, y)` carries `x` and `y` as two little-endian `u16`s, i.e.
+/// `[x & 0xff, (x >> 8) & 0xff, y & 0xff, (y >> 8) & 0xff]`.
+///
+/// The rule is the expectation form a 2048×2048 attachment needs: the whole
+/// plane is four million texels, so the fixture states the function instead of
+/// the bytes. It is injective over any window up to 65536 texels per axis, so a
+/// flipped, transposed or row-shifted readback differs from it, and the check is
+/// still byte for byte — the capture reports the plane's digest and the
+/// declared windows' own bytes, and the comparator recomputes both from this
+/// rule.
+const XY_U16LE_V1: &str = "xy_u16le_v1";
+
+/// The four bytes the reviewed rule stores at texel `(x, y)`.
+fn rule_texel(rule: &str, x: u64, y: u64) -> Result<[u8; 4]> {
+    if rule != XY_U16LE_V1 {
+        return Err(format!("unknown texel rule {rule:?}").into());
+    }
+    let x = u16::try_from(x).map_err(|_| -> Box<dyn Error> {
+        "the reviewed rule addresses texels up to 65536 per axis".into()
+    })?;
+    let y = u16::try_from(y).map_err(|_| -> Box<dyn Error> {
+        "the reviewed rule addresses texels up to 65536 per axis".into()
+    })?;
+    let [x0, x1] = x.to_le_bytes();
+    let [y0, y1] = y.to_le_bytes();
+    Ok([x0, x1, y0, y1])
+}
+
+/// The whole plane the reviewed rule describes, row-major.
+fn rule_bytes(rule: &str, width: u64, height: u64) -> Result<Vec<u8>> {
+    let length = width
+        .checked_mul(height)
+        .and_then(|texels| texels.checked_mul(4))
+        .ok_or("rule extent overflows")?;
+    let mut bytes = Vec::with_capacity(usize::try_from(length)?);
+    for y in 0..height {
+        for x in 0..width {
+            bytes.extend_from_slice(&rule_texel(rule, x, y)?);
+        }
+    }
+    Ok(bytes)
+}
+
+/// The lowercase SHA-256 of one byte plane.
+fn plane_sha256(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// The smallest extent a rule expectation is admissible at (R5a,
+/// `research/docs/23` §73): the rule form exists for the megapixel-class
+/// attachments whose hex spelling the fixture cannot carry, so a small case
+/// keeps stating its texels and the pairwise-distinctness scan stays available.
+const RULE_MIN_DIMENSION: u64 = 1024;
+
+/// The largest extent the reviewed rule addresses: both coordinates travel as
+/// little-endian `u16`s, so a wider axis could not be spelled injectively.
+const RULE_ADDRESS_CEILING: u64 = 65_536;
+
+/// How many readback windows one rule-expected case may declare.
+const MAX_READBACK_WINDOWS: usize = 8;
+
+/// The largest readback window per axis: the capture reports these bytes as
+/// hex, so the reviewed shape keeps each window small (64×64 = 16 KiB).
+const MAX_READBACK_WINDOW_DIMENSION: u64 = 64;
+
+/// Whether a four-byte colour is one of the reviewed rule's texels over a
+/// window of this extent.
+///
+/// The closed form of the distinctness rule: the first two bytes are a
+/// little-endian `x` and the last two a little-endian `y`, so the rule reaches
+/// the colour exactly when both addresses are inside the extent. A clear
+/// colour the rule reaches would let a rail that ignored the draw land bytes
+/// the expectation claims, which is why the check refuses it instead of
+/// scanning a four-million-texel plane.
+fn rule_reaches_colour(rule: &str, colour: &[u8], width: u64, height: u64) -> Result<bool> {
+    if rule != XY_U16LE_V1 {
+        return Err(format!("unknown texel rule {rule:?}").into());
+    }
+    if colour.len() != 4 {
+        return Err("a clear colour is four bytes".into());
+    }
+    let x = u64::from(u16::from_le_bytes([colour[0], colour[1]]));
+    let y = u64::from(u16::from_le_bytes([colour[2], colour[3]]));
+    Ok(x < width && y < height)
+}
+
+/// One writeback a *suite* expects from a compute case: the bytes the view has
+/// to land. The capture's own report shape below is not this one — its
+/// rule-expected form carries a digest instead of bytes — so the two are
+/// separate types and a report cannot be read back as a request.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Writeback {
+struct ExpectedWriteback {
     allocation: u64,
     view: u64,
     offset: u64,
     bytes_hex: String,
 }
 
+/// One landed writeback: the bytes a view landed, or — for a case that declares
+/// a rule expectation (R5a, `research/docs/23` §73) — the digest of the whole
+/// plane plus the declared readback windows' own bytes.
+///
+/// The two forms are mutually exclusive: a rule-expected attachment is four
+/// million texels, so the report carries the plane's SHA-256 (the comparator
+/// recomputes it from the rule) and the small windows the suite names, while
+/// every pre-R5a case keeps reporting its bytes.
+#[derive(Serialize)]
+struct Writeback {
+    allocation: u64,
+    view: u64,
+    offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_windows: Option<Vec<ObservedWindow>>,
+}
+
+/// One declared readback window's actual bytes (`research/docs/23` §73).
+///
+/// The suite states the rectangle; the capture reports the bytes it read there,
+/// so the comparator checks those texels against the rule itself rather than
+/// trusting the plane digest alone.
+#[derive(Serialize)]
+struct ObservedWindow {
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
+    bytes_hex: String,
+}
+
+/// One landed allocation image: the whole image's bytes, or its digest when the
+/// case declares a rule expectation.
 #[derive(Serialize)]
 struct Allocation {
     allocation: u64,
-    bytes_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_length: Option<u64>,
+}
+
+impl Writeback {
+    /// How many bytes this report covers, in either form: the digest form
+    /// states the length, the byte form carries it as hex.
+    fn observed_bytes(&self) -> usize {
+        match (self.bytes_length, self.bytes_hex.as_deref()) {
+            (Some(length), _) => usize::try_from(length).unwrap_or(usize::MAX),
+            (None, Some(hex_)) => hex_.len() / 2,
+            (None, None) => 0,
+        }
+    }
+
+    /// The pre-R5a form: the bytes the view landed, verbatim.
+    fn encoded(allocation: u64, view: u64, offset: u64, bytes: &[u8]) -> Self {
+        Self {
+            allocation,
+            view,
+            offset,
+            bytes_hex: Some(hex(bytes)),
+            bytes_sha256: None,
+            bytes_length: None,
+            observed_windows: None,
+        }
+    }
+
+    /// The rule form: the plane's digest plus the declared windows' bytes.
+    fn ruled(
+        allocation: u64,
+        view: u64,
+        offset: u64,
+        plane: &[u8],
+        width: u64,
+        windows: &[ReadbackWindowDefinition],
+    ) -> Result<Self> {
+        Ok(Self {
+            allocation,
+            view,
+            offset,
+            bytes_hex: None,
+            bytes_sha256: Some(plane_sha256(plane)),
+            bytes_length: Some(plane.len() as u64),
+            observed_windows: Some(
+                windows
+                    .iter()
+                    .map(|window| window.observe(plane, width))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        })
+    }
+}
+
+impl Allocation {
+    /// The form one allocation image is reported in: its bytes, or — when the
+    /// image is wider than the verbatim cap — its digest (R5a,
+    /// `research/docs/23` §73).
+    fn observed(allocation: u64, bytes: &[u8]) -> Self {
+        if bytes.len() > MAX_VERBATIM_ALLOCATION_BYTES {
+            Self::digested(allocation, bytes)
+        } else {
+            Self::encoded(allocation, bytes)
+        }
+    }
+
+    /// The pre-R5a form: the whole image, verbatim.
+    fn encoded(allocation: u64, bytes: &[u8]) -> Self {
+        Self {
+            allocation,
+            bytes_hex: Some(hex(bytes)),
+            bytes_sha256: None,
+            bytes_length: None,
+        }
+    }
+
+    /// The wide form: the whole image's digest.
+    fn digested(allocation: u64, bytes: &[u8]) -> Self {
+        Self {
+            allocation,
+            bytes_hex: None,
+            bytes_sha256: Some(plane_sha256(bytes)),
+            bytes_length: Some(bytes.len() as u64),
+        }
+    }
+}
+
+/// Report one stored colour attachment's landing.
+///
+/// Every pre-R5a case reports the bytes themselves. A rule-expected case (R5a,
+/// `research/docs/23` §73) reports the plane's digest plus the declared
+/// readback windows' bytes instead, because the plane is four million texels:
+/// the comparator recomputes the digest from the rule and checks every window
+/// texel against it. The caller has already refused every shape where the two
+/// planes could differ, so the writeback and the allocation image are the same
+/// bytes here.
+fn attachment_observation(
+    rule: Option<&str>,
+    windows: &[ReadbackWindowDefinition],
+    // The attachment's own identity and row pitch: `(allocation, view, offset,
+    // width)`, in the order the report states the first three.
+    attachment: (u64, u64, u64, u64),
+    write: &[u8],
+    image: &[u8],
+) -> Result<(Writeback, Allocation)> {
+    let (allocation, view, offset, width) = attachment;
+    match rule {
+        None => Ok((
+            Writeback::encoded(allocation, view, offset, write),
+            Allocation::observed(allocation, image),
+        )),
+        Some(_) => {
+            if write.len() != image.len() {
+                return Err("a rule-expected attachment reports one plane".into());
+            }
+            Ok((
+                Writeback::ruled(allocation, view, offset, write, width, windows)?,
+                Allocation::digested(allocation, image),
+            ))
+        }
+    }
 }
 
 /// Device-buffer copy counters for one command buffer. A case that splits its
@@ -2780,6 +3154,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "render_declaring_stencil_resolve",
             "render_declaring_attachment_16x16",
             "render_declaring_attachment_64x64",
+            "render_declaring_attachment_2048x2048",
         ],
         _ => return Err("unsupported suite identity/version".into()),
     };
@@ -2852,7 +3227,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             if buffer.binding != buffers[index].0
                 || buffer.access != buffers[index].1
                 || buffer.length != buffers[index].2
-                || buffer.allocation_size > MAX_BYTES as u64
+                || buffer.allocation_size > MAX_DECLARED_BYTES as u64
                 || end > buffer.allocation_size
                 || (!attachment_target && (buffer.offset < 4 || buffer.allocation_size - end < 4))
                 || !buffer.offset.is_multiple_of(4)
@@ -2878,7 +3253,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 )
                 .into());
             }
-            if unhex(&buffer.initial_hex)?.len() as u64 != buffer.length {
+            // The view's own initial bytes: the hex form every pre-R5a
+            // declaration carries, or the repeated pattern the wide case uses
+            // (R5a, `research/docs/23` §73). Both resolve to exactly `length`
+            // bytes, which is what this check is about.
+            let initial = buffer.initial_bytes()?;
+            if initial.len() as u64 != buffer.length {
                 return Err("initial data length differs from declared view length".into());
             }
             ranges.push((buffer.offset, end));
@@ -2984,7 +3364,9 @@ enum RenderGeometry {
 
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
 /// view its texel bytes travel under, the extent the pass has to share with it,
-/// and the bytes themselves as hex.
+/// and the bytes themselves — as hex for every pre-R5a case, or as a reviewed
+/// per-texel rule for the wide one (R5a, §73), where spelling four million
+/// texels out is what the rule replaces.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentTextureDefinition {
@@ -2993,7 +3375,40 @@ struct FragmentTextureDefinition {
     format: String,
     width: u64,
     height: u64,
-    initial_hex: String,
+    #[serde(default)]
+    initial_hex: Option<String>,
+    #[serde(default)]
+    texel_rule: Option<String>,
+}
+
+impl FragmentTextureDefinition {
+    /// The texels this texture is uploaded with.
+    fn texels(&self) -> Result<Vec<u8>> {
+        match (&self.initial_hex, &self.texel_rule) {
+            (Some(hex_), None) => {
+                let bytes = unhex(hex_)?;
+                let expected = self
+                    .width
+                    .checked_mul(self.height)
+                    .and_then(|texels| texels.checked_mul(4))
+                    .ok_or("texture extent overflows")?;
+                if bytes.len() as u64 != expected {
+                    return Err("the uploaded texels do not match the extent".into());
+                }
+                Ok(bytes)
+            }
+            (None, Some(rule)) => rule_bytes(rule, self.width, self.height),
+            (Some(_), Some(_)) => Err("a texture carries either initial_hex or texel_rule, \
+                                       not both"
+                .into()),
+            (None, None) => Err("a texture needs its texels: initial_hex or texel_rule".into()),
+        }
+    }
+
+    /// The rule the texture's texels follow, when it declares one.
+    fn rule(&self) -> Option<&str> {
+        self.texel_rule.as_deref()
+    }
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -4242,11 +4657,95 @@ fn reviewed_sampled_geometry(
         )
         .into());
     }
-    let texels = unhex(&texture.initial_hex)?;
-    let extent = usize::try_from(texture.width * texture.height * 4)?;
-    if texels.len() != extent {
+    // The texels the texture is uploaded with: the hex spelling for every
+    // pre-R5a case, the reviewed per-texel rule for the wide one (R5a,
+    // `research/docs/23` §73). Both forms already resolve to the extent's own
+    // byte count, so a short or long spelling cannot reach the checks below.
+    let texels = texture.texels()?;
+    let clear = unhex(attachment.clear_hex.as_deref().unwrap_or_default())?;
+    if attachment.load != "clear" || clear.len() != 4 {
         return Err(format!(
-            "{where_}.fragment_textures[0]: the uploaded texels do not match the extent"
+            "{where_}.attachment: the reviewed render-sampler shape clears its attachment, so a \
+             rail that ignores the texture is observable"
+        )
+        .into());
+    }
+    // The rule form: the fixture cannot spell four million texels, so it states
+    // the function instead. The rule is the case's own expectation, it stays
+    // injective over the extent it addresses (`x` and `y` as two little-endian
+    // `u16`s), and the clear colour stays outside its reach — the closed-form
+    // sibling of the pairwise-distinctness scan below, which is exactly what
+    // the rule form cannot run on a 2048² plane.
+    if let Some(rule) = texture.rule() {
+        if texture.width < RULE_MIN_DIMENSION || texture.height < RULE_MIN_DIMENSION {
+            return Err(format!(
+                "{where_}.fragment_textures[0]: a texel rule is the megapixel form; {}×{} \
+                     states its texels instead",
+                texture.width, texture.height
+            )
+            .into());
+        }
+        if texture.width > RULE_ADDRESS_CEILING || texture.height > RULE_ADDRESS_CEILING {
+            return Err(format!(
+                "{where_}.fragment_textures[0]: the reviewed rule addresses at most \
+                     {RULE_ADDRESS_CEILING} texels per axis"
+            )
+            .into());
+        }
+        if case.expected_rule.as_deref() != Some(rule) {
+            return Err(format!(
+                "{where_}: the expectation has to be the texture's own rule: the sampling \
+                     stage's sample at a texel centre is an identity copy"
+            )
+            .into());
+        }
+        let windows = case.readback_windows.as_deref().ok_or_else(|| {
+            format!("{where_}: a rule-expected attachment needs its readback windows")
+        })?;
+        if windows.is_empty() || windows.len() > MAX_READBACK_WINDOWS {
+            return Err(format!(
+                "{where_}.readback_windows: one to {MAX_READBACK_WINDOWS} windows"
+            )
+            .into());
+        }
+        for (index, window) in windows.iter().enumerate() {
+            let window_where = format!("{where_}.readback_windows[{index}]");
+            if window.width == 0 || window.height == 0 {
+                return Err(format!("{window_where}: an empty readback window").into());
+            }
+            if window.width > MAX_READBACK_WINDOW_DIMENSION
+                || window.height > MAX_READBACK_WINDOW_DIMENSION
+            {
+                return Err(format!(
+                    "{window_where}: a readback window is at most \
+                         {MAX_READBACK_WINDOW_DIMENSION} texels per axis"
+                )
+                .into());
+            }
+            let right = window.x.checked_add(window.width);
+            let bottom = window.y.checked_add(window.height);
+            if right.is_none_or(|end| end > texture.width)
+                || bottom.is_none_or(|end| end > texture.height)
+            {
+                return Err(format!(
+                    "{window_where}: the readback window leaves the attachment plane"
+                )
+                .into());
+            }
+        }
+        if rule_reaches_colour(rule, &clear, texture.width, texture.height)? {
+            return Err(format!(
+                "{where_}.attachment: a rule texel equals the clear colour, so a rail that \
+                     ignored the draw could pass"
+            )
+            .into());
+        }
+        return Ok(RenderGeometry::SampledTexture);
+    }
+    if case.expected_rule.is_some() || case.readback_windows.is_some() {
+        return Err(format!(
+            "{where_}: a rule expectation and its readback windows travel with the texture's own \
+             texel rule"
         )
         .into());
     }
@@ -4257,14 +4756,6 @@ fn reviewed_sampled_geometry(
         return Err(format!(
             "{where_}: the expectation has to be the uploaded texels: the sampling stage's \
              sample at a texel centre is an identity copy"
-        )
-        .into());
-    }
-    let clear = unhex(attachment.clear_hex.as_deref().unwrap_or_default())?;
-    if attachment.load != "clear" || clear.len() != 4 {
-        return Err(format!(
-            "{where_}.attachment: the reviewed render-sampler shape clears its attachment, so a \
-             rail that ignores the texture is observable"
         )
         .into());
     }
@@ -4499,6 +4990,15 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     if single == multiple && !no_colour {
         return Err(
             format!("{where_}: exactly one of attachment and attachments is required").into(),
+        );
+    }
+    // A rule expectation is the reviewed sampling shape's (`research/docs/23`
+    // §73): the bound texture's own texels *are* the expectation, so a case
+    // that states a rule without binding the texture carrying it is refused
+    // rather than run against a plane no reviewed draw can produce.
+    if case.expected_rule.is_some() && case.fragment_textures.is_none() {
+        return Err(
+            format!("{where_}: a rule expectation is the reviewed sampling shape's").into(),
         );
     }
     let shapes = render_attachment_shapes(case)?;
@@ -5280,10 +5780,20 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         )?;
         match attachment.store.as_str() {
             "store" => {
-                let expected_hex = expected_hex
-                    .as_deref()
-                    .ok_or(format!("{where_}: a stored attachment needs expected_hex"))?;
-                let texels = unhex(expected_hex)?;
+                // R5a (`research/docs/23` §73): a rule-expected attachment
+                // states its expectation as the reviewed per-texel rule instead
+                // of a hex string. The rule's own plane is computed here, so
+                // every expectation check below reads exactly the texels the
+                // capture's digest and windows cover.
+                let texels = match case.expected_rule.as_deref() {
+                    Some(rule) => rule_bytes(rule, attachment.width, attachment.height)?,
+                    None => {
+                        let expected_hex = expected_hex
+                            .as_deref()
+                            .ok_or(format!("{where_}: a stored attachment needs expected_hex"))?;
+                        unhex(expected_hex)?
+                    }
+                };
                 if texels.len() != extent {
                     return Err(format!(
                         "{where_}: expected texel bytes do not match the attachment"
@@ -5642,7 +6152,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             .ok_or(format!(
                                 "{where_}: the declaring case does not carry the attachment view"
                             ))?;
-                        if unhex(&declared.initial_hex)? != initial {
+                        if declared.initial_bytes()? != initial {
                             return Err(format!(
                                 "{where_}: the declared view's bytes are not the attachment's initial texels"
                             )
@@ -5794,7 +6304,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             .ok_or(format!(
                                 "{where_}: the declaring case does not carry the attachment view"
                             ))?;
-                        if unhex(&declared.initial_hex)? == texels {
+                        if declared.initial_bytes()? == texels {
                             return Err(format!(
                                 "{where_}: the declared view's bytes equal the expectation"
                             )
@@ -5980,6 +6490,19 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 format!("{where_}: attachment extent disagrees with the declaring view").into(),
             );
         }
+        // A rule-expected attachment reports the digest of its declaring
+        // allocation's whole image as well as the view's own plane, so the view
+        // has to *be* the image: the R5a fixture declares offset 0 and a
+        // view that fills its allocation (`research/docs/23` §73).
+        if case.expected_rule.is_some()
+            && (declared.offset != 0 || declared.allocation_size != declared.length)
+        {
+            return Err(format!(
+                "{where_}: a rule-expected attachment's declaring view has to be its whole \
+                 allocation"
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -6081,12 +6604,7 @@ fn merge_writebacks(
     let mut writebacks = Vec::new();
     for ((allocation, view), (offset, data, covered)) in views {
         if covered.iter().all(|value| *value) {
-            writebacks.push(Writeback {
-                allocation,
-                view,
-                offset,
-                bytes_hex: hex(&data),
-            });
+            writebacks.push(Writeback::encoded(allocation, view, offset, &data));
         } else if covered.iter().any(|value| *value) {
             return Err(format!("writebacks do not cover view {view} exactly").into());
         }
@@ -6352,6 +6870,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 16384), (1, "write", 4)][..],
+        ),
+        // R5a: the same copy_word shape over the reviewed window's own
+        // boundary — the 2048x2048 attachment's 16 MiB view, declared with a
+        // repeated pattern rather than spelled out (`research/docs/23` §73).
+        "render_declaring_attachment_2048x2048" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16777216), (1, "write", 4)][..],
         ),
         // v43: the same 4x4 attachment view, plus the depth attachment's own
         // view as a second read, and the 4-byte output view the reviewed
@@ -7412,7 +7939,7 @@ fn run_render_case(
     let mut recorded = BTreeSet::new();
     let mut resources = ResourceTableSnapshot::new();
     for buffer in &declaring.buffers {
-        let initial = unhex(&buffer.initial_hex)?;
+        let initial = buffer.initial_bytes()?;
         let start = usize::try_from(buffer.offset)?;
         let position = match allocations
             .iter()
@@ -7707,7 +8234,7 @@ fn run_render_case(
                         array_length: 1,
                         sample_count: 1,
                         access: TextureAccess::Sampled,
-                        source: TextureSource::OwnedBytes(unhex(&definition.initial_hex)?),
+                        source: TextureSource::OwnedBytes(definition.texels()?),
                     })
                 })
                 .collect::<Result<Vec<_>>>()
@@ -7845,16 +8372,20 @@ fn run_render_case(
             .ok_or("the attachment allocation is missing")?
             .1
             .clone();
-        writebacks.push(Writeback {
-            allocation: attachment.allocation,
-            view: attachment.view,
-            offset: write.offset,
-            bytes_hex: hex(&write.bytes),
-        });
-        images.push(Allocation {
-            allocation: attachment.allocation,
-            bytes_hex: hex(&image),
-        });
+        let (writeback, observation) = attachment_observation(
+            case.expected_rule.as_deref(),
+            case.readback_windows.as_deref().unwrap_or_default(),
+            (
+                attachment.allocation,
+                attachment.view,
+                write.offset,
+                attachment.width,
+            ),
+            &write.bytes,
+            &image,
+        )?;
+        writebacks.push(writeback);
+        images.push(observation);
     }
     // The stored depth attachment's own landing, after the colour ones
     // (`research/docs/23` §3.3, v43): one writeback covering the exact view the
@@ -7908,16 +8439,13 @@ fn run_render_case(
             .ok_or("the depth allocation is missing")?
             .1
             .clone();
-        writebacks.push(Writeback {
+        writebacks.push(Writeback::encoded(
             allocation,
             view,
-            offset: write.offset,
-            bytes_hex: hex(&write.bytes),
-        });
-        images.push(Allocation {
-            allocation,
-            bytes_hex: hex(&image),
-        });
+            write.offset,
+            &write.bytes,
+        ));
+        images.push(Allocation::observed(allocation, &image));
     }
     // The stored stencil attachment's own landing, after the depth one
     // (`research/docs/23` §3.3, v49): one writeback covering the exact view the
@@ -7969,16 +8497,13 @@ fn run_render_case(
             .ok_or("the stencil allocation is missing")?
             .1
             .clone();
-        writebacks.push(Writeback {
+        writebacks.push(Writeback::encoded(
             allocation,
             view,
-            offset: write.offset,
-            bytes_hex: hex(&write.bytes),
-        });
-        images.push(Allocation {
-            allocation,
-            bytes_hex: hex(&image),
-        });
+            write.offset,
+            &write.bytes,
+        ));
+        images.push(Allocation::observed(allocation, &image));
     }
     eprintln!(
         "render case completed: {} attachments={} bytes={}",
@@ -7986,7 +8511,7 @@ fn run_render_case(
         attachments.len(),
         writebacks
             .iter()
-            .map(|writeback| writeback.bytes_hex.len())
+            .map(Writeback::observed_bytes)
             .sum::<usize>()
     );
     Ok(CaseResult {
@@ -8024,7 +8549,7 @@ fn run_object_case(
     for definition in &case.buffers {
         let size = usize::try_from(definition.allocation_size)?;
         let offset = usize::try_from(definition.offset)?;
-        let bytes = unhex(&definition.initial_hex)?;
+        let bytes = definition.initial_bytes()?;
         let image = images
             .entry(definition.allocation)
             .or_insert_with(|| vec![guard; size]);
@@ -8194,10 +8719,7 @@ fn run_object_case(
         // Observe the object's actual host landing, rather than replaying the
         // returned writebacks into a second synthetic allocation. Exactly one
         // entry per allocation: several views may share it.
-        allocations.push(Allocation {
-            allocation: *allocation,
-            bytes_hex: hex(&buffer.read()?),
-        });
+        allocations.push(Allocation::observed(*allocation, &buffer.read()?));
     }
     allocations.sort_by_key(|allocation| allocation.allocation);
     eprintln!(
@@ -8246,7 +8768,7 @@ fn run_object_render_case(
     for definition in &declaring.buffers {
         let size = usize::try_from(definition.allocation_size)?;
         let offset = usize::try_from(definition.offset)?;
-        let bytes = unhex(&definition.initial_hex)?;
+        let bytes = definition.initial_bytes()?;
         let image = images
             .entry(definition.allocation)
             .or_insert_with(|| vec![guard; size]);
@@ -8458,7 +8980,7 @@ fn run_object_render_case(
                 TextureFormat::Rgba8Unorm,
                 definition.width,
                 definition.height,
-                unhex(&definition.initial_hex)?,
+                definition.texels()?,
             )?;
             render.set_fragment_texture(u32::try_from(index)?, &texture)?;
             object_textures.push(texture);
@@ -9016,16 +9538,20 @@ fn run_object_render_case(
             .get(&attachment.allocation)
             .ok_or("the attachment allocation is missing")?
             .read()?;
-        writebacks.push(Writeback {
-            allocation: attachment.allocation,
-            view: attachment.view,
-            offset: landed.offset,
-            bytes_hex: hex(&landed.bytes),
-        });
-        images_report.push(Allocation {
-            allocation: attachment.allocation,
-            bytes_hex: hex(&image),
-        });
+        let (writeback, observation) = attachment_observation(
+            case.expected_rule.as_deref(),
+            case.readback_windows.as_deref().unwrap_or_default(),
+            (
+                attachment.allocation,
+                attachment.view,
+                landed.offset,
+                attachment.width,
+            ),
+            &landed.bytes,
+            &image,
+        )?;
+        writebacks.push(writeback);
+        images_report.push(observation);
     }
     // The stored depth attachment's own landing (`research/docs/23` §3.3,
     // v43/v44), reported exactly as the trace rail reports it: the object API's
@@ -9082,16 +9608,13 @@ fn run_object_render_case(
                 .get(&allocation)
                 .ok_or("the depth allocation is missing")?
                 .read()?;
-            writebacks.push(Writeback {
+            writebacks.push(Writeback::encoded(
                 allocation,
                 view,
-                offset: landed.offset,
-                bytes_hex: hex(&landed.bytes),
-            });
-            images_report.push(Allocation {
-                allocation,
-                bytes_hex: hex(&image),
-            });
+                landed.offset,
+                &landed.bytes,
+            ));
+            images_report.push(Allocation::observed(allocation, &image));
         }
     }
     // The stored stencil attachment's own landing (`research/docs/23` §3.3,
@@ -9147,16 +9670,13 @@ fn run_object_render_case(
                 .get(&allocation)
                 .ok_or("the stencil allocation is missing")?
                 .read()?;
-            writebacks.push(Writeback {
+            writebacks.push(Writeback::encoded(
                 allocation,
                 view,
-                offset: landed.offset,
-                bytes_hex: hex(&landed.bytes),
-            });
-            images_report.push(Allocation {
-                allocation,
-                bytes_hex: hex(&image),
-            });
+                landed.offset,
+                &landed.bytes,
+            ));
+            images_report.push(Allocation::observed(allocation, &image));
         }
     }
     eprintln!(
@@ -9165,7 +9685,7 @@ fn run_object_render_case(
         attachments.len(),
         writebacks
             .iter()
-            .map(|writeback| writeback.bytes_hex.len())
+            .map(Writeback::observed_bytes)
             .sum::<usize>()
     );
     Ok(CaseResult {
@@ -9198,7 +9718,7 @@ fn run_case(
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut recorded = BTreeSet::new();
     for buffer in &case.buffers {
-        let initial = unhex(&buffer.initial_hex)?;
+        let initial = buffer.initial_bytes()?;
         let start = usize::try_from(buffer.offset)?;
         let position = match allocations
             .iter()
@@ -9451,10 +9971,7 @@ fn run_case(
         writebacks,
         allocations: allocations
             .into_iter()
-            .map(|(allocation, bytes)| Allocation {
-                allocation,
-                bytes_hex: hex(&bytes),
-            })
+            .map(|(allocation, bytes)| Allocation::observed(allocation, &bytes))
             .collect(),
         copy_in: None,
         copy_out: None,
@@ -9478,7 +9995,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 
 fn verified_source(directory: &Path, source: &Source) -> Result<Vec<u8>> {
     let path = directory.join(&source.path);
-    let bytes = read_bounded(&path, MAX_BYTES)?;
+    let bytes = read_bounded(&path, MAX_SOURCE_BYTES)?;
     if hex(&Sha256::digest(&bytes)) != source.sha256 {
         return Err(format!("source digest mismatch: {}", path.display()).into());
     }
@@ -9521,6 +10038,82 @@ mod tests {
             .into_iter()
             .find(|case| case.id == id)
             .expect("the reviewed case exists")
+    }
+
+    /// The reviewed rule's own arithmetic (R5a, `research/docs/23` §73).
+    ///
+    /// The texels are spelled out by hand rather than read back from the
+    /// helper, so a moved channel or a swapped axis fails here instead of
+    /// silently changing what every capture of the wide case reports.
+    #[test]
+    fn the_reviewed_rule_is_the_texel_coordinates_little_endian() {
+        for (x, y, expect) in [
+            (0_u64, 0_u64, [0x00, 0x00, 0x00, 0x00]),
+            (1, 0, [0x01, 0x00, 0x00, 0x00]),
+            (0, 1, [0x00, 0x00, 0x01, 0x00]),
+            (255, 3, [0xff, 0x00, 0x03, 0x00]),
+            (256, 3, [0x00, 0x01, 0x03, 0x00]),
+            (2047, 2047, [0xff, 0x07, 0xff, 0x07]),
+        ] {
+            assert_eq!(
+                rule_texel(XY_U16LE_V1, x, y).unwrap(),
+                expect,
+                "texel ({x}, {y})"
+            );
+        }
+        // A rule that is not the reviewed one is refused by name, and the
+        // addressing ceiling is the rule's own: both coordinates travel as
+        // `u16`s, so a wider axis could not be spelled injectively.
+        assert!(rule_texel("other_rule", 0, 0).is_err());
+        assert!(rule_texel(XY_U16LE_V1, RULE_ADDRESS_CEILING, 0).is_err());
+    }
+
+    /// The closed-form clear check: the rule reaches a colour exactly when the
+    /// `x` and `y` its halves name are inside the extent.
+    #[test]
+    fn the_rule_reaches_exactly_the_colours_inside_the_window() {
+        let texel = rule_texel(XY_U16LE_V1, 5, 7).unwrap();
+        assert!(rule_reaches_colour(XY_U16LE_V1, &texel, 2048, 2048).unwrap());
+        // One axis outside the window is enough: the same colour is a texel of
+        // a wider plane only.
+        assert!(!rule_reaches_colour(XY_U16LE_V1, &texel, 5, 2048).unwrap());
+        assert!(!rule_reaches_colour(XY_U16LE_V1, &texel, 2048, 7).unwrap());
+        assert!(rule_reaches_colour(XY_U16LE_V1, &[0x00, 0x00, 0x01, 0x00], 2048, 2048).unwrap());
+    }
+
+    /// One changed texel of the wide plane changes the digest the capture
+    /// reports, and a window that leaves the plane is refused instead of
+    /// reported.
+    #[test]
+    fn one_changed_texel_changes_the_reported_digest() {
+        let plane = rule_bytes(XY_U16LE_V1, 2048, 2048).unwrap();
+        assert_eq!(plane.len(), 2048 * 2048 * 4);
+        let digest = plane_sha256(&plane);
+        let mut changed = plane.clone();
+        // The second byte of the texel at (1024, 1024): only the digest can
+        // catch it, which is what the wide case's observation rests on.
+        changed[(1024 * 2048 + 1024) * 4 + 1] ^= 0x01;
+        assert_ne!(plane_sha256(&changed), digest);
+        assert_ne!(changed, plane);
+
+        let window = ReadbackWindowDefinition {
+            x: 1984,
+            y: 1984,
+            width: 64,
+            height: 64,
+        };
+        let observed = window.observe(&plane, 2048).unwrap();
+        assert_eq!(observed.bytes_hex.len(), 64 * 64 * 4 * 2);
+        assert!(observed
+            .bytes_hex
+            .starts_with(&hex(&rule_texel(XY_U16LE_V1, 1984, 1984).unwrap())));
+        let outside = ReadbackWindowDefinition {
+            x: 1984,
+            y: 1984,
+            width: 65,
+            height: 64,
+        };
+        assert!(outside.observe(&plane, 2048).is_err());
     }
 
     #[test]
@@ -9652,7 +10245,7 @@ mod tests {
         s.cases[0].buffers[0].offset = u64::MAX;
         assert!(validate_suite(&s).is_err());
         let mut s = suite();
-        s.cases[0].buffers[0].initial_hex = "00".into();
+        s.cases[0].buffers[0].initial_hex = Some("00".into());
         assert!(validate_suite(&s).is_err());
         let mut s = suite();
         s.cases[0].buffers[0].allocation_size = u64::MAX;
@@ -10048,7 +10641,7 @@ mod tests {
                     length: buffer.length,
                     access: BufferAccess::Unused,
                     attribute_stride: None,
-                    source: BufferSource::OwnedBytes(unhex(&buffer.initial_hex).unwrap()),
+                    source: BufferSource::OwnedBytes(buffer.initial_bytes().unwrap()),
                 })
                 .collect::<Vec<_>>();
             let trace = case_trace(

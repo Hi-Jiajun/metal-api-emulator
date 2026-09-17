@@ -296,11 +296,13 @@ class RenderObservationTests(unittest.TestCase):
                 compare.validate_capture(suite, self.digest,
                                          synthetic_capture(suite, self.digest))
 
-        # The rail executes extents up to the reviewed ceiling from v27 on, and
-        # R1b (`research/docs/23` §70) widened that ceiling to 64 texels per
-        # axis; one texel beyond it is still an unadmitted shape.
-        rejected(lambda case: case["attachment"].update(width=65, height=65),
-                 "one to 64 texels per axis")
+        # The rail executes extents up to the reviewed ceiling from v27 on; R1b
+        # (`research/docs/23` §70) widened that ceiling to 64 texels per axis
+        # and R5a (§73) to 2048, but one texel beyond it is still an unadmitted
+        # shape.
+        over = compare.REVIEWED_ATTACHMENT_CEILING + 1
+        rejected(lambda case: case["attachment"].update(width=over, height=over),
+                 f"one to {compare.REVIEWED_ATTACHMENT_CEILING} texels per axis")
         # The comparator admits both 8-bit UNORM layouts from v21 on and the
         # single-channel float from v22 (`research/docs/23` §3.3/§15); the
         # integer format is still unadmitted, so it is the probe for "an

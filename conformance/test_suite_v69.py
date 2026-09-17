@@ -76,6 +76,7 @@ def full_capture(suite, overrides=None):
                 v28.msaa_edge_2x_result, v28.msaa_edge_8x_result,
                 v28.sampled_result,
                 v28.full_cover_16x16_result, v28.sampled_64_result,
+                v28.sampled_rule_2048_result,
                 v28.msaa_ds_result)
     for builder in builders:
         result = builder(True)

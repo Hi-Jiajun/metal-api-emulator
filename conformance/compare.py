@@ -7,6 +7,7 @@ It does not attest how a capture was produced or substitute for a native run.
 
 import argparse
 from collections import namedtuple
+import functools
 import hashlib
 import json
 from pathlib import Path
@@ -15,19 +16,31 @@ import struct
 import sys
 
 
-MAX_ALLOCATION_BYTES = 1_048_576
 MAX_SERIAL_RESOURCES = 64
 U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
-# The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70): the
-# window the render rails' fixtures measure. The rails declare the smaller of
-# this ceiling and the device's own framebuffer limit, so a fixture at the
-# ceiling is inside every conformant device's window (Vulkan's minimum
+# The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70; R5a,
+# §73): the window the render rails' fixtures measure. The rails declare the
+# smaller of this ceiling and the device's own framebuffer limit, so a fixture
+# at the ceiling is inside every conformant device's window (Vulkan's minimum
 # `maxFramebufferWidth` is 4096; Metal's 2D texture ceiling is 16384) and the
 # boundary case below runs unconditionally. A wider extent is a deliberate
 # change that owes a boundary fixture at the new value, in all three review
 # surfaces.
-REVIEWED_ATTACHMENT_CEILING = 64
+REVIEWED_ATTACHMENT_CEILING = 2048
+# The largest byte extent one declared view may carry: the reviewed window's own
+# attachment (`REVIEWED_ATTACHMENT_CEILING`² texels of four bytes). R5a (§73)
+# derives the cap from the reviewed window so the wide case's declaring view is
+# admitted while the guard keeps an unchecked suite from asking for more than
+# the review measured.
+MAX_ALLOCATION_BYTES = REVIEWED_ATTACHMENT_CEILING * REVIEWED_ATTACHMENT_CEILING * 4
+# The largest allocation image a capture spells out as hex (R5a,
+# `research/docs/23` §73). A wider image is reported as its digest: the wide
+# attachment's declaring view is 16 MiB, so its image would be 32 MiB of hex in
+# every capture of the suite, and this comparator recomputes the digest from the
+# suite's own declarations. Narrower images keep their bytes, so the review of
+# every pre-R5a case is unchanged.
+MAX_VERBATIM_ALLOCATION_BYTES = 1_048_576
 ALLOCATION_OBSERVATIONS = {
     "native-metal": "gpu-buffer-readback",
     "vulkan": "host-writeback-landing",
@@ -35,6 +48,125 @@ ALLOCATION_OBSERVATIONS = {
     "vulkan-objects": "host-writeback-landing",
     "native-metal-provider-objects": "host-writeback-landing",
 }
+
+# The reviewed per-texel rule of the wide attachment (R5a, `research/docs/23`
+# §73): texel `(x, y)` carries `x` and `y` as two little-endian `u16`s, i.e.
+# `[x & 0xff, (x >> 8) & 0xff, y & 0xff, (y >> 8) & 0xff]`. The rule is how a
+# 2048x2048 fixture states its expectation — four million texels of hex is what
+# it replaces — and it is injective over any window up to `RULE_ADDRESS_CEILING`
+# texels per axis, so a flipped, transposed or row-shifted readback differs from
+# it. The three review surfaces implement this one function: this comparator,
+# `examples/metal-smoke/src/bin/provider-capture.rs` and
+# `conformance/NativeOracle.swift`.
+XY_U16LE_V1 = "xy_u16le_v1"
+# The smallest extent a rule expectation is admissible at: the rule form exists
+# for the megapixel-class attachments whose hex spelling the fixture cannot
+# carry, so a small case keeps stating its texels.
+RULE_MIN_DIMENSION = 1024
+# The largest extent the reviewed rule addresses: both coordinates travel as
+# little-endian `u16`s, so a wider axis could not be spelled injectively.
+RULE_ADDRESS_CEILING = 65_536
+# How many readback windows one rule-expected case may declare, and how wide
+# each may be: the capture reports these bytes as hex, so the reviewed shape
+# keeps them small (two 64x64 windows are 32 KiB of hex).
+MAX_READBACK_WINDOWS = 8
+MAX_READBACK_WINDOW_DIMENSION = 64
+
+
+def _rule_texel(rule, x, y):
+    """The four bytes the reviewed rule stores at texel `(x, y)`."""
+    if rule != XY_U16LE_V1:
+        raise CaptureError(f"unknown texel rule {rule!r}")
+    if not (0 <= x < RULE_ADDRESS_CEILING and 0 <= y < RULE_ADDRESS_CEILING):
+        raise CaptureError("the reviewed rule addresses at most "
+                           f"{RULE_ADDRESS_CEILING} texels per axis")
+    return struct.pack("<HH", x, y)
+
+
+@functools.lru_cache(maxsize=4)
+def _rule_plane(rule, width, height):
+    """The whole plane the reviewed rule describes, row-major."""
+    if rule != XY_U16LE_V1:
+        raise CaptureError(f"unknown texel rule {rule!r}")
+    if not (1 <= width <= RULE_ADDRESS_CEILING and 1 <= height <= RULE_ADDRESS_CEILING):
+        raise CaptureError("the reviewed rule addresses one to "
+                           f"{RULE_ADDRESS_CEILING} texels per axis")
+    # The rule's channels are the two halves of one texel address each, so a row
+    # is four strided copies: the x halves are fixed, the y halves are the row's
+    # own value in every column.
+    row = bytearray(width * 4)
+    row[0::4] = bytes(x & 0xFF for x in range(width))
+    row[1::4] = bytes((x >> 8) & 0xFF for x in range(width))
+    plane = bytearray()
+    for y in range(height):
+        row[2::4] = bytes([y & 0xFF]) * width
+        row[3::4] = bytes([(y >> 8) & 0xFF]) * width
+        plane += row
+    return bytes(plane)
+
+
+@functools.lru_cache(maxsize=4)
+def _rule_digest(rule, width, height):
+    """The SHA-256 of the plane the rule describes, as the capture reports it."""
+    return hashlib.sha256(_rule_plane(rule, width, height)).hexdigest()
+
+
+def _rule_reaches_colour(rule, colour, width, height):
+    """Whether a four-byte colour is one of the rule's texels over this window.
+
+    The closed form of the rule's own injectivity: the first two bytes are a
+    little-endian `x` and the last two a little-endian `y`, so the rule reaches
+    the colour exactly when both addresses are inside the extent. A clear colour
+    the rule reaches would let a rail that ignored the draw land bytes the
+    expectation claims, which is why it is refused without scanning the plane.
+    """
+    if rule != XY_U16LE_V1:
+        raise CaptureError(f"unknown texel rule {rule!r}")
+    if len(colour) != 4:
+        raise CaptureError("a clear colour is four bytes")
+    x = int.from_bytes(colour[:2], "little")
+    y = int.from_bytes(colour[2:], "little")
+    return x < width and y < height
+
+
+def _rule_window_bytes(rule, window):
+    """One declared readback window's expected bytes, tightly packed rows."""
+    x, y, width, height = window
+    out = bytearray()
+    for row in range(height):
+        for column in range(width):
+            out += _rule_texel(rule, x + column, y + row)
+    return bytes(out)
+
+
+def _readback_windows(case, rule, width, height, where):
+    """Parse one rule-expected case's readback windows.
+
+    Each window is a rectangle inside the attachment plane; the tuple carries
+    its own expected bytes, so the capture's reported bytes are compared texel
+    for texel instead of being trusted as "the digest was right".
+    """
+    windows = _list(case.get("readback_windows"), f"{where}.readback_windows")
+    _require(windows, f"{where}: a rule-expected attachment needs its readback windows")
+    _require(len(windows) <= MAX_READBACK_WINDOWS,
+             f"{where}.readback_windows: one to {MAX_READBACK_WINDOWS} windows")
+    parsed = []
+    for index, window in enumerate(windows):
+        window_where = f"{where}.readback_windows[{index}]"
+        _require(isinstance(window, dict), f"{window_where}: expected an object")
+        _require(set(window) == {"x", "y", "width", "height"},
+                 f"{window_where}: expected x, y, width and height")
+        x = _integer(window["x"], f"{window_where}.x")
+        y = _integer(window["y"], f"{window_where}.y")
+        window_width = _integer(window["width"], f"{window_where}.width", 1,
+                                MAX_READBACK_WINDOW_DIMENSION)
+        window_height = _integer(window["height"], f"{window_where}.height", 1,
+                                 MAX_READBACK_WINDOW_DIMENSION)
+        _require(x + window_width <= width and y + window_height <= height,
+                 f"{window_where}: the readback window leaves the attachment plane")
+        parsed.append((x, y, window_width, window_height,
+                       _rule_window_bytes(rule, (x, y, window_width, window_height))))
+    return tuple(parsed)
 
 # The attachment observation a render case has to land
 # (`research/docs/23` §1.1, §5.2). `writes` and `allocations` are the same
@@ -60,8 +192,16 @@ ALLOCATION_OBSERVATIONS = {
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
-    "stencil_filter sample_count_gate texture_uploads",
-    defaults=(None, None, None, None))
+    "stencil_filter sample_count_gate texture_uploads rule",
+    defaults=(None, None, None, None, None))
+
+# One rule-expected attachment (R5a, `research/docs/23` §73): the rule's name,
+# the extent it covers, the digest of the whole plane the rule describes, and
+# the declared readback windows as `(x, y, width, height, bytes)`. A capture
+# cannot report four million texels of hex, so this is the observation the
+# comparator checks: the reported `bytes_sha256` has to be `digest`, and every
+# window's reported bytes have to equal its own `bytes` entry, texel for texel.
+RuleExpectation = namedtuple("RuleExpectation", "rule width height digest windows")
 
 # One render case's present section: the target mode and image count the first
 # increment fixes, the counts a capture has to report, and the sentinel the
@@ -139,6 +279,33 @@ def _list(value, where):
     return value
 
 
+def _buffer_initial_bytes(buffer, where, allocation, view, length):
+    """The bytes one declared buffer view is pre-seeded with.
+
+    R5a (`research/docs/23` §73) adds the repeated-pattern form for the wide
+    attachment's declaring view: the view is 16 MiB, so spelling its fill out
+    would put 32 MiB of hex in the fixture. The fixture states one pattern and
+    the view length it repeats to, and exactly one of the two forms is present,
+    so a declaration cannot carry a pattern beside bytes that disagree with it.
+    """
+    has_hex = "initial_hex" in buffer
+    has_repeat = "initial_repeat_hex" in buffer
+    _require(has_hex != has_repeat,
+             f"{where}: view {view} needs exactly one of initial_hex and "
+             "initial_repeat_hex")
+    if has_hex:
+        initial = _hex(buffer["initial_hex"], f"{where} allocation {allocation}.initial_hex")
+        _require(len(initial) == length, f"{where}: initial length does not match view {view}")
+        return initial
+    pattern = _hex(buffer["initial_repeat_hex"],
+                   f"{where} allocation {allocation}.initial_repeat_hex")
+    _require(pattern, f"{where}: an initial repeat pattern is at least one byte")
+    _require(length % len(pattern) == 0,
+             f"{where}: the initial repeat pattern of {len(pattern)} bytes does not divide "
+             f"view {view}'s {length} bytes")
+    return pattern * (length // len(pattern))
+
+
 def _same_bytes(actual, expected, where, offset=0, wildcards=frozenset(), allowed=None):
     """Compare two byte strings against the case's claim on each byte.
 
@@ -211,25 +378,64 @@ def _compare_observation(result, expected_writes, expected_allocations, where,
 
     seen_allocations = set()
     for value in _list(result["allocations"], f"{where}.allocations"):
-        _object(value, ("allocation", "bytes_hex"), f"{where} allocation")
-        allocation = _integer(value["allocation"], f"{where}.allocation")
+        _require(isinstance(value, dict), f"{where} allocation: expected an object")
+        allocation = _integer(value.get("allocation"), f"{where}.allocation")
         _require(allocation not in seen_allocations, f"{where}: duplicate allocation {allocation}")
         _require(allocation in expected_allocations, f"{where}: unknown allocation {allocation}")
         seen_allocations.add(allocation)
-        actual = _hex(value["bytes_hex"], f"{where} allocation {allocation}.bytes_hex")
-        skipped, allowed = set(), {}
-        for identity, claims in wildcards.items():
-            if identity[0] != allocation:
-                continue
-            for position, candidates in claims.items():
-                if candidates is None:
-                    skipped.add(position)
-                else:
-                    allowed[position] = candidates
-        _same_bytes(actual, expected_allocations[allocation],
-                    f"{where} allocation {allocation}", 0, frozenset(skipped), allowed)
+        _allocation_image(value, expected_allocations[allocation], allocation, where, wildcards)
     missing = set(expected_allocations) - seen_allocations
     _require(not missing, f"{where}: missing allocations {sorted(missing)}")
+
+
+def _allocation_image(value, expected, allocation, where, wildcards):
+    """Compare one reported allocation image against the plan's own image.
+
+    A capture spells an image out as hex while it is at most
+    `MAX_VERBATIM_ALLOCATION_BYTES` wide, and reports the digest of anything
+    wider (R5a, `research/docs/23` §73): the wide attachment's declaring view is
+    16 MiB, so 32 MiB of hex would ride in every capture of the suite. The
+    digest is recomputed here from the plan's own image, so the form that avoids
+    the bytes is still a byte-for-byte check.
+    """
+    has_hex = "bytes_hex" in value
+    has_digest = "bytes_sha256" in value
+    _require(has_hex != has_digest,
+             f"{where} allocation {allocation}: exactly one of bytes_hex and bytes_sha256")
+    if has_digest:
+        _object(value, ("allocation", "bytes_sha256", "bytes_length"),
+                f"{where} allocation {allocation}")
+        length = _integer(value["bytes_length"],
+                          f"{where} allocation {allocation}.bytes_length", 1)
+        _require(length == len(expected),
+                 f"{where} allocation {allocation}: the reported length is not the image's")
+        _require(length > MAX_VERBATIM_ALLOCATION_BYTES,
+                 f"{where} allocation {allocation}: only an image wider than "
+                 f"{MAX_VERBATIM_ALLOCATION_BYTES} bytes is reported by digest")
+        digest = value["bytes_sha256"]
+        _require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+                 f"{where} allocation {allocation}: expected the image's lowercase SHA-256")
+        expected_digest = hashlib.sha256(expected).hexdigest()
+        _require(digest == expected_digest,
+                 f"{where} allocation {allocation}: the image's digest {digest} is not the "
+                 f"plan's {expected_digest}: one byte of the {length}-byte image differs")
+        return
+    _object(value, ("allocation", "bytes_hex"), f"{where} allocation {allocation}")
+    actual = _hex(value["bytes_hex"], f"{where} allocation {allocation}.bytes_hex")
+    _require(len(actual) <= MAX_VERBATIM_ALLOCATION_BYTES,
+             f"{where} allocation {allocation}: an image wider than "
+             f"{MAX_VERBATIM_ALLOCATION_BYTES} bytes is reported by digest")
+    skipped, allowed = set(), {}
+    for identity, claims in wildcards.items():
+        if identity[0] != allocation:
+            continue
+        for position, candidates in claims.items():
+            if candidates is None:
+                skipped.add(position)
+            else:
+                allowed[position] = candidates
+    _same_bytes(actual, expected,
+                f"{where} allocation {allocation}", 0, frozenset(skipped), allowed)
 
 
 def _writeback(value, where):
@@ -238,6 +444,98 @@ def _writeback(value, where):
     data = _hex(value["bytes_hex"], f"{where}.bytes_hex")
     _require(data, f"{where}: empty writeback")
     return identity, data
+
+
+def _rule_plane_field(value, rule, where):
+    """Check one reported plane against the rule it claims to observe.
+
+    Both forms carry the plane's own byte length and SHA-256; the digest is
+    recomputed from the rule here, so a capture cannot pass by reporting a
+    digest of the bytes it was *asked* for: the two agree only if the bytes the
+    rail landed are the rule's own plane (`research/docs/23` §73).
+    """
+    length = _integer(value["bytes_length"], f"{where}.bytes_length", 1)
+    _require(length == rule.width * rule.height * 4,
+             f"{where}: the plane's length does not match the rule's extent")
+    digest = value["bytes_sha256"]
+    _require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+             f"{where}: expected the plane's lowercase SHA-256")
+    _require(digest == rule.digest,
+             f"{where}: the plane's digest {digest} is not the {rule.rule} plane's "
+             f"{rule.digest}: one texel of the {rule.width}x{rule.height} attachment differs")
+
+
+def _rule_window(observed, window, rule, window_where):
+    """Check one reported readback window against the rule, texel for texel."""
+    _object(observed, ("x", "y", "width", "height", "bytes_hex"), window_where)
+    x = _integer(observed["x"], f"{window_where}.x")
+    y = _integer(observed["y"], f"{window_where}.y")
+    width = _integer(observed["width"], f"{window_where}.width", 1)
+    height = _integer(observed["height"], f"{window_where}.height", 1)
+    _require((x, y, width, height) == window[:4],
+             f"{window_where}: the reported rectangle is not the one the suite declares")
+    expected = window[4]
+    actual = _hex(observed["bytes_hex"], f"{window_where}.bytes_hex")
+    _require(len(actual) == len(expected),
+             f"{window_where}: the reported bytes do not match the window's extent")
+    for texel in range(width * height):
+        chunk = slice(texel * 4, texel * 4 + 4)
+        if actual[chunk] != expected[chunk]:
+            column = x + texel % width
+            row = y + texel // width
+            raise CaptureError(
+                f"{window_where}: texel ({column}, {row}) reads {actual[chunk].hex()}, the "
+                f"{rule.rule} rule stores {expected[chunk].hex()}")
+
+
+def _compare_rule_observation(result, expectation, where):
+    """Check one rule-expected attachment's digest-and-windows observation.
+
+    The capture cannot carry four million texels, so the observation is the
+    plane's SHA-256 plus the declared readback windows' bytes
+    (`research/docs/23` §73). The digest is recomputed from the rule, and the
+    windows are compared texel for texel, so a single wrong texel anywhere in
+    the plane changes the digest and a single wrong texel inside a window is
+    named by its coordinates.
+    """
+    rule = expectation.rule
+    attachments = expectation.attachment
+    if isinstance(attachments, tuple):
+        attachments = [attachments]
+    identities = []
+    for value in _list(result["writebacks"], f"{where}.writebacks"):
+        _object(value, ("allocation", "view", "offset", "bytes_sha256", "bytes_length",
+                        "observed_windows"), f"{where} writeback")
+        identity = tuple(_integer(value[key], f"{where} writeback.{key}")
+                         for key in ("allocation", "view", "offset"))
+        _require(identity not in identities, f"{where}: duplicate writeback {identity}")
+        identities.append(identity)
+        _rule_plane_field(value, rule, f"{where} writeback {identity}")
+        observed_windows = _list(value["observed_windows"],
+                                 f"{where} writeback.observed_windows")
+        _require(len(observed_windows) == len(rule.windows),
+                 f"{where} writeback: the capture has to report the "
+                 f"{len(rule.windows)} readback windows the suite declares")
+        for index, (window, observed) in enumerate(zip(rule.windows, observed_windows)):
+            _rule_window(observed, window, rule, f"{where} writeback window[{index}]")
+    _require(set(identities) == {attachment[:3] for attachment in attachments},
+             f"{where}: the attachment writebacks have to be exactly the declared "
+             "attachments")
+    _require(identities == [attachment[:3] for attachment in attachments],
+             f"{where}: writeback order differs from suite")
+
+    seen = set()
+    for value in _list(result["allocations"], f"{where}.allocations"):
+        _object(value, ("allocation", "bytes_sha256", "bytes_length"),
+                f"{where} allocation")
+        allocation = _integer(value["allocation"], f"{where}.allocation")
+        _require(allocation not in seen, f"{where}: duplicate allocation {allocation}")
+        _require(allocation in expectation.allocations,
+                 f"{where}: unknown allocation {allocation}")
+        seen.add(allocation)
+        _rule_plane_field(value, rule, f"{where} allocation {allocation}")
+    missing = set(expectation.allocations) - seen
+    _require(not missing, f"{where}: missing allocations {sorted(missing)}")
 
 
 def _present_observation(value, expectation, where):
@@ -462,8 +760,7 @@ def _suite_plan(suite):
             _require(access in ("read", "write", "read_write"), f"{where}: unknown buffer access")
             _require(view not in views and binding not in bindings, f"{where}: duplicate view or binding")
             _require(offset + length <= size, f"{where}: buffer view outside allocation {allocation}")
-            initial = _hex(buffer.get("initial_hex"), f"{where} allocation {allocation}.initial_hex")
-            _require(len(initial) == length, f"{where}: initial length does not match view {view}")
+            initial = _buffer_initial_bytes(buffer, where, allocation, view, length)
             if allocation not in allocations:
                 allocations[allocation] = bytearray([guard]) * size
                 initial_ranges[allocation] = []
@@ -1633,6 +1930,7 @@ def _render_plan(plan, suite):
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "wildcard_allowed_texels",
                                "base_vertex", "fragment_textures",
+                               "expected_rule", "readback_windows",
                                "depth", "depth_test", "coverage", "cull", "blend",
                                "stencil", "stencil_test", "multisample", "depth_resolve",
                                "requires_depth_resolve_filter", "stencil_resolve",
@@ -1650,7 +1948,7 @@ def _render_plan(plan, suite):
         _require(single != multiple or no_colour,
                  f"{where}: exactly one of attachment and attachments is required")
         if single:
-            _require("expected_hex" in case or "depth" in case,
+            _require("expected_hex" in case or "expected_rule" in case or "depth" in case,
                      f"{where}: missing fields expected_hex")
         elif multiple:
             _require("expected_hex" not in case,
@@ -1719,7 +2017,7 @@ def _render_plan(plan, suite):
             texture = textures[0]
             _require(isinstance(texture, dict), f"{texture_where}: expected an object")
             _require(set(texture).issubset({"allocation", "view", "format", "width",
-                                            "height", "initial_hex"}),
+                                            "height", "initial_hex", "texel_rule"}),
                      f"{texture_where}: unexpected fields")
             _require(_integer(texture.get("allocation"), f"{texture_where}.allocation") > 0
                      and _integer(texture.get("view"), f"{texture_where}.view") > 0,
@@ -1736,25 +2034,60 @@ def _render_plan(plan, suite):
                      and attachment.get("store", "store") == "store",
                      f"{texture_where}: the reviewed sampling shape clears and stores "
                      "its attachment")
-            texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
-            expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
-            _require(expected == texels,
-                     f"{where}: the expectation has to be the uploaded texels: the "
-                     "sampling stage's sample at a texel centre is an identity copy")
-            chunks = [texels[offset:offset + 4] for offset in range(0, len(texels), 4)]
             texture_width = _integer(texture.get("width"), f"{texture_where}.width", 1)
             texture_height = _integer(texture.get("height"), f"{texture_where}.height", 1)
-            _require(len(chunks) == texture_width * texture_height,
-                     f"{texture_where}: the uploaded texels do not match the extent")
-            _require(len(set(chunks)) == len(chunks),
-                     f"{texture_where}: the uploaded texels have to be pairwise distinct, "
-                     "or a repeated read could pass")
             clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
             _require(len(clear) == 4,
                      f"{where}.attachment.clear_hex: a clear colour is four bytes")
-            _require(clear not in chunks,
-                     f"{texture_where}: an uploaded texel equals the clear colour, so a "
-                     "rail that ignored the texture could pass")
+            if "texel_rule" in texture:
+                # The rule form (R5a, `research/docs/23` §73): the texture's
+                # texels and the attachment's expectation are one function of
+                # the texel coordinates, because the sampling stage's sample at
+                # a texel centre is an identity copy. The rule has to stay
+                # injective over the extent it addresses and the clear colour has
+                # to stay outside its reach — the closed-form siblings of the
+                # distinctness rules the hex form is held to below.
+                rule = _string(texture["texel_rule"], f"{texture_where}.texel_rule")
+                _require(rule == XY_U16LE_V1,
+                         f"{texture_where}: unknown texel rule {rule!r}")
+                _require(case.get("expected_rule") == rule,
+                         f"{where}: the expectation has to be the texture's own rule: the "
+                         "sampling stage's sample at a texel centre is an identity copy")
+                _require("initial_hex" not in texture,
+                         f"{texture_where}: a rule texture carries no initial_hex")
+                _require("expected_hex" not in case,
+                         f"{where}: a rule expectation carries no expected_hex")
+                _require(texture_width >= RULE_MIN_DIMENSION
+                         and texture_height >= RULE_MIN_DIMENSION,
+                         f"{texture_where}: a texel rule is the megapixel form; "
+                         f"{texture_width}x{texture_height} states its texels instead")
+                _require(texture_width <= RULE_ADDRESS_CEILING
+                         and texture_height <= RULE_ADDRESS_CEILING,
+                         f"{texture_where}: the reviewed rule addresses at most "
+                         f"{RULE_ADDRESS_CEILING} texels per axis")
+                _require(not _rule_reaches_colour(rule, clear, texture_width, texture_height),
+                         f"{where}.attachment: a rule texel equals the clear colour, so a "
+                         "rail that ignored the draw could pass")
+            else:
+                _require("expected_rule" not in case,
+                         f"{where}: a rule expectation travels with the texture's own "
+                         "texel rule")
+                _require("readback_windows" not in case,
+                         f"{where}: readback windows travel with the texture's own texel rule")
+                texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
+                expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
+                _require(expected == texels,
+                         f"{where}: the expectation has to be the uploaded texels: the "
+                         "sampling stage's sample at a texel centre is an identity copy")
+                chunks = [texels[offset:offset + 4] for offset in range(0, len(texels), 4)]
+                _require(len(chunks) == texture_width * texture_height,
+                         f"{texture_where}: the uploaded texels do not match the extent")
+                _require(len(set(chunks)) == len(chunks),
+                         f"{texture_where}: the uploaded texels have to be pairwise distinct, "
+                         "or a repeated read could pass")
+                _require(clear not in chunks,
+                         f"{texture_where}: an uploaded texel equals the clear colour, so a "
+                         "rail that ignored the texture could pass")
 
         vertex_input = _vertex_input_declaration(case, where)
         # The single attachment form spells its expectation at the case level —
@@ -1765,7 +2098,8 @@ def _render_plan(plan, suite):
         # be stated once that declaration is parsed.
         depth_landing = vertex_input is not None and vertex_input.get("depth_store") is not None
         if single and not depth_landing:
-            _require("expected_hex" in case, f"{where}: missing fields expected_hex")
+            _require("expected_hex" in case or "expected_rule" in case,
+                     f"{where}: missing fields expected_hex")
         if vertex_input is None:
             _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
             _require(not multiple,
@@ -2060,6 +2394,7 @@ def _render_plan(plan, suite):
                      f"{where}: the reviewed multisample shapes carry no base vertex")
         expected_bytes = []
         parsed = []
+        rule_expectation = None
         for position, attachment in enumerate(definitions):
             attachment_where = (f"{where}.attachment" if single
                                 else f"{where}.attachments[{position}]")
@@ -2165,6 +2500,33 @@ def _render_plan(plan, suite):
             if multiple:
                 _require("expected_hex" in attachment,
                          f"{attachment_where}: a stored attachment needs expected_hex")
+            if case.get("expected_rule") is not None:
+                # The rule form (R5a, `research/docs/23` §73): the expectation
+                # is the reviewed function of the texel coordinates rather than
+                # four million texels of hex. The sampled-shape block above
+                # already held the rule, the extent and the clear colour to the
+                # rule's own admissibility; what this arm adds is the landing
+                # shape — the windows the capture reports, the single-attachment
+                # form, and the clearing load a rule-expected attachment has.
+                _require(single,
+                         f"{where}: the rule expectation belongs to the single attachment "
+                         "form")
+                _require(case.get("fragment_textures") is not None,
+                         f"{where}: a rule expectation is the reviewed sampling shape's")
+                _require(attachment.get("load") == "clear",
+                         f"{attachment_where}: a rule-expected attachment clears")
+                _require("initial_hex" not in attachment,
+                         f"{attachment_where}: a cleared attachment carries no initial bytes")
+                rule = _string(case["expected_rule"], f"{where}.expected_rule")
+                rule_expectation = RuleExpectation(
+                    rule, width, height, _rule_digest(rule, width, height),
+                    _readback_windows(case, rule, width, height, where))
+                expected = _rule_plane(rule, width, height)
+                _require(len(expected) == extent,
+                         f"{attachment_where}: expected texel bytes do not match the attachment")
+                parsed.append((attachment, allocation, view, expected))
+                expected_bytes.append(expected)
+                continue
             expected = _hex(case["expected_hex"] if single else attachment.get("expected_hex"),
                             f"{attachment_where}.expected_hex")
             _require(len(expected) == extent,
@@ -2533,6 +2895,14 @@ def _render_plan(plan, suite):
             size = declared["allocation_size"]
             _require(offset + extent <= size,
                      f"{attachment_where}: the declaring view is outside its allocation")
+            # A rule-expected attachment reports the digest of its declaring
+            # allocation's whole image as well as the view's own plane, so the
+            # view has to *be* the image (`research/docs/23` §73): the R5a
+            # fixture declares offset 0 and a view that fills its allocation.
+            if rule_expectation is not None:
+                _require(offset == 0 and size == extent,
+                         f"{attachment_where}: a rule-expected attachment's declaring view "
+                         "has to be its whole allocation")
             # A discarded attachment's declaring view still takes part in the
             # touched count and in the declaration resolution, but its landing
             # never enters the observation surface: no writeback and no
@@ -2682,7 +3052,8 @@ def _render_plan(plan, suite):
             wildcards=wildcards,
             filter=requires_filter,
             stencil_filter=requires_stencil_filter,
-            sample_count_gate=requires_sample_count)
+            sample_count_gate=requires_sample_count,
+            rule=rule_expectation)
     return render_plan
 
 
@@ -2786,8 +3157,14 @@ def validate_capture(suite, digest, report, required_backend=None):
             # by a buffer writeback, and a buffer writeback cannot be reported
             # where the attachment belongs.
             expectation = render_plan[case_id]
-            _compare_observation(result, expectation.writes, expectation.allocations, where,
-                                 expectation.wildcards)
+            if expectation.rule is not None:
+                # A rule-expected attachment reports a digest and its windows
+                # instead of bytes (`research/docs/23` §73), so the byte-for-byte
+                # comparison is the rule's own.
+                _compare_rule_observation(result, expectation, where)
+            else:
+                _compare_observation(result, expectation.writes, expectation.allocations, where,
+                                     expectation.wildcards)
             attachments = expectation.attachment
             if isinstance(attachments, tuple):
                 attachments = [attachments]

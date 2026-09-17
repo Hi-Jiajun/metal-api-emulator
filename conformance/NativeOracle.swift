@@ -19,16 +19,28 @@ import Dispatch
 import Darwin
 
 private let maximumFileBytes = 1_048_576
-private let maximumAllocationBytes: UInt64 = 1_048_576
+/// The largest byte extent one declared view may carry: the reviewed window's
+/// own attachment, four bytes per texel (R5a, `research/docs/23` §73). The guard
+/// keeps an unchecked suite from asking the oracle for more bytes than the
+/// review measured, while the wide case's 2048x2048 declaring view is inside it.
+private let maximumAllocationBytes: UInt64 =
+    UInt64(reviewedAttachmentCeiling * reviewedAttachmentCeiling * 4)
+/// The largest allocation image a capture spells out as hex (R5a,
+/// `research/docs/23` §73). A wider image is reported as its digest: the wide
+/// attachment's declaring view is 16 MiB, so its image would be 32 MiB of hex in
+/// every capture of the suite, and the comparator recomputes the digest from the
+/// suite's own declarations. Narrower images keep their bytes, so the review of
+/// every pre-R5a case is unchanged.
+private let maximumVerbatimAllocationBytes = 1_048_576
 private let maximumPassCount = 8
-/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70): the
-/// window the oracle validates every render fixture against. The rails declare
-/// the smaller of this ceiling and their device's own framebuffer limit, so a
-/// fixture at the ceiling is inside every conformant device's window (Metal's
-/// 2D texture ceiling is 16384, and the Apple Paravirtual device this oracle
-/// runs on answers that). Widening it is a deliberate change that owes a
-/// boundary fixture at the new value, in all three review surfaces.
-private let reviewedAttachmentCeiling = 64
+/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70; R5a,
+/// §73): the window the oracle validates every render fixture against. The
+/// rails declare the smaller of this ceiling and their device's own framebuffer
+/// limit, so a fixture at the ceiling is inside every conformant device's
+/// window (Metal's 2D texture ceiling is 16384, and the Apple Paravirtual
+/// device this oracle runs on answers that). Widening it is a deliberate change
+/// that owes a boundary fixture at the new value, in all three review surfaces.
+private let reviewedAttachmentCeiling = 2048
 
 private struct OracleError: Error, CustomStringConvertible {
     let description: String
@@ -52,13 +64,104 @@ private struct BufferDefinition: Decodable {
     let length: UInt64
     let allocation_size: UInt64
     let access: String
-    let initial_hex: String
+    /// The view's initial bytes, spelled as hex: the form every pre-R5a buffer
+    /// carries. Exactly one of this field and `initial_repeat_hex` is present.
+    let initial_hex: String?
+    /// The view's initial bytes as one short pattern repeated to `length` (R5a,
+    /// `research/docs/23` §73): the wide attachment's declaring view is 16 MiB,
+    /// so spelling its fill out would put 32 MiB of hex in the fixture. The
+    /// pattern's length has to divide the view length.
+    let initial_repeat_hex: String?
+
+    /// The bytes this declaration pre-seeds its view with.
+    func initialBytes(context: String) throws -> Data {
+        switch (initial_hex, initial_repeat_hex) {
+        case let (hex?, nil):
+            let bytes = try decodeHex(hex, context: context)
+            try require(UInt64(bytes.count) == length,
+                        "\(context): initial data length mismatch")
+            return bytes
+        case let (nil, pattern?):
+            let unit = try decodeHex(pattern, context: "\(context).initial_repeat_hex")
+            try require(!unit.isEmpty,
+                        "\(context): an initial repeat pattern is at least one byte")
+            try require(length % UInt64(unit.count) == 0,
+                        "\(context): the initial repeat pattern of \(unit.count) bytes does "
+                        + "not divide the \(length) byte view")
+            var bytes = Data(capacity: Int(length))
+            for _ in 0..<(length / UInt64(unit.count)) {
+                bytes.append(unit)
+            }
+            return bytes
+        case (nil, nil):
+            throw OracleError("\(context): a view needs its initial bytes")
+        default:
+            throw OracleError("\(context): a view carries either initial_hex or "
+                              + "initial_repeat_hex, not both")
+        }
+    }
 }
 
-private struct Writeback: Codable {
+/// One writeback a *suite* expects from a compute case: the bytes the view has
+/// to land. The capture's own report shape below is not this one — its
+/// rule-expected form carries a digest instead of bytes — so the two are
+/// separate types and a report cannot be read back as a request.
+private struct ExpectedWriteback: Decodable {
     let allocation: UInt64
     let view: UInt64
     let offset: UInt64
+    let bytes_hex: String
+}
+
+/// One landed writeback: the bytes a view landed, or — for a rule-expected
+/// attachment (R5a, `research/docs/23` §73) — the digest of the whole plane
+/// plus the declared readback windows' own bytes.
+///
+/// The two forms are mutually exclusive, and the optional fields encode only
+/// when present, so a byte-form writeback keeps exactly the four keys every
+/// pre-R5a capture carries.
+private struct Writeback: Encodable {
+    let allocation: UInt64
+    let view: UInt64
+    let offset: UInt64
+    var bytes_hex: String?
+    var bytes_sha256: String?
+    var bytes_length: UInt64?
+    var observed_windows: [ObservedWindow]?
+
+    /// The byte form: what the view landed, verbatim.
+    init(allocation: UInt64, view: UInt64, offset: UInt64, bytes_hex: String) {
+        self.allocation = allocation
+        self.view = view
+        self.offset = offset
+        self.bytes_hex = bytes_hex
+        self.bytes_sha256 = nil
+        self.bytes_length = nil
+        self.observed_windows = nil
+    }
+
+    /// The rule form: the plane's digest plus the declared windows' bytes.
+    init(allocation: UInt64, view: UInt64, offset: UInt64, plane: Data,
+         rule: ValidatedRenderRule) {
+        self.allocation = allocation
+        self.view = view
+        self.offset = offset
+        self.bytes_hex = nil
+        self.bytes_sha256 = rule.digest
+        self.bytes_length = UInt64(plane.count)
+        self.observed_windows = rule.windows.map { window in
+            ObservedWindow(x: window.x, y: window.y, width: window.width,
+                           height: window.height, bytes_hex: hex(window.bytes))
+        }
+    }
+}
+
+/// One declared readback window's actual bytes (`research/docs/23` §73).
+private struct ObservedWindow: Encodable {
+    let x: UInt64
+    let y: UInt64
+    let width: UInt64
+    let height: UInt64
     let bytes_hex: String
 }
 
@@ -94,7 +197,7 @@ private struct CaseDefinition: Decodable {
     let metal: SourceDefinition
     let buffers: [BufferDefinition]
     let textures: [TextureDefinition]?
-    let expected_writebacks: [Writeback]
+    let expected_writebacks: [ExpectedWriteback]
     /// Which capture rails the suite marks this compute case executable on.
     /// `nil` keeps the pre-v15 shape: a case every rail owes. A case that
     /// carries a heap or indirect section is only executable on the rails its
@@ -133,14 +236,123 @@ private struct RenderSourcePin: Decodable, Equatable {
 /// `load` case keeps from its previous contents.
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
 /// view its texel bytes travel under, the extent the render area has to share
-/// with it, and the bytes themselves as hex.
+/// with it, and the bytes themselves — as hex for every pre-R5a case, or as a
+/// reviewed per-texel rule for the wide one (R5a, §73), where spelling four
+/// million texels out is what the rule replaces.
 private struct FragmentTextureDefinition: Decodable, Equatable {
     let allocation: UInt64
     let view: UInt64
     let format: String
     let width: Int
     let height: Int
-    let initial_hex: String
+    let initial_hex: String?
+    let texel_rule: String?
+
+    /// The texels this texture is uploaded with.
+    func texels(context: String) throws -> Data {
+        switch (initial_hex, texel_rule) {
+        case let (hex?, nil):
+            let bytes = try decodeHex(hex, context: context)
+            try require(bytes.count == width * height * 4,
+                        "\(context): the uploaded texels do not match the extent")
+            return bytes
+        case let (nil, rule?):
+            try require(rule == reviewedTexelRule,
+                        "\(context): unknown texel rule \"\(rule)\"")
+            return try reviewedRulePlane(width: width, height: height, context: context)
+        case (nil, nil):
+            throw OracleError("\(context): a texture needs its texels")
+        default:
+            throw OracleError("\(context): a texture carries either initial_hex or "
+                              + "texel_rule, not both")
+        }
+    }
+}
+
+/// One rectangle of a rule-expected attachment the suite asks the capture to
+/// report verbatim (R5a, `research/docs/23` §73). The rule covers the whole
+/// plane; the windows are where the comparator checks the bytes itself, because
+/// a digest alone would leave the per-texel rule unobservable in the capture.
+private struct ReadbackWindowDefinition: Decodable, Equatable {
+    let x: UInt64
+    let y: UInt64
+    let width: UInt64
+    let height: UInt64
+}
+
+/// The reviewed per-texel rule of the wide attachment (R5a, `research/docs/23`
+/// §73): texel `(x, y)` carries `x` and `y` as two little-endian `u16`s, i.e.
+/// `[x & 0xff, (x >> 8) & 0xff, y & 0xff, (y >> 8) & 0xff]`. It is injective
+/// over any window up to `ruleAddressCeiling` texels per axis, so a flipped,
+/// transposed or row-shifted readback differs from it — which is what lets a
+/// 2048x2048 attachment keep a byte-exact expectation without four million
+/// texels of hex.
+private let reviewedTexelRule = "xy_u16le_v1"
+/// The smallest extent a rule expectation is admissible at: the rule form
+/// exists for the megapixel-class attachments whose hex spelling the fixture
+/// cannot carry, so a small case keeps stating its texels.
+private let ruleMinDimension = 1024
+/// The largest extent the reviewed rule addresses: both coordinates travel as
+/// little-endian `u16`s, so a wider axis could not be spelled injectively.
+private let ruleAddressCeiling = 65_536
+/// How many readback windows one rule-expected case may declare, and how wide
+/// each may be: the capture reports these bytes as hex, so the reviewed shape
+/// keeps them small (two 64x64 windows are 32 KiB of hex).
+private let maximumReadbackWindows = 8
+private let maximumReadbackWindowDimension: UInt64 = 64
+
+/// The four bytes the reviewed rule stores at one texel.
+private func reviewedRuleTexel(x: Int, y: Int) -> Data {
+    Data([UInt8(x & 0xff), UInt8((x >> 8) & 0xff),
+          UInt8(y & 0xff), UInt8((y >> 8) & 0xff)])
+}
+
+/// The whole plane the reviewed rule describes, row-major.
+private func reviewedRulePlane(width: Int, height: Int, context: String) throws -> Data {
+    try require(width >= 1 && height >= 1
+                && width <= ruleAddressCeiling && height <= ruleAddressCeiling,
+                "\(context): the reviewed rule addresses one to \(ruleAddressCeiling) "
+                + "texels per axis")
+    var plane = Data(capacity: width * height * 4)
+    for y in 0..<height {
+        for x in 0..<width {
+            plane.append(reviewedRuleTexel(x: x, y: y))
+        }
+    }
+    return plane
+}
+
+/// One declared readback window's expected bytes, tightly packed rows.
+private func reviewedRuleWindowBytes(_ window: ReadbackWindowDefinition) -> Data {
+    var bytes = Data(capacity: Int(window.width * window.height) * 4)
+    for row in 0..<window.height {
+        for column in 0..<window.width {
+            bytes.append(reviewedRuleTexel(x: Int(window.x + column),
+                                           y: Int(window.y + row)))
+        }
+    }
+    return bytes
+}
+
+/// Whether a four-byte colour is one of the rule's texels over this window.
+///
+/// The closed form of the rule's own injectivity: the first two bytes are a
+/// little-endian `x` and the last two a little-endian `y`, so the rule reaches
+/// the colour exactly when both addresses are inside the extent. A clear colour
+/// the rule reaches would let a pass that ignored the draw land bytes the
+/// expectation claims, which is why it is refused without scanning the plane.
+private func reviewedRuleReaches(colour: Data, width: Int, height: Int) -> Bool {
+    guard colour.count == 4 else { return false }
+    let bytes = [UInt8](colour)
+    let x = Int(bytes[0]) | (Int(bytes[1]) << 8)
+    let y = Int(bytes[2]) | (Int(bytes[3]) << 8)
+    return x < width && y < height
+}
+
+/// The lowercase SHA-256 of one byte plane: the digest form the capture reports
+/// for a rule-expected attachment.
+private func planeSHA256(_ plane: Data) -> String {
+    SHA256.hash(data: plane).map { String(format: "%02x", $0) }.joined()
 }
 
 private struct RenderAttachmentDefinition: Decodable {
@@ -456,6 +668,16 @@ private struct RenderCaseDefinition: Decodable {
     /// The single-attachment case's expectation. An MRT case leaves this
     /// absent and spells the expectation on each attachment entry instead.
     let expected_hex: String?
+    /// The rule the single attachment's own bytes follow, when the case cannot
+    /// spell them (R5a, `research/docs/23` §73). It is the reviewed sampling
+    /// shape's identity rule restated: the fragment stage copies the bound
+    /// texture texel for texel, so the expectation is the same rule the texture
+    /// carries.
+    let expected_rule: String?
+    /// The rectangles of a rule-expected attachment the capture reports
+    /// verbatim (R5a, `research/docs/23` §73), in the order the comparator
+    /// checks them. Required exactly when `expected_rule` is present.
+    let readback_windows: [ReadbackWindowDefinition]?
     /// The coverage claim (`research/docs/23` §3.3, v38): `"partial"` says the
     /// pass's single draw covers only part of the attachment, so the
     /// expectation states the texels the draw missed as the colour the clear
@@ -687,6 +909,28 @@ private struct ValidatedRenderAttachment {
     /// both take it, so the case's expected texels pin which channel order the
     /// attachment is observing.
     let pixelFormat: MTLPixelFormat
+    /// The rule this attachment's expectation follows, or `nil` for the byte
+    /// form every pre-R5a case carries (`research/docs/23` §73). A rule-expected
+    /// attachment reports the plane's digest and its declared windows instead of
+    /// four million texels, and the digest is the one this field holds.
+    let rule: ValidatedRenderRule?
+}
+
+/// The rule one attachment's expectation follows (R5a, `research/docs/23` §73):
+/// the digest of the whole plane the rule describes, and the declared readback
+/// windows with their own expected bytes.
+private struct ValidatedRenderRule {
+    let digest: String
+    let windows: [ValidatedReadbackWindow]
+}
+
+/// One declared readback window with the bytes the rule stores there.
+private struct ValidatedReadbackWindow {
+    let x: UInt64
+    let y: UInt64
+    let width: UInt64
+    let height: UInt64
+    let bytes: Data
 }
 
 /// The reviewed depth pair a case carries (`research/docs/23` §3.3, v36): the
@@ -790,7 +1034,35 @@ private struct ValidatedSuite {
 
 private struct AllocationResult: Encodable {
     let allocation: UInt64
-    let bytes_hex: String
+    var bytes_hex: String?
+    var bytes_sha256: String?
+    var bytes_length: UInt64?
+
+    /// The byte form: the whole image, verbatim.
+    init(allocation: UInt64, bytes_hex: String) {
+        self.allocation = allocation
+        self.bytes_hex = bytes_hex
+        self.bytes_sha256 = nil
+        self.bytes_length = nil
+    }
+
+    /// The rule form: the whole image's digest.
+    init(allocation: UInt64, plane: Data) {
+        self.allocation = allocation
+        self.bytes_hex = nil
+        self.bytes_sha256 = planeSHA256(plane)
+        self.bytes_length = UInt64(plane.count)
+    }
+
+    /// The form one image is reported in: its bytes, or — when the image is
+    /// wider than the verbatim cap — its digest (R5a, `research/docs/23` §73).
+    init(allocation: UInt64, image: Data) {
+        if image.count > maximumVerbatimAllocationBytes {
+            self.init(allocation: allocation, plane: image)
+        } else {
+            self.init(allocation: allocation, bytes_hex: hex(image))
+        }
+    }
 }
 
 private struct CaseResult: Encodable {
@@ -1280,13 +1552,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "\(definition.id): expected a 64-byte read buffer at 0 and a write buffer at 1")
-    case "render_declaring_attachment_16x16", "render_declaring_attachment_64x64":
-        // R1b's declaring cases (`research/docs/23` §70): the same v27 kernel
-        // over the wider attachment view — 1024 bytes for the 16x16 case and
-        // 16384 for the 64x64 boundary — beside the same 4-byte output view.
-        // The view's byte range is the extent the render case restates, which
-        // is what keeps the declaring pass and the attachment in step.
-        let extent: UInt64 = definition.id == "render_declaring_attachment_16x16" ? 1024 : 16384
+    case "render_declaring_attachment_16x16", "render_declaring_attachment_64x64",
+         "render_declaring_attachment_2048x2048":
+        // R1b's declaring cases (`research/docs/23` §70) and R5a's wide one
+        // (§73): the same v27 kernel over the wider attachment view — 1024
+        // bytes for the 16x16 case, 16384 for the 64x64 boundary and 16 MiB
+        // for the reviewed window's own 2048x2048 attachment — beside the same
+        // 4-byte output view. The view's byte range is the extent the render
+        // case restates, which is what keeps the declaring pass and the
+        // attachment in step.
+        let extent: UInt64
+        switch definition.id {
+        case "render_declaring_attachment_16x16": extent = 1024
+        case "render_declaring_attachment_64x64": extent = 16384
+        default: extent = 16_777_216
+        }
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "\(definition.id): unsupported entry or dispatch shape")
@@ -1592,7 +1872,8 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8,
         try require(buffer.access == "read" || buffer.access == "write" || buffer.access == "read_write",
                     "\(context): unsupported access")
         try require(buffer.length > 0 && buffer.allocation_size <= maximumAllocationBytes,
-                    "\(context): allocation must be nonempty and at most 1 MiB")
+                    "\(context): allocation must be nonempty and at most "
+                    + "\(maximumAllocationBytes) bytes")
         try require(buffer.offset <= buffer.allocation_size
                     && buffer.length <= buffer.allocation_size - buffer.offset,
                     "\(context): view extends beyond allocation")
@@ -1621,8 +1902,7 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8,
         try require(declaringLandingView
                     || (buffer.offset >= 4 && buffer.allocation_size - end >= 4),
                     "\(context): expected at least four guard bytes before and after the view")
-        let initial = try decodeHex(buffer.initial_hex, context: context)
-        try require(UInt64(initial.count) == buffer.length, "\(context): initial data length mismatch")
+        let initial = try buffer.initialBytes(context: context)
         // Several buffers may name one allocation while their byte ranges stay
         // disjoint. Overlapping ranges would make the observed image depend on
         // write order, so they are refused here exactly as provider admission
@@ -1734,7 +2014,8 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
                        "render_declaring_depth_resolve", "render_declaring_stencil_store",
                        "render_declaring_stencil_resolve",
                        "render_declaring_attachment_16x16",
-                       "render_declaring_attachment_64x64"]
+                       "render_declaring_attachment_64x64",
+                       "render_declaring_attachment_2048x2048"]
     default:
         throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
@@ -2496,6 +2777,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         // observation, and the depth review below is what pins its texels.
         try require(definition.expected_hex == nil,
                     "\(definition.id): a pass without a colour attachment carries no expectation")
+        try require(definition.expected_rule == nil && definition.readback_windows == nil,
+                    "\(definition.id): a rule expectation needs the attachment it describes")
         expectedHexes = []
     } else if definition.attachment != nil {
         let discards = attachments[0].store == "dontcare"
@@ -2514,12 +2797,22 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             try require(attachments[0].expected_hex == nil,
                         "\(definition.id): a single attachment carries no expected_hex")
             expectedHexes = [nil]
+        } else if definition.expected_rule != nil {
+            // The rule form (R5a, `research/docs/23` §73): the expectation is
+            // the reviewed function of the texel coordinates rather than four
+            // million texels of hex, so the case-level `expected_hex` stays
+            // absent and the rule arm below is what materializes the plane.
+            try require(attachments[0].expected_hex == nil,
+                        "\(definition.id): a single attachment carries no expected_hex")
+            expectedHexes = [nil]
         } else {
             throw OracleError("\(definition.id): a single attachment needs expected_hex")
         }
     } else {
         try require(definition.expected_hex == nil,
                     "\(definition.id): an attachment list carries its own expected_hex")
+        try require(definition.expected_rule == nil && definition.readback_windows == nil,
+                    "\(definition.id): a rule expectation is the single attachment form's")
         expectedHexes = attachments.map { attachment in attachment.expected_hex }
     }
     // The render sampler (`research/docs/23` §3.3, v70): one `rgba8_unorm`
@@ -2556,23 +2849,60 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     && texture.height == attachments[0].height,
                     "\(definition.id): the sampled texture has to share the attachment's "
                     + "extent, so every fragment stands on a texel centre")
-        try require(expectedHexes == [texture.initial_hex as String?],
-                    "\(definition.id): the expectation has to be the uploaded texels: the "
-                    + "sampling stage's sample at a texel centre is an identity copy")
-        let texels = try decodeHex(texture.initial_hex,
-                                   context: "\(definition.id).fragment_textures[0]")
-        let chunks = stride(from: 0, to: texels.count, by: 4).map { offset in
-            Data(texels[offset..<min(offset + 4, texels.count)])
-        }
-        try require(chunks.count == texture.width * texture.height,
-                    "\(definition.id): the uploaded texels do not match the extent")
-        try require(Set(chunks).count == chunks.count,
-                    "\(definition.id): the uploaded texels have to be pairwise distinct")
         let clearHex = attachments[0].clear_hex ?? ""
         let clear = try decodeHex(clearHex, context: "\(definition.id).attachment.clear_hex")
-        try require(clear.count == 4 && !chunks.contains(clear),
-                    "\(definition.id): an uploaded texel equals the clear colour, so a rail "
-                    + "that ignored the texture could pass")
+        if let rule = texture.texel_rule {
+            // The rule form (R5a, `research/docs/23` §73): the texture's texels
+            // and the attachment's expectation are one function of the texel
+            // coordinates, because the sampling stage's sample at a texel
+            // centre is an identity copy. The rule has to stay injective over
+            // the extent it addresses and the clear colour has to stay outside
+            // its reach — the closed-form siblings of the distinctness rules
+            // the hex form is held to below.
+            try require(rule == reviewedTexelRule,
+                        "\(definition.id): unknown texel rule \"\(rule)\"")
+            try require(definition.expected_rule == rule,
+                        "\(definition.id): the expectation has to be the texture's own rule: "
+                        + "the sampling stage's sample at a texel centre is an identity copy")
+            try require(texture.initial_hex == nil,
+                        "\(definition.id).fragment_textures[0]: a rule texture carries no "
+                        + "initial_hex")
+            try require(texture.width >= ruleMinDimension && texture.height >= ruleMinDimension,
+                        "\(definition.id).fragment_textures[0]: a texel rule is the megapixel "
+                        + "form; \(texture.width)x\(texture.height) states its texels instead")
+            try require(texture.width <= ruleAddressCeiling
+                        && texture.height <= ruleAddressCeiling,
+                        "\(definition.id).fragment_textures[0]: the reviewed rule addresses "
+                        + "at most \(ruleAddressCeiling) texels per axis")
+            try require(clear.count == 4,
+                        "\(definition.id).attachment.clear_hex: a clear colour is four bytes")
+            try require(!reviewedRuleReaches(colour: clear, width: texture.width,
+                                             height: texture.height),
+                        "\(definition.id): a rule texel equals the clear colour, so a rail "
+                        + "that ignored the texture could pass")
+        } else {
+            try require(definition.expected_rule == nil,
+                        "\(definition.id): a rule expectation travels with the texture's own "
+                        + "texel rule")
+            try require(definition.readback_windows == nil,
+                        "\(definition.id): readback windows travel with the texture's own "
+                        + "texel rule")
+            try require(expectedHexes == [texture.initial_hex as String?],
+                        "\(definition.id): the expectation has to be the uploaded texels: the "
+                        + "sampling stage's sample at a texel centre is an identity copy")
+            let texels = try texture.texels(
+                context: "\(definition.id).fragment_textures[0]")
+            let chunks = stride(from: 0, to: texels.count, by: 4).map { offset in
+                Data(texels[offset..<min(offset + 4, texels.count)])
+            }
+            try require(chunks.count == texture.width * texture.height,
+                        "\(definition.id): the uploaded texels do not match the extent")
+            try require(Set(chunks).count == chunks.count,
+                        "\(definition.id): the uploaded texels have to be pairwise distinct")
+            try require(clear.count == 4 && !chunks.contains(clear),
+                        "\(definition.id): an uploaded texel equals the clear colour, so a rail "
+                        + "that ignored the texture could pass")
+        }
     }
     // The coverage claim (`research/docs/23` §3.3, v38): only the
     // single-attachment shape may make it, and only the one spelling exists —
@@ -2889,7 +3219,56 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         // an expectation arriving for one is refused (`research/docs/23` §3.6,
         // v19).
         let expected: Data?
-        if let hex = expectedHexes[index] {
+        var validatedRule: ValidatedRenderRule?
+        if definition.expected_rule != nil {
+            // The rule form (R5a, `research/docs/23` §73): the expectation is
+            // the reviewed function of the texel coordinates, so the plane is
+            // computed here instead of parsed from hex. The sampled-shape arm
+            // above already held the rule, the extent and the clear colour to
+            // the rule's own admissibility; what this arm adds is the landing
+            // shape — the windows the capture reports, the single-attachment
+            // form, and the clearing load a rule-expected attachment has.
+            try require(stored,
+                        "\(definition.id): a discarded attachment carries no expectation")
+            try require(index == 0 && attachments.count == 1,
+                        "\(definition.id): the rule expectation belongs to the single "
+                        + "attachment form")
+            try require(definition.fragment_textures != nil,
+                        "\(definition.id): a rule expectation is the reviewed sampling "
+                        + "shape's")
+            try require(definition.attachment?.load == "clear",
+                        "\(definition.id): a rule-expected attachment clears")
+            try require(definition.attachment?.initial_hex == nil,
+                        "\(definition.id): a cleared attachment carries no initial bytes")
+            let plane = try reviewedRulePlane(width: attachment.width,
+                                              height: attachment.height,
+                                              context: "\(definition.id).expected_rule")
+            try require(plane.count == byteCount,
+                        "\(definition.id): expected texel bytes do not match the attachment")
+            let windows = definition.readback_windows ?? []
+            try require(!windows.isEmpty,
+                        "\(definition.id): a rule-expected attachment needs its readback "
+                        + "windows")
+            try require(windows.count <= maximumReadbackWindows,
+                        "\(definition.id): one to \(maximumReadbackWindows) readback windows")
+            var validatedWindows = [ValidatedReadbackWindow]()
+            for window in windows {
+                try require(window.width > 0 && window.height > 0
+                            && window.width <= maximumReadbackWindowDimension
+                            && window.height <= maximumReadbackWindowDimension,
+                            "\(definition.id): a readback window is at most "
+                            + "\(maximumReadbackWindowDimension) texels per axis")
+                try require(window.x + window.width <= UInt64(attachment.width)
+                            && window.y + window.height <= UInt64(attachment.height),
+                            "\(definition.id): a readback window leaves the attachment plane")
+                validatedWindows.append(ValidatedReadbackWindow(
+                    x: window.x, y: window.y, width: window.width, height: window.height,
+                    bytes: reviewedRuleWindowBytes(window)))
+            }
+            validatedRule = ValidatedRenderRule(digest: planeSHA256(plane),
+                                                windows: validatedWindows)
+            expected = plane
+        } else if let hex = expectedHexes[index] {
             try require(stored,
                         "\(definition.id): a discarded attachment carries no expected_hex")
             let texels = try decodeHex(hex, context: "\(definition.id) expected texels")
@@ -3305,7 +3684,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             load: attachment.load, store: attachment.store,
             clearComponents: clearComponents, initial: initial, expected: expected,
             wildcardBytes: wildcardBytes, allowedBytes: allowedBytes,
-            pixelFormat: pixelFormat))
+            pixelFormat: pixelFormat, rule: validatedRule))
     }
     // The two reviewed MRT locations write two different byte strings, so a
     // cleared dual case whose locations read back the same texel could not
@@ -3850,7 +4229,8 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
     }
     var allocations = [AllocationResult]()
     for allocation in observedImages.keys.sorted() {
-        allocations.append(AllocationResult(allocation: allocation, bytes_hex: hex(observedImages[allocation]!)))
+        allocations.append(AllocationResult(allocation: allocation,
+                                             image: observedImages[allocation]!))
     }
     writebacks.sort { ($0.allocation, $0.view) < ($1.allocation, $1.view) }
     return CaseResult(id: definition.id, completion: "CompletedVisible", writebacks: writebacks, allocations: allocations)
@@ -4463,8 +4843,8 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             throw OracleError("\(definition.id): cannot allocate the sampled texture")
         }
         sampled.label = "native oracle: \(definition.id) sample \(index)"
-        let bytes = try decodeHex(texture.initial_hex,
-                                  context: "\(definition.id).fragment_textures[\(index)]")
+        let bytes = try texture.texels(
+            context: "\(definition.id).fragment_textures[\(index)]")
         bytes.withUnsafeBytes { raw in
             if let source = raw.baseAddress {
                 sampled.replace(region: MTLRegionMake2D(0, 0, texture.width, texture.height),
@@ -4599,10 +4979,22 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         // One writeback and one allocation per attachment, both the
         // attachment's own texels.
-        writebacks.append(Writeback(allocation: attachment.allocation, view: attachment.view,
-                                    offset: 0, bytes_hex: hex(observed)))
-        allocations.append(AllocationResult(allocation: attachment.allocation,
-                                             bytes_hex: hex(observed)))
+        if let rule = attachment.rule {
+            // A rule-expected attachment reports the plane's digest and its
+            // declared windows instead of four million texels
+            // (`research/docs/23` §73); the byte comparison above is still the
+            // whole plane's, so what the digest reports is what the oracle read.
+            writebacks.append(Writeback(allocation: attachment.allocation,
+                                        view: attachment.view, offset: 0,
+                                        plane: observed, rule: rule))
+            allocations.append(AllocationResult(allocation: attachment.allocation,
+                                                image: observed))
+        } else {
+            writebacks.append(Writeback(allocation: attachment.allocation, view: attachment.view,
+                                        offset: 0, bytes_hex: hex(observed)))
+            allocations.append(AllocationResult(allocation: attachment.allocation,
+                                                 image: observed))
+        }
     }
     // A stored depth surface reports its texels through the same channel
     // (`research/docs/23` §3.3, v43): one writeback for the depth view at
@@ -4648,7 +5040,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         writebacks.append(Writeback(allocation: store.allocation, view: store.view,
                                     offset: 0, bytes_hex: hex(observed)))
         allocations.append(AllocationResult(allocation: store.allocation,
-                                             bytes_hex: hex(observed)))
+                                             image: observed))
     }
     // A stored stencil surface reports its texels through the same channel
     // (`research/docs/23` §3.3, v49): one writeback for the stencil view at
@@ -4696,7 +5088,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         writebacks.append(Writeback(allocation: store.allocation, view: store.view,
                                     offset: 0, bytes_hex: hex(observed)))
         allocations.append(AllocationResult(allocation: store.allocation,
-                                             bytes_hex: hex(observed)))
+                                             image: observed))
     }
     return CaseResult(id: definition.id, completion: "CompletedVisible",
                       writebacks: writebacks, allocations: allocations)
@@ -4737,6 +5129,8 @@ private func renderSelfTest() throws -> CaseResult {
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        expected_rule: nil,
+        readback_windows: nil,
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
@@ -4815,6 +5209,8 @@ private func presentSelfTest() throws -> CaseResult {
             clear_hex: nil, initial_hex: hex(sentinel), expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        expected_rule: nil,
+        readback_windows: nil,
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
@@ -4915,6 +5311,8 @@ private func vertexSelfTest() throws -> CaseResult {
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        expected_rule: nil,
+        readback_windows: nil,
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
@@ -5019,6 +5417,8 @@ private func mrtSelfTest() throws -> CaseResult {
         // Location 0 first, then location 1: the fixture's own byte strings,
         // spelled per attachment the way a suite's MRT case does.
         expected_hex: nil,
+        expected_rule: nil,
+        readback_windows: nil,
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
@@ -5458,6 +5858,8 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
             clear_hex: "11223344", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: redImage,
+        expected_rule: nil,
+        readback_windows: nil,
         coverage: nil,
         multisample: MultisampleDefinition(sample_count: 4),
         // The validation fixture states the filter this rail declares; the

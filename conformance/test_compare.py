@@ -15,6 +15,18 @@ import compare
 SUITE_PATH = Path(__file__).with_name("suite.json")
 
 
+def initial_bytes(buffer):
+    """The bytes one declared view pre-seeds, in whichever form it states.
+
+    R5a (`research/docs/23` §73) adds the repeated-pattern form for the wide
+    attachment's declaring view: one pattern repeated to the view length.
+    """
+    if "initial_repeat_hex" in buffer:
+        pattern = bytes.fromhex(buffer["initial_repeat_hex"])
+        return pattern * (buffer["length"] // len(pattern))
+    return bytes.fromhex(buffer["initial_hex"])
+
+
 def synthetic_report(suite, digest, backend="vulkan", depth_resolve_modes=0,
                      stencil_resolve_modes=0, render_sample_counts=0):
     """Fabricate expected bytes solely to unit-test the comparator."""
@@ -25,15 +37,26 @@ def synthetic_report(suite, digest, backend="vulkan", depth_resolve_modes=0,
             allocation = buffer["allocation"]
             data = allocations.setdefault(allocation, bytearray([suite["guard_byte"]]) * buffer["allocation_size"])
             offset = buffer["offset"]
-            data[offset:offset + buffer["length"]] = bytes.fromhex(buffer["initial_hex"])
+            data[offset:offset + buffer["length"]] = initial_bytes(buffer)
         for write in case["expected_writebacks"]:
             data = bytes.fromhex(write["bytes_hex"])
             allocations[write["allocation"]][write["offset"]:write["offset"] + len(data)] = data
+        # An image wider than the verbatim cap is reported by digest, exactly as
+        # the rails report it (`research/docs/23` §73): spelling 16 MiB out as
+        # hex is what the wide attachment's declaring view would otherwise cost.
+        images = []
+        for allocation, data in allocations.items():
+            if len(data) > compare.MAX_VERBATIM_ALLOCATION_BYTES:
+                images.append({"allocation": allocation,
+                               "bytes_sha256": hashlib.sha256(bytes(data)).hexdigest(),
+                               "bytes_length": len(data)})
+            else:
+                images.append({"allocation": allocation, "bytes_hex": data.hex()})
         results.append({
             "id": case["id"],
             "completion": "CompletedVisible",
             "writebacks": copy.deepcopy(case["expected_writebacks"]),
-            "allocations": [{"allocation": key, "bytes_hex": data.hex()} for key, data in allocations.items()],
+            "allocations": images,
         })
     return {
         "schema_version": 1,
@@ -217,7 +240,8 @@ class CaptureTests(unittest.TestCase):
         for size in (compare.MAX_ALLOCATION_BYTES + 1, compare.U64_MAX):
             with self.subTest(size=size):
                 self.suite["cases"][0]["buffers"][0]["allocation_size"] = size
-                self.reject("allocation_size: expected integer in 1..1048576")
+                self.reject("allocation_size: expected integer in 1.."
+                            f"{compare.MAX_ALLOCATION_BYTES}")
 
     def test_u64_integer_bounds_and_bool_rejection(self):
         original = copy.deepcopy(self.report)
