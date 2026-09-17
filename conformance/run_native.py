@@ -307,8 +307,9 @@ def validate_stage_buffer_write_selftest(report):
 
     The two runs move the source payload and the geometry independently, so no
     single constant frame can pass both. The second run's source is
-    `(0, 1, 0, 1)`, which the 8-bit attachment stores as `00ff00ff` while the
-    accumulator stores `1.25` and `2.0` in its components.
+    `(0, 1, 0, 1)`, which the 8-bit attachment stores as `00ff00ff`, while both
+    runs start the accumulator from `0.25` in every component (the same
+    previous value) and report `1.25` afterwards.
     """
     if not isinstance(report, dict):
         raise NativeRunError("stage buffer write selftest: report is not an object")
@@ -330,7 +331,7 @@ def validate_stage_buffer_write_selftest(report):
     green = "000000000000803f000000000000803f"
     accumulator_initial = "0000803e" * 4
     accumulator_reviewed = "0000a03f" * 4
-    accumulator_green = "0000a03f" + "00000040" + "0000a03f" + "00000040"
+    accumulator_green = "0000a03f" * 4
     writebacks = report.get("writebacks", [])
     allocations = report.get("allocations", [])
     expected_writebacks = [

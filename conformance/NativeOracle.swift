@@ -6339,9 +6339,10 @@ private func stageBufferWriteSelfTest() throws -> StageBufferWriteSelfTestReport
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
     ])
-    // 0.25 in every component: the read-write binding's previous value, one
-    // the stage adds one to (`1.25` afterwards, and `2.0` for the green run's
-    // two one-components).
+    // 0.25 in every component: the read-write binding's previous value, which
+    // both runs start from and the stage adds one to (`1.25` afterwards). The
+    // two runs move the source payload and the geometry, not this state, so a
+    // rail that bound zeros would publish one alone instead.
     let reviewedAccumulator = Data([
         0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x80, 0x3e,
         0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x80, 0x3e,
@@ -6351,7 +6352,7 @@ private func stageBufferWriteSelfTest() throws -> StageBufferWriteSelfTestReport
     let reviewedFrame = "4080c0ff" + sentinel + sentinel + sentinel
     let fullScreenFrame = String(repeating: "00ff00ff", count: 4)
     let reviewedAccumulatorAfter = String(repeating: "0000a03f", count: 4)
-    let greenAccumulatorAfter = "0000a03f" + "00000040" + "0000a03f" + "00000040"
+    let greenAccumulatorAfter = String(repeating: "0000a03f", count: 4)
 
     let first = try runStageBufferWritePass(device: device, queue: queue, pipeline: pipeline,
                                             positions: reviewedPositions,

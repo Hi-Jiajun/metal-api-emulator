@@ -721,7 +721,7 @@ class StageBufferWriteSelftestValidationTests(unittest.TestCase):
     GREEN = "000000000000803f000000000000803f"
     ACCUMULATOR_INITIAL = "0000803e" * 4
     ACCUMULATOR_REVIEWED = "0000a03f" * 4
-    ACCUMULATOR_GREEN = "0000a03f00000040" + "0000a03f00000040"
+    ACCUMULATOR_GREEN = "0000a03f" * 4
 
     def reviewed_report(self, report_id="stage_buffer_write_2x2",
                         completion="CompletedVisible", writebacks=None,
