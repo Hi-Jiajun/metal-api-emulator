@@ -9,7 +9,7 @@
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, BufferAccess, BufferBindingContract, CompletionDisposition,
     CompletionToken, DispatchKind, FootprintProof, PipelineCompileRequest, PipelineContract,
-    ShaderSource,
+    ShaderSource, TextureBindingContract,
 };
 use metal_api_core::provider::{ProviderError, ProviderErrorClass, ProviderPhase, Retryability};
 
@@ -360,6 +360,17 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
             ));
         }
     };
+    // The v11/v12 texture cases (`research/docs/26` §21.3): the reviewed
+    // kernels read one D2 single-sample `R32Uint` texture at `[[texture(0)]]`
+    // with the translator's synthesized read sampler. Their contracts state
+    // that binding — the shared constructor keeps the declaration identical to
+    // the Vulkan rail's — while every other allowlisted kernel binds none.
+    let texture_bindings = match request.entry_name.as_str() {
+        "read_texture_2d" | "read_texture_2d_cell" => {
+            vec![TextureBindingContract::sampled_r32uint(0)]
+        }
+        _ => Vec::new(),
+    };
     Ok(PipelineContract {
         dispatch_kind: DispatchKind::ThreadsExact,
         required_local_size: None,
@@ -367,6 +378,7 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
         push_constant_offset: 0,
         push_constant_bytes: 0,
         buffer_bindings,
+        texture_bindings,
         shader_capabilities: Vec::new(),
         translator_revision: None,
     })

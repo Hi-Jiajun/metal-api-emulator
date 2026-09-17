@@ -657,6 +657,116 @@ impl TextureSource {
     }
 }
 
+/// Sampler filtering admitted by the first texture-sampling increment.
+///
+/// The translator synthesizes the sampler a sampled texture binding carries
+/// (`research/docs/16` §4.3): the reviewed compute subset binds no Metal
+/// `[[sampler(n)]]` argument, so the contract states the state the descriptor
+/// must carry instead of leaving it to a provider default. The list is
+/// deliberately closed — a provider must refuse an unlisted filter rather than
+/// substitute one, because substituting one changes sampled bytes without
+/// changing the request (`core` cannot see the difference after the fact).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerFilter {
+    Nearest,
+    Linear,
+}
+
+/// Sampler addressing admitted by the first texture-sampling increment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerAddressMode {
+    ClampToEdge,
+    Repeat,
+}
+
+/// The sampler state one sampled texture binding must be executed with.
+///
+/// This is a *contract* fact, not a request knob: a translated module's
+/// sampling operations were lowered against one state, and a provider that
+/// creates a different one silently changes which texels a read returns. The
+/// pair rules in [`ComputePass::validate`] compare the declaration with the
+/// view's own access, and the execution rails refuse a policy they cannot
+/// create for the binding's format by name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplerPolicy {
+    pub filter: SamplerFilter,
+    pub address: SamplerAddressMode,
+}
+
+impl SamplerPolicy {
+    /// The state a texel read lowered to a sample needs.
+    ///
+    /// SPIR-V has no cube texel fetch and no sampler-free LOD query, so a
+    /// `texture.read()` AIR spells exactly can come out of the translator as a
+    /// *sample*. That substitution only preserves the read when the sampler
+    /// filters nothing: nearest at magnification and minification, with a
+    /// clamped address mode. The pinned translator reports the same state for
+    /// its synthesized read sampler (`StaticSamplerState::synthesized_read_sampler`),
+    /// which is why this is the state the reviewed compute subset declares.
+    pub const fn synthesized_read() -> Self {
+        Self {
+            filter: SamplerFilter::Nearest,
+            address: SamplerAddressMode::ClampToEdge,
+        }
+    }
+}
+
+/// How far a shader reaches into one texture binding.
+///
+/// The proof is the texture-side sibling of [`FootprintProof`]: admission may
+/// only execute a binding whose reach is bounded *and* stated. `WholeView` is
+/// the first increment's bound — every texel of the view's tightly packed
+/// extent — and `Unbounded` is the module saying it cannot bound its reach, so
+/// a provider refuses it by name instead of executing against texels nobody
+/// sized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureFootprintProof {
+    WholeView,
+    Unbounded,
+}
+
+/// Minimum reflected binding contract needed before binding a sampled texture.
+///
+/// The texture-side sibling of [`BufferBindingContract`] (`research/docs/26`
+/// §21.3, step 1): the narrow class admits a compute pass only when the
+/// request's own texture binding list matches this declaration field by field.
+/// Without it the class judge would have to trust the request's binding list,
+/// which is exactly what the buffer face refuses to do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextureBindingContract {
+    /// The Metal `[[texture(n)]]` argument index this declaration covers.
+    pub metal_binding: u32,
+    pub access: TextureAccess,
+    pub texture_type: TextureType,
+    pub format: TextureFormat,
+    /// The sampler state the binding must be executed with. See
+    /// [`SamplerPolicy`].
+    pub sampler: SamplerPolicy,
+    /// How far the module's own metadata says the shader reaches.
+    pub footprint: TextureFootprintProof,
+}
+
+impl TextureBindingContract {
+    /// The first increment's compute sampling shape
+    /// (`research/docs/16` §4.5, §4.6): a D2, single-sample `R32Uint` texture
+    /// read whole through the translator's synthesized read sampler.
+    ///
+    /// Both rails that execute compute sampling declare this exact binding —
+    /// the Vulkan rail from the translated module's reflection and the native
+    /// rail from its reviewed module list — so the shape is stated once here
+    /// instead of drifting between two hand-written literals.
+    pub const fn sampled_r32uint(metal_binding: u32) -> Self {
+        Self {
+            metal_binding,
+            access: TextureAccess::Sampled,
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            sampler: SamplerPolicy::synthesized_read(),
+            footprint: TextureFootprintProof::WholeView,
+        }
+    }
+}
+
 /// A logical Metal texture view. Dimensions are texels; the source length is
 /// bytes and is validated against a tightly packed layout of
 /// `width * height * depth * array_length * sample_count` texels.
@@ -928,6 +1038,16 @@ pub struct PipelineContract {
     pub push_constant_offset: u32,
     pub push_constant_bytes: u32,
     pub buffer_bindings: Vec<BufferBindingContract>,
+    /// Sampled texture bindings this pipeline's module reads
+    /// (`research/docs/26` §21.3). Empty for every buffer-only module, which
+    /// is every module the pre-texture contract was written for, so a
+    /// contract built the old way keeps the old pairing rules exactly.
+    ///
+    /// A texture binding's `metal_binding` is an index in Metal's own texture
+    /// namespace, so it may repeat a buffer binding's index: the translator
+    /// reports texture 0 and buffer 0 for one kernel, and only the Vulkan
+    /// descriptor namespace has to stay unique (checked by each provider).
+    pub texture_bindings: Vec<TextureBindingContract>,
     pub shader_capabilities: Vec<String>,
     pub translator_revision: Option<SemanticDigest>,
 }
@@ -1002,6 +1122,22 @@ impl PipelineContract {
             }
             previous_binding = Some(binding.metal_binding);
             if bindings.insert(binding.metal_binding, ()).is_some() {
+                return Err(ContractError::DuplicateBinding(binding.metal_binding));
+            }
+        }
+        // The texture list keeps the same canonical-order and uniqueness rules
+        // inside its own namespace (`research/docs/26` §21.3). The two lists
+        // are deliberately independent: a texture and a buffer may share a
+        // Metal index, and only a provider's Vulkan descriptor namespace has
+        // to keep them apart.
+        let mut textures = BTreeMap::new();
+        let mut previous_texture = None;
+        for binding in &self.texture_bindings {
+            if previous_texture.is_some_and(|previous| previous > binding.metal_binding) {
+                return Err(ContractError::NonCanonicalBindingOrder("pipeline contract"));
+            }
+            previous_texture = Some(binding.metal_binding);
+            if textures.insert(binding.metal_binding, ()).is_some() {
                 return Err(ContractError::DuplicateBinding(binding.metal_binding));
             }
         }
@@ -1103,6 +1239,63 @@ impl ComputePass {
                 .any(|reflected| reflected.metal_binding == actual.metal_binding)
             {
                 return Err(ContractError::UnknownBinding(actual.metal_binding));
+            }
+        }
+        // Texture pair rules (`research/docs/26` §21.3, step 1). They repeat
+        // the buffer face's two directions — every declaration is bound, every
+        // bound view is declared — and then compare the fields a provider
+        // would otherwise have to trust the request for: access, type, format
+        // and the reach the module stated. The sampler policy stays part of
+        // the declaration rather than a request field, so its refusal is the
+        // execution rail's: a policy a device cannot create for a format is a
+        // device fact, not trace structure.
+        for declared in &pipeline_contract.texture_bindings {
+            let Some(bound) = self
+                .textures
+                .iter()
+                .find(|texture| texture.metal_binding == declared.metal_binding)
+            else {
+                return Err(ContractError::MissingTextureBinding {
+                    binding: declared.metal_binding,
+                });
+            };
+            if bound.access != declared.access {
+                return Err(ContractError::TextureAccessMismatch {
+                    binding: declared.metal_binding,
+                    expected: declared.access,
+                    actual: bound.access,
+                });
+            }
+            if bound.texture_type != declared.texture_type {
+                return Err(ContractError::TextureTypeMismatch {
+                    binding: declared.metal_binding,
+                    expected: declared.texture_type,
+                    actual: bound.texture_type,
+                });
+            }
+            if bound.format != declared.format {
+                return Err(ContractError::TextureFormatMismatch {
+                    binding: declared.metal_binding,
+                    expected: declared.format,
+                    actual: bound.format,
+                });
+            }
+            if declared.footprint == TextureFootprintProof::Unbounded {
+                return Err(ContractError::TextureFootprintProofUnsupported {
+                    binding: declared.metal_binding,
+                    proof: declared.footprint,
+                });
+            }
+        }
+        for bound in &self.textures {
+            if !pipeline_contract
+                .texture_bindings
+                .iter()
+                .any(|declared| declared.metal_binding == bound.metal_binding)
+            {
+                return Err(ContractError::UndeclaredTextureBinding {
+                    binding: bound.metal_binding,
+                });
             }
         }
         Ok(())
@@ -1475,6 +1668,17 @@ pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 /// value: the core contract admits the shape, while each rail declares how
 /// many of those bindings it can execute today (`docs/23` §4.2).
 pub const MAX_RENDER_TEXTURES: usize = 1;
+
+/// The sampled textures a compute pass may bind, which is the compute-sampler
+/// shape the reviewed fixtures read (`research/docs/16` §4.5, §4.6; `docs/26`
+/// §21.3): one texture per dispatch, because the reviewed kernels read exactly
+/// one 4×4 `R32Uint` surface. A provider's
+/// `ProviderCapabilities::max_compute_textures` stays independent of this
+/// value: the core contract admits the shape, while each rail declares how
+/// many of those bindings it can execute today — and a wider pass is refused
+/// by name (`compute_texture_limit`) instead of being executed against
+/// descriptor slots nobody sized.
+pub const MAX_COMPUTE_TEXTURES: usize = 1;
 
 /// Stage buffer bindings a render pass may declare, across both stages
 /// (`research/docs/23` §3.3, v83): four, one per binding the reviewed chain
@@ -7112,6 +7316,24 @@ pub struct ProviderCapabilities {
     pub max_invocations: u64,
     pub max_group_count: [u64; 3],
     pub max_storage_buffer_descriptors: u32,
+    /// Whether this snapshot can bind a sampled texture to a compute pass
+    /// (`research/docs/26` §21.3). Defaults to `false`: a snapshot whose rail
+    /// cannot fill the slot refuses a texture-bearing pass during admission
+    /// instead of executing it against descriptor bytes the trace never
+    /// declared. Both rails that publish `true` execute the shape — the Vulkan
+    /// rail in `metal-api-vulkan` and the native rail in `metal-api-native` —
+    /// and each declares the format list it covers below.
+    pub supports_compute_texture_sampling: bool,
+    /// Sampled textures one compute pass may bind. `0` means the snapshot
+    /// cannot sample at all; the field stays at that default for a snapshot
+    /// whose bit above is false, so a caller reading the limit without
+    /// checking the bit cannot read one as an admission.
+    pub max_compute_textures: u32,
+    /// Texture formats this snapshot admits as compute-pass sampling sources.
+    /// Empty means none. Compared by value rather than by wire code so the
+    /// contract's own enum is the single vocabulary, exactly as
+    /// [`Self::supported_color_formats`] is.
+    pub supported_compute_texture_formats: Vec<TextureFormat>,
     pub max_buffer_range: u64,
     pub max_push_constant_bytes: u32,
     pub alias_mode: AliasMode,
@@ -7457,6 +7679,14 @@ impl ProviderCapabilities {
         // `trace.validate()`, and the pipeline/pass pair rules ran in
         // `admit_render_passes` above.
         self.admit_render_stage_buffer_inputs(trace)?;
+
+        // Compute texture admission is the compute-side sibling of the render
+        // sampler gate (`research/docs/26` §21.3): a compute pass that binds a
+        // sampled texture is refused here — bit, count, then format — instead
+        // of being executed against descriptor bytes nobody declared. The
+        // pass's own pair rules (declared, bound, agreeing access/type/format,
+        // stated reach) already ran in `trace.validate()` above.
+        self.admit_compute_texture_inputs(trace)?;
 
         // Present admission is the next gate and sits just as early
         // (`research/docs/24` §4.2): Step 2 publishes the contract and the
@@ -7980,6 +8210,57 @@ impl ProviderCapabilities {
         Ok(())
     }
 
+    /// Compute texture admission, the compute sibling of the render sampler
+    /// gate (`research/docs/26` §21.3).
+    ///
+    /// The order repeats its siblings: the bit the snapshot answers on its own
+    /// comes first, then the count, then the per-texture format. A trace whose
+    /// compute passes bind no texture never enters the walk, so every
+    /// pre-texture trace keeps the admission path it had.
+    ///
+    /// The pipeline/pass pair rules — declared, bound, agreeing
+    /// access/type/format and a stated reach — already ran in
+    /// `trace.validate()`, which is why this gate only answers what the
+    /// snapshot knows: whether it samples compute-side at all, how many
+    /// bindings it admits, and in which formats.
+    fn admit_compute_texture_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        for (pass_index, entry) in trace.passes.iter().enumerate() {
+            let Some(pass) = entry.as_compute() else {
+                continue;
+            };
+            if pass.textures.is_empty() {
+                continue;
+            }
+            if !self.supports_compute_texture_sampling {
+                return Err(capability_error("compute_texture_input_unsupported")
+                    .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                    .with_field("textures", FieldValue::Unsigned(pass.textures.len() as u64)));
+            }
+            if pass.textures.len() > self.max_compute_textures as usize {
+                return Err(capability_error("compute_texture_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(pass.textures.len() as u64),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(self.max_compute_textures as u64),
+                    ));
+            }
+            for texture in &pass.textures {
+                if !self
+                    .supported_compute_texture_formats
+                    .contains(&texture.format)
+                {
+                    return Err(capability_error("compute_texture_format_unsupported")
+                        .with_field("view", FieldValue::Unsigned(texture.view_id.get()))
+                        .with_field("format", FieldValue::Text(format!("{:?}", texture.format))));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Stage buffer admission, the third render gate (`research/docs/23`
     /// §3.3, v83).
     ///
@@ -8388,6 +8669,14 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "render_stage_buffer_footprint_unsupported",
         ),
+        // Compute texture contract (`research/docs/26` §21.3). The reach proof
+        // is the first-increment narrowing and keeps its own capability slug;
+        // the pair rules beside it are caller-fixable trace structure, so they
+        // join the same arm the stage-buffer pairs use.
+        E::TextureFootprintProofUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "compute_texture_footprint_unsupported",
+        ),
         E::EmptyVertexLayout
         | E::ZeroVertexStride { .. }
         | E::EmptyVertexBufferLayout { .. }
@@ -8399,6 +8688,11 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::IndexBufferBindingMismatch { .. }
         | E::RenderTextureBindingMismatch { .. }
         | E::RenderTextureAttachmentConflict { .. }
+        | E::MissingTextureBinding { .. }
+        | E::UndeclaredTextureBinding { .. }
+        | E::TextureAccessMismatch { .. }
+        | E::TextureTypeMismatch { .. }
+        | E::TextureFormatMismatch { .. }
         | E::DuplicateStageBufferBinding { .. }
         | E::MissingStageBufferBinding { .. }
         | E::UndeclaredStageBufferBinding { .. }
@@ -10243,6 +10537,46 @@ pub enum ContractError {
     RenderTextureAttachmentConflict {
         view: ViewId,
     },
+    // Compute texture contract (`research/docs/26` §21.3). The pair rules are
+    // caller-fixable structure, so they keep the trace-contract slug; the
+    // reach proof is the first-increment narrowing and keeps its own
+    // capability slug, exactly as the stage-buffer proof does. The sampler
+    // policy is deliberately absent from this family: it is a device question
+    // and each execution rail refuses it by name with the format in hand.
+    /// A pipeline contract declares a texture binding the pass does not bind,
+    /// which would leave a descriptor the module reads undefined.
+    MissingTextureBinding {
+        binding: u32,
+    },
+    /// A pass binds a texture the pipeline contract never declared, which
+    /// would fill a slot the module never said how to read.
+    UndeclaredTextureBinding {
+        binding: u32,
+    },
+    /// A texture binding's own access does not match the declaration.
+    TextureAccessMismatch {
+        binding: u32,
+        expected: TextureAccess,
+        actual: TextureAccess,
+    },
+    /// A texture binding's dimensionality does not match the declaration.
+    TextureTypeMismatch {
+        binding: u32,
+        expected: TextureType,
+        actual: TextureType,
+    },
+    /// A texture binding's format does not match the declaration.
+    TextureFormatMismatch {
+        binding: u32,
+        expected: TextureFormat,
+        actual: TextureFormat,
+    },
+    /// A texture declaration reaches an unbounded region of its view, which
+    /// the first increment cannot size.
+    TextureFootprintProofUnsupported {
+        binding: u32,
+        proof: TextureFootprintProof,
+    },
     // Stage buffer contract (`research/docs/23` §3.3, v83). The count, the
     // index bound and the footprint proof are first-increment narrowings on a
     // well-formed request; the missing, undeclared, mismatched and
@@ -10973,6 +11307,42 @@ impl fmt::Display for ContractError {
                 formatter,
                 "render pass samples view {view:?} through a texture binding while writing it as an attachment"
             ),
+            Self::MissingTextureBinding { binding } => write!(
+                formatter,
+                "pipeline contract declares texture binding {binding}, but the pass binds no texture there"
+            ),
+            Self::UndeclaredTextureBinding { binding } => write!(
+                formatter,
+                "pass binds texture {binding}, but the pipeline contract declares no texture there"
+            ),
+            Self::TextureAccessMismatch {
+                binding,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "texture {binding} is declared {actual:?}, but the contract pairs it with {expected:?}"
+            ),
+            Self::TextureTypeMismatch {
+                binding,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "texture {binding} states type {actual:?}, but the contract pairs it with {expected:?}"
+            ),
+            Self::TextureFormatMismatch {
+                binding,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "texture {binding} states format {actual:?}, but the contract pairs it with {expected:?}"
+            ),
+            Self::TextureFootprintProofUnsupported { binding, proof } => write!(
+                formatter,
+                "texture {binding} states reach {proof:?}, which the first increment cannot size"
+            ),
             Self::RenderStageBufferLimitExceeded {
                 requested,
                 maximum,
@@ -11578,6 +11948,7 @@ mod tests {
             push_constant_offset: 0,
             push_constant_bytes: 0,
             buffer_bindings: Vec::new(),
+            texture_bindings: Vec::new(),
             shader_capabilities: Vec::new(),
             translator_revision: None,
         }
@@ -11779,7 +12150,7 @@ mod tests {
 
     #[test]
     fn texture_bindings_validate_and_normalize_like_buffer_views() {
-        let contract = unbound_pipeline_contract();
+        let mut contract = unbound_pipeline_contract();
         let mut pass = ComputePass {
             pipeline: PipelineId::new(5),
             buffers: Vec::new(),
@@ -11793,7 +12164,7 @@ mod tests {
         pass.validate(&contract)
             .expect("a pass without texture bindings validates");
 
-        pass.textures.push(texture_view(TextureCase {
+        let view = texture_view(TextureCase {
             texture_type: TextureType::D2,
             format: TextureFormat::R32Uint,
             width: 4,
@@ -11802,7 +12173,9 @@ mod tests {
             array_length: 1,
             sample_count: 1,
             bytes: vec![0; 64],
-        }));
+        });
+        contract.texture_bindings = vec![texture_declaration(&view)];
+        pass.textures.push(view);
         pass.validate(&contract)
             .expect("a well-formed texture binding validates");
 
@@ -11812,6 +12185,88 @@ mod tests {
             pass.validate(&contract),
             Err(ContractError::ZeroDimension { .. })
         ));
+        pass.textures[0].width = 4;
+
+        // Every pair rule the declaration carries is its own named refusal
+        // (`research/docs/26` §21.3): unbound, undeclared, and the three fields
+        // a request could otherwise state freely, plus the reach proof that is
+        // the first increment's bound. Each carries the binding that disagreed
+        // so a fix needs no second lookup.
+        let mut declared_only = pass.clone();
+        declared_only.textures.clear();
+        let refusal = declared_only
+            .validate(&contract)
+            .expect_err("a declaration the pass does not bind is a refusal");
+        eprintln!("compute texture unbound refusal: {refusal} / {refusal:?}");
+        assert_eq!(refusal, ContractError::MissingTextureBinding { binding: 3 });
+
+        let refusal = pass
+            .validate(&unbound_pipeline_contract())
+            .expect_err("a binding the contract does not declare is a refusal");
+        eprintln!("compute texture undeclared refusal: {refusal} / {refusal:?}");
+        assert_eq!(
+            refusal,
+            ContractError::UndeclaredTextureBinding { binding: 3 }
+        );
+
+        let mut wrong_access = contract.clone();
+        wrong_access.texture_bindings[0].access = TextureAccess::Storage;
+        let refusal = pass
+            .validate(&wrong_access)
+            .expect_err("an access mismatch is a refusal");
+        eprintln!("compute texture access refusal: {refusal} / {refusal:?}");
+        assert_eq!(
+            refusal,
+            ContractError::TextureAccessMismatch {
+                binding: 3,
+                expected: TextureAccess::Storage,
+                actual: TextureAccess::Sampled,
+            }
+        );
+
+        let mut wrong_type = contract.clone();
+        wrong_type.texture_bindings[0].texture_type = TextureType::D2Array;
+        let refusal = pass
+            .validate(&wrong_type)
+            .expect_err("a type mismatch is a refusal");
+        eprintln!("compute texture type refusal: {refusal} / {refusal:?}");
+        assert_eq!(
+            refusal,
+            ContractError::TextureTypeMismatch {
+                binding: 3,
+                expected: TextureType::D2Array,
+                actual: TextureType::D2,
+            }
+        );
+
+        let mut wrong_format = contract.clone();
+        wrong_format.texture_bindings[0].format = TextureFormat::R32Float;
+        let refusal = pass
+            .validate(&wrong_format)
+            .expect_err("a format mismatch is a refusal");
+        eprintln!("compute texture format refusal: {refusal} / {refusal:?}");
+        assert_eq!(
+            refusal,
+            ContractError::TextureFormatMismatch {
+                binding: 3,
+                expected: TextureFormat::R32Float,
+                actual: TextureFormat::R32Uint,
+            }
+        );
+
+        let mut unbounded = contract.clone();
+        unbounded.texture_bindings[0].footprint = TextureFootprintProof::Unbounded;
+        let refusal = pass
+            .validate(&unbounded)
+            .expect_err("an unbounded reach is a refusal");
+        eprintln!("compute texture footprint refusal: {refusal} / {refusal:?}");
+        assert_eq!(
+            refusal,
+            ContractError::TextureFootprintProofUnsupported {
+                binding: 3,
+                proof: TextureFootprintProof::Unbounded,
+            }
+        );
     }
 
     fn compile_request(source: ShaderSource) -> PipelineCompileRequest {
@@ -12050,6 +12505,7 @@ mod tests {
                             accesses: Vec::new(),
                         },
                     }],
+                    texture_bindings: Vec::new(),
                     shader_capabilities: Vec::new(),
                     translator_revision: None,
                 },
@@ -12345,6 +12801,9 @@ mod tests {
         ProviderCapabilities {
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            supports_compute_texture_sampling: false,
+            max_compute_textures: 0,
+            supported_compute_texture_formats: Vec::new(),
             max_passes: 1,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -17364,6 +17823,7 @@ mod tests {
     ) -> ComputeTrace {
         let mut value = trace(Vec::new());
         value.pipelines[0].contract.buffer_bindings.clear();
+        value.pipelines[0].contract.texture_bindings = vec![texture_declaration(&texture)];
         value.passes.push(TracePass::Compute(ComputePass {
             pipeline: PipelineId::new(4),
             buffers: Vec::new(),
@@ -17392,6 +17852,21 @@ mod tests {
         })
     }
 
+    /// The declaration one texture-binding fixture has to state back
+    /// (`research/docs/26` §21.3): the pair rules compare access, type and
+    /// format with the view the pass binds, so a fixture that binds a view
+    /// declares the same shape in its pipeline contract.
+    fn texture_declaration(view: &TextureView) -> TextureBindingContract {
+        TextureBindingContract {
+            metal_binding: view.metal_binding,
+            access: view.access,
+            texture_type: view.texture_type,
+            format: view.format,
+            sampler: SamplerPolicy::synthesized_read(),
+            footprint: TextureFootprintProof::WholeView,
+        }
+    }
+
     /// `count` compute passes, each declaring one distinct 2×2 view. With
     /// `attach`, every declaration is also the target of a render pass.
     fn many_attachment_targets(count: usize, attach: bool) -> ComputeTrace {
@@ -17405,6 +17880,7 @@ mod tests {
             let mut texture = two_by_two_texture(TextureFormat::Rgba8Unorm);
             texture.view_id = ViewId::new(index);
             texture.allocation_id = AllocationId::new(index);
+            pipeline.contract.texture_bindings = vec![texture_declaration(&texture)];
             value.passes.push(TracePass::Compute(ComputePass {
                 pipeline: pipeline_id,
                 buffers: Vec::new(),
@@ -17763,6 +18239,111 @@ mod tests {
         provider.max_render_textures = MAX_RENDER_TEXTURES as u32;
         provider.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
         provider
+    }
+
+    /// A compute-only trace whose single pass binds one sampled texture
+    /// (`research/docs/26` §21.3).
+    fn compute_texture_trace() -> ComputeTrace {
+        let view = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: vec![0; 64],
+        });
+        let mut value = trace(Vec::new());
+        value.pipelines[0].contract.buffer_bindings.clear();
+        value.pipelines[0].contract.texture_bindings = vec![texture_declaration(&view)];
+        value.passes.push(TracePass::Compute(ComputePass {
+            pipeline: PipelineId::new(4),
+            buffers: Vec::new(),
+            textures: vec![view],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [4, 4, 1],
+                threads_per_threadgroup: [4, 4, 1],
+            },
+        }));
+        value
+    }
+
+    /// The sampled texture's own allocation, which the texture view's source
+    /// resolves against (`research/docs/18` Step 1).
+    fn compute_texture_resources() -> ResourceTableSnapshot {
+        let mut pool = ResourceTableSnapshot::new();
+        pool.insert_allocation(AllocationRecord {
+            allocation_id: AllocationId::new(11),
+            owner_epoch: DeviceEpoch::new(1),
+            size: 64,
+        })
+        .unwrap();
+        pool
+    }
+
+    /// The compute snapshot extended with the three compute-texture bits.
+    fn compute_texture_capabilities() -> ProviderCapabilities {
+        let mut provider = capabilities();
+        provider.supports_compute_texture_sampling = true;
+        provider.max_compute_textures = MAX_COMPUTE_TEXTURES as u32;
+        provider.supported_compute_texture_formats = vec![TextureFormat::R32Uint];
+        provider
+    }
+
+    #[test]
+    fn compute_texture_bits_gate_the_pass_the_count_and_the_format() {
+        let value = compute_texture_trace();
+        value.validate().expect("the fixture is structurally valid");
+
+        // The bit comes first: a snapshot that samples nothing compute-side
+        // refuses the whole pass instead of executing it against a descriptor
+        // slot the trace never declared.
+        let refusal = capabilities()
+            .admit(&value, &compute_texture_resources())
+            .unwrap_err();
+        eprintln!("compute texture bit refusal: {refusal:?}");
+        assert_eq!(refusal.slug, "compute_texture_input_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+        // Then the declared ceiling, then the per-texture format: each refusal
+        // names the field the snapshot disagreed on.
+        let mut narrow = compute_texture_capabilities();
+        narrow.max_compute_textures = 0;
+        let refusal = narrow
+            .admit(&value, &compute_texture_resources())
+            .unwrap_err();
+        eprintln!("compute texture limit refusal: {refusal:?}");
+        assert_eq!(refusal.slug, "compute_texture_limit");
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        let mut foreign_format = compute_texture_capabilities();
+        foreign_format.supported_compute_texture_formats = vec![TextureFormat::R32Float];
+        let refusal = foreign_format
+            .admit(&value, &compute_texture_resources())
+            .unwrap_err();
+        eprintln!("compute texture format refusal: {refusal:?}");
+        assert_eq!(refusal.slug, "compute_texture_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("R32Uint".to_owned()))
+        );
+
+        // A snapshot that declares the bits admits the pass end to end.
+        compute_texture_capabilities()
+            .admit(&value, &compute_texture_resources())
+            .expect("a snapshot that declares the compute-texture bits admits the pass");
+
+        // A trace whose compute passes bind no texture never enters the walk,
+        // so every pre-texture trace keeps the admission path it had.
+        let plain = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        capabilities()
+            .admit(&plain, &resources())
+            .expect("the pre-texture pass keeps admitting without the bits");
     }
 
     #[test]

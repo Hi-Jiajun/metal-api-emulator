@@ -6,14 +6,15 @@
 
 use ash::vk;
 use metal2vulkan::reflect::{
-    BufferFootprint, KernelDispatch, ResourceAccess, ResourceKind, ShaderReflection,
+    BufferFootprint, KernelDispatch, ResourceAccess, ResourceBinding, ResourceKind,
+    ShaderReflection,
 };
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
     DepthResolveFilter, DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract,
     PresentMode, ProviderCapabilities, SemanticDigest, StencilResolveFilter, StorageMode,
-    TextureFormat, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
-    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    TextureBindingContract, TextureFormat, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
+    MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use metal_api_core::ExecutorError;
 
@@ -85,6 +86,16 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
             .max_per_stage_descriptor_storage_buffers
             .min(limits.max_descriptor_set_storage_buffers)
             .min(limits.max_per_stage_resources),
+        // Compute-side texture sampling is executed: `create_textures`
+        // uploads a D2 single-sample `R32Uint` image through the driver's own
+        // `VkSubresourceLayout.rowPitch` and binds it as a combined image
+        // sampler. Evidence: the v11 case reads texel (0, 0) and the v12 cases
+        // read every cell of a 4×4 texture in two dispatch shapes, on Lavapipe
+        // and on the RTX 5060 (`research/docs/16` §4.5, §4.6). The bit names
+        // exactly that shape: one binding, one format.
+        supports_compute_texture_sampling: true,
+        max_compute_textures: MAX_COMPUTE_TEXTURES as u32,
+        supported_compute_texture_formats: vec![TextureFormat::R32Uint],
         max_buffer_range: u64::from(limits.max_storage_buffer_range),
         max_push_constant_bytes: limits.max_push_constants_size,
         alias_mode: AliasMode::Refused,
@@ -312,11 +323,17 @@ pub(crate) fn pipeline_contract(
         .map_or((0, 0), |range| (range.offset, range.size));
 
     let mut buffer_bindings = Vec::with_capacity(reflection.bindings.len());
+    let mut texture_bindings = Vec::new();
     for binding in &reflection.bindings {
-        // Sampled textures are execution resources, not contract buffer
-        // bindings; the provider's reflection validation already admitted them
-        // (`research/docs/16` §4.7).
+        // Sampled textures get their own list (`research/docs/26` §21.3, step
+        // 1). Before this list existed the class judge had to trust the
+        // request's own texture bindings, because the contract said nothing
+        // about them; now the module's reflection is the declaration the trace
+        // is paired against, exactly as it already is for buffers. The
+        // provider's reflection validation has admitted the binding's kind and
+        // access (`research/docs/16` §4.7).
         if binding.kind == ResourceKind::Texture {
+            texture_bindings.push(map_texture_binding(binding)?);
             continue;
         }
         if binding.kind != ResourceKind::Buffer {
@@ -338,6 +355,7 @@ pub(crate) fn pipeline_contract(
     }
 
     buffer_bindings.sort_by_key(|binding| binding.metal_binding);
+    texture_bindings.sort_by_key(|binding| binding.metal_binding);
     let contract = PipelineContract {
         dispatch_kind,
         required_local_size,
@@ -345,6 +363,7 @@ pub(crate) fn pipeline_contract(
         push_constant_offset,
         push_constant_bytes,
         buffer_bindings,
+        texture_bindings,
         // Capability names are provider admission metadata. A normalized
         // cross-provider vocabulary is intentionally still an open decision.
         shader_capabilities: Vec::new(),
@@ -354,6 +373,47 @@ pub(crate) fn pipeline_contract(
         .validate()
         .map_err(|error| failure(format!("provider pipeline contract: {error}")))?;
     Ok(contract)
+}
+
+/// Map one reflected sampled texture onto the contract's texture face.
+///
+/// The mapping is deliberately closed (`research/docs/26` §21.3): this rail
+/// executes D2, single-sample, non-arrayed textures whose AIR component is
+/// `uint`, so anything else is refused here — before a contract exists —
+/// rather than registered as a shape the execution path would refuse later
+/// with a message no class judge can pair against. The sampler state is the
+/// translator's synthesized read sampler, named in the contract so the
+/// execution path creates exactly that state instead of a provider default.
+fn map_texture_binding(binding: &ResourceBinding) -> Result<TextureBindingContract, ExecutorError> {
+    use metal2vulkan::meta::{TextureComponent, TextureDimension};
+
+    let shape = binding.texture_shape.as_ref().ok_or_else(|| {
+        failure(format!(
+            "texture {} has no reflected shape",
+            binding.metal_index
+        ))
+    })?;
+    if shape.dimension != TextureDimension::D2
+        || shape.arrayed
+        || shape.multisampled
+        || shape.array_ref
+        || shape.writable
+    {
+        return Err(failure(format!(
+            "texture {} is not the D2 single-sample sampled shape this rail executes",
+            binding.metal_index
+        )));
+    }
+    // The component mapping is closed the same way: `uint` is the one AIR
+    // component the first increment executes, and the shared constructor below
+    // names the shape once for both rails.
+    if shape.component != TextureComponent::Uint {
+        return Err(failure(format!(
+            "texture {} samples {:?}, which the first texture increment does not execute",
+            binding.metal_index, shape.component
+        )));
+    }
+    Ok(TextureBindingContract::sampled_r32uint(binding.metal_index))
 }
 
 fn map_access(access: Option<ResourceAccess>, index: u32) -> Result<BufferAccess, ExecutorError> {

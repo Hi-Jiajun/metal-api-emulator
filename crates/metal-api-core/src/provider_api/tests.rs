@@ -175,6 +175,9 @@ impl ComputeProvider for FakeProvider {
         ProviderCapabilities {
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            supports_compute_texture_sampling: false,
+            max_compute_textures: 0,
+            supported_compute_texture_formats: Vec::new(),
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -556,6 +559,7 @@ impl PipelineProvider for FakeProvider {
                         footprint: FootprintProof::Static { max_bytes: 4 },
                     })
                     .collect(),
+                texture_bindings: Vec::new(),
                 shader_capabilities: vec![],
                 translator_revision: None,
             },
@@ -1496,6 +1500,7 @@ fn render_metadata(provider: &FakeProvider) -> CompiledComputePipeline {
             push_constant_offset: 0,
             push_constant_bytes: 0,
             buffer_bindings: Vec::new(),
+            texture_bindings: Vec::new(),
             shader_capabilities: Vec::new(),
             translator_revision: None,
         },
