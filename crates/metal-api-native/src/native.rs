@@ -119,13 +119,14 @@ impl ResolvedRenderResidents {
     }
 }
 
-/// One render pass's execution outcome: a present action hands its one
-/// attachment's texels back through the writeback channel, while an offscreen
-/// pass hands every publishing attachment's own readback back — the resident
-/// ones excluded, because their bytes stay in the provider's images
-/// (`research/docs/23` §76, R7).
+/// One render pass's execution outcome. Both arms carry the pass's whole
+/// readback — the publishing attachments' texels plus every writable stage
+/// buffer's bytes (`research/docs/23` §92, R9k) — because both land through the
+/// same writeback channel; the variant only records which rail produced them.
+/// The resident attachments are excluded from both, because their bytes stay in
+/// the provider's images (`research/docs/23` §76, R7).
 enum PassOutcome {
-    Present(Vec<u8>),
+    Present(render::RenderReadback),
     Offscreen(render::RenderReadback),
 }
 
@@ -2208,9 +2209,15 @@ impl NativeMetalProvider {
                     return Err(error);
                 }
             };
+            // Both arms land through the one writeback channel
+            // (`research/docs/23` §3.3, v86/v92): the attachment's texels and
+            // every writable stage buffer's bytes are read beside each other
+            // after the same fence, so a present pass and an offscreen pass
+            // publish their landings the same way.
             match outcome {
-                PassOutcome::Present(texels) => writebacks.push(planned.writeback(texels)),
-                PassOutcome::Offscreen(readback) => writebacks.extend(planned.writebacks(readback)),
+                PassOutcome::Present(readback) | PassOutcome::Offscreen(readback) => {
+                    writebacks.extend(planned.writebacks(readback));
+                }
             }
         }
         Ok(writebacks)
@@ -2221,12 +2228,17 @@ impl NativeMetalProvider {
     /// it, and read the target back (`research/docs/24` §6 Step 7). The target
     /// texture is created once and reused across submissions until the
     /// allocation's lease is released.
+    ///
+    /// The pass's whole readback comes back — the target's texels beside every
+    /// writable stage buffer's bytes (`research/docs/23` §92, R9k) — so the
+    /// caller resolves the landings through the same writeback list an
+    /// offscreen pass uses.
     fn execute_present_render(
         &self,
         state: &mut State,
         planned: &render::TraceRenderPlan<'_>,
         present: &render::PresentPlan<'_>,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<render::RenderReadback, ProviderError> {
         let key = (
             present.descriptor.target.allocation_id,
             present.descriptor.target.view_id,
@@ -2265,13 +2277,31 @@ impl NativeMetalProvider {
                 sentinel,
             );
         }
-        let texels =
+        let readback =
             render::encode_present_render(&state.device, &state.queue, &planned.plan, &texture)?;
+        // A present pass hands exactly one attachment on, so a readback that
+        // carries no texels names a pass whose target the trace discarded —
+        // the shape the pre-R9k entry point refused here rather than reporting
+        // a present that landed nothing (`research/docs/24` §3.1). The check
+        // stays beside the call for the same reason: the present rail's one
+        // landing view is resolved at plan time, and the encoder's readback is
+        // what proves it produced texels.
+        if readback.attachments.len() != 1 {
+            return Err(refusal(
+                ProviderPhase::Readback,
+                ProviderErrorClass::Resource,
+                "metal_render_attachment_descriptor_unavailable",
+            )
+            .with_detail(
+                "a present pass lands exactly one attachment, and the readback carried none: the \
+                 target's store action discards the texels the present claims to hand on",
+            ));
+        }
         // present: hand the target on after the pass completed.
         self.present_counters
             .presents
             .fetch_add(1, Ordering::Relaxed);
-        Ok(texels)
+        Ok(readback)
     }
 
     #[allow(clippy::too_many_arguments)]

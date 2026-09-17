@@ -701,5 +701,158 @@ class StageBufferSelftestValidationTests(unittest.TestCase):
             run_native.validate_stage_buffer_selftest([])
 
 
+class StageBufferWriteSelftestValidationTests(unittest.TestCase):
+    """The writable stage-buffer self-test's byte comparison, exercised without
+    Metal (`research/docs/23` §92, R9k).
+
+    `run_native.validate_stage_buffer_write_selftest` is the function the CI
+    step reuses, so the five readings each run carries — the bound positions and
+    source, the attachment the fragment returned, the sink the stage wrote and
+    the accumulator it read and wrote — are pinned here rather than only in an
+    inline heredoc.
+    """
+
+    SENTINEL = "fefefefe"
+    REVIEWED_FRAME = "4080c0ff" + SENTINEL * 3
+    FULL_FRAME = "00ff00ff" * 4
+    POSITIONS = "000080bf0000803f0000803e0000803f000080bf000080be"
+    FULL_POSITIONS = "000080bf000080bf00004040000080bf000080bf00004040"
+    SOURCE = "8180803e8180003fc1c0403f0000803f"
+    GREEN = "000000000000803f000000000000803f"
+    ACCUMULATOR_INITIAL = "0000803e" * 4
+    ACCUMULATOR_REVIEWED = "0000a03f" * 4
+    ACCUMULATOR_GREEN = "0000a03f00000040" + "0000a03f00000040"
+
+    def reviewed_report(self, report_id="stage_buffer_write_2x2",
+                        completion="CompletedVisible", writebacks=None,
+                        allocations=None, observations=None):
+        if writebacks is None:
+            writebacks = [
+                {"allocation": 900, "view": 910, "offset": 0,
+                 "bytes_hex": self.REVIEWED_FRAME},
+                {"allocation": 901, "view": 911, "offset": 0,
+                 "bytes_hex": self.SOURCE},
+                {"allocation": 902, "view": 912, "offset": 0,
+                 "bytes_hex": self.ACCUMULATOR_REVIEWED},
+            ]
+        if allocations is None:
+            allocations = [
+                {"allocation": 900, "bytes_hex": self.REVIEWED_FRAME},
+                {"allocation": 901, "bytes_hex": self.SOURCE},
+                {"allocation": 902, "bytes_hex": self.ACCUMULATOR_REVIEWED},
+            ]
+        if observations is None:
+            observations = [
+                {"positions_hex": self.POSITIONS, "source_hex": self.SOURCE,
+                 "accumulator_initial_hex": self.ACCUMULATOR_INITIAL,
+                 "attachment_hex": self.REVIEWED_FRAME, "sink_hex": self.SOURCE,
+                 "accumulator_hex": self.ACCUMULATOR_REVIEWED},
+                {"positions_hex": self.FULL_POSITIONS, "source_hex": self.GREEN,
+                 "accumulator_initial_hex": self.ACCUMULATOR_INITIAL,
+                 "attachment_hex": self.FULL_FRAME, "sink_hex": self.GREEN,
+                 "accumulator_hex": self.ACCUMULATOR_GREEN},
+            ]
+        return {"id": report_id, "completion": completion, "writebacks": writebacks,
+                "allocations": allocations, "observations": observations}
+
+    def test_accepts_the_reviewed_writable_stage_buffer_runs(self):
+        report = self.reviewed_report()
+        self.assertEqual(
+            run_native.validate_stage_buffer_write_selftest(report),
+            "frames=[" + self.REVIEWED_FRAME + ", " + self.FULL_FRAME
+            + "] sinks=[" + self.SOURCE + ", " + self.GREEN
+            + "] accumulators=[" + self.ACCUMULATOR_REVIEWED + ", "
+            + self.ACCUMULATOR_GREEN + "]")
+
+    def test_rejects_a_frame_that_landed_no_source_or_a_foreign_one(self):
+        # The sentinel frame means the fragment's source never arrived; the
+        # other run's frame means the run's own bytes were not what the draw
+        # returned.
+        for index, attachment in ((0, self.SENTINEL * 4), (0, self.FULL_FRAME),
+                                  (1, self.REVIEWED_FRAME)):
+            with self.subTest(index=index, attachment=attachment):
+                observations = self.reviewed_report()["observations"]
+                observations[index]["attachment_hex"] = attachment
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_write_selftest(
+                        self.reviewed_report(observations=observations))
+
+    def test_rejects_a_sink_that_was_not_written(self):
+        # The sink starts as zeros, so a rail that executed the pass but landed
+        # nothing reports them; a rail that bound the wrong slot reports the
+        # other run's payload.
+        for sink in ("00" * 16, self.GREEN):
+            with self.subTest(sink=sink):
+                observations = self.reviewed_report()["observations"]
+                observations[0]["sink_hex"] = sink
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_write_selftest(
+                        self.reviewed_report(observations=observations))
+
+    def test_rejects_an_accumulator_that_never_read_its_previous_bytes(self):
+        # One alone (`0000803f` / `00000040`) is what a rail that bound zeros
+        # publishes; the initial bytes are what the read half added to.
+        for accumulator in ("0000803f" * 4,
+                            "0000803f000000400000803f00000040"):
+            with self.subTest(accumulator=accumulator):
+                observations = self.reviewed_report()["observations"]
+                observations[0]["accumulator_hex"] = accumulator
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_write_selftest(
+                        self.reviewed_report(observations=observations))
+
+    def test_rejects_a_run_that_names_no_bound_payload(self):
+        for field in ("positions_hex", "source_hex", "accumulator_initial_hex"):
+            with self.subTest(field=field):
+                observations = self.reviewed_report()["observations"]
+                observations[1][field] = ""
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_write_selftest(
+                        self.reviewed_report(observations=observations))
+
+    def test_rejects_a_missing_sink_or_a_moved_identity(self):
+        # The writeback shape is part of the claim: one entry per landing, the
+        # attachment first and the two writable bindings behind it, each at its
+        # own view and offset.
+        report = self.reviewed_report()
+        for writebacks in (
+            report["writebacks"][:2],
+            report["writebacks"] + [{"allocation": 903, "view": 913, "offset": 0,
+                                     "bytes_hex": self.SOURCE}],
+            [report["writebacks"][0],
+             dict(report["writebacks"][1], view=912),
+             report["writebacks"][2]],
+            [report["writebacks"][0],
+             dict(report["writebacks"][1], offset=4),
+             report["writebacks"][2]],
+        ):
+            with self.subTest(writebacks=writebacks):
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_write_selftest(
+                        self.reviewed_report(writebacks=writebacks))
+
+    def test_rejects_a_missing_or_extra_run(self):
+        observations = self.reviewed_report()["observations"]
+        for runs in (observations[:1], observations + [observations[0]]):
+            with self.subTest(runs=len(runs)):
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_stage_buffer_write_selftest(
+                        self.reviewed_report(observations=runs))
+
+    def test_rejects_the_read_only_stage_buffer_selftest_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_stage_buffer_write_selftest(
+                self.reviewed_report(report_id="stage_buffer_positions_2x2"))
+
+    def test_rejects_a_non_visible_completion(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_stage_buffer_write_selftest(
+                self.reviewed_report(completion="Submitted"))
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_stage_buffer_write_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()
