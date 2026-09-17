@@ -621,8 +621,15 @@ impl TextureType {
     }
 }
 
-/// How a shader uses one texture binding. The first increment admits read-only
-/// sampling and refuses storage writeback (`research/docs/16` §4.1).
+/// How a shader uses one texture binding.
+///
+/// `Sampled` is the read-only sampled face (`research/docs/16` §4.1).
+/// `Storage` is the writable face Metal spells `texture2d<T, access::write>`
+/// and `texture2d<T, access::read_write>` (`research/docs/26` §21.4, C2): the
+/// translator classifies both as one storage image (`ResourceAccess::Storage`)
+/// because the emitted SPIR-V image is read-write capable either way, so the
+/// contract collapses the two Metal qualifiers into this one arm and refuses
+/// a caller that declares `Sampled` for a module that writes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureAccess {
     Sampled,
@@ -711,7 +718,8 @@ impl SamplerPolicy {
     }
 }
 
-/// How far a shader reaches into one texture binding.
+/// How far a shader reaches into one texture binding, or — for a storage
+/// image — the extent the provider lands back to the owner.
 ///
 /// The proof is the texture-side sibling of [`FootprintProof`]: admission may
 /// only execute a binding whose reach is bounded *and* stated. `WholeView` is
@@ -719,6 +727,13 @@ impl SamplerPolicy {
 /// extent — and `Unbounded` is the module saying it cannot bound its reach, so
 /// a provider refuses it by name instead of executing against texels nobody
 /// sized.
+///
+/// A storage image states `WholeView` for a second reason: the translated
+/// module carries no texture-side reach, so the provider cannot bound the
+/// module's own writes. What it *can* state is the unit it lands: the whole
+/// tightly packed view, exactly the extent the byte-keyed writeback channel
+/// requires (`research/docs/26` §21.4). A declaration that cannot state even
+/// that unit says `Unbounded` and is refused by name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureFootprintProof {
     WholeView,
@@ -741,7 +756,15 @@ pub struct TextureBindingContract {
     pub format: TextureFormat,
     /// The sampler state the binding must be executed with. See
     /// [`SamplerPolicy`].
-    pub sampler: SamplerPolicy,
+    ///
+    /// `Some` exactly when the access is [`TextureAccess::Sampled`]: a storage
+    /// image is bound as a storage descriptor with no sampler at all, and a
+    /// declaration whose access and sampler presence disagree is refused by
+    /// name in [`PipelineContract::validate`]
+    /// (`TextureSamplerDeclarationMismatch`). The sampler stays `Option`-typed
+    /// rather than a second `None`-carrying policy value so a storage
+    /// declaration cannot state a state the rail would then have to ignore.
+    pub sampler: Option<SamplerPolicy>,
     /// How far the module's own metadata says the shader reaches.
     pub footprint: TextureFootprintProof,
 }
@@ -781,7 +804,30 @@ impl TextureBindingContract {
             access: TextureAccess::Sampled,
             texture_type: TextureType::D2,
             format,
-            sampler,
+            sampler: Some(sampler),
+            footprint: TextureFootprintProof::WholeView,
+        }
+    }
+
+    /// The reviewed compute storage-image shape (`research/docs/26` §21.4,
+    /// C2): a D2, single-sample texture a kernel writes through
+    /// `air.write_texture_2d`, with the whole tightly packed view as the
+    /// landing unit.
+    ///
+    /// Metal's `access::write` and `access::read_write` qualifiers both land
+    /// here: the translator reflects both as one writable texture
+    /// (`TextureShape::writable` plus `ResourceAccess::Storage`), and the
+    /// descriptor either runs is a Vulkan `STORAGE_IMAGE`, which is
+    /// read-write capable regardless of the qualifier the source spelled. The
+    /// declaration therefore states the distinction the execution path really
+    /// has instead of inventing a second one.
+    pub const fn storage(metal_binding: u32, format: TextureFormat) -> Self {
+        Self {
+            metal_binding,
+            access: TextureAccess::Storage,
+            texture_type: TextureType::D2,
+            format,
+            sampler: None,
             footprint: TextureFootprintProof::WholeView,
         }
     }
@@ -1159,6 +1205,18 @@ impl PipelineContract {
             previous_texture = Some(binding.metal_binding);
             if textures.insert(binding.metal_binding, ()).is_some() {
                 return Err(ContractError::DuplicateBinding(binding.metal_binding));
+            }
+            // The access decides whether the binding is executed with a
+            // sampler at all (`research/docs/26` §21.4, C2): a sampled binding
+            // is a combined image sampler and must state the state it was
+            // lowered against, while a storage image is a storage descriptor
+            // with no sampler. A declaration whose two halves disagree is
+            // refused here rather than executed with one half ignored.
+            if binding.sampler.is_some() != (binding.access == TextureAccess::Sampled) {
+                return Err(ContractError::TextureSamplerDeclarationMismatch {
+                    binding: binding.metal_binding,
+                    access: binding.access,
+                });
             }
         }
         Ok(())
@@ -7005,6 +7063,12 @@ impl ComputeTrace {
     /// view's access is the union of its uses across all passes; the first use
     /// keeps its binding label. Mirrors [`Self::serial_resources`] for the
     /// sampled-texture increment (`research/docs/16` §4.6).
+    ///
+    /// A writable entry is a landing from C2 on (`research/docs/26` §21.4): a
+    /// storage image's texels leave through the byte-keyed writeback channel
+    /// keyed by the view's identity, so the providers that publish writebacks
+    /// resolve a texture landing through this pool exactly as they resolve a
+    /// buffer one through [`Self::serial_resources`].
     pub fn serial_texture_resources(&self) -> Result<Vec<TextureView>, ContractError> {
         let mut resources = Vec::<TextureView>::new();
         let mut positions = BTreeMap::<ViewId, usize>::new();
@@ -7252,6 +7316,12 @@ fn validate_writebacks_for_trace(
     trace: &ComputeTrace,
 ) -> Result<(), ContractError> {
     let resources = trace.serial_resources()?;
+    // A storage image is a landing too (`research/docs/26` §21.4, C2): its
+    // texels leave through the same byte-keyed channel a buffer view's bytes
+    // do, keyed by the view's own identity. The texture pool is resolved once
+    // and shared by the per-writeback walk and the coverage walk below, exactly
+    // as the executor's own texture pool is.
+    let texture_resources = trace.serial_texture_resources()?;
     let token = completion
         .token()
         .ok_or(ContractError::InvalidSubmissionCompletion(completion))?;
@@ -7267,15 +7337,45 @@ fn validate_writebacks_for_trace(
         ));
     }
     for writeback in writebacks {
-        let view = resources
-            .iter()
-            .find(|view| {
-                view.allocation_id == writeback.allocation_id && view.view_id == writeback.view_id
-            })
-            .ok_or(ContractError::UnknownWriteback {
-                allocation: writeback.allocation_id,
-                view: writeback.view_id,
-            })?;
+        let Some(view) = resources.iter().find(|view| {
+            view.allocation_id == writeback.allocation_id && view.view_id == writeback.view_id
+        }) else {
+            // A writeback that names no buffer view falls back to the texture
+            // face. A storage image has no byte offset of its own — the view is
+            // its whole tightly packed extent — so the only complete landing
+            // starts at zero and ends at the extent the view states. A sampled
+            // or unused texture is the read-only refusal, and an identity no
+            // pass declares at all stays unknown, exactly as it does for
+            // buffers.
+            let texture = texture_resources
+                .iter()
+                .find(|texture| {
+                    texture.allocation_id == writeback.allocation_id
+                        && texture.view_id == writeback.view_id
+                })
+                .ok_or(ContractError::UnknownWriteback {
+                    allocation: writeback.allocation_id,
+                    view: writeback.view_id,
+                })?;
+            if !texture.access.is_writable() {
+                return Err(ContractError::ReadOnlyWriteback(texture.view_id));
+            }
+            let view_end = texture.expected_bytes()?;
+            let end = writeback.end()?;
+            if end > view_end {
+                return Err(ContractError::WritebackRangeOutOfBounds {
+                    view: texture.view_id,
+                    offset: writeback.offset,
+                    end,
+                    view_offset: 0,
+                    view_end,
+                });
+            }
+            if writeback.offset != 0 || end != view_end {
+                return Err(ContractError::IncompleteWriteback(texture.view_id));
+            }
+            continue;
+        };
         if !view.access.is_writable() {
             return Err(ContractError::ReadOnlyWriteback(view.view_id));
         }
@@ -7340,6 +7440,25 @@ fn validate_writebacks_for_trace(
                 allocation: view.allocation_id,
                 view: view.view_id,
             });
+        }
+        // The texture face repeats the same coverage rule: every writable
+        // storage image has to land exactly one complete writeback. There is no
+        // discard arm here — a compute pass has no store operation to excuse a
+        // written image from landing — so a missing entry is always a refusal.
+        for texture in texture_resources
+            .iter()
+            .filter(|texture| texture.access.is_writable())
+        {
+            let covered = writebacks.iter().any(|writeback| {
+                writeback.allocation_id == texture.allocation_id
+                    && writeback.view_id == texture.view_id
+            });
+            if !covered {
+                return Err(ContractError::MissingWriteback {
+                    allocation: texture.allocation_id,
+                    view: texture.view_id,
+                });
+            }
         }
     }
     Ok(())
@@ -8950,6 +9069,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MissingTextureBinding { .. }
         | E::UndeclaredTextureBinding { .. }
         | E::TextureAccessMismatch { .. }
+        | E::TextureSamplerDeclarationMismatch { .. }
         | E::TextureTypeMismatch { .. }
         | E::TextureFormatMismatch { .. }
         | E::DuplicateStageBufferBinding { .. }
@@ -10818,6 +10938,17 @@ pub enum ContractError {
         expected: TextureAccess,
         actual: TextureAccess,
     },
+    /// A texture declaration carries a sampler policy its own access does not
+    /// call for, or omits the one a sampled access needs
+    /// (`research/docs/26` §21.4, C2). A sampled binding is a combined image
+    /// sampler and has to state the state its samples were lowered against; a
+    /// storage image is a storage descriptor with no sampler. Executing either
+    /// half without the other would silently substitute a state the declaration
+    /// never named, so the pair is refused before a provider sees it.
+    TextureSamplerDeclarationMismatch {
+        binding: u32,
+        access: TextureAccess,
+    },
     /// A texture binding's dimensionality does not match the declaration.
     TextureTypeMismatch {
         binding: u32,
@@ -11596,6 +11727,11 @@ impl fmt::Display for ContractError {
             } => write!(
                 formatter,
                 "texture {binding} is declared {actual:?}, but the contract pairs it with {expected:?}"
+            ),
+            Self::TextureSamplerDeclarationMismatch { binding, access } => write!(
+                formatter,
+                "texture {binding} declares {access:?} access with the wrong sampler declaration: \
+                 a sampled binding states a sampler policy and a storage image states none"
             ),
             Self::TextureTypeMismatch {
                 binding,
@@ -18368,14 +18504,17 @@ mod tests {
     /// The declaration one texture-binding fixture has to state back
     /// (`research/docs/26` §21.3): the pair rules compare access, type and
     /// format with the view the pass binds, so a fixture that binds a view
-    /// declares the same shape in its pipeline contract.
+    /// declares the same shape in its pipeline contract. The sampler half
+    /// follows the access (`research/docs/26` §21.4): a sampled binding carries
+    /// the synthesized read state and a storage image carries none, exactly as
+    /// `PipelineContract::validate` requires.
     fn texture_declaration(view: &TextureView) -> TextureBindingContract {
         TextureBindingContract {
             metal_binding: view.metal_binding,
             access: view.access,
             texture_type: view.texture_type,
             format: view.format,
-            sampler: SamplerPolicy::synthesized_read(),
+            sampler: (view.access == TextureAccess::Sampled).then(SamplerPolicy::synthesized_read),
             footprint: TextureFootprintProof::WholeView,
         }
     }
@@ -18857,6 +18996,152 @@ mod tests {
         capabilities()
             .admit(&plain, &resources())
             .expect("the pre-texture pass keeps admitting without the bits");
+    }
+
+    /// The access and the sampler presence are one declaration
+    /// (`research/docs/26` §21.4, C2): a sampled binding is executed through
+    /// the state its samples were lowered against, and a storage image is a
+    /// storage descriptor with no sampler at all. A declaration that states
+    /// only one half is refused instead of being executed with the other half
+    /// ignored.
+    #[test]
+    fn a_texture_declaration_states_a_sampler_exactly_when_it_is_sampled() {
+        let value = compute_texture_trace();
+        let contract = value.pipelines[0].contract.clone();
+        contract
+            .validate()
+            .expect("the sampled declaration is well formed");
+
+        let mut sampled_without_sampler = contract.clone();
+        let binding = contract.texture_bindings[0].metal_binding;
+        sampled_without_sampler.texture_bindings[0].sampler = None;
+        assert_eq!(
+            sampled_without_sampler.validate(),
+            Err(ContractError::TextureSamplerDeclarationMismatch {
+                binding,
+                access: TextureAccess::Sampled,
+            })
+        );
+
+        let mut storage_with_sampler = contract.clone();
+        storage_with_sampler.texture_bindings[0].access = TextureAccess::Storage;
+        assert_eq!(
+            storage_with_sampler.validate(),
+            Err(ContractError::TextureSamplerDeclarationMismatch {
+                binding,
+                access: TextureAccess::Storage,
+            })
+        );
+
+        // The storage constructor states the reviewed shape once: D2,
+        // single-sample, whole-view landing, and no sampler.
+        let storage = TextureBindingContract::storage(binding, TextureFormat::R32Float);
+        assert_eq!(storage.access, TextureAccess::Storage);
+        assert_eq!(storage.texture_type, TextureType::D2);
+        assert_eq!(storage.sampler, None);
+        assert_eq!(storage.footprint, TextureFootprintProof::WholeView);
+        let mut storage_contract = contract;
+        storage_contract.texture_bindings = vec![storage];
+        storage_contract
+            .validate()
+            .expect("the storage declaration is well formed");
+
+        let refusal = contract_error_refusal(ContractError::TextureSamplerDeclarationMismatch {
+            binding,
+            access: TextureAccess::Storage,
+        });
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+    }
+
+    /// A storage image lands through the byte-keyed writeback channel, keyed by
+    /// its own view identity and covering its whole tightly packed extent
+    /// (`research/docs/26` §21.4, C2).
+    #[test]
+    fn a_storage_image_landing_covers_the_view_or_is_refused() {
+        let mut value = compute_texture_trace();
+        let binding = compute_pass(&value, 0).textures[0].metal_binding;
+        let view_id = compute_pass(&value, 0).textures[0].view_id;
+        let allocation = compute_pass(&value, 0).textures[0].allocation_id;
+        let extent = compute_pass(&value, 0).textures[0]
+            .expected_bytes()
+            .unwrap();
+        compute_pass_mut(&mut value, 0).textures[0].access = TextureAccess::Storage;
+        value.pipelines[0].contract.texture_bindings = vec![TextureBindingContract::storage(
+            binding,
+            TextureFormat::R32Uint,
+        )];
+        value.validate().expect("the storage fixture is valid");
+
+        let token = CompletionToken {
+            submission_id: SubmissionId::new(12),
+            device_epoch: value.device_epoch,
+        };
+        let complete = |bytes: Vec<u8>, offset: u64| ProviderSubmission {
+            completion: CompletionDisposition::CompletedVisible { token },
+            writebacks: vec![BufferWriteback {
+                view_id,
+                allocation_id: allocation,
+                offset,
+                bytes,
+            }],
+        };
+
+        complete(vec![0x5a; extent as usize], 0)
+            .validate_for_trace(&value)
+            .expect("a whole-view landing is complete");
+
+        // Every way a landing can miss the view is its own named refusal.
+        assert_eq!(
+            ProviderSubmission {
+                completion: CompletionDisposition::CompletedVisible { token },
+                writebacks: Vec::new(),
+            }
+            .validate_for_trace(&value),
+            Err(ContractError::MissingWriteback {
+                allocation,
+                view: view_id,
+            })
+        );
+        assert_eq!(
+            complete(vec![0x5a; extent as usize - 4], 0).validate_for_trace(&value),
+            Err(ContractError::IncompleteWriteback(view_id))
+        );
+        assert_eq!(
+            complete(vec![0x5a; extent as usize - 4], 4).validate_for_trace(&value),
+            Err(ContractError::IncompleteWriteback(view_id))
+        );
+        assert_eq!(
+            complete(vec![0x5a; extent as usize + 4], 0).validate_for_trace(&value),
+            Err(ContractError::WritebackRangeOutOfBounds {
+                view: view_id,
+                offset: 0,
+                end: extent + 4,
+                view_offset: 0,
+                view_end: extent,
+            })
+        );
+
+        // A sampled binding is not a landing: the same writeback against a
+        // read-only declaration is refused, which keeps a read-only texture
+        // from being reported as written.
+        let sampled = compute_texture_trace();
+        let sampled_view = compute_pass(&sampled, 0).textures[0].view_id;
+        let sampled_allocation = compute_pass(&sampled, 0).textures[0].allocation_id;
+        let sampled_extent = compute_pass(&sampled, 0).textures[0]
+            .expected_bytes()
+            .unwrap();
+        let refusal = ProviderSubmission {
+            completion: CompletionDisposition::CompletedVisible { token },
+            writebacks: vec![BufferWriteback {
+                view_id: sampled_view,
+                allocation_id: sampled_allocation,
+                offset: 0,
+                bytes: vec![0x5a; sampled_extent as usize],
+            }],
+        }
+        .validate_for_trace(&sampled);
+        assert_eq!(refusal, Err(ContractError::ReadOnlyWriteback(sampled_view)));
     }
 
     #[test]
