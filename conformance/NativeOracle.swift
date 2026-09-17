@@ -893,6 +893,14 @@ private struct ValidatedRenderAttachment {
     let store: String
     let clearComponents: [Double]
     let initial: Data?
+    /// The one colour a multisampled `load` attachment's seed pass clears
+    /// every sample with (`research/docs/23` §82, v82), in the component order
+    /// `MTLClearColor` carries. Empty for every other shape: a multisampled
+    /// load cannot be preset through `replaceRegion` any more than it can take
+    /// a buffer copy, so the executor records a `CLEAR`-opened render pass over
+    /// the same n-sample texture before the measured one, exactly as the two
+    /// provider rails do.
+    let seedComponents: [Double]
     /// The reviewed expectation of a stored attachment; `nil` for a discarded
     /// attachment, which carries no expectation and no observation.
     let expected: Data?
@@ -1547,9 +1555,12 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     }
     switch definition.id {
-    case "render_declaring_quad_extent":
+    case "render_declaring_quad_extent", "render_declaring_multisample_seed":
         // v27's declaring case: the reviewed copy_word kernel over a 4x4
-        // attachment view (64 bytes) and a 4-byte output view.
+        // attachment view (64 bytes) and a 4-byte output view. v82's seed
+        // declaring case is the same shape over the same view, holding the one
+        // repeated texel the multisampled load's seed pass clears every sample
+        // with (`research/docs/23` §82).
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "\(definition.id): unsupported entry or dispatch shape")
@@ -2016,6 +2027,7 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_two_attachments"]
     case "compute-buffer-v28":
         expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store",
+                       "render_declaring_multisample_seed",
                        "render_declaring_depth_resolve", "render_declaring_stencil_store",
                        "render_declaring_stencil_resolve",
                        "render_declaring_attachment_16x16",
@@ -3136,8 +3148,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         // constrained claim bounds; a cleared raster has no undefined content,
         // so the channel is only admitted there beside a multisample raster that
         // claims the partial coverage its allowed set resolves
-        // (`research/docs/23` §3.3, v67/v69), and a loaded attachment hands the
-        // pass its own bytes, so nothing is unclaimed beside it.
+        // (`research/docs/23` §3.3, v67/v69). A loaded multisample raster is the
+        // same shape one route along: its declared window is one repeated texel
+        // the seam seeds every sample of the raster with, so the resolve mixes
+        // two colours the fixture owns (`research/docs/23` §82, v82). Beside a
+        // single-sample load nothing is unclaimed, so the channel stays refused
+        // there.
         switch attachment.load {
         case "dontcare":
             break
@@ -3149,7 +3165,11 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         "\(definition.id): a cleared multisample raster states the partial "
                         + "coverage its allowed set resolves")
         case "load":
-            throw OracleError("\(definition.id): a loaded attachment has no unclaimed texel")
+            try require(definition.multisample != nil,
+                        "\(definition.id): a loaded attachment has no unclaimed texel")
+            try require(definition.coverage == "partial",
+                        "\(definition.id): a loaded multisample raster states the partial "
+                        + "coverage its seed resolves")
         default:
             throw OracleError("\(definition.id): unsupported attachment load op "
                               + attachment.load)
@@ -3500,6 +3520,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         let clearComponents: [Double]
         let initial: Data?
+        var seedComponents: [Double] = []
         switch attachment.load {
         case "clear":
             guard let clearHex = attachment.clear_hex else {
@@ -3525,50 +3546,129 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 throw OracleError("\(definition.id): a loaded attachment needs its previous texels")
             }
             let previous = try decodeHex(initialHex, context: "\(definition.id) initial texels")
-            // A loaded attachment hands the pass its own bytes, so no texel is
-            // unclaimed and a constrained claim has no meaning beside it
-            // (`research/docs/23` §3.3, v69); the free list states the same rule
-            // where it is parsed.
-            try require(definition.wildcard_allowed_texels == nil,
-                        "\(definition.id): a loaded attachment has no unclaimed texel")
             try require(previous.count == byteCount,
                         "\(definition.id): initial texels do not match the attachment")
             clearComponents = []
             initial = previous
-            if let expected {
-                try require(previous != expected,
-                            "\(definition.id): the initial texels equal the expectation")
-                // Partial coverage, in both directions: every texel is either
-                // the byte the load handed it or the pass's fragment output,
-                // every drawn texel carries the *same* output, and both halves
-                // appear (`docs/23` §3.3).
-                var drawn: Data? = nil
-                var drawnCount = 0
-                for offset in stride(from: 0, to: expected.count, by: 4) {
-                    let chunk = Data(expected[offset..<(offset + 4)])
-                    let previousChunk = Data(previous[offset..<(offset + 4)])
-                    if chunk == previousChunk {
-                        continue
-                    }
-                    if let drawn {
-                        try require(chunk == drawn,
-                                    "\(definition.id): drawn texels disagree about the fragment output")
-                    } else {
-                        drawn = chunk
-                    }
-                    drawnCount += 1
+            if let multisample = definition.multisample {
+                // The loaded multisampled raster (`research/docs/23` §82, v82):
+                // a multisampled image cannot be uploaded into — the copy
+                // commands are single-sample at both ends — so the seam states
+                // the declared window as one clear its own seed pass writes into
+                // every sample, and the measured pass opens the image with
+                // `load`. A clear value is one colour for the whole attachment,
+                // so the window has to be one repeated texel, and every pinned
+                // texel is the exact k-of-`sample_count` resolve of that seed
+                // and the fragment output. The reference colour of the mixes is
+                // therefore the seed itself, not a `clear_hex` a load does not
+                // carry.
+                try require(definition.coverage == "partial",
+                            "\(definition.id): a loaded multisample raster states the partial "
+                            + "coverage its seed resolves")
+                let samples = Int(multisample.sample_count)
+                let seed = Data(previous.prefix(4))
+                for offset in stride(from: 0, to: previous.count, by: 4) {
+                    try require(Data(previous[offset..<(offset + 4)]) == seed,
+                                "\(definition.id): a seeded multisample raster loads one "
+                                + "repeated texel; a per-texel seed is not a shape the "
+                                + "reviewed rails execute")
                 }
-                // The suite comparator additionally requires at least one
-                // *kept* texel, because a loading case whose draw covers
-                // everything cannot show that the load happened
-                // (`conformance/compare.py`). This oracle's own self-test
-                // fixtures are deliberately that shape — the present self-test
-                // exists to show the sentinel was replaced, not to falsify the
-                // load — so the oracle only insists that something was drawn
-                // here and leaves the falsifiability rule to the comparator and
-                // to the suite fixtures.
-                try require(drawnCount > 0,
-                            "\(definition.id): a loaded attachment needs at least one drawn texel")
+                // The seed travels as the clear colour the executor's own seed
+                // pass states, exactly as a `clear` attachment's components do.
+                seedComponents = [Double(seed[0]) / 255.0, Double(seed[1]) / 255.0,
+                                  Double(seed[2]) / 255.0, Double(seed[3]) / 255.0]
+                if let expected {
+                    try require(previous != expected,
+                                "\(definition.id): the initial texels equal the expectation")
+                    let fragment = Data(expected.prefix(4))
+                    try require(seed != fragment,
+                                "\(definition.id): the seed equals the fragment output")
+                    var claimed = Set<Int>()
+                    for entry in definition.wildcard_allowed_texels ?? [] {
+                        claimed.insert(entry.index)
+                    }
+                    var coveredSeen = Set<Int>()
+                    for offset in stride(from: 0, to: expected.count, by: 4) {
+                        if claimed.contains(offset / 4) {
+                            continue
+                        }
+                        let chunk = Data(expected[offset..<(offset + 4)])
+                        var matched: Int?
+                        for covered in 0...samples {
+                            if chunk == resolveTexel(fragment: fragment, clear: seed,
+                                                     covered: covered, samples: samples) {
+                                matched = covered
+                                break
+                            }
+                        }
+                        guard let covered = matched else {
+                            throw OracleError("\(definition.id): texel \(offset / 4) is not the "
+                                              + "resolve of any coverage of the \(samples)-sample "
+                                              + "raster")
+                        }
+                        coveredSeen.insert(covered)
+                    }
+                    if claimed.isEmpty {
+                        try require(coveredSeen.contains { $0 > 0 && $0 < samples },
+                                    "\(definition.id): a multisample expectation needs at least "
+                                    + "one partially covered texel")
+                    }
+                    try require(coveredSeen.contains(0) && coveredSeen.contains(samples),
+                                "\(definition.id): a multisample expectation needs both a "
+                                + "fully covered and an uncovered texel")
+                    if !claimed.isEmpty {
+                        let admitsPartial = (1..<samples).contains {
+                            resolveTexel(fragment: fragment, clear: seed,
+                                         covered: $0, samples: samples) != nil
+                        }
+                        try require(admitsPartial,
+                                    "\(definition.id): a seeded multisample raster that leaves "
+                                    + "a texel to its allowed set needs an exactly "
+                                    + "representable partial mix of its colours")
+                    }
+                }
+            } else {
+                // A single-sample loaded attachment hands the pass its own
+                // bytes, so no texel is unclaimed and a constrained claim has
+                // no meaning beside it (`research/docs/23` §3.3, v69); the free
+                // list states the same rule where it is parsed.
+                try require(definition.wildcard_allowed_texels == nil,
+                            "\(definition.id): a loaded attachment has no unclaimed texel")
+                if let expected {
+                    try require(previous != expected,
+                                "\(definition.id): the initial texels equal the expectation")
+                    // Partial coverage, in both directions: every texel is
+                    // either the byte the load handed it or the pass's fragment
+                    // output, every drawn texel carries the *same* output, and
+                    // both halves appear (`docs/23` §3.3).
+                    var drawn: Data? = nil
+                    var drawnCount = 0
+                    for offset in stride(from: 0, to: expected.count, by: 4) {
+                        let chunk = Data(expected[offset..<(offset + 4)])
+                        let previousChunk = Data(previous[offset..<(offset + 4)])
+                        if chunk == previousChunk {
+                            continue
+                        }
+                        if let drawn {
+                            try require(chunk == drawn,
+                                        "\(definition.id): drawn texels disagree about the fragment output")
+                        } else {
+                            drawn = chunk
+                        }
+                        drawnCount += 1
+                    }
+                    // The suite comparator additionally requires at least one
+                    // *kept* texel, because a loading case whose draw covers
+                    // everything cannot show that the load happened
+                    // (`conformance/compare.py`). This oracle's own self-test
+                    // fixtures are deliberately that shape — the present
+                    // self-test exists to show the sentinel was replaced, not to
+                    // falsify the load — so the oracle only insists that
+                    // something was drawn here and leaves the falsifiability
+                    // rule to the comparator and to the suite fixtures.
+                    try require(drawnCount > 0,
+                                "\(definition.id): a loaded attachment needs at least one drawn texel")
+                }
             }
         case "dontcare":
             // Undefined pre-pass contents (`docs/23` §13, v20): the pass
@@ -3688,6 +3788,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             width: attachment.width, height: attachment.height,
             load: attachment.load, store: attachment.store,
             clearComponents: clearComponents, initial: initial, expected: expected,
+            seedComponents: seedComponents,
             wildcardBytes: wildcardBytes, allowedBytes: allowedBytes,
             pixelFormat: pixelFormat, rule: validatedRule))
     }
@@ -4730,6 +4831,38 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     try require(commandBuffer.retainedReferences,
                 "\(definition.id): command buffer does not retain resources")
     commandBuffer.label = "native oracle: \(definition.id)"
+    // A multisampled `load` attachment's seed pass (`research/docs/23` §82,
+    // v82) is the command buffer's first encoder: the one `CLEAR`-opened,
+    // `STORE`d colour attachment writes the case's own seed into every sample
+    // of the n-sample texture, which is what the measured encoder below then
+    // opens with `.load`. `replaceRegion` cannot preset a multisampled texture
+    // any more than a buffer copy can, so the load action is the whole work and
+    // no pipeline state is needed.
+    let seeded = fixture.attachments.enumerated().filter {
+        !$0.element.seedComponents.isEmpty
+    }
+    if !seeded.isEmpty {
+        let seedPass = MTLRenderPassDescriptor()
+        for (index, attachment) in seeded {
+            guard let color = seedPass.colorAttachments[index] else {
+                throw OracleError("\(definition.id): cannot reach seeded attachment \(index)")
+            }
+            guard attachment.seedComponents.count == 4 else {
+                throw OracleError("\(definition.id): a seed colour is four components")
+            }
+            color.texture = multisampleTargets[index]
+            color.loadAction = .clear
+            color.storeAction = .store
+            color.clearColor = MTLClearColor(red: attachment.seedComponents[0],
+                                             green: attachment.seedComponents[1],
+                                             blue: attachment.seedComponents[2],
+                                             alpha: attachment.seedComponents[3])
+        }
+        guard let seedEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: seedPass) else {
+            throw OracleError("\(definition.id): cannot create the seed render encoder")
+        }
+        seedEncoder.endEncoding()
+    }
     guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
         throw OracleError("\(definition.id): cannot create a render encoder")
     }

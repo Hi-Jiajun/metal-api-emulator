@@ -2296,12 +2296,16 @@ def _render_plan(plan, suite):
             # reviewed pass opens it from a clear, whose colour is then the
             # reference every expectation is a resolve of — or, from v67 on,
             # from `dontcare` while every unclaimed texel states the closed set
-            # its resolve may land in. The free `wildcard_texels` list stays
-            # refused here: a nominal colour the expectation does not mix with
-            # is what the constrained form exists for.
-            _require(case["attachment"].get("load") in ("clear", "dontcare"),
+            # its resolve may land in — or, from v82 on, from `load`, whose
+            # declared window is one repeated texel the rail seeds every sample
+            # of the raster with before the measured pass opens it, so the
+            # reference is that texel itself. The free `wildcard_texels` list
+            # stays refused here: a nominal colour the expectation does not mix
+            # with is what the constrained form exists for.
+            _require(case["attachment"].get("load") in ("clear", "dontcare", "load"),
                      f"{where}: the reviewed multisample pass opens its attachment from a "
-                     "clear or a dontcare load with constrained wildcard texels")
+                     "clear, a loaded seed or a dontcare load with constrained wildcard "
+                     "texels")
             # The depth surface beside the raster is admitted from v53 on and
             # the stencil surface from v55 (`research/docs/23` §3.3, v53/v55):
             # both are rail-owned — the pass tests and writes them, but keeping
@@ -2709,13 +2713,6 @@ def _render_plan(plan, suite):
             elif load == "load":
                 previous = _hex(attachment.get("initial_hex"),
                                 f"{attachment_where}.initial_hex")
-                # A loaded attachment hands the pass its own bytes, so no texel
-                # is unclaimed and neither wildcard channel has a meaning here:
-                # the expectation compares against what the load carried
-                # (`research/docs/23` §3.3, v69). The free list states the same
-                # rule where it is parsed.
-                _require(wildcard_allowed is None,
-                         f"{attachment_where}: a loaded attachment has no unclaimed texel")
                 _require(len(previous) == len(expected),
                          f"{attachment_where}: initial texels do not match the attachment")
                 _require(previous != expected,
@@ -2736,19 +2733,87 @@ def _render_plan(plan, suite):
                          == attachment.get("initial_hex"),
                          f"{attachment_where}: the declared view's bytes are not the "
                          "attachment's initial texels")
-                # Partial coverage, both directions: every texel is either the
-                # fragment output or the byte the load handed it, every drawn
-                # texel carries the same output, and both halves appear.
-                drawn = {chunk for position, chunk in enumerate(texels)
-                         if chunk != previous[position * 4:position * 4 + 4]}
-                kept = sum(1 for position, chunk in enumerate(texels)
-                           if chunk == previous[position * 4:position * 4 + 4])
-                _require(len(drawn) == 1,
-                         f"{attachment_where}: drawn texels disagree about the fragment "
-                         f"output: {sorted(drawn)}")
-                _require(0 < kept < len(texels),
-                         f"{attachment_where}: a loaded attachment needs both drawn and "
-                         "kept texels")
+                if multisample is not None:
+                    # The loaded multisampled raster (`research/docs/23` §82,
+                    # v82): a multisampled image cannot be uploaded into — the
+                    # transfer commands are single-sample at both ends — so the
+                    # rail states the declared window as one clear its own seed
+                    # pass writes into every sample, and the measured pass then
+                    # opens the image with `LOAD`. A clear value is one colour
+                    # for the whole attachment, so the window has to be one
+                    # repeated texel, and every pinned texel is the exact
+                    # k-of-`sample_count` resolve of that seed and the fragment
+                    # output. The reference colour of the mixes is therefore the
+                    # seed itself, not a `clear_hex` a load does not carry.
+                    _require(wildcard_texels is None,
+                             f"{attachment_where}: the multisample raster claims every "
+                             "texel it resolves, or states the closed allowed set of a "
+                             "constrained wildcard texel")
+                    _require(coverage == "partial",
+                             f"{attachment_where}: a loaded multisample raster states the "
+                             "partial coverage its seed resolves")
+                    samples = multisample["sample_count"]
+                    seed = previous[:4]
+                    _require(all(previous[offset:offset + 4] == seed
+                                 for offset in range(0, len(previous), 4)),
+                             f"{attachment_where}: a seeded multisample raster loads one "
+                             "repeated texel; a per-texel seed is not a shape the reviewed "
+                             "rails execute")
+                    _require(seed != texel,
+                             f"{attachment_where}: the seed equals the fragment output")
+                    if wildcard_allowed is not None:
+                        # The constrained channel, hosted by the seed: the named
+                        # texels state the closed set of exact k-of-N mixes of
+                        # the fragment output and the seed, and the pinned texels
+                        # still carry both extremes.
+                        _check_allowed_texels(wildcard_allowed, len(texels), texel, samples,
+                                              seed.hex(), attachment_where)
+                        _require(any(_resolve_texel(texel, seed, covered, samples) is not None
+                                     for covered in range(1, samples)),
+                                 f"{attachment_where}: a seeded multisample raster that "
+                                 "leaves a texel to its allowed set needs an exactly "
+                                 "representable partial mix of its colours")
+                    covered_seen = set()
+                    for position, chunk in enumerate(texels):
+                        if wildcard_allowed is not None and position in wildcard_allowed:
+                            continue
+                        for covered in range(samples + 1):
+                            if chunk == _resolve_texel(texel, seed, covered, samples):
+                                covered_seen.add(covered)
+                                break
+                        else:
+                            raise CaptureError(
+                                f"{attachment_where}: texel {position} is not the resolve of "
+                                f"any coverage of the {samples}-sample raster")
+                    if wildcard_allowed is None:
+                        _require(any(0 < covered < samples for covered in covered_seen),
+                                 f"{attachment_where}: a multisample expectation needs at "
+                                 "least one partially covered texel")
+                    _require(0 in covered_seen and samples in covered_seen,
+                             f"{attachment_where}: a multisample expectation needs both "
+                             "a fully covered and an uncovered texel")
+                else:
+                    # A single-sample loaded attachment hands the pass its own
+                    # bytes, so no texel is unclaimed and neither wildcard
+                    # channel has a meaning here: the expectation compares
+                    # against what the load carried (`research/docs/23` §3.3,
+                    # v69). The free list states the same rule where it is
+                    # parsed. Partial coverage, both directions: every texel is
+                    # either the fragment output or the byte the load handed it,
+                    # every drawn texel carries the same output, and both halves
+                    # appear.
+                    _require(wildcard_allowed is None,
+                             f"{attachment_where}: a loaded attachment has no unclaimed texel")
+                    drawn = {chunk for position, chunk in enumerate(texels)
+                             if chunk != previous[position * 4:position * 4 + 4]}
+                    kept = sum(1 for position, chunk in enumerate(texels)
+                               if chunk == previous[position * 4:position * 4 + 4])
+                    _require(len(drawn) == 1,
+                             f"{attachment_where}: drawn texels disagree about the fragment "
+                             f"output: {sorted(drawn)}")
+                    _require(0 < kept < len(texels),
+                             f"{attachment_where}: a loaded attachment needs both drawn and "
+                             "kept texels")
             elif load == "dontcare":
                 # A `dontcare` load claims no previous bytes, so every texel it
                 # *observes* has to be the fragment output and the unclaimed

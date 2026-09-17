@@ -2392,6 +2392,20 @@ pub(crate) struct PlannedAttachment<'a> {
     /// mapping, so the upload reads the pages the footprint proof read and the
     /// plan names the lease its submission has to retain.
     pub(crate) initial: Option<PlannedInputSource<'a>>,
+    /// The one colour a multisampled `Load` seeds every sample of the
+    /// attachment with before the measured pass opens it
+    /// (`research/docs/23` §82, v82), in the pass's own component order.
+    ///
+    /// Metal's load route cannot upload into a multisampled texture either —
+    /// a blit copy is single-sample at both ends, exactly as the Vulkan rail's
+    /// copy is — so the encoder records a seed render pass whose load action is
+    /// `Clear` and whose store action keeps the seeded samples, and the
+    /// measured pass then opens the texture with `MTLLoadAction::Load`. A clear
+    /// value is one colour for the whole attachment, so the declared window has
+    /// to be one repeated texel and has to come from a window this submission
+    /// owns; both deviations are refused by name
+    /// ([`multisample_seed`]). `Some` exactly for that shape.
+    pub(crate) seed: Option<[f64; 4]>,
 }
 
 impl PlannedAttachment<'_> {
@@ -2401,6 +2415,80 @@ impl PlannedAttachment<'_> {
     pub(crate) fn initial_bytes(&self) -> Option<&[u8]> {
         self.initial.as_ref().map(|source| source.proof_bytes())
     }
+}
+
+/// The one colour a multisampled `Load` seeds every sample with
+/// (`research/docs/23` §82, v82).
+///
+/// Metal's copy commands are single-sample at both ends exactly as Vulkan's
+/// are (`replaceRegion` into a multisampled texture is not a route this rail
+/// takes either), so the load is executed by a *seed pass*: the encoder opens
+/// the same multisampled texture with `MTLLoadAction::Clear` — which writes the
+/// clear colour to every sample — stores it, and the measured pass then opens
+/// it with `MTLLoadAction::Load`. The clear colour is one value for the whole
+/// attachment, so the declaration has to be one repeated texel of its own
+/// format width, read from a window this submission owns.
+///
+/// The two deviations carry the Vulkan rail's own names, so a capture can read
+/// the same slug on either rail (`research/docs/23` §82):
+///
+/// - a window that is not one repeated texel
+///   (`render_multisample_load_nonuniform_unsupported`): a per-texel seed needs
+///   a full-coverage fragment shader this rail does not own — the reviewed
+///   modules are the trace's, not the rail's;
+/// - an owner's own mapping (`render_multisample_load_borrowed_unsupported`):
+///   the seed is host state read before the encoder exists, so a borrowed
+///   window would be a snapshot of the owner's pages rather than a device read
+///   of them. The staged arm states the same bytes through the provider's own
+///   copy.
+fn multisample_seed(
+    source: &PlannedInputSource<'_>,
+    attachment: usize,
+    bytes_per_texel: u64,
+    format: RenderPixelFormat,
+) -> Result<[f64; 4], ProviderError> {
+    if matches!(source, PlannedInputSource::NoCopy { .. }) {
+        return Err(
+            capability_refusal("render_multisample_load_borrowed_unsupported")
+                .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+                .with_field(
+                    "storage_mode",
+                    FieldValue::Text("borrowed_no_copy".to_owned()),
+                )
+                .with_detail(
+                    "a multisampled `Load` is executed by a seed pass whose clear value is host \
+                     state; a borrowed seed would be read here instead of by the device at \
+                     execution",
+                ),
+        );
+    }
+    let bytes = source.proof_bytes();
+    let width = usize::try_from(bytes_per_texel).unwrap_or(usize::MAX);
+    if width == 0 || bytes.len() < width {
+        return Err(args_refusal("render_attachment_initial_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("byte_length", FieldValue::Unsigned(bytes.len() as u64))
+            .with_detail("a multisampled load's seed window holds at least one texel"));
+    }
+    let (texel, rest) = bytes.split_at(width);
+    if rest.chunks(width).any(|chunk| chunk != texel) {
+        return Err(
+            capability_refusal("render_multisample_load_nonuniform_unsupported")
+                .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+                .with_detail(
+                    "the seed route states one clear value for the whole raster, so the loaded \
+                     window has to be one repeated texel; a per-texel seed needs a \
+                     full-coverage fragment shader this rail does not own",
+                ),
+        );
+    }
+    let clear = ClearColor::from_bytes(texel).ok_or_else(|| {
+        args_refusal("render_attachment_initial_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("byte_length", FieldValue::Unsigned(texel.len() as u64))
+            .with_detail("a seed texel is one to eight bytes")
+    })?;
+    Ok(clear_components(clear, format))
 }
 
 /// Validate a render request against the contract and the rail's own allowlist.
@@ -2736,6 +2824,14 @@ pub(crate) fn plan_with_leases<'a>(
         );
     }
     let mut planned_attachments = Vec::with_capacity(attachments.len());
+    // The rasters this rail executes (`research/docs/23` §3.3, v51/v61): only
+    // an admitted two-, four- or eight-sample raster has a seed route, and a
+    // state of one sample falls through to the refusal below exactly as it did
+    // before.
+    let multisampled = matches!(
+        request.pass.multisample.map(|state| state.sample_count),
+        Some(SampleCount::Two | SampleCount::Four | SampleCount::Eight)
+    );
     for (index, (attachment, previous)) in attachments
         .iter()
         .zip(request.initial.iter().cloned())
@@ -2856,6 +2952,26 @@ pub(crate) fn plan_with_leases<'a>(
             // attachment drops them, so neither one produces a readback.
             publishes: attachment.store == StoreOp::Store,
             resident: declares_resident,
+            // The multisampled load's seed (`research/docs/23` §82, v82): a
+            // four-sample surface cannot be uploaded into, so the plan states
+            // the one colour the encoder's seed pass clears every sample with.
+            // The same rule the Vulkan rail states, with the same names.
+            seed: match (load, &initial) {
+                (RenderLoadAction::Load, Some(source)) if multisampled => Some(multisample_seed(
+                    source,
+                    index,
+                    attachment.format.bytes_per_texel(),
+                    format,
+                )?),
+                (RenderLoadAction::Load, None) if multisampled => {
+                    return Err(capability_refusal("render_multisample_load_unsupported")
+                        .with_detail(
+                            "a multisampled `Load` is seeded by a clear the plan has to state; \
+                             this attachment declares no previous bytes",
+                        ));
+                }
+                _ => None,
+            },
             initial,
         });
     }
@@ -2949,11 +3065,13 @@ pub(crate) fn plan_with_leases<'a>(
         cull: request.pass.cull,
         blend: request.pass.blend.clone(),
         // The multisample raster (`research/docs/23` §3.3, v51/v61). The
-        // contract already refused a single-sample state, a non-clear load and
-        // a depth or stencil surface beside it; the rail re-asserts the counts
-        // its encoder knows how to build, so a directly-constructed request
-        // cannot reach `newTextureWithDescriptor` with a raster this
-        // increment does not execute.
+        // contract already refused a single-sample state; the rail re-asserts
+        // the counts its encoder knows how to build, so a directly-constructed
+        // request cannot reach `newTextureWithDescriptor` with a raster this
+        // increment does not execute. The attachment's load was decided above:
+        // a `clear`/`dontcare` opens the image from its own action, and a
+        // `Load` carries the seed the encoder's seed pass clears every sample
+        // with (`research/docs/23` §82, v82).
         multisample: match request.pass.multisample {
             Some(multisample)
                 if matches!(
@@ -4480,6 +4598,47 @@ fn encode_into_and_readback(
     // synchronous, so neither has to be retained: nothing here outlives this
     // pool.
     let command = queue.new_command_buffer();
+    // The multisampled load's seed pass (`research/docs/23` §82, v82) is the
+    // first encoder of the command buffer: one `CLEAR`-opened, `STORE`d colour
+    // attachment per seeded location — the very multisampled textures the
+    // measured encoder below names — so every sample of those texels holds the
+    // plan's own seed when the measured pass opens them with
+    // `MTLLoadAction::Load`. The load action is the whole work: no pipeline
+    // state, no draw, and therefore no pipeline the rail would have to own.
+    if planned
+        .attachments
+        .iter()
+        .any(|attachment| attachment.seed.is_some())
+    {
+        let multisampled = multisample_targets.as_ref().ok_or_else(|| {
+            capability_refusal("render_multisample_load_unsupported").with_detail(
+                "a seeded multisampled load needs the n-sample textures the seed pass clears",
+            )
+        })?;
+        let seed_pass = MetalRenderPassDescriptor::new();
+        for (index, attachment) in planned.attachments.iter().enumerate() {
+            let Some(components) = attachment.seed else {
+                continue;
+            };
+            let color = seed_pass
+                .color_attachments()
+                .object_at(index as u64)
+                .ok_or_else(|| {
+                    resource_refusal("metal_render_attachment_descriptor_unavailable")
+                })?;
+            color.set_texture(Some(&multisampled[index]));
+            color.set_load_action(MTLLoadAction::Clear);
+            color.set_clear_color(MTLClearColor::new(
+                components[0],
+                components[1],
+                components[2],
+                components[3],
+            ));
+            color.set_store_action(MTLStoreAction::Store);
+        }
+        let seed_encoder = command.new_render_command_encoder(seed_pass);
+        seed_encoder.end_encoding();
+    }
     let encoder = command.new_render_command_encoder(pass);
     encoder.set_render_pipeline_state(&pipeline);
     // Metal's depth state is encoder state (`research/docs/23` §3.3, v36): the
@@ -4762,7 +4921,14 @@ fn attachment_textures(
         // image before the draw, exactly as they define a fresh per-pass
         // attachment (`research/docs/23` §76, R7).
         if let Some(source) = &attachment.initial {
-            upload_texels(&texture, planned, attachment.texel, source.proof_bytes());
+            // A multisampled `Load` is seeded by the encoder's own seed pass
+            // (`research/docs/23` §82, v82): those bytes define the n-sample
+            // surface, not the single-sample texture this loop holds, which the
+            // resolve overwrites whole — so the upload is skipped rather than
+            // written into bytes the pass never reads.
+            if planned.multisample.is_none() {
+                upload_texels(&texture, planned, attachment.texel, source.proof_bytes());
+            }
         }
         textures.push(texture);
     }
@@ -9526,6 +9692,211 @@ mod tests {
         assert_eq!(
             error.fields.get("attachment"),
             Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// The v82 shape at the plan level: a four-sample attachment the pass opens
+    /// with `LoadOp::Load` (`research/docs/23` §82).
+    ///
+    /// Metal's copy commands are single-sample at both ends, so the load is
+    /// executed by the encoder's own seed pass, whose clear value is host
+    /// state. What these tests pin is everything answerable without a device:
+    /// the one uniform texel the plan turns into components, the two shapes it
+    /// refuses by name — a window that is not one repeated texel, and an
+    /// owner's own mapping, which the seed would read on the host rather than
+    /// through the device — and the missing-bytes shape a load with no seed
+    /// cannot execute.
+    #[test]
+    fn plan_states_the_seed_of_a_multisampled_load_and_refuses_the_shapes_it_cannot_read() {
+        let seeded: Vec<u8> = [0x22_u8, 0x44, 0x66, 0x89].repeat(4);
+        let mut pass = milestone_pass(LoadOp::Load);
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        let pipeline = milestone_pipeline();
+        let planned = plan_pass(&milestone_request(&pass, &pipeline, Some(&seeded)))
+            .expect("one repeated texel is the seed the seed pass clears with");
+        assert_eq!(planned.multisample, Some(SampleCount::Four));
+        let [attachment] = planned.attachments.as_slice() else {
+            panic!("the milestone renders one attachment");
+        };
+        // The load itself stays a load: the seed is what the encoder's own
+        // render pass clears, not a change of the trace's declaration.
+        assert_eq!(attachment.load, RenderLoadAction::Load);
+        assert_eq!(
+            attachment.seed,
+            Some([
+                0x22 as f64 / 255.0,
+                0x44 as f64 / 255.0,
+                0x66 as f64 / 255.0,
+                0x89 as f64 / 255.0,
+            ]),
+            "the seed decodes through the attachment's own format"
+        );
+        assert_eq!(attachment.initial_bytes(), Some(seeded.as_slice()));
+
+        // A per-texel seed: the clear value is one colour for the whole
+        // attachment, and a full-coverage shader that could write every sample
+        // is not a module this rail owns.
+        let mut mixed = seeded.clone();
+        mixed[7] = 0xff;
+        let error = plan_pass(&milestone_request(&pass, &pipeline, Some(&mixed)))
+            .expect_err("a per-texel seed is refused by name");
+        eprintln!("nonuniform multisampled load refused: {error:?}");
+        assert_eq!(error.slug, "render_multisample_load_nonuniform_unsupported");
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // No bytes at all: the offscreen shape is refused by the load's own
+        // declaration rule — a `Load` that declares nothing has nothing to
+        // upload — and the multisampled route adds no second spelling of it.
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None))
+            .expect_err("a load without declared bytes is refused by name");
+        eprintln!("seedless multisampled load refused: {error:?}");
+        assert_eq!(error.slug, "render_attachment_initial_mismatch");
+
+        // The multisampled *present* shape is the one arm that reaches the
+        // plan with a `Load` and no declared bytes: its n-sample surface is
+        // rail-owned and the sentinel preset a single-sample present target
+        // carries cannot define a multisampled image, so the shape has no seed
+        // to state and is refused by name instead of opening the surface from
+        // undefined memory.
+        let mut presenting = milestone_pass(LoadOp::Load);
+        presenting.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        presenting.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(9),
+                view_id: ViewId::new(7),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: 1,
+                initial: InitialState::Undefined,
+            },
+            source: ViewId::new(7),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        let error = plan_pass(&milestone_request(&presenting, &pipeline, None))
+            .expect_err("a multisampled present load has no seed to state");
+        eprintln!("present multisampled load refused: {error:?}");
+        assert_eq!(error.slug, "render_multisample_load_unsupported");
+
+        // The single-sample load keeps the upload it always had: the seed is
+        // the multisampled route's own fact, and a pre-v82 pass states none.
+        let mut single = milestone_pass(LoadOp::Load);
+        single.multisample = None;
+        let planned = plan_pass(&milestone_request(&single, &pipeline, Some(&seeded)))
+            .expect("a single-sample load keeps its upload");
+        assert_eq!(planned.attachments[0].seed, None);
+    }
+
+    /// An owner's own mapping is not a seed the multisampled route can read
+    /// (`research/docs/23` §82): the clear value is host state, so the borrowed
+    /// window would be a snapshot of the owner's pages rather than the device
+    /// read §74 promises. The staged arm states the same bytes through the
+    /// provider's own copy and is admitted.
+    #[test]
+    fn plan_refuses_a_borrowed_seed_and_admits_the_staged_one() {
+        let epoch = DeviceEpoch::new(3);
+        let seed: Vec<u8> = [0x22_u8, 0x44, 0x66, 0x89].repeat(4);
+        let borrow_id = LeaseId::new(64);
+        let borrow_reservation =
+            lease_registration(borrow_id, AllocationId::new(9), OWNER_ALIGNMENT, epoch);
+        let mut owner_attachment =
+            OwnerPages::new(OWNER_ALIGNMENT as usize, OWNER_ALIGNMENT as usize);
+        owner_attachment.write(&seed);
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(borrow_reservation, owner_attachment.as_ptr())
+                    .expect("the owner's attachment window is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let staged_id = LeaseId::new(63);
+        let staged_reservation = lease_registration(staged_id, AllocationId::new(9), 16, epoch);
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(staged_reservation, seed.clone())
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let resources = owner_attachment_resources(epoch, borrow_reservation, OWNER_ALIGNMENT);
+        let staged_resources =
+            owner_attachment_resources(epoch, staged_reservation, OWNER_ALIGNMENT);
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let (mut trace, _) = milestone_trace(LoadOp::Load);
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        lease_the_milestone_attachment(&mut trace, BufferSource::BorrowedNoCopy(borrow_id));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), None, 0, 0)
+            .expect_err("a borrowed seed would be read on the host");
+        eprintln!("borrowed multisampled seed refused: {error:?}");
+        assert_eq!(error.slug, "render_multisample_load_borrowed_unsupported");
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // The staged arm states the same bytes through the provider's own copy,
+        // so the seed route reads them exactly as it reads declared bytes.
+        let (mut staged_trace, _) = milestone_trace(LoadOp::Load);
+        let Some(TracePass::Render(pass)) = staged_trace.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        lease_the_milestone_attachment(&mut staged_trace, BufferSource::StagedLease(staged_id));
+        let pool = staged_trace
+            .serial_resources()
+            .expect("admitted serial pool");
+        let staged_leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &staged_resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let planned = plan_trace_with_leases(
+            &staged_trace,
+            &pool,
+            &contracts,
+            Some(&staged_leases),
+            None,
+            0,
+            0,
+        )
+        .expect("a staged seed is the provider's own copy");
+        assert_eq!(
+            planned[0].plan.attachments[0].seed,
+            Some([
+                0x22 as f64 / 255.0,
+                0x44 as f64 / 255.0,
+                0x66 as f64 / 255.0,
+                0x89 as f64 / 255.0,
+            ])
         );
     }
 

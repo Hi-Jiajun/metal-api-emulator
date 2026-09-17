@@ -704,6 +704,19 @@ pub(crate) struct OffscreenColorAttachment<'a> {
     /// owner window is imported as the copy's own source, and the retain the
     /// pass took keeps it alive until the fence signals (R5b).
     pub previous: Option<RenderInputSource<'a>>,
+    /// The one texel a multisampled `Load` seeds every sample with
+    /// (`research/docs/23` §82, v82).
+    ///
+    /// A multisampled attachment cannot receive its previous bytes through
+    /// `vkCmdCopyBufferToImage` (the command's own valid usage holds
+    /// `dstImage` to a sample count of one), so the reviewed load route is a
+    /// *seed pass*: a render pass the rail records before the measured one,
+    /// opening the same image from `CLEAR` — every sample of the render area
+    /// takes the clear value — and storing it, after which the measured pass
+    /// opens the image with `LOAD_OP_LOAD`. A clear value is one colour for the
+    /// whole attachment, so the declared window has to be one repeated texel;
+    /// `Some` exactly for that shape and `None` for every other load.
+    pub seed: Option<ClearColor>,
     /// The provider-owned image this attachment renders into instead of a
     /// per-pass attachment image, or `None` for the offscreen shape every
     /// earlier increment published (`research/docs/23` §76, R7).
@@ -2209,12 +2222,29 @@ fn prepare_render_request_with_resident<'a>(
             }
             Some(_) => {}
         }
+        // The multisampled load's seed (`research/docs/23` §82, v82): a
+        // multisampled image cannot take its previous bytes from a buffer
+        // copy, so the rail's load route is a seed pass whose clear value is
+        // host state. The declaration therefore has to be one repeated texel
+        // read from a window this submission owns; both deviations are refused
+        // by name here, before any device object exists.
+        let seed = match previous.as_ref() {
+            Some(source)
+                if pass
+                    .multisample
+                    .is_some_and(|state| state.sample_count != SampleCount::One) =>
+            {
+                Some(resolve_multisample_seed(source, index, attachment.format)?)
+            }
+            _ => None,
+        };
         attachments.push(OffscreenColorAttachment {
             format: attachment.format,
             store: attachment.store,
             load: attachment.load,
             previous,
             resident,
+            seed,
         });
     }
     // A pass with no colour attachment takes its extent from the depth
@@ -2771,6 +2801,82 @@ fn resolve_attachment_load<'a>(
             ));
     }
     Ok(source)
+}
+
+/// The one texel a multisampled `Load` seeds every sample with
+/// (`research/docs/23` §82, v82).
+///
+/// A multisampled image cannot take its previous bytes from a buffer copy:
+/// `vkCmdCopyBufferToImage` holds its destination to
+/// `VK_SAMPLE_COUNT_1_BIT` (`VUID-vkCmdCopyBufferToImage-dstImage-07973`), a
+/// blit is single-sample at both ends
+/// (`VUID-vkCmdBlitImage-srcImage-00233`/`-dstImage-00234`), and a resolve
+/// reduces a multisampled source into a single-sample destination
+/// (`VUID-vkCmdResolveImage-srcImage-00257`/`-dstImage-00259`) — the other
+/// direction. What is left is a *seed pass*: a render pass that opens the same
+/// image from `CLEAR`, which writes the clear value to every sample of the
+/// render area, before the measured pass opens it with `LOAD`. A clear value is
+/// one colour for the whole attachment, so the declaration has to be one
+/// repeated texel of its own format byte extent.
+///
+/// Two deviations are refused by name instead of being read as something else
+/// (`research/docs/23` §82):
+///
+/// - a window that is not one repeated texel
+///   (`render_multisample_load_nonuniform_unsupported`): a per-texel seed needs
+///   a full-coverage fragment shader writing every sample, and the rail owns no
+///   shader of its own;
+/// - an owner's own mapping (`render_multisample_load_borrowed_unsupported`):
+///   the seed's clear value is host state read before the first command exists,
+///   so a borrowed window would be a snapshot here, not the device read of the
+///   owner's live pages §74 promises for the load channel. The staged arm
+///   states the same bytes through the provider's own copy.
+fn resolve_multisample_seed(
+    source: &RenderInputSource<'_>,
+    attachment: usize,
+    format: AttachmentFormat,
+) -> Result<ClearColor, ProviderError> {
+    if source.borrowed_lease().is_some() {
+        return Err(
+            capability_refusal("render_multisample_load_borrowed_unsupported")
+                .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+                .with_field(
+                    "storage_mode",
+                    FieldValue::Text("borrowed_no_copy".to_owned()),
+                )
+                .with_detail(
+                    "a multisampled `Load` is executed by a seed pass whose clear value is host \
+                     state; a borrowed seed would be read here instead of by the device at \
+                     execution",
+                ),
+        );
+    }
+    let width = usize::try_from(format.bytes_per_texel()).unwrap_or(usize::MAX);
+    let bytes = source.proof_bytes();
+    if width == 0 || bytes.len() < width {
+        return Err(args_refusal("render_attachment_initial_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("byte_length", FieldValue::Unsigned(bytes.len() as u64))
+            .with_detail("a multisampled load's seed window holds at least one texel"));
+    }
+    let (texel, rest) = bytes.split_at(width);
+    if rest.chunks(width).any(|chunk| chunk != texel) {
+        return Err(
+            capability_refusal("render_multisample_load_nonuniform_unsupported")
+                .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+                .with_detail(
+                    "the seed route states one clear value for the whole raster, so the loaded \
+                     window has to be one repeated texel; a per-texel seed needs a \
+                     full-coverage fragment shader this rail does not own",
+                ),
+        );
+    }
+    ClearColor::from_bytes(texel).ok_or_else(|| {
+        args_refusal("render_attachment_initial_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("byte_length", FieldValue::Unsigned(texel.len() as u64))
+            .with_detail("a seed texel is one to eight bytes")
+    })
 }
 
 /// Resolve one sampled texture's bytes into the source the rail uploads or
@@ -4066,18 +4172,33 @@ fn execute_offscreen_render_with_retains(
                     ));
             }
             // A multisampled attachment's load (`research/docs/23` §3.3,
-            // v51/v67): `clear` and `dontcare` both execute — the second opens
-            // the multisampled image from undefined contents and resolves
-            // whatever the samples hold. A `load` would have to upload
-            // single-sample previous bytes into a multisampled image, which is
-            // the load increment this rail does not execute.
-            if matches!(attachment.load, LoadOp::Load) {
-                return Err(
-                    capability_refusal("render_multisample_load_unsupported").with_detail(
-                        "a multisampled surface's previous contents are the load increment \
-                         this rail does not execute",
-                    ),
-                );
+            // v51/v67/v82): `clear` and `dontcare` both execute — the second
+            // opens the multisampled image from undefined contents and resolves
+            // whatever the samples hold — and `load` executes from v82 on
+            // through the seed pass the request's own `seed` names. The shape
+            // decision itself was made before any device object existed
+            // (`resolve_multisample_seed`); what is re-asserted here is the
+            // agreement between a hand-built request's load and its seed, so a
+            // request that states one without the other is refused by name
+            // instead of reaching `vkCreateImage` with a route it has no colour
+            // for.
+            if samples != vk::SampleCountFlags::TYPE_1 {
+                match (attachment.load, attachment.seed) {
+                    (LoadOp::Load, None) => {
+                        return Err(capability_refusal("render_multisample_load_unsupported")
+                            .with_detail(
+                                "a multisampled surface's previous contents are seeded by a \
+                                 clear the request has to state",
+                            ));
+                    }
+                    (LoadOp::Load, Some(_)) => {}
+                    (_, Some(_)) => {
+                        return Err(contract_refusal(
+                            "only a multisampled `Load` carries a seed clear",
+                        ));
+                    }
+                    (_, None) => {}
+                }
             }
         }
         // The depth surface beside the raster is created with the same sample
@@ -4310,6 +4431,7 @@ fn execute_offscreen_render_with_retains(
                 width,
                 height,
                 attachment.load,
+                attachment.seed,
                 attachment.store == StoreOp::Store,
                 samples,
             )?,
@@ -4410,6 +4532,12 @@ fn execute_offscreen_render_with_retains(
         // every other pass carries none (`research/docs/23` §3.3, v60).
         request.stencil_resolve.map(|resolve| resolve.filter),
     )?;
+    // The seed pass a multisampled `Load` is executed with
+    // (`research/docs/23` §82, v82) is created beside the measured pass: both
+    // name the same images, and `record` runs the seed pass first so the
+    // measured pass's `LOAD` opens samples the clear already defined.
+    objects.create_seed_render_pass(&vk_formats)?;
+    objects.create_seed_framebuffer(width, height)?;
     objects.create_framebuffer(width, height)?;
     // The sampled textures are created before the pipeline, because the
     // sampled pipeline's layout is built from the descriptor set layout they
@@ -4447,7 +4575,15 @@ fn execute_offscreen_render_with_retains(
     objects.base_vertex = request.base_vertex;
     for (index, attachment) in request.attachments.iter().enumerate() {
         if let Some(previous) = &attachment.previous {
-            objects.create_previous_bytes(index, previous)?;
+            // A multisampled attachment's `Load` is seeded by the clear of the
+            // rail's own render pass instead of a buffer copy
+            // (`research/docs/23` §82, v82): `vkCmdCopyBufferToImage` cannot
+            // address a multisampled image, so no previous-byte buffer exists
+            // for this arm and the seed is what `record` states. Every
+            // single-sample load keeps the upload it always had.
+            if attachment.seed.is_none() {
+                objects.create_previous_bytes(index, previous)?;
+            }
         }
     }
     match request.indirect {
@@ -5222,6 +5358,15 @@ struct OffscreenObjects<'a> {
     present: bool,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
+    /// The rail's own render pass over the seeded multisampled attachments
+    /// (`research/docs/23` §82, v82): one `CLEAR`-opened subpass whose
+    /// clear values are the seeds `record` states, storing the image so the
+    /// measured pass can open it with `LOAD`. Null for every pass that seeds
+    /// nothing, which is every pre-v82 shape.
+    seed_render_pass: vk::RenderPass,
+    /// The framebuffer of [`Self::seed_render_pass`]: the seeded attachments'
+    /// own views, in location order.
+    seed_framebuffer: vk::Framebuffer,
     pipeline_layout: vk::PipelineLayout,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
@@ -5444,6 +5589,12 @@ struct AttachmentObjects {
     /// (`docs/23` §3.6, v19).
     store_op: vk::AttachmentStoreOp,
     initial_layout: vk::ImageLayout,
+    /// The single colour every sample of this attachment is seeded with before
+    /// a multisampled `Load` opens it (`research/docs/23` §82, v82). `Some`
+    /// exactly for the seeded load shape, whose seed pass
+    /// ([`OffscreenObjects::create_seed_render_pass`]) clears the image in
+    /// place of the `vkCmdCopyBufferToImage` a single-sample load records.
+    seed: Option<ClearColor>,
     /// Whether this pass scope created the attachment's own image, memory and
     /// view and has to destroy them on Drop. A single-sample present pass
     /// borrows the provider-owned [`ProviderTargetImage`] for this half, so it
@@ -5563,6 +5714,8 @@ impl<'a> OffscreenObjects<'a> {
             present: false,
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
+            seed_render_pass: vk::RenderPass::null(),
+            seed_framebuffer: vk::Framebuffer::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             vertex_module: vk::ShaderModule::null(),
             fragment_module: vk::ShaderModule::null(),
@@ -5629,6 +5782,7 @@ impl<'a> OffscreenObjects<'a> {
                 // this runs.
                 store_op: vk::AttachmentStoreOp::STORE,
                 initial_layout,
+                seed: None,
                 // The target itself is the provider's: the pass scope destroys
                 // none of its image, memory or view (`docs/24` §5.2).
                 owns_image: false,
@@ -5694,6 +5848,7 @@ impl<'a> OffscreenObjects<'a> {
             // The n-sample surface opens from a clear, so nothing defines its
             // bytes before the pass.
             initial_layout: vk::ImageLayout::UNDEFINED,
+            seed: None,
             owns_image: true,
             owns_resolve: false,
             publishes: true,
@@ -5780,6 +5935,7 @@ impl<'a> OffscreenObjects<'a> {
             load_op,
             store_op: vk::AttachmentStoreOp::STORE,
             initial_layout,
+            seed: None,
             // The image is the provider's: this pass scope destroys none of
             // its image, memory or view (`research/docs/23` §76, R7).
             owns_image: false,
@@ -6209,16 +6365,28 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    // One argument per fact the reviewed shape states — the format, the two
+    // dimensions, the load op, its seed, the store decision and the raster's
+    // sample count — the same spelling the request itself carries.
+    #[allow(clippy::too_many_arguments)]
     fn create_attachment(
         &mut self,
         format: vk::Format,
         width: u32,
         height: u32,
         load: LoadOp,
+        seed: Option<ClearColor>,
         storing: bool,
         samples: vk::SampleCountFlags,
     ) -> Result<(), ProviderError> {
         let loading = matches!(load, LoadOp::Load);
+        // A multisampled attachment's `Load` is seeded by a clear inside a
+        // rail-owned render pass (`research/docs/23` §82, v82), so the image
+        // is never a transfer destination: `vkCmdCopyBufferToImage` cannot
+        // address it (`VUID-vkCmdCopyBufferToImage-dstImage-07973`) and asking
+        // for the usage would put a combination the transfer stage can never
+        // use in front of `vkCreateImage`.
+        let single_sample = samples == vk::SampleCountFlags::TYPE_1;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -6247,7 +6415,7 @@ impl<'a> OffscreenObjects<'a> {
                     // `vkCmdCopyBufferToImage`, so the image needs the transfer
                     // destination usage exactly when one is uploaded
                     // (`research/docs/23` §3.3).
-                    | if loading {
+                    | if loading && single_sample {
                         vk::ImageUsageFlags::TRANSFER_DST
                     } else {
                         vk::ImageUsageFlags::empty()
@@ -6352,6 +6520,9 @@ impl<'a> OffscreenObjects<'a> {
             } else {
                 vk::ImageLayout::UNDEFINED
             },
+            // The seed the rail's own render pass clears every sample with
+            // (`research/docs/23` §82, v82); `None` for every other attachment.
+            seed,
             publishes: storing,
             // An offscreen attachment and its resolve target are both created
             // by this pass scope and destroyed with it
@@ -6361,6 +6532,111 @@ impl<'a> OffscreenObjects<'a> {
             previous_buffer: vk::Buffer::null(),
             previous_memory: vk::DeviceMemory::null(),
         });
+        Ok(())
+    }
+
+    /// The seed pass a multisampled `Load` is executed with
+    /// (`research/docs/23` §82, v82).
+    ///
+    /// One subpass over the seeded attachments, in location order: each is a
+    /// `CLEAR`-opened, `STORE`d description of the same multisampled image the
+    /// measured pass then opens with `LOAD`. A clear writes its value to every
+    /// sample of the render area, which is what makes the samples defined
+    /// before the measured pass reads them; the seed pass leaves each image in
+    /// `COLOR_ATTACHMENT_OPTIMAL`, the layout the measured pass declares as its
+    /// initial one. The two dependencies are the pair the load needs: the
+    /// external→subpass one scopes the clear's own destination access, and the
+    /// subpass→external one hands the writes on as colour-attachment reads and
+    /// writes — a load is a read of the attachment, so an availability-only
+    /// hand-off would leave it unsynchronized.
+    ///
+    /// Nothing is created when the scope seeds no attachment, so every earlier
+    /// shape keeps exactly the objects it had.
+    fn create_seed_render_pass(&mut self, vk_formats: &[vk::Format]) -> Result<(), ProviderError> {
+        let seeded = self
+            .attachments
+            .iter()
+            .enumerate()
+            .filter(|(_, attachment)| attachment.seed.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if seeded.is_empty() {
+            return Ok(());
+        }
+        let descriptions = seeded
+            .iter()
+            .map(|index| {
+                let attachment = &self.attachments[*index];
+                vk::AttachmentDescription2::default()
+                    .format(vk_formats[*index])
+                    .samples(attachment.samples)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            })
+            .collect::<Vec<_>>();
+        let refs = (0..descriptions.len())
+            .map(|index| {
+                vk::AttachmentReference2::default()
+                    .attachment(index as u32)
+                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            })
+            .collect::<Vec<_>>();
+        let subpasses = [vk::SubpassDescription2::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&refs)];
+        let dependencies = [
+            vk::SubpassDependency2::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            vk::SubpassDependency2::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                ),
+        ];
+        let info = vk::RenderPassCreateInfo2::default()
+            .attachments(&descriptions)
+            .subpasses(&subpasses)
+            .dependencies(&dependencies);
+        self.seed_render_pass = unsafe { self.context.device.create_render_pass2(&info, None) }
+            .map_err(|error| execution_refusal("create seed render pass", &error.to_string()))?;
+        Ok(())
+    }
+
+    /// The framebuffer of [`Self::create_seed_render_pass`]: the seeded
+    /// attachments' own views, in the same order the seed pass lists them.
+    /// Nothing is created when the scope seeds no attachment.
+    fn create_seed_framebuffer(&mut self, width: u32, height: u32) -> Result<(), ProviderError> {
+        if self.seed_render_pass == vk::RenderPass::null() {
+            return Ok(());
+        }
+        let views = self
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.seed.is_some())
+            .map(|attachment| attachment.view)
+            .collect::<Vec<_>>();
+        let info = vk::FramebufferCreateInfo::default()
+            .render_pass(self.seed_render_pass)
+            .attachments(&views)
+            .width(width)
+            .height(height)
+            .layers(1);
+        self.seed_framebuffer = unsafe { self.context.device.create_framebuffer(&info, None) }
+            .map_err(|error| execution_refusal("create seed framebuffer", &error.to_string()))?;
         Ok(())
     }
 
@@ -6789,13 +7065,33 @@ impl<'a> OffscreenObjects<'a> {
             subpass = subpass.push_next(&mut depth_stencil_resolve);
         }
         let subpasses = [subpass];
+        // A seeded attachment's load reads the seed pass's clear
+        // (`research/docs/23` §82, v82), so the external→subpass dependency
+        // states the write class the seed pass handed on as well as the
+        // load's own read. Every unseeded pass keeps the availability-only
+        // scope it always had, byte for byte.
+        let seeded = self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.seed.is_some());
         let mut dependencies = vec![vk::SubpassDependency2::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+            .src_access_mask(if seeded {
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            } else {
+                vk::AccessFlags::empty()
+            })
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | if seeded {
+                        vk::AccessFlags::COLOR_ATTACHMENT_READ
+                    } else {
+                        vk::AccessFlags::empty()
+                    },
+            )];
         dependencies.push(if self.present {
             // The present path does its own `COLOR_ATTACHMENT_OPTIMAL →
             // TRANSFER_SRC_OPTIMAL` transition in `record`, so the render pass
@@ -8240,6 +8536,37 @@ impl<'a> OffscreenObjects<'a> {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
+        // The seed pass a multisampled `Load` is executed with
+        // (`research/docs/23` §82, v82) runs before the measured pass: the one
+        // clear per seeded attachment writes every sample of the render area,
+        // and the measured pass below opens the same images with `LOAD`. No
+        // draw is recorded — the load operation *is* the seed pass's work — so
+        // the encoder only has to begin and end the subpass.
+        if self.seed_render_pass != vk::RenderPass::null() {
+            let seed_values = self
+                .attachments
+                .iter()
+                .zip(attachments)
+                .filter_map(|(objects, attachment)| {
+                    objects.seed.map(|seed| vk::ClearValue {
+                        color: clear_value_for(attachment.format, seed),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let seed_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.seed_render_pass)
+                .framebuffer(self.seed_framebuffer)
+                .render_area(render_area)
+                .clear_values(&seed_values);
+            unsafe {
+                self.context.device.cmd_begin_render_pass(
+                    self.command,
+                    &seed_begin,
+                    vk::SubpassContents::INLINE,
+                );
+                self.context.device.cmd_end_render_pass(self.command);
+            }
+        }
         let pass_begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)
             .framebuffer(self.framebuffer)
@@ -8815,6 +9142,16 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 self.context
                     .device
                     .destroy_framebuffer(self.framebuffer, None);
+            }
+            if self.seed_framebuffer != vk::Framebuffer::null() {
+                self.context
+                    .device
+                    .destroy_framebuffer(self.seed_framebuffer, None);
+            }
+            if self.seed_render_pass != vk::RenderPass::null() {
+                self.context
+                    .device
+                    .destroy_render_pass(self.seed_render_pass, None);
             }
             if self.render_pass != vk::RenderPass::null() {
                 self.context
@@ -9745,6 +10082,7 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::Clear(clear),
                     previous: None,
+                    seed: None,
                     resident: None,
                 }],
                 extent: [2, 2],
@@ -10075,6 +10413,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                seed: None,
                 resident: None,
             }],
             extent: [2, 2],
@@ -10148,6 +10487,7 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(clear),
                         previous: None,
+                        seed: None,
                         resident: None,
                     }],
                     extent: [2, 2],
@@ -10392,6 +10732,7 @@ mod tests {
                         ClearColor::from_bytes(&RGBA16F_CLEAR).expect("one eight-byte texel"),
                     ),
                     previous: None,
+                    seed: None,
                     resident: None,
                 }],
                 extent: [2, 2],
@@ -10446,6 +10787,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                seed: None,
                 resident: None,
             }],
             extent: [2, 0],
@@ -11009,6 +11351,7 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        seed: None,
                         resident: None,
                     },
                     OffscreenColorAttachment {
@@ -11016,6 +11359,7 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        seed: None,
                         resident: None,
                     },
                 ],
@@ -11083,6 +11427,7 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        seed: None,
                         resident: None,
                     },
                     OffscreenColorAttachment {
@@ -11090,6 +11435,7 @@ mod tests {
                         store: StoreOp::DontCare,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        seed: None,
                         resident: None,
                     },
                 ],
@@ -11161,6 +11507,7 @@ mod tests {
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
+                        seed: None,
                         resident: None,
                     },
                     OffscreenColorAttachment {
@@ -11168,6 +11515,7 @@ mod tests {
                         store: StoreOp::DontCare,
                         load: LoadOp::Load,
                         previous: Some(RenderInputSource::TraceBytes(&previous)),
+                        seed: None,
                         resident: None,
                     },
                 ],
@@ -11216,6 +11564,7 @@ mod tests {
                 store: StoreOp::DontCare,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                seed: None,
                 resident: None,
             }],
             extent: [2, 2],
@@ -11312,6 +11661,7 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
+                    seed: None,
                     resident: None,
                 },
                 OffscreenColorAttachment {
@@ -11319,6 +11669,7 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
+                    seed: None,
                     resident: None,
                 },
             ],
@@ -11513,6 +11864,152 @@ mod tests {
         assert_eq!(context.buffer_copy_counts(), (0, 0));
     }
 
+    /// The v82 seed shape at the rail's own request level
+    /// (`research/docs/23` §82): a four-sample attachment whose `Load` the rail
+    /// executes with a `CLEAR`-opened seed pass.
+    ///
+    /// The device half: the seed defines every sample of the image, a scissor
+    /// keeps the draw off the right column, and the resolve then lands the
+    /// declared texel there byte for byte and the fragment output in the drawn
+    /// column. A rail that dropped the seed would land the driver's own
+    /// undefined contents in the kept column, which is exactly what the
+    /// pre-v82 shape could not distinguish.
+    #[test]
+    fn a_multisampled_load_is_seeded_by_one_texel() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let seed_texel: [u8; 4] = [0x22, 0x44, 0x66, 0x89];
+        let previous = seed_texel.repeat(4);
+        let blobs = execute_offscreen_render(
+            &context,
+            &OffscreenRenderRequest {
+                textures: Vec::new(),
+                blend: None,
+                multisample: Some(MultisampleState {
+                    sample_count: SampleCount::Four,
+                }),
+                depth_resolve: None,
+                stencil_resolve: None,
+                cull: None,
+                depth: None,
+                base_vertex: 0,
+                stencil: None,
+                // The left column is drawn; the right one keeps the seed.
+                scissor: Some([0, 0, 1, 2]),
+                attachments: vec![OffscreenColorAttachment {
+                    format: AttachmentFormat::Rgba8Unorm,
+                    store: StoreOp::Store,
+                    load: LoadOp::Load,
+                    previous: Some(RenderInputSource::TraceBytes(&previous)),
+                    seed: Some(ClearColor::new(seed_texel)),
+                    resident: None,
+                }],
+                extent: [2, 2],
+                vertex: milestone_vertex(),
+                translated_fragment: None,
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                instance_count: 1,
+                index_stream: None,
+                indirect: None,
+            },
+        )
+        .expect("the seeded multisampled load executes");
+        let texels = blobs.attachments[0]
+            .as_ref()
+            .expect("the stored attachment reads back");
+        eprintln!("seeded multisampled readback: {texels:02x?}");
+        let expected = [
+            EXPECTED_RGBA8_TEXELS,
+            seed_texel,
+            EXPECTED_RGBA8_TEXELS,
+            seed_texel,
+        ]
+        .concat();
+        assert_eq!(
+            *texels, expected,
+            "the drawn column resolves the fragment output and the kept one the seed"
+        );
+    }
+
+    /// The two declarations the seed route cannot read, refused before any
+    /// device object exists (`research/docs/23` §82).
+    ///
+    /// A four-sample attachment whose declared window is not one repeated
+    /// texel has no clear value the seed pass could state, and a borrowed
+    /// window's bytes would have to be read on the host — the §74 property this
+    /// route cannot keep. Both are value-level facts, so they hold on a host
+    /// with no device.
+    #[test]
+    fn a_multisampled_load_refuses_a_nonuniform_seed_and_states_the_admitted_one() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut nonuniform = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        nonuniform.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        nonuniform.color_attachments[0].load = LoadOp::Load;
+        nonuniform
+            .validate()
+            .expect("the fixture pass is a legal shape");
+        let bytes = [0x22, 0x44, 0x66, 0x89, 0x22, 0x44, 0x66, 0xff].repeat(2);
+        let view = BufferView {
+            view_id: ViewId::new(11),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(12),
+            offset: 0,
+            length: u64::try_from(bytes.len()).expect("fixture length"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes.clone()),
+        };
+        // `prepare_render_request` is where the seed is resolved, so it is also
+        // where both refusals live; the no-copy arm needs a lease channel the
+        // caller can state, which the borrowed case below does.
+        let error = match prepare_render_request(
+            &stages,
+            &nonuniform,
+            &[Some(&view)],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a per-texel seed has no clear value"),
+        };
+        eprintln!("nonuniform multisampled seed refused: {error:?}");
+        assert_eq!(error.slug, "render_multisample_load_nonuniform_unsupported");
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        let uniform = [0x22, 0x44, 0x66, 0x89].repeat(4);
+        let uniform_view = BufferView {
+            length: u64::try_from(uniform.len()).expect("fixture length"),
+            source: BufferSource::OwnedBytes(uniform.clone()),
+            ..view
+        };
+        let declared = [Some(&uniform_view)];
+        let admitted = prepare_render_request(
+            &stages,
+            &nonuniform,
+            &declared,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("one repeated texel is the seed the rail can state");
+        assert_eq!(
+            admitted.attachments[0].seed,
+            Some(ClearColor::new([0x22, 0x44, 0x66, 0x89])),
+            "the seed travels with the request for the seed pass to clear"
+        );
+        assert!(matches!(admitted.attachments[0].load, LoadOp::Load));
+    }
+
     /// The v20 load increment (`docs/23` §3.1): a `LoadOp::DontCare`
     /// attachment declares its pre-pass contents undefined, so the rail opens
     /// the pass with `LOAD_OP_DONT_CARE` from `UNDEFINED`, uploads nothing,
@@ -11542,6 +12039,7 @@ mod tests {
                     store: StoreOp::Store,
                     load: LoadOp::DontCare,
                     previous: None,
+                    seed: None,
                     resident: None,
                 }],
                 extent: [2, 2],
@@ -11663,6 +12161,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                seed: None,
                 resident: None,
             }],
             extent: [2, 2],
@@ -11755,6 +12254,7 @@ mod tests {
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
+                seed: None,
                 resident: None,
             }],
             extent: [4, 4],
@@ -12408,6 +12908,69 @@ mod tests {
         assert_eq!(refused.slug, "lease_alignment_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(24)));
+        assert_eq!(
+            refused.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// An owner's own mapping is not a seed the multisampled route can read
+    /// (`research/docs/23` §82): the seed pass's clear value is host state, so
+    /// the window would be read here instead of by the device at execution —
+    /// the §74 property the borrowed arm of a single-sample load keeps. The
+    /// refusal is by name, before any import or image exists.
+    #[test]
+    fn a_borrowed_multisampled_seed_is_refused_by_name() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(26);
+        let allocation = AllocationId::new(47);
+        let reservation = lease_registration(lease_id, allocation, 16, epoch);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 16,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers its view");
+        let borrowed = BorrowedLeaseRegistry::new();
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, 0x2000)
+                    .expect("a null-free owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(borrowed);
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = loading_pass();
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        let view = attachment_previous_view(BufferSource::BorrowedNoCopy(lease_id), allocation);
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a borrowed seed would be read on the host"),
+        };
+        eprintln!("borrowed multisampled seed refused: {refused:?}");
+        assert_eq!(refused.slug, "render_multisample_load_borrowed_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
         assert_eq!(
             refused.fields.get("attachment"),
             Some(&FieldValue::Unsigned(0))
