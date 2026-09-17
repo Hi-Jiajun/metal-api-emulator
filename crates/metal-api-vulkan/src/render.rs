@@ -29,12 +29,14 @@
 //! attachment.
 
 use ash::vk;
-use metal2vulkan::reflect::{ResourceAccess, ResourceKind, ShaderReflection, ShaderStage};
+use metal2vulkan::reflect::{
+    BufferFootprint, BufferIndexSource, ResourceAccess, ResourceKind, ShaderReflection, ShaderStage,
+};
 use metal_api_core::provider::{
-    AttachmentFormat, BlendFactor, BlendOperation, BorrowedLeaseRegistry, BorrowedView,
-    BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction, CullMode, DepthLoadOp,
-    DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, FootprintProof,
-    IndexFormat, IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp,
+    AffineAccess, AffineTerm, AttachmentFormat, BlendFactor, BlendOperation, BorrowedLeaseRegistry,
+    BorrowedView, BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction, CullMode,
+    DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue,
+    FootprintProof, IndexFormat, IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp,
     MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, Retryability, SampleCount,
@@ -708,6 +710,12 @@ pub(crate) struct StageBufferStream<'a> {
     /// from (`research/docs/23` §3.3, v84).
     pub slot: StageBufferSlot,
     pub source: RenderInputSource<'a>,
+    /// Whether the contract declares this binding writable
+    /// (`research/docs/23` §3.3, v86). A writable stream reads *and* writes
+    /// its view, and the pass's bytes land back through the same byte-keyed
+    /// writeback channel a stored attachment's texels use, so the rail has to
+    /// read them once the fence has signalled.
+    pub writable: bool,
 }
 
 /// The Vulkan descriptor slot one stage buffer is bound to
@@ -1075,10 +1083,48 @@ impl RenderStages {
     pub(crate) fn validate_stage_pair(&self) -> Result<(), ProviderError> {
         self.validate_vertex_half()?;
         self.validate_fragment_half()?;
+        self.validate_reviewed_stage_buffer_access()?;
         if let (Some(vertex), Some(fragment)) =
             (&self.vertex_translation, &self.fragment_translation)
         {
             validate_varying_linkage(vertex, fragment, &self.contract.fragment_entry)?;
+        }
+        Ok(())
+    }
+
+    /// A reviewed stage-buffer module reads its slot; nothing this rail
+    /// compiles itself writes one (`research/docs/23` §3.3, v86).
+    ///
+    /// A declaration that marks a reviewed stage's slot writable has no writer
+    /// behind it: the module would read the bytes the pass uploaded, and the
+    /// writeback channel would publish exactly those bytes — a "the stage
+    /// received something" claim with nothing behind it. The writable arm is
+    /// the translated stages', whose reflections state the write and whose
+    /// pairing holds the declaration to it
+    /// ([`validate_translated_stage_buffers`]), so this arm is refused by name
+    /// instead of being executed as the read-only shape it really is.
+    fn validate_reviewed_stage_buffer_access(&self) -> Result<(), ProviderError> {
+        for declared in &self.contract.stage_buffers {
+            let reviewed = match declared.stage {
+                RenderPipelineStage::Vertex => self.vertex_translation.is_none(),
+                RenderPipelineStage::Fragment => self.fragment_translation.is_none(),
+            };
+            if !reviewed || !declared.access.is_writable() {
+                continue;
+            }
+            return Err(capability_refusal("render_stage_buffer_write_unsupported")
+                .with_field("stage", FieldValue::Text(declared.stage.name().to_owned()))
+                .with_field("index", FieldValue::Unsigned(u64::from(declared.index)))
+                .with_field(
+                    "access",
+                    FieldValue::Text(buffer_access_name(declared.access).to_owned()),
+                )
+                .with_detail(
+                    "this rail's reviewed stage-buffer modules read their slots, so a \
+                         writable declaration has no writer behind it; a writable stage buffer \
+                         is executed on the translated arm, where the module's own reflection \
+                         states the write the declaration is paired with",
+                ));
         }
         Ok(())
     }
@@ -1792,37 +1838,75 @@ fn validate_translated_stage_buffers(
                  declared extent is what the pass's view is proven against",
             ));
         };
-        if footprint.has_unbounded_access || !footprint.strided_accesses.is_empty() {
-            return Err(mismatch(index).with_detail(
-                "the reflected reach is not a static byte extent, and the render contract states \
-                 stage buffer footprints as static extents alone",
-            ));
-        }
-        let Some(reflected_bytes) = footprint
-            .static_ranges
-            .iter()
-            .map(|range| range.offset.saturating_add(range.size))
-            .max()
-        else {
-            return Err(mismatch(index).with_detail(
-                "the reflection states no byte range for this read binding, so the declared extent \
-                 is not what its reach was proven against",
-            ));
-        };
-        let FootprintProof::Static { max_bytes } = declared.footprint else {
-            return Err(mismatch(index).with_detail(
-                "the declared footprint is not a static byte extent, and this rail executes stage \
-                 buffers whose reach is stated as bytes",
-            ));
-        };
-        if reflected_bytes > max_bytes {
-            return Err(mismatch(index)
-                .with_field("declared_bytes", FieldValue::Unsigned(max_bytes))
-                .with_field("reflected_bytes", FieldValue::Unsigned(reflected_bytes))
-                .with_detail(
-                    "the translation reaches past the declared extent, and the pass's view is \
-                     proven against the declaration rather than the reflection",
-                ));
+        // The two footprint arms state the same measurement at different
+        // levels, so they are paired differently (`research/docs/23` §3.3,
+        // v86). A *static* declaration is a ceiling: the reflected reach has to
+        // fit under it, which is what the pass's view is proven against. An
+        // *affine* declaration is the measurement itself — the reflected
+        // `constant + stride * index` accesses, restated — so the two ends have
+        // to be the same access set, and a declaration that states anything
+        // else describes a module nobody translated.
+        match &declared.footprint {
+            FootprintProof::Static { max_bytes } => {
+                if footprint.has_unbounded_access || !footprint.strided_accesses.is_empty() {
+                    return Err(mismatch(index).with_detail(
+                        "the reflected reach is not a static byte extent, and the declaration \
+                         states one: the pass's view is proven against the declaration, which the \
+                         reflection's own reach has to fit under",
+                    ));
+                }
+                let Some(reflected_bytes) = footprint
+                    .static_ranges
+                    .iter()
+                    .map(|range| range.offset.saturating_add(range.size))
+                    .max()
+                else {
+                    return Err(mismatch(index).with_detail(
+                        "the reflection states no byte range for this read binding, so the \
+                         declared extent is not what its reach was proven against",
+                    ));
+                };
+                if reflected_bytes > *max_bytes {
+                    return Err(mismatch(index)
+                        .with_field("declared_bytes", FieldValue::Unsigned(*max_bytes))
+                        .with_field("reflected_bytes", FieldValue::Unsigned(reflected_bytes))
+                        .with_detail(
+                            "the translation reaches past the declared extent, and the pass's \
+                             view is proven against the declaration rather than the reflection",
+                        ));
+                }
+            }
+            FootprintProof::Affine { accesses } => {
+                let Some(reflected) = reflected_affine_accesses(footprint) else {
+                    return Err(mismatch(index).with_detail(
+                        "the reflected reach is unbounded, or it is strided over an invocation \
+                         index a draw does not have, and the declaration states a bounded affine \
+                         proof over the draw's own vertex and instance indices",
+                    ));
+                };
+                if affine_access_set(&reflected) != affine_access_set(accesses) {
+                    return Err(mismatch(index)
+                        .with_field(
+                            "declared_accesses",
+                            FieldValue::Unsigned(accesses.len() as u64),
+                        )
+                        .with_field(
+                            "reflected_accesses",
+                            FieldValue::Unsigned(reflected.len() as u64),
+                        )
+                        .with_detail(
+                            "the declaration and the reflection state different affine access \
+                             sets, and this arm pairs two measurements of one module rather than \
+                             a ceiling with a reach",
+                        ));
+                }
+            }
+            FootprintProof::Unbounded => {
+                return Err(mismatch(index).with_detail(
+                    "the declared footprint is unbounded, which the render contract does not \
+                     admit for a stage buffer at all",
+                ))
+            }
         }
     }
     for declared in stages
@@ -1853,6 +1937,80 @@ fn buffer_access_name(access: BufferAccess) -> &'static str {
         BufferAccess::ReadWrite => "read_write",
         BufferAccess::Unused => "unused",
     }
+}
+
+/// The affine access set one reflected buffer footprint states, in the
+/// contract's own terms (`research/docs/23` §3.3, v86).
+///
+/// The two reflected shapes map onto the declaration's two: a static range
+/// becomes a term-less access, and a strided access becomes the contract's
+/// `AffineAccess` with the draw's own axes — the reflection's `VertexIndex` is
+/// axis 0 and its `InstanceIndex` axis 1. `None` means the reflection reaches
+/// somewhere this contract cannot state: an unbounded access, or a stride over
+/// an invocation index a draw does not have (a compute builtin, which no
+/// render stage carries).
+fn reflected_affine_accesses(footprint: &BufferFootprint) -> Option<Vec<AffineAccess>> {
+    if footprint.has_unbounded_access {
+        return None;
+    }
+    let mut accesses =
+        Vec::with_capacity(footprint.static_ranges.len() + footprint.strided_accesses.len());
+    for range in &footprint.static_ranges {
+        accesses.push(AffineAccess {
+            base_offset: range.offset,
+            access_size: range.size,
+            terms: Vec::new(),
+        });
+    }
+    for access in &footprint.strided_accesses {
+        let mut terms = Vec::with_capacity(access.terms.len());
+        for term in &access.terms {
+            let axis = match term.source {
+                BufferIndexSource::VertexIndex => 0,
+                BufferIndexSource::InstanceIndex => 1,
+                _ => return None,
+            };
+            terms.push(AffineTerm {
+                axis,
+                stride: term.stride,
+            });
+        }
+        accesses.push(AffineAccess {
+            base_offset: access.base_offset,
+            access_size: access.access_size,
+            terms,
+        });
+    }
+    Some(accesses)
+}
+
+/// One normalized affine access: base offset, access size and the ascending
+/// `(axis, stride)` terms (`research/docs/23` §3.3, v86).
+type NormalizedAffineAccess = (u64, u64, Vec<(u8, u64)>);
+
+/// The order- and duplicate-insensitive form of one affine access set: what the
+/// two ends of the pairing compare (`research/docs/23` §3.3, v86).
+///
+/// The reflection sorts its static ranges and strided accesses inside their own
+/// lists, while a declaration is free to state the same set in any order; the
+/// normalized form drops both degrees of freedom so "the same access set" is
+/// one comparison.
+fn affine_access_set(accesses: &[AffineAccess]) -> Vec<NormalizedAffineAccess> {
+    let mut normalized = accesses
+        .iter()
+        .map(|access| {
+            let mut terms = access
+                .terms
+                .iter()
+                .map(|term| (term.axis, term.stride))
+                .collect::<Vec<_>>();
+            terms.sort_unstable();
+            (access.base_offset, access.access_size, terms)
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
 }
 
 /// Whether one AIR type name is the component shape a contract vertex format
@@ -3494,6 +3652,17 @@ fn resolve_stage_buffers<'a>(
         // (`research/docs/23` §3.3, v84): a translated stage names its set and
         // binding in the reflection, the reviewed pair reads its fixed slots.
         let slot = stage_buffer_slot(stages, stage.stage, index)?;
+        // Whether the stream is a landing is the *declaration's* answer, not
+        // the view's: the pair rules held the two to each other field by field
+        // (`RenderPipelineContract::validate_against`), so reading the
+        // declaration is reading the settled pair
+        // (`research/docs/23` §3.3, v86).
+        let writable = stages
+            .contract
+            .stage_buffers
+            .iter()
+            .find(|binding| binding.stage == stage.stage && binding.index == index)
+            .is_some_and(|binding| binding.access.is_writable());
         let source = resolve_render_input(&stage.view, leases, RenderInputRole::StageBuffer, {
             usize::try_from(index).unwrap_or(usize::MAX)
         })?;
@@ -3513,6 +3682,7 @@ fn resolve_stage_buffers<'a>(
             index,
             slot,
             source,
+            writable,
         });
     }
     Ok(streams)
@@ -4395,6 +4565,25 @@ pub(crate) struct OffscreenReadback {
     pub attachments: Vec<Option<Vec<u8>>>,
     pub depth: Option<Vec<u8>>,
     pub stencil: Option<Vec<u8>>,
+    /// The bytes every *writable* stage buffer holds after the pass, in
+    /// canonical order (`research/docs/23` §3.3, v86). Empty for every pass
+    /// whose stage buffers are read-only, which is the shape every pre-v86
+    /// pass states.
+    pub stage_buffers: Vec<StageBufferReadback>,
+}
+
+/// One writable stage buffer's bytes, read once the pass's fence has
+/// signalled (`research/docs/23` §3.3, v86).
+///
+/// The entry names the binding the way the contract does — stage plus the
+/// index inside that stage's own namespace — so the provider can resolve the
+/// landing view the trace declared without re-deriving the slot from a
+/// position.
+#[derive(Debug)]
+pub(crate) struct StageBufferReadback {
+    pub stage: RenderPipelineStage,
+    pub index: u32,
+    pub bytes: Vec<u8>,
 }
 
 fn execute_offscreen_render_with_retains(
@@ -5284,10 +5473,15 @@ fn execute_offscreen_render_with_retains(
     // copy-out channel; its byte extent is one per texel, not the colour
     // attachments' four (`research/docs/23` §3.3, v49).
     let stencil = objects.stencil_readback_bytes(stencil_byte_length as usize, context)?;
+    // The writable stage buffers come last, after the attachments' own
+    // landings (`research/docs/23` §3.3, v86): their bytes are the pass's other
+    // observable output, read beside the texels that same submission wrote.
+    let stage_buffers = objects.stage_buffer_readback_bytes(context)?;
     Ok(OffscreenReadback {
         attachments: results,
         depth,
         stencil,
+        stage_buffers,
     })
 }
 
@@ -5977,6 +6171,28 @@ struct StageBufferDescriptorSet {
     descriptor_set: vk::DescriptorSet,
 }
 
+/// Where one writable stage buffer's bytes are read from after the pass's
+/// fence has signalled (`research/docs/23` §3.3, v86).
+///
+/// The two arms are the two arms a stage buffer's bytes come from, and they are
+/// read the way each one already is: a rail-owned (uploaded or staged) binding
+/// lives in a host-visible allocation this pass re-maps for the readback, while
+/// a no-copy binding *is* the owner's own mapping — the same pointer the import
+/// bound, which the rail never mapped and never frees.
+struct StageBufferLanding {
+    stage: RenderPipelineStage,
+    index: u32,
+    /// The rail-owned allocation to map for the readback, or `None` for the
+    /// owner's window.
+    memory: Option<vk::DeviceMemory>,
+    /// The owner's window pointer, for the no-copy arm. Unused for the
+    /// rail-owned arm.
+    owner_pointer: usize,
+    /// The number of bytes the view declares, which is what a writeback
+    /// publishes (`BufferWriteback` carries the view's whole extent).
+    length: usize,
+}
+
 /// A failure at any step destroys exactly what already exists, which is the
 /// ownership shape `ExecutionResources` gives the compute rail scoped to this
 /// one-shot rail (`research/docs/23` §6 Step 3b).
@@ -6047,6 +6263,11 @@ struct OffscreenObjects<'a> {
     /// and 2, or the sets a translated stage's reflection names. Empty for
     /// every pre-v83 pass.
     stage_buffer_sets: Vec<StageBufferDescriptorSet>,
+    /// The host pointers one writable stage buffer's bytes are read from once
+    /// the fence has signalled, in canonical order (`research/docs/23` §3.3,
+    /// v86). Empty for a pass whose stage buffers are all read-only, which is
+    /// the shape every pre-v86 pass states.
+    stage_buffer_landings: Vec<StageBufferLanding>,
     /// The pipeline layout's own set list for a pass that binds stage buffers:
     /// entry `i` is the layout of set `i`. Positions no input face occupies
     /// carry an empty layout — including set 0 on the reviewed pair's shape,
@@ -6391,6 +6612,7 @@ impl<'a> OffscreenObjects<'a> {
             descriptor_set: vk::DescriptorSet::null(),
             stage_buffer_inputs: Vec::new(),
             stage_buffer_sets: Vec::new(),
+            stage_buffer_landings: Vec::new(),
             stage_buffer_layout_slots: Vec::new(),
             stage_buffer_gap_layouts: Vec::new(),
             indirect_buffer: vk::Buffer::null(),
@@ -8376,6 +8598,35 @@ impl<'a> OffscreenObjects<'a> {
                     vk::BufferUsageFlags::STORAGE_BUFFER,
                     "stage buffer",
                 )?;
+                // A writable stream is a landing: its bytes leave through the
+                // writeback channel after the fence, so the pass remembers
+                // where to read them (`research/docs/23` §3.3, v86). A
+                // no-copy binding's bytes are the owner's own mapping; a
+                // rail-owned one is the host-visible allocation that was just
+                // filled, which the readback re-maps.
+                if stream.writable {
+                    self.stage_buffer_landings.push(match &stream.source {
+                        RenderInputSource::TraceBytes(_) | RenderInputSource::StagedBytes(_) => {
+                            StageBufferLanding {
+                                stage: stream.stage,
+                                index: stream.index,
+                                memory: Some(memory),
+                                owner_pointer: 0,
+                                // `resolve_stage_buffers` held the resolved
+                                // bytes to the view's own length, so the
+                                // writeback publishes exactly the view.
+                                length: stream.source.len(),
+                            }
+                        }
+                        RenderInputSource::Borrowed { window, .. } => StageBufferLanding {
+                            stage: stream.stage,
+                            index: stream.index,
+                            memory: None,
+                            owner_pointer: window.pointer,
+                            length: window.len,
+                        },
+                    });
+                }
                 self.stage_buffer_inputs.push((buffer, memory));
                 buffer_infos.push(
                     vk::DescriptorBufferInfo::default()
@@ -9000,6 +9251,66 @@ impl<'a> OffscreenObjects<'a> {
         context.record_buffer_readback();
         context.record_buffer_readback_bytes(texels.len());
         Ok(Some(texels))
+    }
+
+    /// The bytes every writable stage buffer holds, read once the fence has
+    /// signalled (`research/docs/23` §3.3, v86).
+    ///
+    /// One entry per writable stream, in canonical order; empty for every pass
+    /// whose bindings are read-only, which is the shape every pre-v86 pass
+    /// states. A rail-owned binding's allocation is host-visible and
+    /// host-coherent by construction (`create_host_visible_buffer`), so this
+    /// re-maps it for the readback exactly as the compute rail reads its own
+    /// mappings back; a no-copy binding's bytes are the owner's mapping, which
+    /// the import already bound and the rail only has to read. Both arms
+    /// publish the *whole* view, which is the extent `BufferWriteback` requires
+    /// for a written view.
+    fn stage_buffer_readback_bytes(
+        &self,
+        context: &VulkanContext,
+    ) -> Result<Vec<StageBufferReadback>, ProviderError> {
+        let mut readbacks = Vec::with_capacity(self.stage_buffer_landings.len());
+        for landing in &self.stage_buffer_landings {
+            let bytes = match landing.memory {
+                Some(memory) => {
+                    let mapping = unsafe {
+                        self.context.device.map_memory(
+                            memory,
+                            0,
+                            vk::WHOLE_SIZE,
+                            vk::MemoryMapFlags::empty(),
+                        )
+                    }
+                    .map_err(|error| {
+                        execution_refusal(
+                            &format!(
+                                "map the {} stage buffer {} for its writeback",
+                                landing.stage.name(),
+                                landing.index
+                            ),
+                            &error.to_string(),
+                        )
+                    })?;
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(mapping as *const u8, landing.length).to_vec()
+                    };
+                    unsafe { self.context.device.unmap_memory(memory) };
+                    bytes
+                }
+                None => unsafe {
+                    std::slice::from_raw_parts(landing.owner_pointer as *const u8, landing.length)
+                        .to_vec()
+                },
+            };
+            context.record_buffer_readback();
+            context.record_buffer_readback_bytes(bytes.len());
+            readbacks.push(StageBufferReadback {
+                stage: landing.stage,
+                index: landing.index,
+                bytes,
+            });
+        }
+        Ok(readbacks)
     }
 
     /// Create one `TRANSFER_DST` host-visible buffer and map it, without
@@ -10519,9 +10830,9 @@ mod tests {
         AcquirePolicy, AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease,
         DepthFormat, DepthLoadOp, InitialState, LeaseReservation, PipelineId, PresentDescriptor,
         PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderStencilAttachment, RenderStencilIdentity, StagedLease, StencilFormat, StencilLoadOp,
-        TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexLayout,
-        ViewId,
+        RenderStencilAttachment, RenderStencilIdentity, StageBufferBinding, StagedLease,
+        StencilFormat, StencilLoadOp, TextureAccess, TextureFormat, TextureSource, TextureType,
+        TextureView, VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -10803,6 +11114,87 @@ mod tests {
         )
         .expect("the shape is admitted; the binding question is the execution's");
         assert!(request.textures.is_empty());
+    }
+
+    /// R9f (`research/docs/23` §3.3, v86): the stage-buffer pairing is re-asked
+    /// at execution, of the value the rail was handed.
+    ///
+    /// Registration is one of the two places the gate runs; `prepare_render_request`
+    /// runs the same `validate_stage_pair` on the `RenderStages` it was handed, so
+    /// a directly-constructed value cannot skip it. Both halves of the writable
+    /// pairing are measured here against a *hand-built* `RenderStages`: a
+    /// translated module that writes while the contract declares read-only (the
+    /// disagreement the registration refuses, re-asked), and a reviewed module
+    /// under a writable declaration (the shape no reviewed module can back).
+    #[test]
+    fn the_stage_buffer_pairing_is_re_asked_at_execution() {
+        // The translated half needs one real translation, which needs a device
+        // and this rail's own translator.
+        if let Ok(executor) = crate::VulkanExecutor::new() {
+            let device = metal_api_core::Device::new(
+                Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+            );
+            let library = device
+                .new_library_with_air(include_str!(
+                    "../tests/fixtures/render_stage_buffer_write.frag.ll"
+                ))
+                .expect("the write fixture loads");
+            let function = library
+                .function("render_stage_buffer_write_rgba8")
+                .expect("the write entry exists");
+            let fragment =
+                crate::TranslatedRenderStage::translate(RenderStage::Fragment, &function)
+                    .expect("the write stage translates");
+            let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+            stages.contract.fragment_entry = "render_stage_buffer_write_rgba8".to_owned();
+            stages.fragment_spirv = fragment.spirv.clone();
+            stages.contract.stage_buffers = vec![
+                StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index: 0,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                },
+                StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index: 1,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                },
+            ];
+            stages.fragment_translation = Some(fragment.reflection.clone());
+            let refused = stages
+                .validate_stage_pair()
+                .expect_err("a writable module under a read-only declaration is refused");
+            eprintln!("refused at execution, translated half: {refused:?}");
+            assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+            assert_eq!(
+                refused.fields.get("reflected_access"),
+                Some(&FieldValue::Text("write".to_owned()))
+            );
+        } else {
+            eprintln!("SKIP: no Vulkan device, the translated half is not measured");
+        }
+
+        // The reviewed half needs no translation: the reviewed stage-buffer
+        // modules read their slots, so the writable declaration is refused
+        // whatever the pass binds.
+        let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        stages.contract.stage_buffers = vec![StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Write,
+            footprint: FootprintProof::Static { max_bytes: 16 },
+        }];
+        let refused = stages
+            .validate_stage_pair()
+            .expect_err("a writable declaration under a reviewed module is refused");
+        eprintln!("refused at execution, reviewed half: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_buffer_write_unsupported");
+        assert_eq!(
+            refused.fields.get("access"),
+            Some(&FieldValue::Text("write".to_owned()))
+        );
     }
 
     /// Append `OpCapability FloatControls2` + `OpExtension "SPV_KHR_float_controls2"`
