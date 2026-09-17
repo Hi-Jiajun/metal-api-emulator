@@ -30,7 +30,7 @@ use metal_api_core::provider::{
     StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
     StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
     TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    Winding, MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    Winding, MAX_COLOR_ATTACHMENTS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -248,6 +248,22 @@ const RENDER_WIDE_FEATURE_DEPTH_RESOLVE: u16 = 0x4000;
 /// than a ninth bit.
 const RENDER_WIDE_FEATURE_STENCIL_RESOLVE: u16 = 0x8000;
 
+/// A render pass that carries the sampled textures its fragment stage reads
+/// (`research/docs/23` §3.3, v70).
+///
+/// The wide feature word is full to its last bit (`0x8000`), so the next
+/// optional section needed a mechanism of its own and this tag is it — the
+/// choice [`RENDER_WIDE_FEATURE_STENCIL_RESOLVE`]'s comment already named. The
+/// payload is the same `u16` wide feature word (same meanings, so the two
+/// tags keep sharing the section walker) followed by the texture block — a
+/// `u8` count and that many full [`TextureView`]s, source and all, because the
+/// texel bytes a render pass samples have to travel with the trace that binds
+/// them, exactly as a compute pass's texture bindings do. A pass that binds no
+/// texture keeps writing [`PASS_KIND_RENDER_EXT`] / [`PASS_KIND_RENDER_EXT_WIDE`]
+/// and every pre-v70 frame keeps its exact bytes; a decoder that predates this
+/// tag answers [`CodecError::UnknownPassTag`] for it.
+const PASS_KIND_RENDER_SAMPLED: u8 = 0x12;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
@@ -381,6 +397,26 @@ const CAPABILITY_DEPTH_RESOLVE_TAIL: u8 = 0x08;
 /// declares stencil resolve but none of the earlier blocks still keeps the
 /// decoder's position rules unambiguous.
 const CAPABILITY_STENCIL_RESOLVE_TAIL: u8 = 0x10;
+
+/// Presence tag of the capability tail's render-sampler block
+/// (`research/docs/23` §3.3, v70).
+///
+/// The block follows the stencil-resolve block when the snapshot declares any
+/// of the three render-sampler bits, and carries the bool, the binding cap and
+/// the admitted texture formats. It is a separate tagged section for the same
+/// reason the five blocks before it are: a snapshot that declares render
+/// texture sampling but none of the earlier blocks still keeps the decoder's
+/// position rules unambiguous.
+const CAPABILITY_RENDER_TEXTURE_TAIL: u8 = 0x20;
+
+/// Maximum texture formats one capability snapshot may declare as render-pass
+/// sampling sources.
+///
+/// The contract's own list is the closed four-value [`TextureFormat`] family,
+/// so this bound can never refuse a well-formed snapshot; it only stops a
+/// corrupt count from driving the decoder — the same rule
+/// [`MAX_SUPPORTED_COLOR_FORMATS`] states for the attachment formats.
+pub const MAX_SUPPORTED_RENDER_TEXTURE_FORMATS: usize = 8;
 
 /// Maximum number of bytes one present target's sentinel may carry.
 ///
@@ -2105,6 +2141,18 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // never sets the bit, and the contract refuses the bit without
                 // the stored multisampled stencil surface it reduces.
                 let has_stencil_resolve = pass.stencil_resolve.is_some();
+                // The sampled-texture block is the section the wide word had
+                // no bit for (`research/docs/23` §3.3, v70): a pass that binds
+                // no fragment texture never sets it, so every pre-v70 frame
+                // keeps its exact bytes and only a texture-bearing pass takes
+                // the tag of its own.
+                let has_render_textures = !pass.textures.is_empty();
+                if has_render_textures && pass.textures.len() > MAX_RENDER_TEXTURES {
+                    return Err(CodecError::RenderTextureCount {
+                        count: pass.textures.len(),
+                        maximum: MAX_RENDER_TEXTURES,
+                    });
+                }
                 let wide = has_depth_store
                     || has_depth_resource
                     || has_stencil
@@ -2121,6 +2169,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     || has_cull
                     || has_blend
                     || wide
+                    || has_render_textures
                 {
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
@@ -2148,7 +2197,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     if has_blend {
                         features |= RENDER_FEATURE_BLEND;
                     }
-                    if wide {
+                    if wide || has_render_textures {
                         // The wide word's low byte is the narrow byte, so a
                         // decoder reads both tags through one section walker
                         // and only the extra bits differ.
@@ -2177,8 +2226,27 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         if has_stencil_resolve {
                             wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
                         }
-                        encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
-                        encoder.u16(wide_features);
+                        if has_render_textures {
+                            // The wide word is full, so the texture block
+                            // rides the tag of its own: the same `u16` word
+                            // (same meanings, so the section walker is
+                            // shared) followed by the block
+                            // (`research/docs/23` §3.3, v70).
+                            encoder.u8(PASS_KIND_RENDER_SAMPLED);
+                            encoder.u16(wide_features);
+                            encoder.u8(u8::try_from(pass.textures.len()).map_err(|_| {
+                                CodecError::RenderTextureCount {
+                                    count: pass.textures.len(),
+                                    maximum: MAX_RENDER_TEXTURES,
+                                }
+                            })?);
+                            for texture in &pass.textures {
+                                put_texture(encoder, texture);
+                            }
+                        } else {
+                            encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
+                            encoder.u16(wide_features);
+                        }
                     } else {
                         encoder.u8(PASS_KIND_RENDER_EXT);
                         encoder.u8(features);
@@ -2650,6 +2718,19 @@ fn get_trace_tagged(
                 }
                 TracePass::Render(get_render_ext_pass(decoder, features)?)
             }
+            // The sampled kind carries the same wide feature word as the tag
+            // above and, right after it, the texture block the wide word had
+            // no bit for (`research/docs/23` §3.3, v70). An unknown bit is
+            // refused exactly as it is there: a section this decoder does not
+            // know cannot be skipped to reach the ones after it.
+            PASS_KIND_RENDER_SAMPLED => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_sampled_pass(decoder, features)?)
+            }
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -2718,8 +2799,49 @@ fn get_render_ext_pass(
     features: u16,
 ) -> Result<RenderPassDescriptor, CodecError> {
     let mut pass = get_render_pass(decoder, false)?;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the sampled-texture render pass of [`PASS_KIND_RENDER_SAMPLED`]
+/// (`research/docs/23` §3.3, v70).
+///
+/// The layout repeats the wide tag's — the same `u16` feature word, then the
+/// section walker below — with the texture block read immediately after the
+/// word, where the encoder writes it: a `u8` count and that many full
+/// [`TextureView`]s. A count above the contract's own cap is refused with
+/// [`CodecError::RenderTextureCount`] before a single texture is read, so a
+/// corrupt count cannot drive the decoder.
+fn get_render_sampled_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let texture_count = usize::from(decoder.u8()?);
+    if texture_count > MAX_RENDER_TEXTURES {
+        return Err(CodecError::RenderTextureCount {
+            count: texture_count,
+            maximum: MAX_RENDER_TEXTURES,
+        });
+    }
+    let mut textures = Vec::with_capacity(texture_count);
+    for _ in 0..texture_count {
+        textures.push(get_texture(decoder)?);
+    }
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.textures = textures;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the optional sections an extended render pass's feature word names,
+/// in the one order both extended tags write them.
+fn get_render_ext_sections(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+    pass: &mut RenderPassDescriptor,
+) -> Result<(), CodecError> {
     if features & u16::from(RENDER_FEATURE_VERTEX_INPUT) != 0 {
-        get_vertex_input(decoder, &mut pass)?;
+        get_vertex_input(decoder, pass)?;
     }
     if features & u16::from(RENDER_FEATURE_PRESENT) != 0 {
         pass.present = Some(get_present_descriptor(decoder)?);
@@ -2922,7 +3044,7 @@ fn get_render_ext_pass(
         }
         pass.blend = Some(RenderPassBlend { attachments });
     }
-    Ok(pass)
+    Ok(())
 }
 
 fn get_render_pass(
@@ -2990,6 +3112,9 @@ fn get_render_pass(
         // depth state (`research/docs/23` §3.3, v36).
         depth: None,
         depth_test: None,
+        // A frame that is not the sampled-texture tag binds no fragment
+        // texture (`research/docs/23` §3.3, v70).
+        textures: Vec::new(),
         present,
     })
 }
@@ -4016,6 +4141,12 @@ fn put_capabilities(
         // guard is what keeps the declaration from being silently dropped
         // (`research/docs/23` §3.3, v60).
         || capabilities.declares_stencil_resolve_support()
+        // The render-sampler block follows the same rule one more time: a
+        // snapshot that declares only the three render-sampler bits still has
+        // to write the heap/ICB half the decoder reads by position before the
+        // tag, and this guard is what keeps the declaration from being
+        // silently dropped (`research/docs/23` §3.3, v70).
+        || capabilities.declares_render_texture_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -4097,6 +4228,26 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_STENCIL_RESOLVE_TAIL);
             encoder.bool(capabilities.supports_render_stencil_resolve);
             encoder.u32(capabilities.stencil_resolve_modes);
+        }
+        // The render-sampler block is the tail's newest section and follows
+        // the stencil-resolve half when the snapshot declares any of its three
+        // bits (`research/docs/23` §3.3, v70).
+        if capabilities.declares_render_texture_support() {
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_TAIL);
+            encoder.bool(capabilities.supports_render_texture_sampling);
+            encoder.u32(capabilities.max_render_textures);
+            if capabilities.supported_render_texture_formats.len()
+                > MAX_SUPPORTED_RENDER_TEXTURE_FORMATS
+            {
+                return Err(CodecError::RenderTextureFormatCount {
+                    count: capabilities.supported_render_texture_formats.len(),
+                    maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+                });
+            }
+            encoder.u64(capabilities.supported_render_texture_formats.len() as u64);
+            for format in &capabilities.supported_render_texture_formats {
+                put_texture_format(encoder, *format);
+            }
         }
     }
     Ok(())
@@ -4193,6 +4344,14 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // caller did not state (`research/docs/23` §3.3, v60).
         supports_render_stencil_resolve: false,
         stencil_resolve_modes: 0,
+        // A legacy payload cannot have declared the render sampler either:
+        // all three bits take the "cannot sample" defaults, so a legacy
+        // provider is refused a texture-bearing pass instead of being
+        // executed with a cleared sampling result the caller did not state
+        // (`research/docs/23` §3.3, v70).
+        supports_render_texture_sampling: false,
+        max_render_textures: 0,
+        supported_render_texture_formats: Vec::new(),
         // A legacy payload cannot have declared presentation, so the present
         // bits take the same "cannot present" defaults the render bits take
         // here (`docs/24` §4.2): a decoder that predates the present tag reads
@@ -4365,6 +4524,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         && tag != CAPABILITY_MULTISAMPLE_TAIL
         && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
         && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
+        && tag != CAPABILITY_RENDER_TEXTURE_TAIL
     {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
@@ -4378,6 +4538,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         if tag != CAPABILITY_MULTISAMPLE_TAIL
             && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
+            && tag != CAPABILITY_RENDER_TEXTURE_TAIL
         {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
@@ -4389,7 +4550,10 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
-        if tag != CAPABILITY_DEPTH_RESOLVE_TAIL && tag != CAPABILITY_STENCIL_RESOLVE_TAIL {
+        if tag != CAPABILITY_DEPTH_RESOLVE_TAIL
+            && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
+            && tag != CAPABILITY_RENDER_TEXTURE_TAIL
+        {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
     }
@@ -4404,17 +4568,46 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
-        if tag != CAPABILITY_STENCIL_RESOLVE_TAIL {
+        if tag != CAPABILITY_STENCIL_RESOLVE_TAIL && tag != CAPABILITY_RENDER_TEXTURE_TAIL {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
     }
-    // The stencil-resolve block is the tail's fifth and newest optional
-    // section (`research/docs/23` §3.3, v60): it follows the depth-resolve
-    // block when present, and reads the bool plus the filter bitmask.
-    if tag != CAPABILITY_STENCIL_RESOLVE_TAIL {
+    // The stencil-resolve block is the tail's fifth optional section
+    // (`research/docs/23` §3.3, v60): it follows the depth-resolve block when
+    // present, and reads the bool plus the filter bitmask. The render-sampler
+    // block may follow it, so the walk continues while bytes remain.
+    if tag == CAPABILITY_STENCIL_RESOLVE_TAIL {
+        capabilities.supports_render_stencil_resolve = decoder.bool()?;
+        capabilities.stencil_resolve_modes = decoder.u32()?;
+        if decoder.remaining() == 0 {
+            return Ok(capabilities);
+        }
+        tag = decoder.u8()?;
+    }
+    // The render-sampler block is the tail's sixth and newest optional section
+    // (`research/docs/23` §3.3, v70): it follows the stencil-resolve block when
+    // present, and reads the bool, the binding cap and the admitted texture
+    // formats.
+    if tag != CAPABILITY_RENDER_TEXTURE_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
-    capabilities.supports_render_stencil_resolve = decoder.bool()?;
-    capabilities.stencil_resolve_modes = decoder.u32()?;
+    capabilities.supports_render_texture_sampling = decoder.bool()?;
+    capabilities.max_render_textures = decoder.u32()?;
+    let render_texture_format_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::RenderTextureFormatCount {
+            count: usize::MAX,
+            maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+        })?;
+    if render_texture_format_count > MAX_SUPPORTED_RENDER_TEXTURE_FORMATS {
+        return Err(CodecError::RenderTextureFormatCount {
+            count: render_texture_format_count,
+            maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+        });
+    }
+    let mut supported_render_texture_formats = Vec::with_capacity(render_texture_format_count);
+    for _ in 0..render_texture_format_count {
+        supported_render_texture_formats.push(get_texture_format(decoder)?);
+    }
+    capabilities.supported_render_texture_formats = supported_render_texture_formats;
     Ok(capabilities)
 }

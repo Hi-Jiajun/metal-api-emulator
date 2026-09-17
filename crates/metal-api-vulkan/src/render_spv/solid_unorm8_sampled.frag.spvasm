@@ -1,0 +1,43 @@
+; 采样纹理 fixture 的片元着色器（research/docs/23 §3.3，v70）。
+; 与 solid_unorm8.frag.spvasm 的差别只有一处：颜色不是常量，而是对 DescriptorSet 0 /
+; Binding 0 的组合图像采样器（VkDescriptorType::COMBINED_IMAGE_SAMPLER）按
+; Location 0 的插值 uv 做隐式 LOD 采样。provider 合成 nearest/clamp 采样器
+; （与 compute 轨道同一做法），且 fixture 要求采样纹理与附件同尺寸、uv 落在 texel 中心，
+; 所以采样结果就是上传 texel 的恒等拷贝：忽略纹理的 rail 会读回 clear 色、线性过滤会
+; 混合相邻 texel、UV 翻转或转置会改变行/列序，全部可证伪。
+; 本文件是 solid_unorm8_sampled.frag.spv 的可读源，由渲染轨道 include_bytes! 内嵌。复现命令：
+;   spirv-as --target-env vulkan1.0 solid_unorm8_sampled.frag.spvasm -o solid_unorm8_sampled.frag.spv
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "fragment_main" %uv %out
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "fragment_main"
+               OpName %uv "uv"
+               OpName %out "out"
+               OpName %tex "tex"
+               OpDecorate %uv Location 0
+               OpDecorate %out Location 0
+               OpDecorate %tex DescriptorSet 0
+               OpDecorate %tex Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+        %img = OpTypeImage %float 2D 0 0 0 1 Unknown
+ %sampledimg = OpTypeSampledImage %img
+%_ptr_UniformConstant = OpTypePointer UniformConstant %sampledimg
+%_ptr_Input_v2float = OpTypePointer Input %v2float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+         %uv = OpVariable %_ptr_Input_v2float Input
+        %out = OpVariable %_ptr_Output_v4float Output
+        %tex = OpVariable %_ptr_UniformConstant UniformConstant
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+     %coords = OpLoad %v2float %uv
+    %texture = OpLoad %sampledimg %tex
+      %color = OpImageSampleImplicitLod %v4float %texture %coords
+               OpStore %out %color
+               OpReturn
+               OpFunctionEnd

@@ -159,11 +159,12 @@ class RenderObservationTests(unittest.TestCase):
                          case["metal"]["sha256"])
         text = PROVIDER_PATH.read_text(encoding="utf-8")
         pinned = re.findall(r'include_bytes!\(\s*"([^"]*render_spv/[^"]+)"\s*\)', text)
-        # Two reviewed pairs: the milestone's `vertex_id` triangle, and the
-        # vertex-input quad (`research/docs/23` §3.3). Both are pinned by bytes
-        # rather than by name, which is what keeps a renamed module from
+        # Three reviewed pairs: the milestone's `vertex_id` triangle, the
+        # vertex-input quad (`research/docs/23` §3.3), and the render sampler's
+        # triangle-plus-sampling pair (§3.3, v70). All of them are pinned by
+        # bytes rather than by name, which is what keeps a renamed module from
         # slipping past the review.
-        self.assertEqual(len(pinned), 4, "the capture pins two reviewed stage pairs")
+        self.assertEqual(len(pinned), 6, "the capture pins three reviewed stage pairs")
         for relative in pinned:
             module = (PROVIDER_PATH.parent / relative).resolve()
             self.assertTrue(module.is_file(), "pinned stage module is missing: " + relative)

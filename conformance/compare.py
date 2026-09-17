@@ -51,7 +51,7 @@ ALLOCATION_OBSERVATIONS = {
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
-    "stencil_filter sample_count_gate",
+    "stencil_filter sample_count_gate texture_uploads",
     defaults=(None, None, None, None))
 
 # One render case's present section: the target mode and image count the first
@@ -1623,7 +1623,7 @@ def _render_plan(plan, suite):
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "wildcard_allowed_texels",
-                               "base_vertex",
+                               "base_vertex", "fragment_textures",
                                "depth", "depth_test", "coverage", "cull", "blend",
                                "stencil", "stencil_test", "multisample", "depth_resolve",
                                "requires_depth_resolve_filter", "stencil_resolve",
@@ -1683,6 +1683,69 @@ def _render_plan(plan, suite):
         fragment_entry = _string(case["fragment_entry"], f"{where}.fragment_entry")
         _require(vertex_entry != fragment_entry,
                  f"{where}: the vertex and fragment entries have to differ")
+
+        # The render sampler (`research/docs/23` §3.3, v70): the case binds one
+        # texture whose own texels *are* the expectation, so "the fragment stage
+        # sampled the texture" is the claim under test rather than a colour a
+        # module could store without one. The extent rule is the rail's own: a
+        # texture of another size puts some fragment's sample on a texel boundary
+        # or inside a neighbour, which is a filtered read the review never
+        # covered.
+        fragment_textures = case.get("fragment_textures")
+        if fragment_textures is not None:
+            textures = _list(fragment_textures, f"{where}.fragment_textures")
+            _require(len(textures) == 1,
+                     f"{where}: the reviewed sampling shape binds exactly one texture")
+            _require(single,
+                     f"{where}: the reviewed sampling shape stores one attachment")
+            for absent in ("vertex_layout", "vertex_buffers", "indices", "scissor",
+                           "instance_count", "base_vertex", "cull", "blend",
+                           "multisample", "depth", "depth_test", "depth_resolve",
+                           "stencil", "stencil_test", "stencil_resolve", "present",
+                           "icb", "coverage", "wildcard_texels",
+                           "wildcard_allowed_texels"):
+                _require(absent not in case,
+                         f"{where}: the reviewed sampling shape carries no {absent}")
+            texture_where = f"{where}.fragment_textures[0]"
+            texture = textures[0]
+            _require(isinstance(texture, dict), f"{texture_where}: expected an object")
+            _require(set(texture).issubset({"allocation", "view", "format", "width",
+                                            "height", "initial_hex"}),
+                     f"{texture_where}: unexpected fields")
+            _require(_integer(texture.get("allocation"), f"{texture_where}.allocation") > 0
+                     and _integer(texture.get("view"), f"{texture_where}.view") > 0,
+                     f"{texture_where}: zero texture identity")
+            _require(texture.get("format") == "rgba8_unorm",
+                     f"{texture_where}: the reviewed sampling stage reads one "
+                     "rgba8_unorm surface")
+            attachment = case["attachment"]
+            _require(texture.get("width") == attachment.get("width")
+                     and texture.get("height") == attachment.get("height"),
+                     f"{texture_where}: the sampled texture has to share the "
+                     "attachment's extent")
+            _require(attachment.get("load") == "clear"
+                     and attachment.get("store", "store") == "store",
+                     f"{texture_where}: the reviewed sampling shape clears and stores "
+                     "its attachment")
+            texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
+            expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
+            _require(expected == texels,
+                     f"{where}: the expectation has to be the uploaded texels: the "
+                     "sampling stage's sample at a texel centre is an identity copy")
+            chunks = [texels[offset:offset + 4] for offset in range(0, len(texels), 4)]
+            texture_width = _integer(texture.get("width"), f"{texture_where}.width", 1)
+            texture_height = _integer(texture.get("height"), f"{texture_where}.height", 1)
+            _require(len(chunks) == texture_width * texture_height,
+                     f"{texture_where}: the uploaded texels do not match the extent")
+            _require(len(set(chunks)) == len(chunks),
+                     f"{texture_where}: the uploaded texels have to be pairwise distinct, "
+                     "or a repeated read could pass")
+            clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
+            _require(len(clear) == 4,
+                     f"{where}.attachment.clear_hex: a clear colour is four bytes")
+            _require(clear not in chunks,
+                     f"{texture_where}: an uploaded texel equals the clear colour, so a "
+                     "rail that ignored the texture could pass")
 
         vertex_input = _vertex_input_declaration(case, where)
         # The single attachment form spells its expectation at the case level —
@@ -2224,7 +2287,15 @@ def _render_plan(plan, suite):
                              f"{attachment_where}: a partial coverage claim needs both "
                              "drawn and clear texels")
                 elif scissor is None:
-                    if vertex_input and vertex_input.get("instanced"):
+                    if case.get("fragment_textures") is not None:
+                        # The render sampler's expectation is the uploaded
+                        # texture itself (`research/docs/23` §3.3, v70), so its
+                        # claim is the identity the fragment-texture block
+                        # above already pinned: the texels are pairwise distinct
+                        # and none is the clear colour, which is what rules out
+                        # a uniform store or a repeated read.
+                        pass
+                    elif vertex_input and vertex_input.get("instanced"):
                         # The instanced fixture covers each half of the
                         # attachment with its own instance tint
                         # (`research/docs/23` §3.3, v31): the left half has to
@@ -2572,11 +2643,21 @@ def _render_plan(plan, suite):
                 }
         if claims:
             wildcards[(allocation, view, offset)] = claims
+        # The render sampler's own texture upload is a copy-in the count
+        # contract owes (`research/docs/23` §3.3, v70): the rail uploads the
+        # pass's sampled texels exactly as it uploads every allocation the
+        # declaring pass touches, and the compute plan's textured cases count
+        # their bindings the same way. The texture carries no allocation in the
+        # policy table, so it is counted here rather than added to `touched`.
+        texture_uploads = 0
+        if fragment_textures is not None:
+            texture_uploads = len(fragment_textures)
         render_plan[case_id] = RenderExpectation(
             writes=writes,
             allocations=images,
             touched=touched,
             written=written,
+            texture_uploads=texture_uploads,
             rails=frozenset(rails),
             # The single-attachment shape declares one landing, so one identity
             # is the whole review surface. A case that also stores its depth
@@ -2717,7 +2798,10 @@ def validate_capture(suite, digest, report, required_backend=None):
                 # readback the pool would otherwise do), so the counts stay one
                 # per touched and one per written allocation
                 # (`research/docs/23` §3.5, §5.3).
-                expected_in = len(expectation.touched)
+                # The render sampler's own texture upload rides the same
+                # submission, so it is one more copy-in than the declaring
+                # pass's touched allocations (`research/docs/23` §3.3, v70).
+                expected_in = len(expectation.touched) + expectation.texture_uploads
                 expected_out = len(expectation.written)
                 _require(counts[0] == expected_in,
                          f"{where}: copy_in {counts[0]} does not match {expected_in} "

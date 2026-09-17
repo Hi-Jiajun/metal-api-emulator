@@ -1608,6 +1608,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }
@@ -2909,6 +2910,136 @@ mod tests {
         ));
     }
 
+    /// The one sampled texture a v70 render pass binds: a 4x4 `rgba8_unorm`
+    /// surface whose sixteen texels are pairwise distinct
+    /// (`research/docs/23` §3.3, v70).
+    fn sampled_texture_view(binding: u32) -> TextureView {
+        let mut bytes = Vec::with_capacity(64);
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                bytes.extend_from_slice(&[x, y, x.wrapping_add(y), 0xff]);
+            }
+        }
+        TextureView {
+            view_id: ViewId::new(83),
+            metal_binding: binding,
+            allocation_id: AllocationId::new(53),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(bytes),
+        }
+    }
+
+    /// A render trace whose pass states the four-sample raster *and* samples
+    /// one texture, so both the wide word and the v70 block are present
+    /// (`research/docs/23` §3.3, v51/v70).
+    fn sampled_multisample_trace() -> ComputeTrace {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.textures = vec![sampled_texture_view(0)];
+        trace
+    }
+
+    #[test]
+    fn a_sampled_render_pass_takes_its_own_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: sampled_multisample_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The sampled tag is followed by the same wide feature word the wide
+        // tag carries and then by the block the word had no bit for: a `u8`
+        // count and one full `TextureView` (`research/docs/23` §3.3, v70).
+        assert!(
+            frame
+                .windows(4)
+                .any(|window| window == [0x12, 0x20, 0x01, 0x01]),
+            "the sampled pass carries its own tag, the wide word and the texture count"
+        );
+        // The texel bytes travel with the frame, so a provider can build the
+        // image without a second declaration.
+        let texels: Vec<u8> = (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect();
+        assert!(
+            frame.windows(texels.len()).any(|window| window == texels),
+            "the sampled texture's own bytes travel in the frame"
+        );
+    }
+
+    #[test]
+    fn a_sampled_pass_is_the_pre_v70_frame_with_one_tag_and_one_block_more() {
+        // The only difference between a pre-v70 wide frame and a v70 sampled
+        // frame has to be the tag byte and the inserted block: the wide word
+        // keeps its meanings, and every section after the block is byte
+        // identical. This is the "old frames keep their bytes" rule stated as
+        // a comparison instead of a golden vector.
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: multisample_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let sampled_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: sampled_multisample_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        // The nine-byte frame header carries the payload length, which the
+        // block deliberately changes; every byte after it is what this test
+        // compares.
+        let plain = &plain_frame[9..];
+        let sampled = &sampled_frame[9..];
+        let position = plain
+            .windows(3)
+            .position(|window| window == [0x11, 0x20, 0x01])
+            .expect("the plain fixture takes the wide tag");
+        assert_eq!(&sampled[..position], &plain[..position]);
+        assert_eq!(sampled[position], 0x12);
+        assert_eq!(
+            &sampled[position + 1..position + 3],
+            &plain[position + 1..position + 3],
+            "the sampled tag carries the same wide word"
+        );
+        assert_eq!(sampled[position + 3], 0x01, "one sampled texture");
+        let block_length = sampled.len() - plain.len() - 1;
+        assert_eq!(
+            &sampled[position + 4 + block_length..],
+            &plain[position + 3..],
+            "every section after the block is byte identical"
+        );
+    }
+
+    #[test]
+    fn a_sampled_pass_refuses_a_texture_count_above_the_contract_cap() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: sampled_multisample_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let position = frame
+            .windows(4)
+            .position(|window| window == [0x12, 0x20, 0x01, 0x01])
+            .expect("the sampled fixture carries its own tag");
+        let mut patched = frame.clone();
+        patched[position + 3] = 0x02;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched),
+            Err(CodecError::RenderTextureCount {
+                count: 2,
+                maximum: 1,
+            })
+        ));
+    }
+
     /// A render trace whose pass states the pass-wide four-sample raster
     /// (`research/docs/23` §3.3, v51).
     fn multisample_trace() -> ComputeTrace {
@@ -3435,6 +3566,94 @@ mod tests {
         assert!(matches!(
             CommandCodec::decode_response(&patched),
             Err(CodecError::UnknownCapabilityTail(0x12))
+        ));
+    }
+
+    #[test]
+    fn render_texture_capability_bits_round_trip_and_extend_the_stencil_resolve_frame() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_stencil_resolve = true;
+        capabilities.stencil_resolve_modes = 0b11;
+        assert!(!capabilities.declares_render_texture_support());
+        let plain = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&plain).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: capabilities.clone(),
+            }
+        );
+
+        capabilities.supports_render_texture_sampling = true;
+        capabilities.max_render_textures = 1;
+        capabilities.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        assert!(capabilities.declares_render_texture_support());
+        assert!(capabilities.declares_render_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The render-sampler block is the extended payload's newest optional
+        // section: one presence tag, one bool, one `u32` binding cap, one
+        // `u64` format count and one byte per format (`research/docs/23`
+        // §3.3, v70).
+        let block = [
+            0x20, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x02,
+        ];
+        assert!(
+            frame.windows(block.len()).any(|window| window == block),
+            "the render-sampler tail carries its tag, its bool, its cap and its format list"
+        );
+        assert_eq!(frame.len(), plain.len() + block.len());
+
+        // The v51 half guard, one section later: a snapshot that declares
+        // *only* the render-sampler bits still writes the heap/ICB half the
+        // decoder reads by position before the tag, so its declaration cannot
+        // be dropped on the wire.
+        let mut only_render_texture = fake_capabilities();
+        only_render_texture.supports_render_passes = true;
+        only_render_texture.max_color_attachments = 1;
+        only_render_texture.max_attachment_dimension = [2, 2];
+        only_render_texture.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        only_render_texture.supports_render_texture_sampling = true;
+        only_render_texture.max_render_textures = 1;
+        only_render_texture.supported_render_texture_formats =
+            vec![TextureFormat::Rgba8Unorm, TextureFormat::Rgba8Unorm];
+        let only_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: only_render_texture.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&only_frame).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: only_render_texture,
+            }
+        );
+
+        // A decoder that predates the section refuses a tag this version does
+        // not know rather than reading it as another section's bytes.
+        let mut patched = frame.clone();
+        let tag = frame
+            .windows(block.len())
+            .position(|window| window == block)
+            .expect("the render-sampler tail carries its presence tag");
+        patched[tag] = 0x40;
+        assert!(matches!(
+            CommandCodec::decode_response(&patched),
+            Err(CodecError::UnknownCapabilityTail(0x40))
         ));
     }
 
@@ -4388,6 +4607,9 @@ mod tests {
                     depth_resolve_modes: 0,
                     supports_render_stencil_resolve: false,
                     stencil_resolve_modes: 0,
+                    supports_render_texture_sampling: false,
+                    max_render_textures: 0,
+                    supported_render_texture_formats: Vec::new(),
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -4759,6 +4981,9 @@ mod tests {
             depth_resolve_modes: 0,
             supports_render_stencil_resolve: false,
             stencil_resolve_modes: 0,
+            supports_render_texture_sampling: false,
+            max_render_textures: 0,
+            supported_render_texture_formats: Vec::new(),
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

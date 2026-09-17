@@ -4,8 +4,9 @@ use crate::provider::{
     BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, ContractError,
     FootprintProof, FunctionIdentity, FunctionSource, PipelineContract, PipelineId, PresentMode,
     ProviderErrorClass, ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability,
-    SemanticDigest, ShaderSource, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+    SemanticDigest, ShaderSource, StorageMode, SubmissionId, TextureFormat, TextureSource,
+    TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -65,6 +66,7 @@ struct FakeProvider {
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     render: bool,
     vertex_input: bool,
+    fragment_texture: bool,
     depth_resolve: bool,
     heap: bool,
     icb: bool,
@@ -88,6 +90,7 @@ impl FakeProvider {
             gate: None,
             render: false,
             vertex_input: false,
+            fragment_texture: false,
             depth_resolve: false,
             heap: false,
             icb: false,
@@ -103,6 +106,10 @@ impl FakeProvider {
     }
     fn with_vertex_input(mut self) -> Self {
         self.vertex_input = true;
+        self
+    }
+    fn with_fragment_texture(mut self) -> Self {
+        self.fragment_texture = true;
         self
     }
     fn with_depth_resolve(mut self) -> Self {
@@ -127,6 +134,23 @@ impl FakeProvider {
                 .next()
                 .map(|pass| pass.color_attachments[0].load)
         })
+    }
+
+    /// The fragment textures the most recent render pass carried, in binding
+    /// order, for the encoder-side render-sampler test
+    /// (`research/docs/23` §3.3, v70).
+    fn last_render_textures(&self) -> Vec<contract::TextureView> {
+        self.traces
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|trace| {
+                trace
+                    .render_passes()
+                    .next()
+                    .map(|pass| pass.textures.clone())
+            })
+            .unwrap_or_default()
     }
 
     fn error(&self, token: CompletionToken) -> ProviderError {
@@ -215,6 +239,16 @@ impl ComputeProvider for FakeProvider {
             // (`research/docs/23` §3.3, v60).
             supports_render_stencil_resolve: false,
             stencil_resolve_modes: 0,
+            // The fixture provider executes the render sampler only when the
+            // texture flag is set on it, exactly as the depth resolve above
+            // (`research/docs/23` §3.3, v70).
+            supports_render_texture_sampling: self.render && self.fragment_texture,
+            max_render_textures: u32::from(self.fragment_texture),
+            supported_render_texture_formats: self
+                .fragment_texture
+                .then_some(TextureFormat::Rgba8Unorm)
+                .into_iter()
+                .collect(),
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self
@@ -1540,6 +1574,103 @@ fn a_recording_can_load_its_attachment_instead_of_clearing_it() {
     // recording that claims to load has to reach it as a load rather than as a
     // clear the provider had to reinterpret.
     assert_eq!(provider.last_render_load(), Some(LoadOp::Load));
+}
+
+#[test]
+fn a_recording_binds_one_fragment_texture_in_binding_order() {
+    // The object-API half of the render sampler (`research/docs/23` §3.3,
+    // v70): the encoder binds one texture, the pass it records carries the
+    // binding positionally with the texture's own bytes, and the two binding
+    // refusals are the vertex streams' own (a repeated index, an index past
+    // the contract's cap).
+    let provider = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
+    let device = Device::new(provider.clone());
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let render_metadata = render_metadata(&provider);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let texels: Vec<u8> = (0..4u8)
+        .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+        .collect();
+    let sampled = device
+        .new_texture_with_bytes(TextureFormat::Rgba8Unorm, 4, 4, texels.clone())
+        .unwrap();
+    let foreign = {
+        let other = Device::new(Arc::new(
+            FakeProvider::new().with_render().with_fragment_texture(),
+        ));
+        other
+            .new_texture_with_bytes(TextureFormat::Rgba8Unorm, 4, 4, texels)
+            .unwrap()
+    };
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        assert!(matches!(
+            encoder.set_fragment_texture(0, &foreign),
+            Err(Error::ForeignTexture)
+        ));
+        encoder.set_fragment_texture(0, &sampled).unwrap();
+        assert!(matches!(
+            encoder.set_fragment_texture(0, &sampled),
+            Err(Error::FragmentTextureAlreadyBound { index: 0 })
+        ));
+        assert!(matches!(
+            encoder.set_fragment_texture(1, &sampled),
+            Err(Error::FragmentTextureIndexOutOfRange {
+                index: 1,
+                maximum: 1,
+            })
+        ));
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .expect("a sampled pass records like the pre-v70 one");
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    // The trace the provider received carries the binding: position zero, the
+    // texture's own view identity and its bytes, which is what makes the
+    // sampling falsifiable instead of the driver's default.
+    let textures = provider.last_render_textures();
+    assert_eq!(textures.len(), 1, "one fragment texture reaches the trace");
+    assert_eq!(textures[0].metal_binding, 0);
+    assert_eq!(textures[0].view_id, sampled.view_id());
+    assert_eq!(textures[0].format, TextureFormat::Rgba8Unorm);
+    assert_eq!(textures[0].width, 4);
+    assert_eq!(textures[0].height, 4);
+    assert_eq!(
+        textures[0].source,
+        TextureSource::OwnedBytes(
+            (0..4u8)
+                .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+                .collect()
+        )
+    );
 }
 
 #[test]
@@ -4637,6 +4768,7 @@ fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
             Err(Error::IndirectReplayInputConflict {
                 vertex_buffers: 1,
                 index_buffer: false,
+                fragment_textures: 0,
             })
         );
     }

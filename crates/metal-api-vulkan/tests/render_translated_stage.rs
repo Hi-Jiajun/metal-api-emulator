@@ -254,6 +254,7 @@ fn render_pass(pipeline: PipelineId) -> RenderPassDescriptor {
         vertex_buffers: Vec::new(),
         indices: None,
         instance_count: 1,
+        textures: Vec::new(),
         present: None,
     }
 }

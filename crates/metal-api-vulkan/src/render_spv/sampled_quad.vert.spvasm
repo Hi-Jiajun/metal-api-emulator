@@ -1,0 +1,70 @@
+; 采样纹理 fixture 的顶点着色器（research/docs/23 §3.3，v70）。
+; 与 fullscreen_triangle.vert.spvasm 同一份几何与同一条 y 取反规则：输出 y 被取反
+; （OpFNegate），使 Vulkan 侧的 framebuffer 图像与 Metal 侧同一 fixture 的图像逐字节一致
+; （Metal NDC 的 +y 向上、Vulkan NDC 的 +y 向下）。区别只有一处：本模块额外输出
+; Location 0 的 float32x2 uv，取值为 ((x + 1) / 2, (1 - y) / 2)，即几何自身的
+; 归一化坐标。全屏几何覆盖整个 viewport 时，片段在 framebuffer 第 r 行（自顶向下）
+; 的插值结果恰为 (r + 0.5) / height，也就是该行 texel 中心 —— 恒等采样的期望字节
+; 因此不依赖驱动的边界规则（fixture 还要求采样纹理与附件同尺寸，见 render.rs）。
+; 本文件是 sampled_quad.vert.spv 的可读源，由渲染轨道 include_bytes! 内嵌。复现命令：
+;   spirv-as --target-env vulkan1.0 sampled_quad.vert.spvasm -o sampled_quad.vert.spv
+; 入口名 vertex_main：与 core 的 RenderPipelineContract 对 reviewed 模块的入口约定一致。
+               OpCapability Shader
+          %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "vertex_main" %vid %glpos %uv
+               OpSource GLSL 450
+               OpName %main "vertex_main"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpName %vid "gl_VertexIndex"
+               OpName %glpos "gl_PerVertex"
+               OpName %uv "uv"
+               OpDecorate %vid BuiltIn VertexIndex
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+               OpDecorate %uv Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+%_ptr_Input_int = OpTypePointer Input %int
+%_ptr_Output_v2float = OpTypePointer Output %v2float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%gl_PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %gl_PerVertex
+        %vid = OpVariable %_ptr_Input_int Input
+      %glpos = OpVariable %_ptr_Output_PerVertex Output
+         %uv = OpVariable %_ptr_Output_v2float Output
+    %float_n1 = OpConstant %float -1
+     %float_0 = OpConstant %float 0
+  %float_half = OpConstant %float 0.5
+     %float_1 = OpConstant %float 1
+     %float_4 = OpConstant %float 4
+     %float_3 = OpConstant %float 3
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %ix = OpLoad %int %vid
+         %fx = OpConvertSToF %float %ix
+       %quad = OpFMul %float %fx %float_4
+        %xm1 = OpFSub %float %quad %float_1
+      %isTop = OpSGreaterThan %bool %ix %int_1
+          %x = OpSelect %float %isTop %float_n1 %xm1
+          %y = OpSelect %float %isTop %float_3 %float_n1
+        %flipped_y = OpFNegate %float %y
+        %pos = OpCompositeConstruct %v4float %x %flipped_y %float_0 %float_1
+  %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
+               OpStore %glpos_ptr %pos
+       %x1 = OpFAdd %float %x %float_1
+          %u = OpFMul %float %x1 %float_half
+       %y1 = OpFSub %float %float_1 %y
+          %v = OpFMul %float %y1 %float_half
+       %uvc = OpCompositeConstruct %v2float %u %v
+               OpStore %uv %uvc
+               OpReturn
+               OpFunctionEnd

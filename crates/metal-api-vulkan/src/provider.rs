@@ -12,7 +12,8 @@ use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
     DepthResolveFilter, DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract,
     PresentMode, ProviderCapabilities, SemanticDigest, StencilResolveFilter, StorageMode,
-    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
+    TextureFormat, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
+    MAX_RENDER_TEXTURES,
 };
 use metal_api_core::ExecutorError;
 
@@ -137,6 +138,20 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // (`research/docs/23` §3.3, v60).
         supports_render_stencil_resolve: false,
         stencil_resolve_modes: 0,
+        // The render sampler is executed (`research/docs/23` §3.3, v70):
+        // `render.rs` uploads each bound texture into a host-visible linear
+        // image, builds the sampled pipeline's descriptor set layout from the
+        // bindings and samples them at texel centres through a
+        // provider-synthesised nearest/clamp sampler. Evidence: the reviewed
+        // `sampled_texel_4x4` case on Lavapipe and on the RTX 5060 (the
+        // attachment reads back the uploaded texels exactly), and the rail's
+        // own `render_e2e` sampling test. The bits name the reviewed window —
+        // one binding, one `rgba8_unorm` format, one texture of the render
+        // area's own extent — so a wider request is refused by core admission
+        // or by the rail's shape gates rather than silently narrowed.
+        supports_render_texture_sampling: true,
+        max_render_textures: MAX_RENDER_TEXTURES as u32,
+        supported_render_texture_formats: vec![TextureFormat::Rgba8Unorm],
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

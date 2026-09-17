@@ -54,8 +54,8 @@ use metal_api_core::provider::{
     IndexFormat, IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode,
     ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
     RenderPassDescriptor, RenderPipelineContract, SampleCount, StencilResolveFilter, StencilTest,
-    StoreOp, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
-    FULL_SCREEN_TRIANGLE_VERTICES,
+    StoreOp, TextureFormat, TextureSource, TextureType, TracePass, VertexFormat, VertexLayout,
+    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -193,6 +193,26 @@ pub(crate) const DEPTH_ONLY_VERTEX_ENTRY: &str = "render_depth_only_vertex";
 /// Fragment entry of the reviewed zero-colour-attachment depth module.
 pub(crate) const DEPTH_ONLY_FRAGMENT_ENTRY: &str = "render_depth_only_fragment";
 
+/// The reviewed render-sampler module (`research/docs/23` §3.3, v70): the
+/// milestone's `vertex_id` geometry with one `float2` varying holding the
+/// geometry's own normalised coordinate, and a fragment stage that samples the
+/// pass's own texture binding at that coordinate through a `constexpr`
+/// nearest/clamp sampler.
+///
+/// The module shares the milestone's *shape* — `VertexLayout::None`, one
+/// `Rgba8Unorm` location — so it is selected by its entry pair rather than by
+/// the layout (`reviewed_module_for`): a registration has no pass to look at,
+/// and the pass that binds a texture is exactly the one that names these two
+/// entries.
+pub(crate) const REVIEWED_SAMPLED_SOURCE: &str =
+    include_str!("../../../conformance/shaders/render_sampled_4x4.metal");
+
+/// Vertex entry of the reviewed render-sampler module.
+pub(crate) const SAMPLED_VERTEX_ENTRY: &str = "render_sampled_quad_vertex";
+
+/// Fragment entry of the reviewed render-sampler module.
+pub(crate) const SAMPLED_FRAGMENT_ENTRY: &str = "render_sampled_texel";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -222,7 +242,7 @@ pub(crate) struct ReviewedModule {
 
 /// The reviewed modules, one per (vertex-input shape, colour-format shape)
 /// pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 9] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -294,6 +314,16 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 9] = [
         vertex_entry: DEPTH_ONLY_VERTEX_ENTRY,
         fragment_entry: DEPTH_ONLY_FRAGMENT_ENTRY,
         binds_buffers: true,
+    },
+    // The reviewed render-sampler fixture (`research/docs/23` §3.3, v70): the
+    // milestone's shape with its own entry pair, selected by the registration's
+    // entries rather than by the layout it shares with module 0.
+    ReviewedModule {
+        source: REVIEWED_SAMPLED_SOURCE,
+        path: "conformance/shaders/render_sampled_4x4.metal",
+        vertex_entry: SAMPLED_VERTEX_ENTRY,
+        fragment_entry: SAMPLED_FRAGMENT_ENTRY,
+        binds_buffers: false,
     },
 ];
 
@@ -379,6 +409,36 @@ pub(crate) fn reviewed_module(
     }
 }
 
+/// The reviewed module one registration executes, entry names included
+/// (`research/docs/23` §3.3, v70).
+///
+/// [`reviewed_module`] answers the *shape* question — which module a
+/// (vertex-input layout, colour-format list) pair compiles — and that answer is
+/// unique for every shape except the render sampler's, which shares the
+/// milestone's `vertex_id` + one-`Rgba8Unorm`-location shape. Its own entry
+/// pair is what tells the two apart, so this is the question the registration
+/// gate and the plan both ask: a registration names entries, and entries are
+/// the only thing that distinguishes a sampling pipeline from a solid one
+/// before a pass exists to look at.
+pub(crate) fn reviewed_module_for(
+    contract: &RenderPipelineContract,
+) -> Option<&'static ReviewedModule> {
+    let module = reviewed_module(&contract.vertex_layout, &contract.color_formats)?;
+    if contract.vertex_entry == module.vertex_entry
+        && contract.fragment_entry == module.fragment_entry
+    {
+        return Some(module);
+    }
+    if contract.vertex_entry == SAMPLED_VERTEX_ENTRY
+        && contract.fragment_entry == SAMPLED_FRAGMENT_ENTRY
+        && matches!(contract.vertex_layout, VertexLayout::None)
+        && contract.color_formats == [AttachmentFormat::Rgba8Unorm]
+    {
+        return Some(&REVIEWED_MODULES[9]);
+    }
+    None
+}
+
 /// Colour attachments this rail executes today: two. The core contract admits
 /// the full MRT shape (up to `metal_api_core::provider::MAX_COLOR_ATTACHMENTS`,
 /// now 4) while this rail's capability bit stays at 2: the reviewed dual
@@ -416,6 +476,15 @@ pub(crate) struct RenderCapabilityBits {
     pub(crate) max_color_attachments: u32,
     pub(crate) max_attachment_dimension: [u64; 2],
     pub(crate) supported_color_formats: Vec<AttachmentFormat>,
+    /// Render-sampler bits, declared next to the render bits for the same
+    /// reason: the snapshot and the rail cannot disagree about what this
+    /// provider samples (`research/docs/23` §3.3, v70). The three fields come
+    /// from [`render_texture_capability_bits`], so their flip condition is one
+    /// observation rather than a second set of inline literals that could
+    /// drift from the comment.
+    pub(crate) supports_render_texture_sampling: bool,
+    pub(crate) max_render_textures: u32,
+    pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -466,17 +535,57 @@ pub(crate) const MAX_RENDER_INSTANCES: u32 = 4;
 /// without an eligible device rather than an executed reviewed path.
 pub(crate) fn capability_bits() -> RenderCapabilityBits {
     let present = present_capability_bits();
+    let render_texture = render_texture_capability_bits();
     RenderCapabilityBits {
         supports_render_passes: true,
         max_color_attachments: MAX_COLOR_ATTACHMENTS,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
+        supports_render_texture_sampling: render_texture.supports_render_texture_sampling,
+        max_render_textures: render_texture.max_render_textures,
+        supported_render_texture_formats: render_texture.supported_render_texture_formats,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
         max_present_image_count: present.max_present_image_count,
     }
 }
+
+/// The render-sampler bits the provider declares (`research/docs/23` §3.3,
+/// v70).
+///
+/// The bits name this rail's own window: one `rgba8_unorm` binding whose
+/// texture shares the render area's extent, uploaded into a shared-storage
+/// `MTLTexture` and sampled through the reviewed fragment stage's `constexpr`
+/// nearest/clamp sampler. Flip evidence: the reviewed
+/// `conformance/shaders/render_sampled_4x4.metal` module and the plan gates the
+/// host-side tests below pin; the macOS `--render-selftest` run of the same
+/// case is what the CI job's oracle reports next.
+pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
+    RenderTextureCapabilityBits {
+        supports_render_texture_sampling: true,
+        max_render_textures: MAX_RENDER_TEXTURES,
+        supported_render_texture_formats: SUPPORTED_RENDER_TEXTURE_FORMATS.to_vec(),
+    }
+}
+
+/// The render-sampler bits, in the same shape [`PresentCapabilityBits`] uses:
+/// one value so the macOS snapshot and the host-side tests cannot drift.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RenderTextureCapabilityBits {
+    pub(crate) supports_render_texture_sampling: bool,
+    pub(crate) max_render_textures: u32,
+    pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
+}
+
+/// The first render-sampler increment's binding cap, spelled once so the
+/// snapshot and its tests cannot drift from core's value
+/// (`research/docs/23` §3.3, v70).
+pub(crate) const MAX_RENDER_TEXTURES: u32 = metal_api_core::provider::MAX_RENDER_TEXTURES as u32;
+
+/// The texture formats the first render-sampler increment samples: the
+/// reviewed fragment stage reads one `rgba8_unorm` texel.
+pub(crate) const SUPPORTED_RENDER_TEXTURE_FORMATS: [TextureFormat; 1] = [TextureFormat::Rgba8Unorm];
 
 /// The present bits this provider declares as of the present-track flip.
 ///
@@ -1377,6 +1486,15 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub(crate) initial: Vec<Option<&'a [u8]>>,
 }
 
+/// One sampled texture a render pass binds (`research/docs/23` §3.3, v70): the
+/// trace's own tightly packed texel bytes plus the extent the pass's render
+/// area shares with it.
+#[derive(Debug)]
+pub(crate) struct PlannedTexture<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) extent: [u32; 2],
+}
+
 /// Everything the encoder needs, decided before the first Metal object exists.
 #[derive(Debug)]
 pub(crate) struct RenderPlan<'a> {
@@ -1392,6 +1510,11 @@ pub(crate) struct RenderPlan<'a> {
     /// the load/store actions and the previous bytes the encoder writes into
     /// each attachment before the pass opens.
     pub(crate) attachments: Vec<PlannedAttachment<'a>>,
+    /// The pass's sampled textures, in binding order (`research/docs/23` §3.3,
+    /// v70): the reviewed sampling pair's one `rgba8_unorm` surface whose
+    /// extent is the render area's own, carried as the bytes the encoder
+    /// uploads into its own `MTLTexture`. Empty for every pre-v70 plan.
+    pub(crate) textures: Vec<PlannedTexture<'a>>,
     /// Attachment extent in texels, as `[width, height]`.
     pub(crate) extent: [u32; 2],
     /// `[origin_x, origin_y, width, height]`, copied from the validated pass.
@@ -1678,10 +1801,7 @@ pub(crate) fn plan<'a>(
     // The pipeline's (vertex-input shape, colour-format list) pair selects the
     // one reviewed module this call may compile; the (module, entry pair) pair
     // is then the whole allowlist, re-checked by `review_contract` below.
-    let module = reviewed_module(
-        &request.pipeline.vertex_layout,
-        &request.pipeline.color_formats,
-    );
+    let module = reviewed_module_for(request.pipeline);
     match module {
         Some(module) if request.source == module.source => {}
         Some(module) => {
@@ -1732,6 +1852,29 @@ pub(crate) fn plan<'a>(
     }
     // Bounded by the check above, so these conversions cannot lose a bit.
     let extent = [raster[0] as u32, raster[1] as u32];
+    // The render sampler (`research/docs/23` §3.3, v70) is one decision in two
+    // halves, so both are answered together: the reviewed sampling module
+    // samples the pass's own texture binding, and a pass that binds a texture
+    // runs only through that module. A pass that binds none keeps the empty
+    // list every pre-v70 plan carried.
+    let textures =
+        if request.pass.textures.is_empty() {
+            if request.source == REVIEWED_SAMPLED_SOURCE {
+                return Err(capability_refusal("render_texture_binding_required").with_detail(
+                "the reviewed sampling pair samples the pass's own texture binding; this pass \
+                 binds none",
+            ));
+            }
+            Vec::new()
+        } else {
+            if request.source != REVIEWED_SAMPLED_SOURCE {
+                return Err(capability_refusal("render_texture_stage_unsupported").with_detail(
+                "the pass binds a render texture but its fragment stage is not the reviewed \
+                 sampling module",
+            ));
+            }
+            resolve_render_textures(request.pass, extent)?
+        };
     // Every admitted colour format and `depth32float` alike store four bytes per
     // texel, so one texel-byte count serves the colour attachments and the
     // depth-only pass's readback (`crates/metal-api-core`:
@@ -1887,6 +2030,10 @@ pub(crate) fn plan<'a>(
         vertex_entry: request.pipeline.vertex_entry.as_str(),
         fragment_entry: request.pipeline.fragment_entry.as_str(),
         attachments: planned_attachments,
+        // The pass's sampled textures, resolved above
+        // (`research/docs/23` §3.3, v70). Empty for every pre-v70 plan, which
+        // is the shape the encoder's texture bind branches on.
+        textures,
         extent,
         viewport: request.pass.viewport,
         scissor: request.pass.scissor,
@@ -2086,6 +2233,14 @@ pub(crate) fn layout_name(layout: &VertexLayout) -> &'static str {
 /// (`NativeMetalProvider::register_render_pipeline`) and [`plan`] both run it,
 /// so the refusal is reachable before a submission as well as inside one.
 pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), ProviderError> {
+    if reviewed_module_for(contract).is_some() {
+        return Ok(());
+    }
+    // The refusal names the entry pair the shape carries, so a caller can fix
+    // the registration without reading the rail: the shape's own module is the
+    // one a matching pair compiles, and the render-sampler shape shares the
+    // milestone's — which is exactly why the entry pair, not the shape, is
+    // what a caller has to correct here (`research/docs/23` §3.3, v70).
     let Some(module) = reviewed_module(&contract.vertex_layout, &contract.color_formats) else {
         return Err(
             allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
@@ -2095,21 +2250,108 @@ pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), P
             )),
         );
     };
-    if contract.vertex_entry != module.vertex_entry
-        || contract.fragment_entry != module.fragment_entry
-    {
-        return Err(
-            allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
-                "a {} layout with {:?} compiles `{}`, which carries {:?} and {:?}",
-                layout_name(&contract.vertex_layout),
-                contract.color_formats,
-                module.path,
-                module.vertex_entry,
-                module.fragment_entry,
-            )),
-        );
+    Err(
+        allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
+            "a {} layout with {:?} compiles `{}`, which carries {:?} and {:?}",
+            layout_name(&contract.vertex_layout),
+            contract.color_formats,
+            module.path,
+            module.vertex_entry,
+            module.fragment_entry,
+        )),
+    )
+}
+
+/// Resolve one pass's sampled textures into the rail's own plan shape
+/// (`research/docs/23` §3.3, v70).
+///
+/// The Vulkan rail's window, restated for a directly-constructed pass: exactly
+/// one `rgba8_unorm` 2D single-sample surface, trace-owned bytes, whose extent
+/// equals the render area. The extent rule is what makes the fixture's
+/// expectation driver-independent — the interpolated varying stands on a texel
+/// centre only when the texture and the render area share their extent — so a
+/// texture of another size is refused by name instead of sampled as a filtered
+/// read the review never covered.
+fn resolve_render_textures<'a>(
+    pass: &'a RenderPassDescriptor,
+    extent: [u32; 2],
+) -> Result<Vec<PlannedTexture<'a>>, ProviderError> {
+    if pass.textures.len() > MAX_RENDER_TEXTURES as usize {
+        return Err(capability_refusal("render_texture_limit")
+            .with_field(
+                "requested",
+                FieldValue::Unsigned(pass.textures.len() as u64),
+            )
+            .with_field(
+                "maximum",
+                FieldValue::Unsigned(u64::from(MAX_RENDER_TEXTURES)),
+            ));
     }
-    Ok(())
+    let mut textures = Vec::with_capacity(pass.textures.len());
+    for (index, view) in pass.textures.iter().enumerate() {
+        if view.format != TextureFormat::Rgba8Unorm {
+            return Err(capability_refusal("render_texture_format_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
+                .with_detail("the reviewed sampling module reads one rgba8_unorm surface"));
+        }
+        if view.texture_type != TextureType::D2
+            || view.sample_count != 1
+            || view.depth != 1
+            || view.array_length != 1
+        {
+            return Err(capability_refusal("render_texture_shape_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field(
+                    "texture_type",
+                    FieldValue::Text(format!("{:?}", view.texture_type)),
+                )
+                .with_field("sample_count", FieldValue::Unsigned(view.sample_count))
+                .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
+        }
+        let TextureSource::OwnedBytes(bytes) = &view.source else {
+            return Err(capability_refusal("render_texture_source_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_detail("the first render-sampler increment uploads trace-owned bytes only"));
+        };
+        let width = u32::try_from(view.width).unwrap_or(u32::MAX);
+        let height = u32::try_from(view.height).unwrap_or(u32::MAX);
+        if width == 0 || height == 0 {
+            return Err(contract_refusal(ContractError::ZeroDimension {
+                field: "render texture",
+                axis: 0,
+            }));
+        }
+        if [width, height] != extent {
+            return Err(capability_refusal("render_texture_extent_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("width", FieldValue::Unsigned(u64::from(width)))
+                .with_field("height", FieldValue::Unsigned(u64::from(height)))
+                .with_field("render_width", FieldValue::Unsigned(u64::from(extent[0])))
+                .with_field("render_height", FieldValue::Unsigned(u64::from(extent[1])))
+                .with_detail(
+                    "the reviewed sampling shape samples a texture of the render area's own \
+                     extent, so every fragment stands on a texel centre",
+                ));
+        }
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
+            .ok_or_else(|| contract_refusal(ContractError::ArithmeticOverflow("render texture")))?;
+        let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if actual != expected {
+            return Err(contract_refusal(ContractError::SourceLengthMismatch {
+                view: view.view_id,
+                expected,
+                actual,
+            }));
+        }
+        textures.push(PlannedTexture {
+            bytes,
+            extent: [width, height],
+        });
+    }
+    Ok(textures)
 }
 
 /// The previous bytes an offscreen `LoadOp::Load` pass uploads before it opens.
@@ -2583,8 +2825,7 @@ pub(crate) fn plan_trace<'a>(
             &OffscreenRenderRequest {
                 pass,
                 pipeline: contract,
-                source: reviewed_module(&contract.vertex_layout, &contract.color_formats)
-                    .map_or("", |module| module.source),
+                source: reviewed_module_for(contract).map_or("", |module| module.source),
                 initial: previous,
             },
             depth_resolve_modes,
@@ -2784,6 +3025,12 @@ fn encode_into_and_readback(
     indirect: Option<icb::IcbPlan>,
 ) -> Result<RenderReadback, ProviderError> {
     let pipeline = render_pipeline_state(device, planned)?;
+    // The sampled textures the reviewed sampling pair reads
+    // (`research/docs/23` §3.3, v70): one shared-storage `MTLTexture` per
+    // binding, filled with the trace's own texels, bound on the encoder below
+    // and kept in this local for the same reason the depth texture is — the
+    // encoder references it until it ends.
+    let sampled_textures = sampled_textures(device, planned)?;
     // A multisampled pass renders into its own four-sample textures
     // (`research/docs/23` §3.3, v51): one per colour location, created beside
     // the resolve targets `targets` already holds. The resolve targets are what
@@ -3131,6 +3378,15 @@ fn encode_into_and_readback(
         width: metal::NSUInteger::from(scissor_width),
         height: metal::NSUInteger::from(scissor_height),
     });
+    // The sampled textures are bound before the draw, in binding order: the
+    // entry's position in the plan is the binding the reviewed fragment stage
+    // reads (`research/docs/23` §3.3, v70).
+    for (index, texture) in sampled_textures.iter().enumerate() {
+        encoder.set_fragment_texture(
+            u64::try_from(index).unwrap_or(u64::MAX),
+            Some(texture.as_ref()),
+        );
+    }
     match indirect {
         None => match &planned.indices {
             // An indexed draw names its index buffer in the draw call, which is
@@ -3803,6 +4059,54 @@ fn read_stencil_texels(
 }
 
 #[cfg(target_os = "macos")]
+/// The sampled textures one plan carries, as the shared-storage `MTLTexture`s
+/// the encoder binds (`research/docs/23` §3.3, v70).
+///
+/// Each texture is created with `ShaderRead` usage — the sampling stage is the
+/// only reader — and filled with the plan's own bytes through
+/// `replaceRegion`, one tightly packed `width * 4`-byte row per texel row, which
+/// is the same upload shape the rail's attachment presets use.
+#[cfg(target_os = "macos")]
+fn sampled_textures(
+    device: &Device,
+    planned: &RenderPlan<'_>,
+) -> Result<Vec<Texture>, ProviderError> {
+    let mut textures = Vec::with_capacity(planned.textures.len());
+    for sampled in &planned.textures {
+        let [width, height] = sampled.extent;
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(metal_pixel_format(RenderPixelFormat::Rgba8Unorm));
+        descriptor.set_width(u64::from(width));
+        descriptor.set_height(u64::from(height));
+        descriptor.set_mipmap_level_count(1);
+        descriptor.set_usage(MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        let pointer: *mut metal::MTLTexture =
+            unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
+        if pointer.is_null() {
+            return Err(resource_refusal("metal_render_texture_allocation_failed"));
+        }
+        let texture = unsafe { Texture::from_ptr(pointer) };
+        texture.replace_region(
+            MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: u64::from(width),
+                    height: u64::from(height),
+                    depth: 1,
+                },
+            },
+            0,
+            sampled.bytes.as_ptr().cast(),
+            NSUInteger::try_from(u64::from(width) * 4).unwrap_or(NSUInteger::MAX),
+        );
+        textures.push(texture);
+    }
+    Ok(textures)
+}
+
+#[cfg(target_os = "macos")]
 fn region(planned: &RenderPlan<'_>) -> MTLRegion {
     MTLRegion {
         origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -3875,7 +4179,7 @@ mod tests {
         ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
         RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest,
         StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
-        StorageMode, VertexAttribute, VertexBufferLayout, VertexLayout, ViewId,
+        StorageMode, TextureAccess, VertexAttribute, VertexBufferLayout, VertexLayout, ViewId,
         PROVIDER_SCHEMA_VERSION,
     };
 
@@ -3912,6 +4216,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }
@@ -3930,6 +4235,48 @@ mod tests {
     /// pass.
     fn sentinel() -> ClearColor {
         ClearColor::new([0xfe, 0xfe, 0xfe, 0xfe])
+    }
+
+    /// The reviewed render-sampler fixture's contract and its 4×4 pass
+    /// (`research/docs/23` §3.3, v70).
+    fn sampled_pipeline() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_entry: SAMPLED_VERTEX_ENTRY.to_owned(),
+            fragment_entry: SAMPLED_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::None,
+        }
+    }
+
+    /// One `size`×`size` sampled texture view whose sixteen texels are pairwise
+    /// distinct.
+    fn sampled_texture_view(size: u64) -> metal_api_core::provider::TextureView {
+        let bytes = (0..size as u8)
+            .flat_map(|y| (0..size as u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect::<Vec<_>>();
+        metal_api_core::provider::TextureView {
+            view_id: ViewId::new(83),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(53),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: size,
+            height: size,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(bytes),
+        }
+    }
+
+    fn sampled_pass(size: u64) -> RenderPassDescriptor {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.color_attachments[0].width = size;
+        pass.color_attachments[0].height = size;
+        pass.viewport = [0, 0, size as u32, size as u32];
+        pass.textures = vec![sampled_texture_view(size)];
+        pass
     }
 
     fn milestone_request<'a>(
@@ -3954,6 +4301,158 @@ mod tests {
         request: &OffscreenRenderRequest<'a>,
     ) -> Result<RenderPlan<'a>, ProviderError> {
         plan(request, 0, 0)
+    }
+
+    /// The render sampler's shape selection and its plan gates
+    /// (`research/docs/23` §3.3, v70).
+    ///
+    /// Host-side: the encoder body lives behind `cfg(target_os = "macos")`, so
+    /// what these tests pin is everything answerable from values — which
+    /// reviewed module a registration selects, what the plan admits, and what
+    /// it refuses by name — which is also the whole falsification surface the
+    /// macOS run then executes.
+    #[test]
+    fn the_render_sampler_is_selected_by_its_entries_and_gated_by_its_shape() {
+        let sampled = sampled_pipeline();
+        let selected = reviewed_module_for(&sampled).expect("the sampled pair is reviewed");
+        assert_eq!(selected.source, REVIEWED_SAMPLED_SOURCE);
+        assert_eq!(
+            selected.path,
+            "conformance/shaders/render_sampled_4x4.metal"
+        );
+        review_contract(&sampled).expect("the sampled registration passes the allowlist");
+        // The milestone shares the sampled pair's shape, so the entries are the
+        // only thing that tells the two apart — and a crossed pair is refused.
+        let milestone = milestone_pipeline();
+        assert_eq!(
+            reviewed_module_for(&milestone).map(|module| module.path),
+            Some("conformance/shaders/render_offscreen_2x2.metal")
+        );
+        let crossed = RenderPipelineContract {
+            vertex_entry: VERTEX_ENTRY.to_owned(),
+            fragment_entry: SAMPLED_FRAGMENT_ENTRY.to_owned(),
+            ..sampled_pipeline()
+        };
+        assert!(reviewed_module_for(&crossed).is_none());
+        assert_eq!(
+            review_contract(&crossed).unwrap_err().slug,
+            "native_render_source_not_reviewed"
+        );
+
+        // The reviewed shape plans: one 4x4 texture whose extent is the render
+        // area's own.
+        let pass = sampled_pass(4);
+        let plan = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &sampled,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+        })
+        .expect("the reviewed sampling shape is planned");
+        assert_eq!(plan.textures.len(), 1);
+        assert_eq!(plan.textures[0].extent, [4, 4]);
+        assert_eq!(plan.textures[0].bytes.len(), 64);
+        assert_eq!(plan.vertex_entry, SAMPLED_VERTEX_ENTRY);
+        assert_eq!(plan.fragment_entry, SAMPLED_FRAGMENT_ENTRY);
+
+        // The pair and the binding are one decision in both directions.
+        let unbound = {
+            let mut pass = sampled_pass(4);
+            pass.textures = Vec::new();
+            pass
+        };
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &unbound,
+            pipeline: &sampled,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+        })
+        .unwrap_err();
+        eprintln!("unbound refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_binding_required");
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &milestone,
+            source: REVIEWED_SOURCE,
+            initial: vec![None],
+        })
+        .unwrap_err();
+        eprintln!("uncoupled refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_stage_unsupported");
+
+        // Another extent puts some fragment's sample on a texel boundary or
+        // inside a neighbour, which is a filtered read the review never covered.
+        let other_extent = {
+            let mut pass = sampled_pass(4);
+            pass.textures = vec![sampled_texture_view(2)];
+            pass
+        };
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &other_extent,
+            pipeline: &sampled,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+        })
+        .unwrap_err();
+        eprintln!("extent refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_extent_unsupported");
+
+        // The reviewed fragment stage reads one `rgba8_unorm` 2D surface, and
+        // the first increment uploads trace-owned bytes only.
+        let other_format = {
+            let mut pass = sampled_pass(4);
+            let mut view = sampled_texture_view(4);
+            view.format = TextureFormat::Bgra8Unorm;
+            pass.textures = vec![view];
+            pass
+        };
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &other_format,
+            pipeline: &sampled,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+        })
+        .unwrap_err();
+        assert_eq!(error.slug, "render_texture_format_unsupported");
+        let leased = {
+            let mut pass = sampled_pass(4);
+            let mut view = sampled_texture_view(4);
+            view.source = TextureSource::StagedLease(metal_api_core::provider::LeaseId::new(7));
+            pass.textures = vec![view];
+            pass
+        };
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &leased,
+            pipeline: &sampled,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+        })
+        .unwrap_err();
+        assert_eq!(error.slug, "render_texture_source_unsupported");
+    }
+
+    /// The render bits the provider declares now carry the sampler
+    /// (`research/docs/23` §3.3, v70): the three values are the rail's own
+    /// window, so they and the plan gates cannot disagree.
+    #[test]
+    fn render_texture_capability_bits_name_the_reviewed_window() {
+        let bits = render_texture_capability_bits();
+        assert!(bits.supports_render_texture_sampling);
+        assert_eq!(bits.max_render_textures, 1);
+        assert_eq!(
+            bits.supported_render_texture_formats,
+            vec![TextureFormat::Rgba8Unorm]
+        );
+        let declared = capability_bits();
+        assert_eq!(
+            declared.supports_render_texture_sampling,
+            bits.supports_render_texture_sampling
+        );
+        assert_eq!(declared.max_render_textures, bits.max_render_textures);
+        assert_eq!(
+            declared.supported_render_texture_formats,
+            bits.supported_render_texture_formats
+        );
     }
 
     /// The refusal of a (source, entry pair) triple the rail does not review.
@@ -5173,6 +5672,14 @@ mod tests {
             depth_resolve_modes: 0,
             supports_render_stencil_resolve: false,
             stencil_resolve_modes: 0,
+            // The test snapshot spells the pre-flip shape out for the same
+            // reason the multisample pair above does: a test constructs the
+            // "cannot sample render-side textures" declaration and asserts
+            // core admission refuses the texture-bearing pass
+            // (`research/docs/23` §3.3, v70).
+            supports_render_texture_sampling: false,
+            max_render_textures: 0,
+            supported_render_texture_formats: Vec::new(),
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -5316,6 +5823,7 @@ mod tests {
                 format: IndexFormat::Uint16,
             }),
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }

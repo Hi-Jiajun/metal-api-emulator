@@ -334,6 +334,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         })
     }
@@ -426,6 +427,9 @@ mod tests {
             depth_resolve_modes: 0,
             supports_render_stencil_resolve: false,
             stencil_resolve_modes: 0,
+            supports_render_texture_sampling: false,
+            max_render_textures: 0,
+            supported_render_texture_formats: Vec::new(),
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

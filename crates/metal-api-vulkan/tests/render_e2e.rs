@@ -35,7 +35,8 @@ use metal_api_core::provider::{
     LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
     ProviderCapabilities, ProviderError, ProviderErrorClass, RenderAttachment,
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
-    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
@@ -182,6 +183,7 @@ fn render_pass(
         vertex_buffers: Vec::new(),
         indices: None,
         instance_count: 1,
+        textures: Vec::new(),
         present: None,
     }
 }
@@ -608,6 +610,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 vertex_buffers: Vec::new(),
                 indices: None,
                 instance_count: 1,
+                textures: Vec::new(),
                 present: None,
             }),
         ],
@@ -802,6 +805,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 vertex_buffers: Vec::new(),
                 indices: None,
                 instance_count: 1,
+                textures: Vec::new(),
                 present: None,
             }),
         ],
@@ -1874,5 +1878,190 @@ fn vertex_input_refusals_name_the_stream_that_cannot_be_read() {
         .expect_err("index 4 names a fifth vertex the 32-byte stream does not hold");
     eprintln!("out-of-range index refused: {refused:?}");
     assert_eq!(refused.slug, "render_vertex_buffer_footprint_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+/// The reviewed sampling pair (`research/docs/23` §3.3, v70): the full-screen
+/// geometry with its `Location 0` uv varying, and the fragment stage that
+/// samples `DescriptorSet 0 / Binding 0` with it.
+const SAMPLED_QUAD_VERT_SPV: &[u8] = include_bytes!("../src/render_spv/sampled_quad.vert.spv");
+const SAMPLED_UNORM8_FRAG_SPV: &[u8] =
+    include_bytes!("../src/render_spv/solid_unorm8_sampled.frag.spv");
+
+const SAMPLED_TEXTURE_VIEW: ViewId = ViewId::new(712);
+const SAMPLED_TEXTURE_ALLOCATION: AllocationId = AllocationId::new(812);
+
+/// The sixteen texels the sampled texture holds, row-major: four distinct
+/// channels per texel, so a transposed, flipped or filtered read lands bytes
+/// no expectation of this fixture contains.
+fn sampled_texels() -> Vec<u8> {
+    (0..4u8)
+        .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+        .collect()
+}
+
+/// The whole chain for the render sampler: a 4×4 attachment, one texture the
+/// fragment stage samples at texel centres, and the bytes that land in the
+/// writeback channel. The falsification is the point: a rail that ignores the
+/// texture reads back the clear sentinel, one that filters reads a neighbour's
+/// texel, and one that flips or transposes the uv reads another row or column.
+#[test]
+fn a_render_pass_samples_its_texture_and_lands_the_texels() {
+    let Some(executor) = executor() else {
+        return;
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_sampled_compute"))
+        .expect("the compute pipeline registers");
+    let render = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv: SAMPLED_UNORM8_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_sampled_stages"),
+        })
+        .expect("the sampled pair registers");
+
+    let texels = sampled_texels();
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 4, 4);
+    pass.textures = vec![TextureView {
+        view_id: SAMPLED_TEXTURE_VIEW,
+        metal_binding: 0,
+        allocation_id: SAMPLED_TEXTURE_ALLOCATION,
+        texture_type: TextureType::D2,
+        format: TextureFormat::Rgba8Unorm,
+        width: 4,
+        height: 4,
+        depth: 1,
+        array_length: 1,
+        sample_count: 1,
+        access: TextureAccess::Sampled,
+        source: TextureSource::OwnedBytes(texels.clone()),
+    }];
+
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(11),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        // 4×4 texels of four bytes: exactly the extent the
+                        // render attachment restates.
+                        length: 64,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; 64]),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(pass),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [(ATTACHMENT_ALLOCATION, 64), (SCRATCH_ALLOCATION, 8)] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the sampled trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!(
+        "sampled attachment readback: {} ({} bytes)",
+        hex(&attachment),
+        attachment.len()
+    );
+    eprintln!("uploaded texels: {}", hex(&texels));
+
+    assert_eq!(attachment.len(), 64);
+    assert_eq!(
+        attachment, texels,
+        "the fragment stage's sample over a texel-aligned texture is the uploaded texel itself"
+    );
+    assert!(
+        !attachment
+            .chunks_exact(4)
+            .any(|texel| texel == CLEAR_SENTINEL),
+        "a surviving clear sentinel means the sampled pass did not cover every texel: {}",
+        hex(&attachment)
+    );
+
+    // The falsification control: the same pass without its texture binding is
+    // refused by name instead of executed with an unbound descriptor (which
+    // would read the clear, not the texels).
+    let mut unbound = trace.clone();
+    if let Some(TracePass::Render(pass)) = unbound.passes.last_mut() {
+        pass.textures = Vec::new();
+    }
+    let refused = match provider
+        .capabilities()
+        .validate_trace(unbound, resources.clone())
+    {
+        Ok(admitted) => provider
+            .submit(admitted)
+            .expect_err("the reviewed sampling pair needs a texture binding"),
+        Err(error) => error,
+    };
+    eprintln!("sampling without a texture refused: {refused:?}");
+    assert_eq!(refused.slug, "render_texture_binding_required");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 }

@@ -74,6 +74,7 @@ def full_capture(suite, overrides=None):
                 v28.msaa_stencil_resolve_sample0_result,
                 v28.msaa_uniform_2x_result, v28.msaa_uniform_8x_result,
                 v28.msaa_edge_2x_result, v28.msaa_edge_8x_result,
+                v28.sampled_result,
                 v28.msaa_ds_result)
     for builder in builders:
         result = builder(True)
