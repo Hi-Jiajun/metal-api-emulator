@@ -4487,6 +4487,47 @@ impl LeaseRegistry {
         device_epoch: DeviceEpoch,
         resources: &ResourceTableSnapshot,
     ) -> Result<Vec<u8>, ProviderError> {
+        self.window_bytes(lease_id, LeaseWindow::View(view), device_epoch, resources)
+    }
+
+    /// Resolve the bytes a staged lease supplies to one texture
+    /// (`research/docs/23` §75, R5c).
+    ///
+    /// [`TextureSource`]'s contract holds that a lease covers the whole
+    /// texture in the first increment: the texture's tightly packed extent sits
+    /// at the reservation's own start, while the reservation may be larger —
+    /// the import rules make owners page-align their windows, so a 64-byte
+    /// fixture legitimately lives in a 4 KiB reservation. A reservation (or
+    /// staged copy) shorter than the texture stays `lease_range_out_of_bounds`
+    /// instead of being read past its end.
+    pub fn texture_bytes(
+        &self,
+        lease_id: LeaseId,
+        texture: &TextureView,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.window_bytes(
+            lease_id,
+            LeaseWindow::Texture(texture),
+            device_epoch,
+            resources,
+        )
+    }
+
+    /// One window's bytes out of the staged copy.
+    ///
+    /// Both public entry points land here, so a view and a texture are held to
+    /// the same identity, snapshot, epoch and bounds checks in the same order:
+    /// the staged import first (`lease_not_imported`), then the admitted
+    /// reservation (`lease_not_admitted`), and the window's own range last.
+    fn window_bytes(
+        &self,
+        lease_id: LeaseId,
+        window: LeaseWindow<'_>,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<Vec<u8>, ProviderError> {
         let leases = self.lock();
         let staged = leases
             .get(&lease_id)
@@ -4494,6 +4535,7 @@ impl LeaseRegistry {
         let reservation = resources.lease(lease_id).ok_or_else(|| {
             lease_error("lease_not_admitted", lease_id, ProviderErrorClass::Resource)
         })?;
+        let (offset, length) = window.window(reservation)?;
         if staged.reservation != reservation {
             return Err(lease_error(
                 "lease_snapshot_mismatch",
@@ -4514,10 +4556,10 @@ impl LeaseRegistry {
             ));
         }
         let lease_end = reservation.end().map_err(contract_error_refusal)?;
-        let view_end = view.offset.checked_add(view.length).ok_or_else(|| {
+        let view_end = offset.checked_add(length).ok_or_else(|| {
             contract_error_refusal(ContractError::ArithmeticOverflow("staged lease view range"))
         })?;
-        let start = view.offset.checked_sub(reservation.offset).ok_or_else(|| {
+        let start = offset.checked_sub(reservation.offset).ok_or_else(|| {
             lease_error(
                 "lease_range_out_of_bounds",
                 lease_id,
@@ -4536,7 +4578,7 @@ impl LeaseRegistry {
         let start = usize::try_from(start).map_err(|_| {
             contract_error_refusal(ContractError::ArithmeticOverflow("staged lease offset"))
         })?;
-        let length = usize::try_from(view.length).map_err(|_| {
+        let length = usize::try_from(length).map_err(|_| {
             contract_error_refusal(ContractError::ArithmeticOverflow(
                 "staged lease view length",
             ))
@@ -4773,6 +4815,43 @@ impl BorrowedLeaseRegistry {
         device_epoch: DeviceEpoch,
         resources: &ResourceTableSnapshot,
     ) -> Result<BorrowedView, ProviderError> {
+        self.window_pointer(lease_id, LeaseWindow::View(view), device_epoch, resources)
+    }
+
+    /// Resolve the owner memory one texture's lease covers
+    /// (`research/docs/23` §75, R5c).
+    ///
+    /// The same window rule [`LeaseRegistry::texture_bytes`] states: the
+    /// texture's tightly packed extent at the reservation's own start, so the
+    /// pointer this hands back is the owner's reservation base and the length
+    /// is the texture's own. A reservation that does not cover the extent stays
+    /// `lease_range_out_of_bounds`.
+    pub fn texture_pointer(
+        &self,
+        lease_id: LeaseId,
+        texture: &TextureView,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<BorrowedView, ProviderError> {
+        self.window_pointer(
+            lease_id,
+            LeaseWindow::Texture(texture),
+            device_epoch,
+            resources,
+        )
+    }
+
+    /// One window's owner memory, with the checks both entry points share and
+    /// in the order the staged registry uses: the import first
+    /// (`lease_not_imported`), then the admitted snapshot, the epoch, and the
+    /// window's range last.
+    fn window_pointer(
+        &self,
+        lease_id: LeaseId,
+        window: LeaseWindow<'_>,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<BorrowedView, ProviderError> {
         let leases = self.lock();
         let entry = leases
             .get(&lease_id)
@@ -4780,6 +4859,7 @@ impl BorrowedLeaseRegistry {
         let reservation = resources.lease(lease_id).ok_or_else(|| {
             lease_error("lease_not_admitted", lease_id, ProviderErrorClass::Resource)
         })?;
+        let (offset, length) = window.window(reservation)?;
         if entry.lease.reservation != reservation {
             return Err(lease_error(
                 "lease_snapshot_mismatch",
@@ -4800,12 +4880,12 @@ impl BorrowedLeaseRegistry {
             ));
         }
         let lease_end = reservation.end().map_err(contract_error_refusal)?;
-        let view_end = view.offset.checked_add(view.length).ok_or_else(|| {
+        let view_end = offset.checked_add(length).ok_or_else(|| {
             contract_error_refusal(ContractError::ArithmeticOverflow(
                 "borrowed lease view range",
             ))
         })?;
-        let start = view.offset.checked_sub(reservation.offset).ok_or_else(|| {
+        let start = offset.checked_sub(reservation.offset).ok_or_else(|| {
             lease_error(
                 "lease_range_out_of_bounds",
                 lease_id,
@@ -4824,7 +4904,7 @@ impl BorrowedLeaseRegistry {
         let start = usize::try_from(start).map_err(|_| {
             contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease offset"))
         })?;
-        let len = usize::try_from(view.length).map_err(|_| {
+        let len = usize::try_from(length).map_err(|_| {
             contract_error_refusal(ContractError::ArithmeticOverflow(
                 "borrowed lease view length",
             ))
@@ -4832,7 +4912,7 @@ impl BorrowedLeaseRegistry {
         let pointer = entry.lease.host_pointer.checked_add(start).ok_or_else(|| {
             contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease pointer"))
         })?;
-        let capacity = usize::try_from(lease_end - view.offset).map_err(|_| {
+        let capacity = usize::try_from(lease_end - offset).map_err(|_| {
             contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease capacity"))
         })?;
         let base_len = usize::try_from(reservation.length).map_err(|_| {
@@ -4861,6 +4941,39 @@ fn lease_error(slug: &'static str, lease_id: LeaseId, class: ProviderErrorClass)
     ProviderError::new(ProviderPhase::Resolve, class, slug)
         .expect("non-empty lease error slug")
         .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+}
+
+/// The byte window one lease-backed declaration covers (`research/docs/23`
+/// §75, R5c).
+///
+/// Both registries resolve two kinds of declaration through this window, and
+/// both hold them to the same identity, snapshot, epoch and bounds checks: a
+/// buffer view names its window with the offset and length core admission
+/// already validated, while a texture names none — [`TextureSource`]'s contract
+/// holds that a lease covers the whole texture in the first increment, so the
+/// texture's tightly packed extent is the window and it sits at the
+/// reservation's own start. A reservation larger than the texture (the import
+/// rules page-align owner windows) is padding, not a second declaration.
+#[derive(Clone, Copy)]
+enum LeaseWindow<'a> {
+    /// A buffer view's own offset and length inside its allocation.
+    View(&'a BufferView),
+    /// A texture's whole tightly packed extent at the reservation's start.
+    Texture(&'a TextureView),
+}
+
+impl LeaseWindow<'_> {
+    /// The absolute `(offset, length)` this declaration covers inside its
+    /// allocation, resolved against the reservation the snapshot admits.
+    fn window(&self, reservation: LeaseReservation) -> Result<(u64, u64), ProviderError> {
+        match self {
+            Self::View(view) => Ok((view.offset, view.length)),
+            Self::Texture(texture) => Ok((
+                reservation.offset,
+                texture.expected_bytes().map_err(contract_error_refusal)?,
+            )),
+        }
+    }
 }
 
 /// Provider-side import of owner-issued lease backing.
@@ -13281,6 +13394,132 @@ mod tests {
         assert_eq!(
             registry
                 .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_not_imported"
+        );
+    }
+
+    /// A texture's lease window is its own tightly packed extent at the
+    /// reservation's start (`research/docs/23` §75, R5c).
+    ///
+    /// Both registries answer the same rule, so a texture resolves through the
+    /// same identity, snapshot, epoch and range checks a view does — one lease
+    /// object, two declarations. The reservation starts at the allocation's own
+    /// offset, and may be larger than the texture: the import rules make owners
+    /// page-align their windows, so a sixty-four-byte surface legitimately
+    /// lives in a four-kilobyte reservation.
+    #[test]
+    fn lease_registries_resolve_a_texture_window_at_the_reservation_start() {
+        let lease_id = LeaseId::new(5);
+        let allocation = AllocationId::new(6);
+        // The owner's window starts sixteen bytes into the allocation, exactly
+        // as `LeaseReservation::offset` says; a resolution that read the
+        // texture from the allocation's zero would be refused as out of range.
+        let reservation = lease_reservation(5, 6, 16, 4096);
+        let staged_bytes = (0..4096).map(|index| index as u8).collect::<Vec<u8>>();
+        let registry = LeaseRegistry::new();
+        registry
+            .import(StagedLease::new(reservation, staged_bytes).unwrap())
+            .unwrap();
+
+        let mut texture = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: Vec::new(),
+        });
+        texture.allocation_id = allocation;
+        texture.source = TextureSource::StagedLease(lease_id);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: DeviceEpoch::new(1),
+                size: 8192,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+        assert_eq!(texture.expected_bytes().unwrap(), 64);
+        assert_eq!(
+            registry
+                .texture_bytes(lease_id, &texture, DeviceEpoch::new(1), &resources)
+                .unwrap(),
+            (0..64).map(|index| index as u8).collect::<Vec<u8>>(),
+            "the window is the reservation's first sixty-four bytes"
+        );
+
+        // A reservation that does not cover the texture is refused by the
+        // registry's own range name instead of being read past its end.
+        let short = lease_reservation(7, 6, 16, 32);
+        let short_registry = LeaseRegistry::new();
+        short_registry
+            .import(StagedLease::new(short, vec![0x2d; 32]).unwrap())
+            .unwrap();
+        let mut short_resources = ResourceTableSnapshot::new();
+        short_resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: DeviceEpoch::new(1),
+                size: 8192,
+            })
+            .unwrap();
+        short_resources.insert_lease(short).unwrap();
+        let mut leased_texture = texture.clone();
+        leased_texture.source = TextureSource::StagedLease(LeaseId::new(7));
+        assert_eq!(
+            short_registry
+                .texture_bytes(
+                    LeaseId::new(7),
+                    &leased_texture,
+                    DeviceEpoch::new(1),
+                    &short_resources
+                )
+                .unwrap_err()
+                .slug,
+            "lease_range_out_of_bounds"
+        );
+
+        // The same declaration through the borrowed registry: the pointer is
+        // the reservation's base and the length is the texture's own, so the
+        // whole-page window the owner keeps alive is what the device reads.
+        let borrowed_registry = BorrowedLeaseRegistry::new();
+        borrowed_registry
+            .import(BorrowedLease::new(reservation, 0x2000).unwrap())
+            .unwrap();
+        let mut borrowed_texture = texture.clone();
+        borrowed_texture.source = TextureSource::BorrowedNoCopy(lease_id);
+        let window = borrowed_registry
+            .texture_pointer(lease_id, &borrowed_texture, DeviceEpoch::new(1), &resources)
+            .unwrap();
+        assert_eq!(window.pointer, 0x2000);
+        assert_eq!(window.len, 64);
+        assert_eq!(window.offset, 0, "the window starts at the reservation");
+        assert_eq!(window.base_pointer, 0x2000);
+        assert_eq!(window.base_len, 4096);
+        assert_eq!(window.capacity, 4096);
+
+        // Both registries answer the identity arm the same way: a lease that
+        // was never imported keeps its own name, whichever registry is asked.
+        assert_eq!(
+            registry
+                .texture_bytes(LeaseId::new(9), &texture, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_not_imported"
+        );
+        assert_eq!(
+            borrowed_registry
+                .texture_pointer(
+                    LeaseId::new(9),
+                    &borrowed_texture,
+                    DeviceEpoch::new(1),
+                    &resources
+                )
                 .unwrap_err()
                 .slug,
             "lease_not_imported"

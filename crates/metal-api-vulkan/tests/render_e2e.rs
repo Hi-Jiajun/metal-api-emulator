@@ -2947,3 +2947,232 @@ fn a_presenting_pass_beside_the_sampling_pair_is_refused_by_name() {
     assert_eq!(refused.slug, "render_texture_binding_required");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 }
+
+/// Submit one sampled trace exactly as the milestone case does and land the
+/// attachment's bytes (`research/docs/23` §75, R5c).
+fn submit_sampled(
+    provider: &VulkanComputeProvider,
+    trace: &ComputeTrace,
+    resources: &ResourceTableSnapshot,
+) -> Vec<u8> {
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the sampled declaration is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    readback(&writebacks, ATTACHMENT_VIEW)
+}
+
+/// The sixteen texels the owner's rewritten window holds
+/// (`research/docs/23` §75, R5c): four distinct channels per texel, none of
+/// them equal to the fixture's own, so "the device read the owner's pages after
+/// the rewrite" is falsifiable per texel.
+fn rewritten_texels() -> Vec<u8> {
+    (0..4u8)
+        .flat_map(|y| (0..4u8).flat_map(move |x| [0x80 | x, 0x40 | y, x ^ y, 0xff]))
+        .collect()
+}
+
+/// The staged half of the render-texture lease channel (`research/docs/23`
+/// §75, R5c): the sampled texels arrive as a staged lease instead of
+/// trace-owned bytes, and the identity-sampling fixture lands the same
+/// attachment bytes.
+///
+/// The reservation is the page-aligned window a real owner has to hand out —
+/// four kilobytes for a sixty-four-byte surface — so this case also pins the
+/// window rule: the texture is the reservation's first sixty-four bytes, and
+/// the padding behind them is not part of any declaration.
+#[test]
+fn a_staged_lease_render_texture_samples_the_providers_copy() {
+    let Some((provider, trace, resources, texels)) = sampled_fixture() else {
+        return;
+    };
+    let owned = submit_sampled(&provider, &trace, &resources);
+
+    let epoch = provider.device_epoch();
+    let lease = LeaseId::new(61);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: lease,
+            allocation_id: SAMPLED_TEXTURE_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 4096,
+    };
+    let mut staged_bytes = vec![0x5a_u8; 4096];
+    staged_bytes[..texels.len()].copy_from_slice(&texels);
+    provider
+        .import_staged_lease(
+            StagedLease::new(reservation, staged_bytes)
+                .expect("the staged window carries one byte per reserved byte"),
+        )
+        .expect("the provider imports the owner's staged window");
+
+    let mut leased = trace.clone();
+    if let Some(TracePass::Render(pass)) = leased.passes.last_mut() {
+        pass.textures[0].source = TextureSource::StagedLease(lease);
+    }
+    let mut leased_resources = resources.clone();
+    leased_resources
+        .insert_allocation(AllocationRecord {
+            allocation_id: SAMPLED_TEXTURE_ALLOCATION,
+            owner_epoch: epoch,
+            size: 4096,
+        })
+        .expect("the owner's window allocation is well formed");
+    leased_resources
+        .insert_lease(reservation)
+        .expect("the staged reservation covers the texture");
+    let attachment = submit_sampled(&provider, &leased, &leased_resources);
+    eprintln!("staged lease texture: {}", hex(&attachment));
+    assert_eq!(
+        attachment, owned,
+        "the staged lease channel uploads the texels the trace-owned fixture carries"
+    );
+
+    // The staged bytes are the provider's copy: releasing them is what the
+    // owner's ledger drives, and the same declaration is refused afterwards.
+    provider
+        .release_staged_lease(lease)
+        .expect("the staged texture lease is released");
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources)
+        .expect("the declaration stays well formed after the release");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a released staged lease cannot be read");
+    eprintln!("released staged texture lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+}
+
+/// The no-copy half of the render-texture lease channel (`research/docs/23`
+/// §75, R5c): the sampled texels stay in the owner's own mapping, the device
+/// reads that mapping as the copy's transfer source, and the registry's hold is
+/// retired once the pass's fence has signalled.
+///
+/// The falsifications are the point: a rail that snapshotted the owner's window
+/// when the texture was declared — or that uploaded it into its own image while
+/// building the pass — would keep sampling the first texels after the owner
+/// rewrites the pages, and a rail whose copy read stale bytes could not show
+/// the owner's new texels at all.
+#[test]
+fn a_borrowed_lease_render_texture_reads_the_owners_pages() {
+    let Some((provider, trace, resources, texels)) = sampled_fixture() else {
+        return;
+    };
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        eprintln!("SKIP: the device does not import host memory");
+        return;
+    }
+    let owned = submit_sampled(&provider, &trace, &resources);
+
+    // The owner's window is the page-aligned reservation a real backing needs;
+    // the texture is its first sixty-four bytes.
+    let mut owner_texture = AlignedBuffer::new(4096, alignment as usize);
+    owner_texture.as_mut_slice().fill(0x5a);
+    owner_texture.as_mut_slice()[..texels.len()].copy_from_slice(&texels);
+
+    let epoch = provider.device_epoch();
+    let lease = LeaseId::new(62);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: lease,
+            allocation_id: SAMPLED_TEXTURE_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 4096,
+    };
+    // SAFETY: the owner allocation outlives every submission below and the
+    // provider's release of the import.
+    unsafe {
+        provider
+            .import_borrowed_lease(
+                BorrowedLease::new(reservation, owner_texture.as_ptr() as usize)
+                    .expect("the owner's texture window is a valid reservation"),
+            )
+            .expect("the provider imports the owner's texture window");
+    }
+
+    let mut leased = trace.clone();
+    if let Some(TracePass::Render(pass)) = leased.passes.last_mut() {
+        pass.textures[0].source = TextureSource::BorrowedNoCopy(lease);
+    }
+    let mut leased_resources = resources.clone();
+    leased_resources
+        .insert_allocation(AllocationRecord {
+            allocation_id: SAMPLED_TEXTURE_ALLOCATION,
+            owner_epoch: epoch,
+            size: 4096,
+        })
+        .expect("the owner's window allocation is well formed");
+    leased_resources
+        .insert_lease(reservation)
+        .expect("the borrowed reservation covers the texture");
+    let attachment = submit_sampled(&provider, &leased, &leased_resources);
+    eprintln!("borrowed lease texture: {}", hex(&attachment));
+    assert_eq!(
+        attachment, owned,
+        "the no-copy channel samples the owner's window and lands the owned fixture's bytes"
+    );
+
+    // The pass is synchronous, so its fence is the retirement evidence: the
+    // hold the texture's own window took is back to zero.
+    let registry = provider.borrowed_registry();
+    assert_eq!(
+        registry.outstanding(lease),
+        Some(0),
+        "the texture hold is retired once the fence signals"
+    );
+
+    // A device that had snapshotted the owner's pages at import would keep
+    // sampling the first texels; the owner's rewrite reaches every texel the
+    // draw reads instead.
+    let rewritten = rewritten_texels();
+    owner_texture.as_mut_slice()[..rewritten.len()].copy_from_slice(&rewritten);
+    let attachment = submit_sampled(&provider, &leased, &leased_resources);
+    eprintln!(
+        "owner-rewritten texture window readback: {}",
+        hex(&attachment)
+    );
+    assert_eq!(
+        attachment,
+        rewritten,
+        "the owner's rewritten window is what the fragment stage samples: {}",
+        hex(&attachment)
+    );
+    assert!(
+        !attachment
+            .chunks_exact(4)
+            .any(|texel| texel == &texels[..4]),
+        "no texel keeps the pre-rewrite value a snapshot would have pinned: {}",
+        hex(&attachment)
+    );
+
+    // Once the owner releases the import, the same declaration is refused by
+    // name instead of being read through a mapping the provider no longer owns.
+    registry
+        .release(lease)
+        .expect("no retain is outstanding after the fence");
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources)
+        .expect("the declaration stays well formed after the release");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a released no-copy lease cannot be read");
+    eprintln!("released borrowed texture lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
+}
