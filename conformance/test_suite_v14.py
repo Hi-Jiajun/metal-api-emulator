@@ -508,9 +508,11 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # v29 carries no render case: it is the compute texture face's content
         # pair (`research/docs/26` §21.3), so it adds one file and no plan. v30
         # carries none either (its two lease cases are compute cases with no
-        # attachment), so it joins the same list, and the count below tracks the
-        # committed suites.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 29)
+        # attachment), so it joins the same list. v31's two render cases carry
+        # the stage-buffer face (`research/docs/23` §3.3, v83-v86) and are
+        # pinned by `test_suite_v31.py`, which owns that section, so it joins
+        # the list as well, and the count below tracks the committed suites.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 30)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -523,7 +525,8 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v22", "compute-buffer-v23",
                                       "compute-buffer-v24", "compute-buffer-v25",
                                       "compute-buffer-v26", "compute-buffer-v27",
-                                      "compute-buffer-v28", "compute-buffer-v29", "compute-buffer-v30"):
+                                      "compute-buffer-v28", "compute-buffer-v29",
+                                      "compute-buffer-v30", "compute-buffer-v31"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

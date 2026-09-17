@@ -1,28 +1,30 @@
 //! Capture a provider run of the shared, versioned native-oracle suite.
 
+use metal2vulkan::reflect::DescriptorLayout;
 use metal_api_core::provider::queue_priorities_for_device;
 #[cfg(unix)]
 use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
-    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment, BlendFactor,
-    BlendOperation, BufferAccess, BufferLease, BufferSource, BufferSourceKind, BufferView,
-    ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    ComputePass, ComputeTrace, CullMode, DepthFormat, DepthLoadOp, DepthResolveFilter,
-    DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, HostRegion,
-    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
-    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId,
-    LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
-    MultisampleStencilResolve, NoCopyLeaseImporter, OperationId, PipelineCompileRequest,
-    PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, QueuePriority,
-    QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
-    RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SampleCount,
-    SemanticDigest, ShaderSource, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
-    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    PROVIDER_SCHEMA_VERSION,
+    AcquirePolicy, AffineAccess, AffineTerm, AllocationId, AllocationRecord, AttachmentFormat,
+    BlendAttachment, BlendFactor, BlendOperation, BufferAccess, BufferLease, BufferSource,
+    BufferSourceKind, BufferView, ClearColor, CompareFunction, CompiledComputePipeline,
+    CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace, CullMode, DepthFormat,
+    DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind,
+    DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
+    HostRegion, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve,
+    MultisampleState, MultisampleStencilResolve, NoCopyLeaseImporter, OperationId,
+    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
+    RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
+    ResourceTableSnapshot, SampleCount, SemanticDigest, ShaderSource, StageBufferBinding,
+    StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
+    StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS,
+    MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION, RENDER_AFFINE_AXES,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -30,7 +32,8 @@ use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemotePr
 #[cfg(target_os = "macos")]
 use metal_api_native::{NativeMetalProvider, NativeRenderPipelineRequest};
 use metal_api_vulkan::{
-    IcbReplayObservation, RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor,
+    IcbReplayObservation, RenderPipelineRequest, RenderStage, TranslatedRenderPipelineRequest,
+    TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor,
 };
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
@@ -120,6 +123,53 @@ const SAMPLED_UNORM8_FRAG_SPV: &[u8] = include_bytes!(
 );
 const SAMPLED_MSL_VERTEX_ENTRY: &str = "render_sampled_quad_vertex";
 const SAMPLED_MSL_FRAGMENT_ENTRY: &str = "render_sampled_texel";
+
+/// The reviewed stage-buffer pair (`research/docs/23` §3.3, v83): two stages
+/// that read their own `[[buffer(N)]]` arguments — the vertex stage its three
+/// `float32x2` positions, the fragment stage one `float32x4` tint — instead of
+/// taking their bytes from a vertex layout or an immediate. The Vulkan rail
+/// compiles `stage_buffer_positions.vert.spv` + `stage_buffer_tint.frag.spv`
+/// (entries `stage_buffer_positions_main` / `stage_buffer_tint_main`, the
+/// fixed slots set 1 / set 2 the reviewed modules were written for), the
+/// native rail compiles `conformance/shaders/render_stage_buffer_2x2.metal`
+/// (entries `render_stage_buffer_vertex` / `render_stage_buffer_tint`), and a
+/// case that declares stage-buffer slots names exactly this pair.
+///
+/// The bytes travel through `concat!` rather than a bare `include_bytes!`
+/// because `conformance/test_suite_v13.py` text-scans the six stage pairs that
+/// predate this one; the pin stays byte-exact and the Vulkan rail re-checks it
+/// against the reviewed modules it compiles itself.
+const STAGE_BUFFER_POSITIONS_ENTRY: &str = "stage_buffer_positions_main";
+const STAGE_BUFFER_TINT_ENTRY: &str = "stage_buffer_tint_main";
+const STAGE_BUFFER_POSITIONS_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "stage_buffer_positions.vert.spv"
+));
+const STAGE_BUFFER_TINT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "stage_buffer_tint.frag.spv"
+));
+const STAGE_BUFFER_MSL_VERTEX_ENTRY: &str = "render_stage_buffer_vertex";
+const STAGE_BUFFER_MSL_FRAGMENT_ENTRY: &str = "render_stage_buffer_tint";
+/// The reviewed pair's two slots: the vertex stage's three `float32x2`
+/// positions (twenty-four bytes) and the fragment stage's one `float32x4` tint
+/// (sixteen). Both are read once, so both declarations are static ceilings —
+/// the affine arm is a *translated* module's measurement and has no reviewed
+/// module to pair with (`research/docs/23` §3.3, v86).
+const STAGE_BUFFER_POSITIONS_BYTES: u64 = 24;
+const STAGE_BUFFER_TINT_BYTES: u64 = 16;
+/// Vertices the reviewed pair's `vertex_id` triangle draws: three, the draw
+/// every stage-buffer case states (its slot declarations are proven against
+/// the draw's own vertex count, `research/docs/23` §3.3, v86).
+const STAGE_BUFFER_VERTICES: u64 = 3;
+/// The descriptor sets the two translated stages of a stage-buffer case land
+/// in (`research/docs/23` §3.3, v84): the vertex stage's `[[buffer(N)]]`
+/// arguments in set 1, the fragment stage's in set 2 — the arrangement the
+/// reviewed pair's own modules were written for, and the one that keeps the
+/// two stages' independent Metal buffer namespaces from colliding in a single
+/// descriptor set.
+const STAGE_BUFFER_VERTEX_SET: u32 = 1;
+const STAGE_BUFFER_FRAGMENT_SET: u32 = 2;
 
 /// The reviewed vertex-input fixture (`research/docs/23` §3.3): a caller-held
 /// `float32x2` position stream and six `uint16` indices over it. The Vulkan rail
@@ -1319,6 +1369,7 @@ fn create_provider(
 fn register_render_pipeline(
     registrar: &RenderRegistrar,
     identity: &str,
+    case: &RenderCase,
     geometry: RenderGeometry,
     formats: &[AttachmentFormat],
 ) -> Result<CompiledComputePipeline> {
@@ -1327,6 +1378,14 @@ fn register_render_pipeline(
         "suite-sha256-entry-v1",
         format!("{identity}:offscreen_render_pipeline:{attachment_count}").into_bytes(),
     )?;
+    // The pipeline-level half of a stage-buffer case's declaration
+    // (`research/docs/23` §3.3, v83-v86). Every other geometry declares no
+    // slots, so its contract's list stays empty and its bytes are unchanged.
+    let stage_buffers = if geometry == RenderGeometry::StageBuffers {
+        stage_buffer_declarations(case)?
+    } else {
+        Vec::new()
+    };
     // The registration names the reviewed pair for the case's geometry: the
     // Vulkan rail compiles the vertex stage's SPIR-V, the native rail its MSL
     // sibling, and both re-run their own review gate over the pair
@@ -1443,11 +1502,25 @@ fn register_render_pipeline(
             (SAMPLED_QUAD_VERT_SPV, SAMPLED_UNORM8_FRAG_SPV),
             VertexLayout::None,
         ),
+        // The reviewed stage-buffer pair (`research/docs/23` §3.3, v83): the
+        // vertex stage's three positions and the fragment stage's one tint,
+        // each read from the slot the case declares. The modules fix their own
+        // descriptor slots (the vertex stage's bindings in set 1, the fragment
+        // stage's in set 2), so the pair carries no vertex layout at all.
+        RenderGeometry::StageBuffers => (
+            (STAGE_BUFFER_POSITIONS_ENTRY, STAGE_BUFFER_TINT_ENTRY),
+            (
+                STAGE_BUFFER_MSL_VERTEX_ENTRY,
+                STAGE_BUFFER_MSL_FRAGMENT_ENTRY,
+            ),
+            (STAGE_BUFFER_POSITIONS_SPV, STAGE_BUFFER_TINT_SPV),
+            VertexLayout::None,
+        ),
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
-                stage_buffers: Vec::new(),
+                stage_buffers: stage_buffers.clone(),
                 vertex_entry: vulkan_entries.0.to_owned(),
                 fragment_entry: vulkan_entries.1.to_owned(),
                 color_formats: formats.to_vec(),
@@ -1466,7 +1539,7 @@ fn register_render_pipeline(
             // fixture is refused.
             native.register_render_pipeline(NativeRenderPipelineRequest {
                 contract: RenderPipelineContract {
-                    stage_buffers: Vec::new(),
+                    stage_buffers: stage_buffers.clone(),
                     vertex_entry: msl_entries.0.to_owned(),
                     fragment_entry: msl_entries.1.to_owned(),
                     color_formats: formats.to_vec(),
@@ -1478,6 +1551,141 @@ fn register_render_pipeline(
     }
     .map_err(|error| format!("register render pipeline: {error:?}"))?;
     Ok(registered)
+}
+
+/// Register one render case's pipeline, whichever arm its stages belong to
+/// (`research/docs/23` §3.3, v83-v86).
+///
+/// A reviewed case hands its geometry to [`register_render_pipeline`], which
+/// mints the rail's own reviewed pair. A case that carries `translated_stages`
+/// has no reviewed pair: the Vulkan rail translates its two AIR modules itself
+/// and registers the result, so the descriptor slots come from each module's
+/// own reflection and the contract's declarations are what the rail pairs that
+/// reflection with.
+fn register_render_case_pipeline(
+    registrar: &RenderRegistrar,
+    counters: &CopyCounters,
+    identity: &str,
+    case: &RenderCase,
+    directory: &Path,
+    geometry: RenderGeometry,
+    formats: &[AttachmentFormat],
+) -> Result<CompiledComputePipeline> {
+    if case.translated_stages.is_none() {
+        return register_render_pipeline(registrar, identity, case, geometry, formats);
+    }
+    match (registrar, counters) {
+        (RenderRegistrar::Vulkan(vulkan), CopyCounters::Vulkan { executor, .. }) => {
+            register_translated_stage_buffer_pipeline(
+                vulkan, executor, identity, case, directory, formats,
+            )
+        }
+        // Only the Vulkan trace rail translates AIR, and `validate_render_case`
+        // marks a translated case for that rail alone, so this arm is the
+        // native build's honest answer rather than a path a suite can reach.
+        #[cfg(target_os = "macos")]
+        _ => Err(format!(
+            "render case {}: a translated stage-buffer case runs on the Vulkan trace rail, and \
+             this rail translates no AIR to execute",
+            case.id
+        )
+        .into()),
+    }
+}
+
+/// Translate and register the two AIR stages of a stage-buffer case on the
+/// Vulkan trace rail (`research/docs/23` §3.3, v84/v86).
+///
+/// Each stage translates into its own descriptor set — the vertex stage's
+/// `[[buffer(N)]]` arguments in set 1, the fragment stage's in set 2 — the
+/// arrangement the rail's reviewed stage-buffer pair binds. The two stages'
+/// Metal buffer namespaces are independent, so one set cannot carry both
+/// without one stage's slot overwriting the other's, and the rail refuses that
+/// collision by name.
+///
+/// The rail's own registration gate pairs each reflection with the contract's
+/// declarations field by field, so a module that writes a slot the case
+/// declares read-only, or reaches past a static ceiling, is refused by name
+/// rather than executed with the disagreement dropped.
+fn register_translated_stage_buffer_pipeline(
+    vulkan: &VulkanComputeProvider,
+    executor: &Arc<VulkanExecutor>,
+    identity: &str,
+    case: &RenderCase,
+    directory: &Path,
+    formats: &[AttachmentFormat],
+) -> Result<CompiledComputePipeline> {
+    let where_ = format!("render case {}", case.id);
+    let translated = case
+        .translated_stages
+        .as_ref()
+        .ok_or("a translated stage-buffer case carries its two AIR modules")?;
+    let device = metal_api_core::Device::new(
+        Arc::clone(executor) as Arc<dyn metal_api_core::ComputeExecutor>
+    );
+    let policy = executor.spirv_feature_policy();
+    let mut stages = Vec::with_capacity(2);
+    for (stage, source, entry, set) in [
+        (
+            RenderStage::Vertex,
+            &translated.vertex,
+            case.vertex_entry.as_str(),
+            STAGE_BUFFER_VERTEX_SET,
+        ),
+        (
+            RenderStage::Fragment,
+            &translated.fragment,
+            case.fragment_entry.as_str(),
+            STAGE_BUFFER_FRAGMENT_SET,
+        ),
+    ] {
+        let air = String::from_utf8(verified_source(directory, source)?)?;
+        let library = device
+            .new_library_with_air(air.as_str())
+            .map_err(|error| format!("{where_}: load translated stage AIR: {error:?}"))?;
+        let function = library.function(entry).map_err(|error| {
+            format!("{where_}: unknown translated stage entry {entry}: {error:?}")
+        })?;
+        let translated_stage = TranslatedRenderStage::translate_with_policy_and_layout(
+            stage,
+            &function,
+            policy,
+            DescriptorLayout {
+                set,
+                ..DescriptorLayout::default()
+            },
+        )
+        .map_err(|error| format!("{where_}: translate {entry}: {error:?}"))?;
+        stages.push(translated_stage);
+    }
+    let [vertex, fragment]: [TranslatedRenderStage; 2] = stages
+        .try_into()
+        .map_err(|_| format!("{where_}: two translated stages"))?;
+    let contract = RenderPipelineContract {
+        vertex_entry: case.vertex_entry.clone(),
+        fragment_entry: case.fragment_entry.clone(),
+        color_formats: formats.to_vec(),
+        vertex_layout: VertexLayout::None,
+        stage_buffers: stage_buffer_declarations(case)?,
+    };
+    let logical_digest = SemanticDigest::new(
+        "suite-sha256-entry-v1",
+        format!(
+            "{identity}:translated_render_pipeline:{}:{}:{}",
+            case.vertex_entry,
+            case.fragment_entry,
+            formats.len()
+        )
+        .into_bytes(),
+    )?;
+    let registered = vulkan.register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+        contract,
+        vertex,
+        fragment,
+        logical_digest,
+    });
+    registered
+        .map_err(|error| format!("{where_}: register translated render pipeline: {error:?}").into())
 }
 
 /// Retire the registration [`register_render_pipeline`] minted, on the context
@@ -1598,7 +1806,14 @@ struct RenderCase {
     declaring_case: String,
     vertex_entry: String,
     fragment_entry: String,
-    metal: Source,
+    /// The reviewed MSL module the case's stages were written as, or `None`
+    /// for a *translated* case (`research/docs/23` §3.3, v84/v86): a case whose
+    /// stages are translated from AIR has no canonical MSL sibling yet, so it
+    /// pins its two AIR modules through `translated_stages` instead. Every
+    /// reviewed case still pin its MSL module, and
+    /// [`reviewed_stage_buffer_geometry`] refuses the two spellings together.
+    #[serde(default)]
+    metal: Option<Source>,
     vertices: u64,
     viewport: [u64; 4],
     /// The scissor rectangle the pass clips to, in `[x, y, width, height]`, or
@@ -1657,6 +1872,18 @@ struct RenderCase {
     /// to carry them (`research/docs/23` §3.6).
     #[serde(default)]
     vertex_buffers: Vec<RenderInputDefinition>,
+    /// The stage-buffer slots this case's pipeline declares and its pass binds
+    /// (`research/docs/23` §3.3, v83-v86): one entry per slot, carrying the
+    /// pipeline's declaration beside the pass's view. Empty for every pre-v83
+    /// case, which declares and binds none.
+    #[serde(default)]
+    stage_buffers: Vec<StageBufferDefinition>,
+    /// The two AIR stages a *translated* pipeline is registered from
+    /// (`research/docs/23` §3.3, v84): present only for a case whose stages are
+    /// not one of the reviewed pairs. Absent for every case the reviewed
+    /// registry serves, which is every pre-R9f render case.
+    #[serde(default)]
+    translated_stages: Option<TranslatedStagesDefinition>,
     /// The index buffer the draw runs through, when the case is indexed.
     #[serde(default)]
     indices: Option<IndexInputDefinition>,
@@ -2161,6 +2388,112 @@ struct RenderInputDefinition {
     offset: u64,
     length: u64,
     initial_hex: String,
+}
+
+/// One stage-buffer slot a render case declares (`research/docs/23` §3.3,
+/// v83-v86, R9f/R9i): the pipeline's own declaration of the slot
+/// ([`StageBufferBinding`]: the stage, the index inside that stage's Metal
+/// buffer namespace, the access and the byte footprint the module's reflection
+/// has to agree with) beside the pass's view of it ([`StageBufferView`]: the
+/// identity, the range and the bytes, or the lease they come from).
+///
+/// One entry carries both halves on purpose: the pair rules hold the two to
+/// each other field by field (`RenderPipelineContract::validate_against`), so a
+/// fixture that spelled them twice could state a pass the pipeline never
+/// declares. The `access` field is the one both halves carry, and the
+/// `footprint` is the pipeline's half alone — the pass view states the bytes,
+/// not the reach.
+///
+/// A *writable* entry is a landing: the pass's bytes leave through the same
+/// byte-keyed writeback channel a stored attachment's texels use, so the entry
+/// carries the `expected_hex` the readback has to show, and the view has to be
+/// one the declaring compute pass also declares (a write lands in the trace's
+/// own view pool).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageBufferDefinition {
+    stage: String,
+    index: u32,
+    access: String,
+    footprint: FootprintDefinition,
+    allocation: u64,
+    view: u64,
+    offset: u64,
+    length: u64,
+    /// The owner window's byte length, when the view's bytes are imported
+    /// through a lease (`research/docs/23` §90, R9i). Required exactly when
+    /// `storage_mode` names a lease arm: the borrowed arm maps the allocation
+    /// sized owner window, so the fixture has to state how long the owner's
+    /// registration is.
+    #[serde(default)]
+    allocation_size: Option<u64>,
+    initial_hex: String,
+    /// Where the view's bytes come from: `owned_bytes` (the default the
+    /// pre-R9i fixtures meant), `staged_lease` or `borrowed_no_copy`. The bytes
+    /// themselves stay in `initial_hex` for every arm — they are the owner's
+    /// own window — exactly as a compute case's `storage_mode` declares them.
+    #[serde(default)]
+    storage_mode: Option<String>,
+    /// The bytes a writable slot's writeback has to carry. Required exactly
+    /// when the access is writable; refused beside a read-only slot, which has
+    /// no landing.
+    #[serde(default)]
+    expected_hex: Option<String>,
+}
+
+/// One stage-buffer slot's byte footprint (`research/docs/23` §3.3, v86), the
+/// declaration half of the pair above.
+///
+/// Two arms exist and no third: a static ceiling in bytes (the shape the
+/// reviewed stage-buffer pair declares), or the affine access set a translated
+/// module's reflection states — one entry per `constant + stride * index`
+/// access, each naming the axis of the draw's invocation indices it strides
+/// over ([`RENDER_AFFINE_AXES`]: `0` is the vertex index, `1` the instance
+/// index). `unbounded` is deliberately absent: the render contract refuses it
+/// by name rather than executing a reach nobody can prove.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum FootprintDefinition {
+    Static {
+        max_bytes: u64,
+    },
+    Affine {
+        accesses: Vec<AffineAccessDefinition>,
+    },
+}
+
+/// One affine access (`metal_api_core::provider::AffineAccess`): the base
+/// offset, the byte width of the access, and the terms that stride it.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AffineAccessDefinition {
+    base_offset: u64,
+    access_size: u64,
+    terms: Vec<AffineTermDefinition>,
+}
+
+/// One affine term (`metal_api_core::provider::AffineTerm`): the invocation
+/// axis and the byte stride the access advances by.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AffineTermDefinition {
+    axis: usize,
+    stride: u64,
+}
+
+/// The two AIR stages a case declares when its pipeline is a *translation*
+/// rather than one of the reviewed pairs (`research/docs/23` §3.3, v84/v86).
+///
+/// The Vulkan rail translates each stage from the AIR here and registers the
+/// pair through `register_translated_render_pipeline`, so the descriptor slots
+/// come from the module's own reflection. The native rails compile no AIR, so a
+/// case that carries this section is executable on the Vulkan trace rail alone
+/// and its marker has to say so; `validate_render_case` refuses the alternative.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranslatedStagesDefinition {
+    vertex: Source,
+    fragment: Source,
 }
 
 /// One index buffer view: the same fields plus the width of the indices.
@@ -2980,12 +3313,21 @@ fn main() -> Result<()> {
             sources.insert((program.entry, case.air_encoding), source);
         }
     }
-    // A render case pins the one reviewed MSL module; each trace rail executes
-    // its own reviewed source pair — the Vulkan rail the matching SPIR-V stages
-    // pinned in code above, the native rail the MSL module itself — so only the
-    // module's declared identity is verified here.
+    // A reviewed render case pins the one reviewed MSL module; each trace rail
+    // executes its own reviewed source pair — the Vulkan rail the matching
+    // SPIR-V stages pinned in code above, the native rail the MSL module
+    // itself — so only the module's declared identity is verified here. A
+    // translated stage-buffer case pins its two AIR modules instead
+    // (`research/docs/23` §3.3, v84), and both pins are verified before any
+    // provider exists.
     for case in &suite.render_cases {
-        verified_source(directory, &case.metal)?;
+        if let Some(metal) = &case.metal {
+            verified_source(directory, metal)?;
+        }
+        if let Some(translated) = &case.translated_stages {
+            verified_source(directory, &translated.vertex)?;
+            verified_source(directory, &translated.fragment)?;
+        }
     }
     // Every rail owns a render execution path now: both trace rails
     // (`conformance/RENDER-CAPTURE.md` §4) and both object rails — the Vulkan
@@ -3196,7 +3538,32 @@ fn main() -> Result<()> {
             .iter()
             .any(|rail| rail == backend.report_name(api))
         {
+            // A rail the marker does not name omits the case. A stage-buffer
+            // case says why out loud, because the omission is a boundary of
+            // the shape rather than a device's answer: the object API has no
+            // stage-buffer entry point yet (`research/docs/23` §3.3, v83), and
+            // the native rails carry no translator for it.
+            if !case.stage_buffers.is_empty() {
+                println!(
+                    "render case skipped: {} ({} binds no stage buffers; the case is marked for \
+                     {})",
+                    case.id,
+                    backend.report_name(api),
+                    case.capture_rails.join(", ")
+                );
+            }
             continue;
+        }
+        // A rail the marker *does* name has to execute the shape: executing a
+        // stage-buffer case through the object API would drop the bindings,
+        // which is why the refusal is by name rather than a silent run.
+        if !case.stage_buffers.is_empty() && object_device.is_some() {
+            return Err(format!(
+                "render case {}: the object API binds no stage buffers yet, so this case runs \
+                 on the trace rail alone",
+                case.id
+            )
+            .into());
         }
         // The device gate (`research/docs/23` §3.3, v57d): a case that
         // requires a depth resolve filter appears in the capture if and only
@@ -3281,9 +3648,12 @@ fn main() -> Result<()> {
                     pipeline.clone()
                 }
                 _ => {
-                    let registered = register_render_pipeline(
+                    let registered = register_render_case_pipeline(
                         &render_registrar,
+                        &counters,
                         &identity,
+                        case,
+                        directory,
                         geometry,
                         &attachment_formats,
                     )?;
@@ -3315,14 +3685,22 @@ fn main() -> Result<()> {
                     pipeline.clone()
                 }
                 _ => {
-                    let registered = register_render_pipeline(
+                    let registered = register_render_case_pipeline(
                         &render_registrar,
+                        &counters,
                         &identity,
+                        case,
+                        directory,
                         geometry,
                         &attachment_formats,
                     )?;
-                    render_pipeline =
-                        Some((attachment_formats.clone(), geometry, registered.clone()));
+                    // A translated case registers its own two stages, so two of
+                    // them never share one cached registration: only the
+                    // reviewed arm's registration is reused across cases.
+                    if case.translated_stages.is_none() {
+                        render_pipeline =
+                            Some((attachment_formats.clone(), geometry, registered.clone()));
+                    }
                     registered
                 }
             };
@@ -3334,6 +3712,7 @@ fn main() -> Result<()> {
                 &pipeline,
                 1000 + offset as u64,
                 suite.guard_byte,
+                &leases,
             )?
         };
         let after = counters.read();
@@ -3478,6 +3857,14 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // The lease face (`research/docs/23` §90, R9i): the two source arms
         // the providers execute beyond owned bytes, one case each.
         (1, "compute-buffer-v30") => &["staged_lease_copy_word", "borrowed_lease_copy_word"],
+        // The stage-buffer face (`research/docs/23` §3.3, v83-v86): the two
+        // declaring passes the stage-buffer render cases resolve their views
+        // against — the writable sink's own pool view, and the borrowed tint's
+        // owner registration.
+        (1, "compute-buffer-v31") => &[
+            "render_declaring_stage_buffer_sink",
+            "render_declaring_stage_buffer_lease",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -3682,6 +4069,14 @@ enum RenderGeometry {
     /// `rgba8_unorm` texture of the render area's own extent, so the attachment
     /// reads back exactly the uploaded texels.
     SampledTexture,
+    /// The stage-buffer shape (`research/docs/23` §3.3, v83-v86): the pass
+    /// binds one or more `[[buffer(N)]]` slots and the pipeline declares what
+    /// each stage reaches there. One reviewed pair serves the *reviewed* arm
+    /// (the two stages read their own slots with static footprints), while a
+    /// case that carries `translated_stages` registers its stages from AIR and
+    /// executes the writable and affine faces the reviewed modules cannot
+    /// state (R9f).
+    StageBuffers,
 }
 
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
@@ -5102,6 +5497,521 @@ fn reviewed_sampled_geometry(
     Ok(RenderGeometry::SampledTexture)
 }
 
+/// Classify a stage-buffer case and pin the declarations the reviewed arms
+/// admit (`research/docs/23` §3.3, v83-v86).
+///
+/// Two arms exist and no third. A case without `translated_stages` names the
+/// reviewed pair and declares exactly its two slots — the vertex stage's
+/// twenty-four byte positions and the fragment stage's sixteen byte tint, both
+/// read once under a static ceiling — while a case that carries
+/// `translated_stages` hands its stages to the Vulkan rail's translator and is
+/// executable there alone, so its marker has to say so and it pins no MSL
+/// sibling (there is no reviewed module to name).
+///
+/// The geometry itself is the `vertex_id` triangle in both arms: the stages
+/// read their bytes from their own buffers, so no vertex layout, stream or
+/// index buffer takes part, and the draw's vertex count is what the
+/// declaration's footprint proof is evaluated against.
+fn reviewed_stage_buffer_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    if case.vertex_layout.is_some() || !case.vertex_buffers.is_empty() || case.indices.is_some() {
+        return Err(format!(
+            "{where_}: a stage-buffer case binds no vertex stream, layout or index buffer"
+        )
+        .into());
+    }
+    if case.vertices != STAGE_BUFFER_VERTICES {
+        return Err(format!(
+            "{where_}: the reviewed stage-buffer geometry draws {STAGE_BUFFER_VERTICES} vertices"
+        )
+        .into());
+    }
+    // The rest of the reviewed state families describe other geometries: a
+    // depth, stencil, cull, blend, multisample or sampled-texture shape beside
+    // a stage-buffer declaration would be a second reviewed shape inside one
+    // case, which is exactly what the whitelist refuses.
+    if case.fragment_textures.is_some()
+        || case.depth.is_some()
+        || case.stencil.is_some()
+        || case.cull.is_some()
+        || case.blend.is_some()
+        || case.multisample.is_some()
+        || case.depth_resolve.is_some()
+        || case.stencil_resolve.is_some()
+        || case.present.is_some()
+        || case.icb.is_some()
+    {
+        return Err(format!(
+            "{where_}: a stage-buffer case carries no texture, depth, stencil, cull, blend, \
+             multisample, resolve, present or indirect section"
+        )
+        .into());
+    }
+    if case.stage_buffers.is_empty() {
+        return Err(format!(
+            "{where_}: a translated stage-buffer case declares the slots its stages read"
+        )
+        .into());
+    }
+    if case.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+        return Err(format!(
+            "{where_}: the reviewed stage-buffer ceiling is {MAX_RENDER_STAGE_BUFFERS} slots"
+        )
+        .into());
+    }
+    // One rail executes the shape today, and the marker has to say so. The
+    // native rails compile no AIR and their render stage-buffer capability is
+    // off at this commit (`crates/metal-api-native/src/render.rs` publishes
+    // `supports_render_stage_buffers = false`), while the object API has no
+    // stage-buffer entry point at all (`crates/metal-api-core/src/provider_api.rs`):
+    // a case that named either would claim a capture that rail cannot report,
+    // so the marker is the Vulkan trace rail alone.
+    if case.capture_rails.as_slice() != ["vulkan"] {
+        return Err(format!(
+            "{where_}: a stage-buffer case runs on the Vulkan trace rail alone, so its \
+             capture_rails has to be [\"vulkan\"]"
+        )
+        .into());
+    }
+    if let Some(translated) = &case.translated_stages {
+        if case.metal.is_some() {
+            return Err(format!(
+                "{where_}: a translated stage-buffer case has no MSL sibling to pin, so it \
+                 carries no metal source"
+            )
+            .into());
+        }
+        if translated.vertex.path == translated.fragment.path {
+            return Err(
+                format!("{where_}: the two translated stages name their own AIR modules").into(),
+            );
+        }
+    }
+    let mut slots = Vec::with_capacity(case.stage_buffers.len());
+    for definition in &case.stage_buffers {
+        let stage = stage_buffer_stage(&definition.stage, where_)?;
+        let access = stage_buffer_access(&definition.access, where_)?;
+        if definition.index >= MAX_RENDER_STAGE_BUFFER_INDEX {
+            return Err(format!(
+                "{where_}: stage buffer index {} is at or above the reviewed ceiling \
+                 {MAX_RENDER_STAGE_BUFFER_INDEX}",
+                definition.index
+            )
+            .into());
+        }
+        if definition.allocation == 0 || definition.view == 0 {
+            return Err(format!("{where_}: zero stage-buffer view identity").into());
+        }
+        // The contract's list is canonical — vertex bindings before fragment
+        // bindings, ascending inside each stage — and a slot cannot be named
+        // twice (`validate_stage_buffer_bindings`). The fixture spells the same
+        // order so the declaration it feeds the rail is the one it states.
+        let slot = (stage.code(), definition.index);
+        if slots.last().is_some_and(|previous| *previous >= slot) {
+            return Err(format!(
+                "{where_}: stage buffers are declared once each, vertex bindings before \
+                 fragment bindings and ascending inside each stage (at {}/{})",
+                definition.stage, definition.index
+            )
+            .into());
+        }
+        slots.push(slot);
+        let bytes = unhex(&definition.initial_hex)?;
+        if bytes.len() != usize::try_from(definition.length)? {
+            return Err(format!(
+                "{where_}: stage buffer {}/{} declares {} bytes of view but {} bytes of data",
+                definition.stage,
+                definition.index,
+                definition.length,
+                bytes.len()
+            )
+            .into());
+        }
+        let mode = stage_buffer_storage_mode(definition, where_)?;
+        let landed = access.is_writable();
+        match (&definition.expected_hex, landed) {
+            (Some(hex_), true) => {
+                if unhex(hex_)?.len() != usize::try_from(definition.length)? {
+                    return Err(format!(
+                        "{where_}: stage buffer {}/{} has to land exactly the bytes its view \
+                         covers",
+                        definition.stage, definition.index
+                    )
+                    .into());
+                }
+            }
+            (Some(_), false) => {
+                return Err(format!(
+                    "{where_}: a read-only stage buffer carries no expectation, and {}/{} \
+                     states one",
+                    definition.stage, definition.index
+                )
+                .into());
+            }
+            (None, true) => {
+                return Err(format!(
+                    "{where_}: writable stage buffer {}/{} has to state the bytes its writeback \
+                     lands",
+                    definition.stage, definition.index
+                )
+                .into());
+            }
+            (None, false) => {}
+        }
+        if mode != BufferSourceKind::OwnedBytes && definition.allocation_size.is_none() {
+            return Err(format!(
+                "{where_}: the lease-armed stage buffer {}/{} states the allocation size its \
+                 owner window covers",
+                definition.stage, definition.index
+            )
+            .into());
+        }
+        if mode == BufferSourceKind::OwnedBytes && definition.allocation_size.is_some() {
+            return Err(format!(
+                "{where_}: an owned stage buffer maps no owner window, so {}/{} states no \
+                 allocation size",
+                definition.stage, definition.index
+            )
+            .into());
+        }
+        match &definition.footprint {
+            FootprintDefinition::Static { max_bytes } => {
+                if *max_bytes == 0 {
+                    return Err(format!(
+                        "{where_}: a static stage-buffer ceiling is at least one byte"
+                    )
+                    .into());
+                }
+            }
+            FootprintDefinition::Affine { accesses } => {
+                if accesses.is_empty() {
+                    return Err(format!(
+                        "{where_}: an affine stage-buffer declaration names at least one access"
+                    )
+                    .into());
+                }
+                for access_ in accesses {
+                    if access_.access_size == 0 {
+                        return Err(format!(
+                            "{where_}: an affine access is at least one byte wide"
+                        )
+                        .into());
+                    }
+                    for term in &access_.terms {
+                        if term.axis >= RENDER_AFFINE_AXES {
+                            return Err(format!(
+                                "{where_}: affine axis {} is above the two the draw states \
+                                 (vertex, instance)",
+                                term.axis
+                            )
+                            .into());
+                        }
+                        if term.stride == 0 {
+                            return Err(format!(
+                                "{where_}: an affine term needs a non-zero stride"
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+        if case.translated_stages.is_none() {
+            if access != BufferAccess::Read {
+                return Err(format!(
+                    "{where_}: this rail's reviewed stage-buffer pair reads its slots, so a \
+                     writable declaration has no writer behind it; the writable face is a \
+                     translated case's"
+                )
+                .into());
+            }
+            let positions_slot = matches!(
+                (stage, definition.index, &definition.footprint),
+                (RenderPipelineStage::Vertex, 0, FootprintDefinition::Static { max_bytes })
+                    if *max_bytes == STAGE_BUFFER_POSITIONS_BYTES
+            );
+            let tint_slot = matches!(
+                (stage, definition.index, &definition.footprint),
+                (RenderPipelineStage::Fragment, 0, FootprintDefinition::Static { max_bytes })
+                    if *max_bytes == STAGE_BUFFER_TINT_BYTES
+            );
+            if !positions_slot && !tint_slot {
+                return Err(format!(
+                    "{where_}: the reviewed stage-buffer pair declares vertex slot 0 \
+                     ({STAGE_BUFFER_POSITIONS_BYTES} bytes) and fragment slot 0 \
+                     ({STAGE_BUFFER_TINT_BYTES} bytes), both read once with a static ceiling"
+                )
+                .into());
+            }
+        }
+    }
+    if case.translated_stages.is_none() {
+        let reviewed = [
+            (RenderPipelineStage::Vertex.code(), 0),
+            (RenderPipelineStage::Fragment.code(), 0),
+        ];
+        if slots.len() != reviewed.len() || !reviewed.iter().all(|slot| slots.contains(slot)) {
+            return Err(format!(
+                "{where_}: the reviewed stage-buffer pair reads both of its slots, so the case \
+                 declares vertex slot 0 and fragment slot 0"
+            )
+            .into());
+        }
+    }
+    Ok(RenderGeometry::StageBuffers)
+}
+
+/// One stage-buffer declaration's stage, in the contract's own vocabulary.
+fn stage_buffer_stage(spelling: &str, where_: &str) -> Result<RenderPipelineStage> {
+    match spelling {
+        "vertex" => Ok(RenderPipelineStage::Vertex),
+        "fragment" => Ok(RenderPipelineStage::Fragment),
+        other => Err(format!("{where_}: unknown stage-buffer stage {other:?}").into()),
+    }
+}
+
+/// One stage-buffer declaration's access, in the contract's own vocabulary.
+fn stage_buffer_access(spelling: &str, where_: &str) -> Result<BufferAccess> {
+    match spelling {
+        "read" => Ok(BufferAccess::Read),
+        "write" => Ok(BufferAccess::Write),
+        "read_write" => Ok(BufferAccess::ReadWrite),
+        other => Err(format!("{where_}: unknown stage-buffer access {other:?}").into()),
+    }
+}
+
+/// The source arm one stage-buffer declaration's bytes come from
+/// (`research/docs/23` §90, R9i): the same three names a compute case's
+/// `storage_mode` spells.
+fn stage_buffer_storage_mode(
+    definition: &StageBufferDefinition,
+    where_: &str,
+) -> Result<BufferSourceKind> {
+    match definition.storage_mode.as_deref() {
+        None | Some("owned_bytes") => Ok(BufferSourceKind::OwnedBytes),
+        Some("staged_lease") => Ok(BufferSourceKind::StagedLease),
+        Some("borrowed_no_copy") => Ok(BufferSourceKind::BorrowedNoCopy),
+        Some(other) => Err(format!(
+            "{where_}: stage buffer {}/{} names unknown storage mode {other:?}",
+            definition.stage, definition.index
+        )
+        .into()),
+    }
+}
+
+/// The source arm every lease-armed stage buffer of one render case ran with
+/// (`research/docs/23` §90, R9i), or `None` for a case that declares no lease
+/// arm: a capture of an owned-only fixture keeps the result shape it always
+/// had, while a lease case states which arm each view ran with — the
+/// observation the comparator checks instead of trusting the trace's own
+/// naming.
+fn stage_buffer_storage_modes(case: &RenderCase) -> Result<Option<Vec<StorageModeObservation>>> {
+    let where_ = format!("render case {}", case.id);
+    let declared = case
+        .stage_buffers
+        .iter()
+        .map(|definition| {
+            Ok((
+                definition.view,
+                stage_buffer_storage_mode(definition, &where_)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(declared
+        .iter()
+        .any(|(_, mode)| *mode != BufferSourceKind::OwnedBytes)
+        .then(|| {
+            declared
+                .iter()
+                .map(|(view, mode)| StorageModeObservation {
+                    view: *view,
+                    mode: storage_mode_name(*mode),
+                })
+                .collect()
+        }))
+}
+
+/// The pipeline-level declarations one render case's stage-buffer slots carry
+/// (`research/docs/23` §3.3, v83-v86): the exact list the contract hands the
+/// rail, built from the same entries the pass's views come from. Both halves of
+/// one entry travel together, so the declaration cannot drift from the view the
+/// rail binds.
+fn stage_buffer_declarations(case: &RenderCase) -> Result<Vec<StageBufferBinding>> {
+    let where_ = format!("render case {}", case.id);
+    case.stage_buffers
+        .iter()
+        .map(|definition| {
+            Ok(StageBufferBinding {
+                stage: stage_buffer_stage(&definition.stage, &where_)?,
+                index: definition.index,
+                access: stage_buffer_access(&definition.access, &where_)?,
+                footprint: match &definition.footprint {
+                    FootprintDefinition::Static { max_bytes } => FootprintProof::Static {
+                        max_bytes: *max_bytes,
+                    },
+                    FootprintDefinition::Affine { accesses } => FootprintProof::Affine {
+                        accesses: accesses
+                            .iter()
+                            .map(|access| -> Result<AffineAccess> {
+                                Ok(AffineAccess {
+                                    base_offset: access.base_offset,
+                                    access_size: access.access_size,
+                                    terms: access
+                                        .terms
+                                        .iter()
+                                        .map(|term| {
+                                            Ok(AffineTerm {
+                                                axis: u8::try_from(term.axis).map_err(
+                                                    |_| -> Box<dyn Error> {
+                                                        format!(
+                                                            "{where_}: affine axis {} has no \
+                                                             wire spelling",
+                                                            term.axis
+                                                        )
+                                                        .into()
+                                                    },
+                                                )?,
+                                                stride: term.stride,
+                                            })
+                                        })
+                                        .collect::<Result<Vec<_>>>()?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    },
+                },
+            })
+        })
+        .collect()
+}
+
+/// The pass-level views one render case's stage-buffer slots bind
+/// (`research/docs/23` §3.3, v83): the same entries the declarations are built
+/// from, resolved to the bytes their own source arm names.
+///
+/// An owned view reads the case's own bytes every time a trace is built, while
+/// a lease-armed view names the import the provider already holds — exactly the
+/// rule a compute case's `case_sources` follows (`research/docs/23` §90, R9i).
+fn stage_buffer_views(
+    case: &RenderCase,
+    leases: &LeaseHandles,
+    provider: &dyn PipelineProvider,
+    guard: u8,
+    imported: &mut CaseLeases,
+    windows: &mut Vec<OwnerWindow>,
+) -> Result<Vec<StageBufferView>> {
+    let where_ = format!("render case {}", case.id);
+    let mut views = Vec::with_capacity(case.stage_buffers.len());
+    for definition in &case.stage_buffers {
+        let stage = stage_buffer_stage(&definition.stage, &where_)?;
+        let access = stage_buffer_access(&definition.access, &where_)?;
+        let bytes = unhex(&definition.initial_hex)?;
+        let source = match stage_buffer_storage_mode(definition, &where_)? {
+            BufferSourceKind::OwnedBytes => BufferSource::OwnedBytes(bytes),
+            BufferSourceKind::StagedLease => {
+                let reservation = LeaseReservation {
+                    lease: BufferLease {
+                        lease_id: LeaseId::new(definition.view),
+                        allocation_id: AllocationId::new(definition.allocation),
+                        owner_epoch: provider.device_epoch(),
+                    },
+                    offset: definition.offset,
+                    length: definition.length,
+                };
+                let staged = StagedLease::new(reservation, bytes)?;
+                leases
+                    .staged
+                    .import_staged_lease(staged)
+                    .map_err(|error| format!("{where_}: import staged lease: {error:?}"))?;
+                imported.reservations.push(reservation);
+                imported.staged.push(reservation.lease.lease_id);
+                BufferSource::StagedLease(reservation.lease.lease_id)
+            }
+            BufferSourceKind::BorrowedNoCopy => {
+                // The window is the owner's own mapping, so the same alignment
+                // and coverage rules a compute case's borrowed view follows
+                // apply here (`research/docs/23` §90): the view's offset and its
+                // rounded window have to sit on the host-import grid, and the
+                // allocation-sized registration has to cover them both.
+                let page = leases.borrowed.no_copy_alignment();
+                if page == 0 || !page.is_power_of_two() {
+                    return Err(format!(
+                        "{where_}: view {} is borrowed_no_copy, and the provider reports host \
+                         import granularity {page}, so it publishes `storage_mode_unsupported` \
+                         for this arm",
+                        definition.view
+                    )
+                    .into());
+                }
+                let allocation_size = definition
+                    .allocation_size
+                    .ok_or("a borrowed stage buffer states its allocation size")?;
+                if !definition.offset.is_multiple_of(page) {
+                    return Err(format!(
+                        "{where_}: view {} starts at offset {} inside its allocation, which is \
+                         not a multiple of the {page} byte host-import granularity",
+                        definition.view, definition.offset
+                    )
+                    .into());
+                }
+                let window_length = round_up_to_page(definition.length, page)?;
+                let region_length = round_up_to_page(allocation_size, page)?;
+                if definition.offset + window_length > allocation_size {
+                    return Err(format!(
+                        "{where_}: view {} needs a {window_length} byte window at offset {}, \
+                         which its {allocation_size} byte allocation does not cover",
+                        definition.view, definition.offset
+                    )
+                    .into());
+                }
+                let mut window =
+                    OwnerWindow::new(usize::try_from(region_length)?, usize::try_from(page)?)?;
+                window.as_mut_slice().fill(guard);
+                let start = usize::try_from(definition.offset)?;
+                window.as_mut_slice()[start..start + bytes.len()].copy_from_slice(&bytes);
+                let region = HostRegion {
+                    lease_id: LeaseId::new(definition.view),
+                    owner_epoch: provider.device_epoch(),
+                    host_pointer: window.as_ptr() as usize,
+                    length: region_length,
+                    page_size: page,
+                };
+                let borrowed = region.borrowed_window(
+                    AllocationId::new(definition.allocation),
+                    definition.offset,
+                    window_length,
+                )?;
+                // Safety: the window is page-aligned, lives until the case's
+                // last submission has been waited for (it is owned by
+                // `windows`), and covers the whole reservation.
+                unsafe {
+                    leases
+                        .borrowed
+                        .import_borrowed_lease(borrowed)
+                        .map_err(|error| format!("{where_}: import borrowed lease: {error:?}"))?
+                };
+                windows.push(window);
+                imported.reservations.push(borrowed.reservation);
+                imported.borrowed.push(borrowed.reservation.lease.lease_id);
+                BufferSource::BorrowedNoCopy(borrowed.reservation.lease.lease_id)
+            }
+        };
+        views.push(StageBufferView {
+            stage,
+            view: BufferView {
+                view_id: ViewId::new(definition.view),
+                metal_binding: definition.index,
+                allocation_id: AllocationId::new(definition.allocation),
+                offset: definition.offset,
+                length: definition.length,
+                access,
+                attribute_stride: None,
+                source,
+            },
+        });
+    }
+    Ok(views)
+}
+
 /// Classify a render case's geometry and pin the reviewed shape.
 ///
 /// The checks are deliberately exact: the vertex-input case names one stream,
@@ -5109,6 +6019,13 @@ fn reviewed_sampled_geometry(
 /// draw the fixture claims, with every index naming one of the four reviewed
 /// vertices. Anything else is a case the reviewers have not seen.
 fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    // The stage-buffer shape is classified first (`research/docs/23` §3.3,
+    // v83-v86): its stages read their bytes from `[[buffer(N)]]` arguments
+    // rather than from a vertex layout or the vertex index, so a case that
+    // declares one is that shape and nothing else may be added to it.
+    if !case.stage_buffers.is_empty() || case.translated_stages.is_some() {
+        return reviewed_stage_buffer_geometry(case, where_);
+    }
     // The render sampler is classified first: its shape is the milestone's
     // vertex_id geometry plus one texture binding, so a case that carries the
     // binding is the sampled shape and nothing else may be added to it
@@ -5241,10 +6158,13 @@ fn render_inputs(
     where_: &str,
 ) -> Result<(Vec<BufferView>, Option<IndexBufferBinding>)> {
     // The render sampler binds no stream either: its geometry is the
-    // milestone's `vertex_id` triangle (`research/docs/23` §3.3, v70).
+    // milestone's `vertex_id` triangle (`research/docs/23` §3.3, v70), and the
+    // stage-buffer shape is the same triangle whose vertices come from the
+    // vertex stage's own `[[buffer(0)]]` argument rather than a stream
+    // (`research/docs/23` §3.3, v83).
     if matches!(
         render_geometry(case, where_)?,
-        RenderGeometry::Milestone | RenderGeometry::SampledTexture
+        RenderGeometry::Milestone | RenderGeometry::SampledTexture | RenderGeometry::StageBuffers
     ) {
         return Ok((Vec::new(), None));
     }
@@ -5445,6 +6365,91 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::StageBuffers => {
+            // The stage-buffer geometry and its declarations were pinned by
+            // `reviewed_stage_buffer_geometry` above; what is left here is the
+            // landing half. A writable slot is a landing, so the view has to be
+            // one the declaring case also declares — the trace's own view pool
+            // is where a writeback lands (`research/docs/23` §3.3, v86).
+            let declaring = suite
+                .cases
+                .iter()
+                .find(|candidate| candidate.id == case.declaring_case);
+            for definition in &case.stage_buffers {
+                if !stage_buffer_access(&definition.access, &where_)?.is_writable() {
+                    // A read-only slot carries its own bytes, exactly as a
+                    // vertex stream does, so it cannot name a view the
+                    // declaring case already declares: one identity would then
+                    // stand for two byte strings. A writable slot is the other
+                    // arm — it has to name the declaring view, because that is
+                    // the pool entry its writeback lands in.
+                    if let Some(declaring) = declaring {
+                        if declaring
+                            .buffers
+                            .iter()
+                            .any(|buffer| buffer.view == definition.view)
+                        {
+                            return Err(format!(
+                                "{where_}: the read-only stage buffer {} names view {}, which \
+                                 the declaring case already declares",
+                                definition.index, definition.view
+                            )
+                            .into());
+                        }
+                    }
+                    continue;
+                }
+                let Some(declaring) = declaring else {
+                    return Err(format!(
+                        "{where_}: unknown declaring case {:?}",
+                        case.declaring_case
+                    )
+                    .into());
+                };
+                let pool = declaring.buffers.iter().find(|buffer| {
+                    buffer.allocation == definition.allocation && buffer.view == definition.view
+                });
+                let Some(pool) = pool else {
+                    return Err(format!(
+                        "{where_}: the writable stage buffer {}/{} (allocation {}, view {}) \
+                         lands in the trace's own view pool, so the declaring case has to \
+                         declare that view",
+                        definition.stage, definition.index, definition.allocation, definition.view
+                    )
+                    .into());
+                };
+                if pool.access != "read" {
+                    return Err(format!(
+                        "{where_}: the declaring pass reads the writable stage buffer's view, \
+                         and {} is declared {:?}",
+                        definition.view, pool.access
+                    )
+                    .into());
+                }
+                if pool.offset != definition.offset || pool.length != definition.length {
+                    return Err(format!(
+                        "{where_}: the writable stage buffer's view {} and the declaring case's \
+                         declaration of it cover different ranges",
+                        definition.view
+                    )
+                    .into());
+                }
+                if pool.initial_bytes()? != unhex(&definition.initial_hex)? {
+                    return Err(format!(
+                        "{where_}: the writable stage buffer's view {} carries different bytes \
+                         than the declaring case's declaration of it",
+                        definition.view
+                    )
+                    .into());
+                }
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a stage-buffer case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
     }
     if let Some(present) = &case.present {
         if present.mode != "fifo" {
@@ -5492,6 +6497,17 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // The render sampler's MSL module carries its own entry pair
         // (`research/docs/23` §3.3, v70).
         RenderGeometry::SampledTexture => (SAMPLED_MSL_VERTEX_ENTRY, SAMPLED_MSL_FRAGMENT_ENTRY),
+        // A translated stage-buffer case names its own two AIR entries rather
+        // than a reviewed MSL pair — the stage module above pinned that the
+        // case carries `translated_stages` and no MSL pin — while the reviewed
+        // arm names the pair's MSL siblings (`research/docs/23` §3.3, v83/v86).
+        RenderGeometry::StageBuffers if case.translated_stages.is_some() => {
+            (case.vertex_entry.as_str(), case.fragment_entry.as_str())
+        }
+        RenderGeometry::StageBuffers => (
+            STAGE_BUFFER_MSL_VERTEX_ENTRY,
+            STAGE_BUFFER_MSL_FRAGMENT_ENTRY,
+        ),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -5511,6 +6527,14 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             }
         },
     };
+    if case.vertex_entry.trim().is_empty()
+        || case.fragment_entry.trim().is_empty()
+        || case.vertex_entry == case.fragment_entry
+    {
+        return Err(
+            format!("{where_}: a render case names two distinct, non-empty stage entries").into(),
+        );
+    }
     if (case.vertex_entry.as_str(), case.fragment_entry.as_str()) != reviewed_entries {
         return Err(format!(
             "{where_}: unreviewed render pipeline identity {:?}/{:?}",
@@ -7314,6 +8338,25 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4), (2, "read", 64)][..],
         ),
+        // v83-v86: the stage-buffer cases' declaring passes. The first is the
+        // witness kernel with the colour attachment's own 2x2 view (sixteen
+        // bytes), the copy landing and the *writable stage buffer's* pool view
+        // as its third read — the view the render pass's writeback lands in
+        // (`research/docs/23` §3.3, v86). The second is the plain copy kernel
+        // over the same attachment, because the borrowed stage buffer's bytes
+        // travel through the owner's own registration instead of a pool view.
+        "render_declaring_stage_buffer_sink" => (
+            "copy_word_with_witness",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4), (2, "read", 16)][..],
+        ),
+        "render_declaring_stage_buffer_lease" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4)][..],
+        ),
         // v49: the same read pair with the *stencil* surface's own one-byte
         // extent (4x4 texels = 16 bytes) as the third read binding, so one
         // submission declares the colour attachment's view and the stencil
@@ -8339,6 +9382,11 @@ fn case_stencil(
 /// declaring pass's own landing belongs to the declaring case, which is what
 /// keeps an attachment observation from being confusable with a buffer
 /// writeback.
+// The render runner's own signature is the case's whole input set: the
+// declaring pass's programs, the render registration, the pass's identity and
+// the lease channels a stage buffer may source its bytes from. Splitting it into
+// a context struct would put the same fields behind one more name.
+#[allow(clippy::too_many_arguments)]
 fn run_render_case(
     provider: &dyn PipelineProvider,
     programs: &[CompiledComputePipeline],
@@ -8347,6 +9395,7 @@ fn run_render_case(
     render_pipeline: &CompiledComputePipeline,
     operation: u64,
     guard: u8,
+    leases: &LeaseHandles,
 ) -> Result<CaseResult> {
     let attachments = render_attachment_shapes(case)?;
     let (depth_attachment, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
@@ -8416,6 +9465,50 @@ fn run_render_case(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // The pass's own stage buffers (`research/docs/23` §3.3, v83-v86): one
+    // view per declared slot, resolved through the same three-arm source
+    // channel a compute case's views use (R9i). The lease imports have to be
+    // made before the trace is built and admitted, because the snapshot the
+    // admission reads has to carry the same reservations the trace's
+    // `BufferSource` names; the owner windows a borrowed view maps are kept
+    // alive in `owner_windows` until this case's submission has been waited
+    // for.
+    let mut case_leases = CaseLeases::default();
+    let mut owner_windows = Vec::new();
+    // A lease-armed stage buffer's allocation is the *owner's* registration, so
+    // the trace's own table has to carry it before the reservation can be
+    // admitted: `ResourceTableSnapshot::insert_lease` resolves the lease's
+    // allocation, and a snapshot without it refuses the reservation by name
+    // (`research/docs/23` §90, R9i). An owned stage buffer declares no owner
+    // window and adds no record.
+    for definition in &case.stage_buffers {
+        if stage_buffer_storage_mode(definition, &format!("render case {}", case.id))?
+            == BufferSourceKind::OwnedBytes
+        {
+            continue;
+        }
+        let allocation = AllocationId::new(definition.allocation);
+        if resources.allocation(allocation).is_none() {
+            resources.insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size: definition
+                    .allocation_size
+                    .ok_or("a leased stage buffer states the owner window's length")?,
+            })?;
+        }
+    }
+    let stage_buffers = stage_buffer_views(
+        case,
+        leases,
+        provider,
+        guard,
+        &mut case_leases,
+        &mut owner_windows,
+    )?;
+    for reservation in &case_leases.reservations {
+        resources.insert_lease(*reservation)?;
+    }
     // One declared view per attachment, in location order: every attachment
     // resolves against that view exactly as `validate_render_case` pinned.
     let declared_views = attachments
@@ -8667,7 +9760,7 @@ fn run_render_case(
         .transpose()?
         .unwrap_or_default();
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
-        stage_buffers: Vec::new(),
+        stage_buffers,
         pipeline: render_pipeline.pipeline_id,
         color_attachments,
         viewport: [
@@ -8737,6 +9830,24 @@ fn run_render_case(
         return Err("provider completion observation changed".into());
     }
     let mut landed = BTreeMap::new();
+    // The views whose writebacks this case observes: the attachments' own
+    // declaring views, the stored depth and stencil landings, and the writable
+    // stage buffers' pool views (`research/docs/23` §3.3, v86). Every other
+    // writeback belongs to the declaring pass and is not this case's landing.
+    let writable_stage_buffers = case
+        .stage_buffers
+        .iter()
+        .filter(|definition| {
+            stage_buffer_access(&definition.access, &format!("render case {}", case.id))
+                .is_ok_and(|access| access.is_writable())
+        })
+        .map(|definition| {
+            (
+                AllocationId::new(definition.allocation),
+                ViewId::new(definition.view),
+            )
+        })
+        .collect::<Vec<_>>();
     for write in output.writebacks {
         let (_, backing) = allocations
             .iter_mut()
@@ -8749,6 +9860,7 @@ fn run_render_case(
             .chain(depth_view.iter())
             .chain(stencil_view.iter())
             .any(|view| view.view_id == write.view_id && view.allocation_id == write.allocation_id)
+            || writable_stage_buffers.contains(&(write.allocation_id, write.view_id))
         {
             landed.insert((write.allocation_id, write.view_id), write);
         }
@@ -8756,6 +9868,25 @@ fn run_render_case(
     provider
         .release_completion(token)
         .map_err(|error| format!("release completion: {error:?}"))?;
+    // The lease imports belong to this case alone: a later case may reuse a view
+    // id, and the registry refuses a duplicate import until the previous one is
+    // released. This case's single submission has been waited for and its
+    // completion released, which is the point the no-copy registry's own
+    // retirement rule waits on (`research/docs/23` §90, R9i).
+    for lease_id in &case_leases.staged {
+        leases
+            .staged
+            .release_staged_lease(*lease_id)
+            .map_err(|error| format!("render case {}: release staged lease: {error:?}", case.id))?;
+    }
+    for lease_id in &case_leases.borrowed {
+        leases
+            .borrowed
+            .release_borrowed_lease(*lease_id)
+            .map_err(|error| {
+                format!("render case {}: release borrowed lease: {error:?}", case.id)
+            })?;
+    }
     // One writeback and one allocation image per attachment, in location
     // order. Each writeback has to cover the exact range its declaring view
     // states: a rail that landed a different range cannot be reported as this
@@ -8931,6 +10062,84 @@ fn run_render_case(
         ));
         images.push(Allocation::observed(allocation, &image));
     }
+    // The writable stage buffers' own landings (`research/docs/23` §3.3, v86),
+    // after the colour, depth and stencil ones: one writeback covering the
+    // exact view the declaring pass declared, and one allocation image holding
+    // the bytes the writeback left there. The landing travels through the same
+    // byte-keyed channel the attachments use, so a rail that executed the
+    // write but reported nothing cannot pass this case.
+    let case_where = format!("render case {}", case.id);
+    for definition in &case.stage_buffers {
+        let access = stage_buffer_access(&definition.access, &case_where)?;
+        if !access.is_writable() {
+            continue;
+        }
+        let declared = views
+            .iter()
+            .find(|view| {
+                view.view_id == ViewId::new(definition.view)
+                    && view.allocation_id == AllocationId::new(definition.allocation)
+            })
+            .ok_or("the writable stage buffer's view is not in the trace's pool")?;
+        let write = landed
+            .get(&(
+                AllocationId::new(definition.allocation),
+                ViewId::new(definition.view),
+            ))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!(
+                    "render case {}: the pass landed no writeback for the writable stage buffer \
+                     {}/{}",
+                    case.id, definition.stage, definition.index
+                )
+                .into()
+            })?;
+        if write.offset != declared.offset || write.bytes.len() as u64 != declared.length {
+            return Err(format!(
+                "render case {}: the writable stage buffer {}/{} landed {}..{} instead of \
+                 {}..{}",
+                case.id,
+                definition.stage,
+                definition.index,
+                write.offset,
+                write.offset + write.bytes.len() as u64,
+                declared.offset,
+                declared.offset + declared.length
+            )
+            .into());
+        }
+        let expected = unhex(
+            definition
+                .expected_hex
+                .as_deref()
+                .ok_or("a writable stage buffer states the bytes it lands")?,
+        )?;
+        if write.bytes != expected {
+            return Err(format!(
+                "render case {}: the writable stage buffer {}/{} landed {} against the reviewed \
+                 {}",
+                case.id,
+                definition.stage,
+                definition.index,
+                hex(&write.bytes),
+                hex(&expected)
+            )
+            .into());
+        }
+        let image = allocations
+            .iter()
+            .find(|(id, _)| *id == definition.allocation)
+            .ok_or("the writable stage buffer's allocation is missing")?
+            .1
+            .clone();
+        writebacks.push(Writeback::encoded(
+            definition.allocation,
+            definition.view,
+            write.offset,
+            &write.bytes,
+        ));
+        images.push(Allocation::observed(definition.allocation, &image));
+    }
     eprintln!(
         "render case completed: {} attachments={} bytes={}",
         case.id,
@@ -8940,6 +10149,7 @@ fn run_render_case(
             .map(Writeback::observed_bytes)
             .sum::<usize>()
     );
+    let storage_modes = stage_buffer_storage_modes(case)?;
     Ok(CaseResult {
         id: case.id.clone(),
         completion: "CompletedVisible",
@@ -8951,7 +10161,7 @@ fn run_render_case(
         present: None,
         heap: None,
         icb: None,
-        storage_modes: None,
+        storage_modes,
     })
 }
 

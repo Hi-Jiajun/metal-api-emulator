@@ -646,7 +646,23 @@ private struct RenderCaseDefinition: Decodable {
     let declaring_case: String
     let vertex_entry: String
     let fragment_entry: String
-    let metal: RenderSourcePin
+    /// The pinned MSL module the case's two stages were written as, or `nil`
+    /// for a *translated* case (`research/docs/23` §3.3, v84/v86): a case whose
+    /// stages the Vulkan rail translates from AIR carries its two AIR pins
+    /// through `translated_stages` instead, and no MSL sibling exists for this
+    /// oracle to compile. `validateRenderCase` routes both arms.
+    let metal: RenderSourcePin?
+    /// The stage-buffer slots the case's pipeline declares and its pass binds
+    /// (`research/docs/23` §3.3, v83-v86), or `nil` for every pre-v83 case.
+    /// This oracle executes none of them: the native rail publishes no render
+    /// stage-buffer capability at this revision and compiles no AIR, so a case
+    /// that declares a slot is marked for the Vulkan trace rail alone and this
+    /// rail refuses to claim it (`validateRenderCase`).
+    let stage_buffers: [RenderStageBufferDefinition]?
+    /// The two AIR modules a translated case's stages come from
+    /// (`research/docs/23` §3.3, v84), or `nil` for a reviewed case, which
+    /// names its MSL module instead. Exactly one of the two is present.
+    let translated_stages: TranslatedStagesDefinition?
     let vertices: UInt64
     let viewport: [UInt64]
     /// The pass's scissor rectangle in framebuffer coordinates, or `nil` for the
@@ -811,6 +827,28 @@ private struct RenderCaseDefinition: Decodable {
     /// reports a case its marker does not name). v14's present case is marked
     /// for the provider rails; its Apple evidence is `--present-selftest`.
     let capture_rails: [String]
+}
+
+/// One stage-buffer slot a render case declares (`research/docs/23` §3.3,
+/// v83-v86).
+///
+/// The oracle decodes the slot's identity so a suite's marker rule can be
+/// checked on macOS exactly as `conformance/compare.py` checks it on Linux; the
+/// three fields below are the ones that rule and the refusal message need. The
+/// footprint, the view's bytes and the writable slot's expectation belong to
+/// the Vulkan trace rail's own validation, which is where the shape executes.
+private struct RenderStageBufferDefinition: Decodable {
+    let stage: String
+    let index: UInt32
+    let access: String
+}
+
+/// The two AIR modules a translated render case's stages come from
+/// (`research/docs/23` §3.3, v84). The oracle pins the paths so a suite cannot
+/// leave them dangling; it compiles no AIR itself.
+private struct TranslatedStagesDefinition: Decodable {
+    let vertex: RenderSourcePin
+    let fragment: RenderSourcePin
 }
 
 /// A render case whose shape, source identity and expectation are reviewed.
@@ -2210,8 +2248,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // is compared against.
     case "compute-buffer-v30":
         expectedIDs = ["staged_lease_copy_word", "borrowed_lease_copy_word"]
+    // The stage-buffer face (`research/docs/23` §3.3, v83-v86): the two
+    // declaring passes of the stage-buffer render cases. This oracle validates
+    // those cases' *metadata* — including the marker rule that keeps them off
+    // this rail — and executes the two declaring passes as ordinary compute
+    // cases; the stage-buffer shape itself is executed by the Vulkan trace rail
+    // (`research/docs/23` §3.3, v84/v86).
+    case "compute-buffer-v31":
+        expectedIDs = ["render_declaring_stage_buffer_sink",
+                       "render_declaring_stage_buffer_lease"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v30 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v31 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -2660,6 +2707,47 @@ private func loadRenderSource(_ pin: RenderSourcePin, root: URL) throws -> Data 
 }
 
 @available(macOS 11.0, *)
+/// Validate one stage-buffer render case's metadata and refuse to execute it
+/// (`research/docs/23` §3.3, v83-v86).
+///
+/// This oracle compiles MSL, not the AIR a translated case pins, and the native
+/// rail publishes no render stage-buffer capability at this revision — its
+/// `stage_buffer_capability_bits()` reports `supports_render_stage_buffers =
+/// false`, so a native capture could only drop the bindings. The case is
+/// therefore marked for the Vulkan trace rail alone, and that rule is what this
+/// function enforces: a suite that named a native rail here would claim an
+/// observation no native capture can report.
+///
+/// The returned value is a placeholder that is never read: the runner selects
+/// the cases it executes by the same marker this function pins, and the marker
+/// rule is what keeps this rail out of the case. The pinned sources are still
+/// verified, so a suite cannot leave a dangling fixture behind a skipped case.
+private func validateStageBufferRenderCase(_ definition: RenderCaseDefinition,
+                                           _ stageBuffers: [RenderStageBufferDefinition],
+                                           root: URL) throws -> ValidatedRender {
+    try require(!definition.capture_rails.contains(where: { $0.hasPrefix("native-metal") }),
+                "\(definition.id): the native rails execute no stage-buffer case yet: mark it "
+                + "for the Vulkan trace rail, which binds the slots this case declares")
+    for slot in stageBuffers {
+        try require(slot.stage == "vertex" || slot.stage == "fragment",
+                    "\(definition.id): unknown stage-buffer stage \"\(slot.stage)\"")
+        try require(["read", "write", "read_write"].contains(slot.access),
+                    "\(definition.id): unknown stage-buffer access \"\(slot.access)\"")
+    }
+    if let translated = definition.translated_stages {
+        for pin in [translated.vertex, translated.fragment] {
+            _ = try loadRenderSource(pin, root: root)
+        }
+    } else if let metal = definition.metal {
+        _ = try loadRenderSource(metal, root: root)
+    } else {
+        throw OracleError("\(definition.id): a stage-buffer case pins the sources its stages "
+                          + "read")
+    }
+    return ValidatedRender(definition: definition, source: "", attachments: [],
+                           vertexStreams: [], indexStream: nil, depth: nil, stencil: nil)
+}
+
 private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [ValidatedRender] {
     var renderCases = [ValidatedRender]()
     for definition in suite.render_cases ?? [] {
@@ -2723,6 +2811,15 @@ private func instancedTintTexels(_ stream: ValidatedVertexStream,
 @available(macOS 11.0, *)
 private func validateRenderCase(_ definition: RenderCaseDefinition,
                                 root: URL) throws -> ValidatedRender {
+    // The stage-buffer shape (`research/docs/23` §3.3, v83-v86) is the one
+    // render case this oracle does not execute: `crates/metal-api-native/src/render.rs`
+    // publishes `supports_render_stage_buffers = false` at this revision, and a
+    // *translated* case pins two AIR modules this oracle does not compile. The
+    // case is therefore marked for the Vulkan trace rail alone, and the marker
+    // is refused here rather than read as an ordinary render case.
+    if let stageBuffers = definition.stage_buffers, !stageBuffers.isEmpty {
+        return try validateStageBufferRenderCase(definition, stageBuffers, root: root)
+    }
     let reviewed = try reviewedModule(for: definition)
     try require(definition.vertex_entry == reviewed.vertex_entry
                 && definition.fragment_entry == reviewed.fragment_entry

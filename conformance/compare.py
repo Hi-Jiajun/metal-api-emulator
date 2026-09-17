@@ -55,6 +55,30 @@ ALLOCATION_OBSERVATIONS = {
 # owes the arm each view actually ran with.
 BUFFER_STORAGE_MODES = ("owned_bytes", "staged_lease", "borrowed_no_copy")
 
+# The stage-buffer face (`research/docs/23` §3.3, v83-v86): a render case may
+# declare slots whose bytes its stages read — and, for a writable one, land —
+# directly. The vocabulary is the contract's own (`StageBufferBinding` /
+# `StageBufferView`), and the bounds restate `metal_api_core`'s constants.
+STAGE_BUFFER_STAGES = ("vertex", "fragment")
+STAGE_BUFFER_ACCESSES = ("read", "write", "read_write")
+MAX_RENDER_STAGE_BUFFERS = 4
+MAX_RENDER_STAGE_BUFFER_INDEX = 16
+# The invocation axes an affine footprint may stride over
+# (`metal_api_core::provider::RENDER_AFFINE_AXES`): `0` is the vertex index,
+# `1` the instance index.
+RENDER_AFFINE_AXES = 2
+# The Vulkan trace rail: the one rail that translates a stage-buffer case's AIR
+# stages and binds their slots today (`research/docs/23` §3.3, v83-v86).
+VULKAN_TRACE_RAIL = "vulkan"
+
+# One stage-buffer slot a render case declares (`research/docs/23` §3.3,
+# v83-v86): the pipeline's declaration (`stage`, `index`, `access`, `footprint`)
+# beside the pass's view (`view` identity, range and bytes). `expected` is the
+# landing a writable slot's writeback has to carry, or `None` for a read-only
+# one; `mode` is the source arm the view's bytes come from (`research/docs/23`
+# §90, R9i), and `borrowed` says whether that arm copies the bytes in.
+StageBuffer = namedtuple("StageBuffer", "stage index access footprint view expected mode borrowed")
+
 # The reviewed per-texel rule of the wide attachment (R5a, `research/docs/23`
 # §73): texel `(x, y)` carries `x` and `y` as two little-endian `u16`s, i.e.
 # `[x & 0xff, (x >> 8) & 0xff, y & 0xff, (y >> 8) & 0xff]`. The rule is how a
@@ -198,8 +222,8 @@ def _readback_windows(case, rule, width, height, where):
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
-    "stencil_filter sample_count_gate texture_uploads rule",
-    defaults=(None, None, None, None, None))
+    "stencil_filter sample_count_gate texture_uploads rule stage_buffer_modes",
+    defaults=(None, None, None, None, None, None))
 
 # One rule-expected attachment (R5a, `research/docs/23` §73): the rule's name,
 # the extent it covers, the digest of the whole plane the rule describes, and
@@ -1956,6 +1980,228 @@ def _check_allowed_texels(allowed, texel_count, fragment, samples, clear, where)
                  + ", ".join(f"0x{value.hex()}" for value in sorted(missing)))
 
 
+def _affine_required_bytes(declaration, counts, where):
+    """The byte extent one affine footprint reaches over the draw's own counts.
+
+    The arithmetic is `metal_api_core::provider::render_affine_required_bytes`'s
+    (`research/docs/23` §3.3, v86): each access reaches `base_offset +
+    access_size` at its lowest index and adds `(count - 1) * stride` per term,
+    and the widest access decides. The comparator recomputes it so a suite whose
+    declaration its own draw cannot cover is refused on Linux, before any rail
+    sees it.
+    """
+    required = 0
+    for access in declaration:
+        end = access["base_offset"] + access["access_size"]
+        for term in access["terms"]:
+            if term["axis"] >= len(counts):
+                raise CaptureError(f"{where}: affine axis {term['axis']} is not one of the "
+                                   "draw's own invocation axes")
+            end += max(counts[term["axis"]] - 1, 0) * term["stride"]
+        required = max(required, end)
+    return required
+
+
+def _stage_buffer_footprint(value, counts, where):
+    """Parse one stage-buffer slot's declared footprint (`research/docs/23` §3.3, v86).
+
+    Two arms exist and no third: a static ceiling in bytes, or the affine access
+    set a translated module's reflection states. The return value is the byte
+    extent the pass's own view has to cover — the ceiling for the static arm,
+    the recomputed affine reach for the other — so the caller can hold the two
+    declarations to each other.
+    """
+    _require(isinstance(value, dict) and len(value) == 1,
+             f"{where}: a footprint is one of static and affine")
+    if "static" in value:
+        static = value["static"]
+        _object(static, ("max_bytes",), f"{where}.footprint.static")
+        return _integer(static["max_bytes"], f"{where}.footprint.static.max_bytes", 1)
+    accesses = value.get("affine")
+    _require(isinstance(accesses, dict) and set(accesses) == {"accesses"},
+             f"{where}: an affine footprint is an access list")
+    entries = _list(accesses["accesses"], f"{where}.footprint.affine.accesses")
+    _require(entries, f"{where}: an affine footprint names at least one access")
+    parsed = []
+    for position, entry in enumerate(entries):
+        access_where = f"{where}.footprint.affine.accesses[{position}]"
+        _object(entry, ("base_offset", "access_size", "terms"), access_where)
+        base_offset = _integer(entry["base_offset"], f"{access_where}.base_offset")
+        access_size = _integer(entry["access_size"], f"{access_where}.access_size", 1)
+        terms = []
+        for index, term in enumerate(_list(entry["terms"], f"{access_where}.terms")):
+            term_where = f"{access_where}.terms[{index}]"
+            _object(term, ("axis", "stride"), term_where)
+            axis = _integer(term["axis"], f"{term_where}.axis")
+            _require(axis < RENDER_AFFINE_AXES,
+                     f"{term_where}: affine axis {axis} is above the draw's two invocation "
+                     "axes (vertex, instance)")
+            terms.append({"axis": axis,
+                          "stride": _integer(term["stride"], f"{term_where}.stride", 1)})
+        parsed.append({"base_offset": base_offset, "access_size": access_size, "terms": terms})
+    return _affine_required_bytes(parsed, counts, where)
+
+
+def _stage_buffer_section(case, declaring_case, declaring_images, where):
+    """Plan one render case's stage-buffer slots (`research/docs/23` §3.3, v83-v86).
+
+    Each entry carries both halves of one slot: the pipeline's declaration
+    (`stage`, `index`, `access`, `footprint`) and the pass's view of it
+    (`allocation`, `view`, `offset`, `length` and the bytes themselves, or the
+    lease they come from). The comparator holds the same fields the two rails
+    hold, so a suite neither rail could execute is refused here first.
+
+    A *writable* slot is a landing: its bytes leave through the same byte-keyed
+    writeback channel a stored attachment's texels use, so the entry states the
+    bytes the writeback has to carry and the view has to be one the declaring
+    pass also declares — the trace's own view pool is where a write lands. The
+    caller appends these landings after the colour, depth and stencil ones, in
+    the order the rails report them.
+
+    Returns `(writes, images, views, written, modes)`:
+
+    * `writes` are `((allocation, view, offset), bytes)` landings in slot order;
+    * `images` are the landed allocations' own images, the declaring case's
+      image with each landing overlaid;
+    * `views` maps view id to `(allocation, offset, length, access)`;
+    * `written` is the set of landed allocations;
+    * `modes` is `None` for a case whose slots are all trace-owned, or the
+      `{view: mode}` map a capture of a lease-armed case has to report
+      (`research/docs/23` §90, R9i).
+    """
+    entries = _list(case.get("stage_buffers", []), f"{where}.stage_buffers")
+    if not entries:
+        return [], {}, {}, set(), None
+    _require(len(entries) <= MAX_RENDER_STAGE_BUFFERS,
+             f"{where}: the reviewed stage-buffer ceiling is {MAX_RENDER_STAGE_BUFFERS} slots")
+    # The draw the declarations are proven against: the shape is the
+    # `vertex_id` triangle, so the vertex axis is the draw's own vertex count
+    # and the instance axis its instance count.
+    _require("indices" not in case,
+             f"{where}: a stage-buffer case binds no index buffer")
+    counts = (_integer(case["vertices"], f"{where}.vertices"),
+              _integer(case.get("instance_count", 1), f"{where}.instance_count", 1))
+    required_keys = {"stage", "index", "access", "footprint", "allocation", "view", "offset",
+                     "length", "initial_hex"}
+    allowed_keys = required_keys | {"allocation_size", "storage_mode", "expected_hex"}
+    slots = []
+    views = {}
+    modes = {}
+    writes = []
+    images = {}
+    written = set()
+    for position, entry in enumerate(entries):
+        entry_where = f"{where}.stage_buffers[{position}]"
+        _require(isinstance(entry, dict), f"{entry_where}: expected an object")
+        missing = sorted(required_keys - set(entry))
+        _require(not missing, f"{entry_where}: missing fields {', '.join(missing)}")
+        unexpected = sorted(set(entry) - allowed_keys)
+        _require(not unexpected, f"{entry_where}: unexpected fields {', '.join(unexpected)}")
+        stage = _string(entry["stage"], f"{entry_where}.stage")
+        _require(stage in STAGE_BUFFER_STAGES,
+                 f"{entry_where}: unknown stage-buffer stage {stage!r}")
+        index = _integer(entry["index"], f"{entry_where}.index")
+        _require(index < MAX_RENDER_STAGE_BUFFER_INDEX,
+                 f"{entry_where}: stage buffer index {index} is at or above the reviewed "
+                 f"ceiling {MAX_RENDER_STAGE_BUFFER_INDEX}")
+        access = entry["access"]
+        _require(access in STAGE_BUFFER_ACCESSES,
+                 f"{entry_where}: unknown stage-buffer access {access!r}")
+        # The contract's list is canonical — vertex bindings before fragment
+        # bindings, ascending inside each stage, no slot twice
+        # (`validate_stage_buffer_bindings`).
+        # The ordinal is the contract's own (`RenderPipelineStage::code`):
+        # vertex before fragment, so the two stages' index spaces can share one
+        # canonical list.
+        slot = (STAGE_BUFFER_STAGES.index(stage), index)
+        _require(not slots or slots[-1] < slot,
+                 f"{entry_where}: stage buffers are declared once each, vertex bindings before "
+                 "fragment bindings and ascending inside each stage")
+        slots.append(slot)
+        footprint = _stage_buffer_footprint(entry["footprint"], counts, entry_where)
+        allocation = _integer(entry["allocation"], f"{entry_where}.allocation", 1)
+        view = _integer(entry["view"], f"{entry_where}.view", 1)
+        _require(view not in views, f"{entry_where}: duplicate stage-buffer view {view}")
+        offset = _integer(entry["offset"], f"{entry_where}.offset")
+        length = _integer(entry["length"], f"{entry_where}.length", 1, MAX_ALLOCATION_BYTES)
+        initial = _hex(entry["initial_hex"], f"{entry_where}.initial_hex")
+        _require(len(initial) == length,
+                 f"{entry_where}: the view's bytes do not cover its declared length")
+        _require(footprint <= length,
+                 f"{entry_where}: the declared footprint reaches {footprint} bytes, past the "
+                 f"view's own {length}")
+        mode = entry.get("storage_mode", "owned_bytes")
+        _require(mode in BUFFER_STORAGE_MODES,
+                 f"{entry_where}: unknown stage-buffer storage mode {mode!r}")
+        allocation_size = entry.get("allocation_size")
+        if mode == "owned_bytes":
+            _require(allocation_size is None,
+                     f"{entry_where}: an owned stage buffer maps no owner window, so it states "
+                     "no allocation size")
+        else:
+            _require(allocation_size is not None,
+                     f"{entry_where}: a lease-armed stage buffer states the allocation size its "
+                     "owner window covers")
+        if allocation_size is not None:
+            _integer(allocation_size, f"{entry_where}.allocation_size", 1, MAX_ALLOCATION_BYTES)
+            _require(offset + length <= allocation_size,
+                     f"{entry_where}: the view lies outside its owner's registration")
+        expected = entry.get("expected_hex")
+        landed = access != "read"
+        if landed:
+            _require(expected is not None,
+                     f"{entry_where}: a writable stage buffer states the bytes its writeback "
+                     "lands")
+        else:
+            _require(expected is None,
+                     f"{entry_where}: a read-only stage buffer carries no expectation")
+        views[view] = (allocation, offset, length, access)
+        modes[view] = mode
+        if not landed:
+            # A read-only slot carries its own bytes, exactly as a vertex
+            # stream does, so it cannot name a view the declaring case already
+            # declares: one identity would then stand for two byte strings.
+            # (A writable slot is the other arm: it *must* name the declaring
+            # view, because that is the pool entry its writeback lands in.)
+            _require(all(buffer["view"] != view for buffer in declaring_case["buffers"]),
+                     f"{entry_where}: a read-only stage buffer declares its own bytes, so view "
+                     f"{view} cannot be one the declaring case already declares")
+            continue
+        landed_bytes = _hex(expected, f"{entry_where}.expected_hex")
+        _require(len(landed_bytes) == length,
+                 f"{entry_where}: a landing covers exactly the bytes its view covers")
+        declared = [buffer for buffer in declaring_case["buffers"]
+                    if buffer["allocation"] == allocation and buffer["view"] == view]
+        _require(len(declared) == 1,
+                 f"{entry_where}: a writable stage buffer lands in the trace's own view pool, so "
+                 "the declaring case has to declare exactly that view")
+        declared = declared[0]
+        _require(declared["access"] == "read",
+                 f"{entry_where}: the declaring pass reads the writable stage buffer's view")
+        _require((declared["offset"], declared["length"]) == (offset, length),
+                 f"{entry_where}: the writable stage buffer's view and the declaring case's "
+                 "declaration of it cover different ranges")
+        _require(_buffer_initial_bytes(declared, where, allocation, view, length)
+                 == initial,
+                 f"{entry_where}: the writable stage buffer's view carries different bytes than "
+                 "the declaring case's declaration of it")
+        image = bytearray(declaring_images[allocation])
+        _require(len(image) == declared["allocation_size"],
+                 f"{entry_where}: inconsistent allocation size")
+        image[offset:offset + length] = landed_bytes
+        images[allocation] = bytes(image)
+        writes.append(((allocation, view, offset), landed_bytes))
+        written.add(allocation)
+    # A lease-armed case states one view per allocation, exactly as a compute
+    # case's own lease rule does: the owner window is the view's own range
+    # inside the registration (`research/docs/23` §90).
+    if any(mode != "owned_bytes" for mode in modes.values()):
+        _require(len(set(views[view][0] for view in views)) == len(views),
+                 f"{where}: a case that declares a lease arm declares one view per allocation")
+        return writes, images, views, written, modes
+    return writes, images, views, written, None
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -1988,7 +2234,7 @@ def _render_plan(plan, suite):
         # single `attachment` object plus the case-level `expected_hex`
         # (v13-v17), or the MRT `attachments` list whose entries each carry
         # their own `expected_hex` (v18).
-        required = ("id", "declaring_case", "vertex_entry", "fragment_entry", "metal",
+        required = ("id", "declaring_case", "vertex_entry", "fragment_entry",
                     "vertices", "viewport", "capture_rails")
         missing = [field for field in required if field not in case]
         _require(not missing, f"{where}: missing fields {', '.join(missing)}")
@@ -2001,8 +2247,26 @@ def _render_plan(plan, suite):
                                "depth", "depth_test", "coverage", "cull", "blend",
                                "stencil", "stencil_test", "multisample", "depth_resolve",
                                "requires_depth_resolve_filter", "stencil_resolve",
-                               "requires_stencil_resolve_filter", "requires_sample_count"})
+                               "requires_stencil_resolve_filter", "requires_sample_count",
+                               "metal", "translated_stages", "stage_buffers"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
+        # A reviewed case pins the MSL module its two stages were written as; a
+        # *translated* case pins its two AIR modules instead
+        # (`research/docs/23` §3.3, v84). Exactly one of the two spellings is
+        # present, so a case cannot claim a canonical MSL sibling its stages do
+        # not have.
+        translated = case.get("translated_stages")
+        _require(("metal" in case) != (translated is not None),
+                 f"{where}: exactly one of metal and translated_stages is required")
+        if translated is not None:
+            _object(translated, ("vertex", "fragment"), f"{where}.translated_stages")
+            for kind in ("vertex", "fragment"):
+                source = translated[kind]
+                _object(source, ("path", "sha256"), f"{where}.translated_stages.{kind}")
+                _string(source["path"], f"{where}.translated_stages.{kind}.path")
+                _require(isinstance(source["sha256"], str)
+                         and re.fullmatch(r"[0-9a-f]{64}", source["sha256"]),
+                         f"{where}.translated_stages.{kind}: invalid source digest")
         single = "attachment" in case
         multiple = "attachments" in case
         # The v46 pass binds *no* colour attachment at all (`research/docs/23`
@@ -2047,12 +2311,13 @@ def _render_plan(plan, suite):
                                                             "command_buffers")),
                  f"{where}: the declaring case must be one pass over its whole view pool")
 
-        source = case["metal"]
-        _object(source, ("path", "sha256"), f"{where}.metal")
-        _string(source["path"], f"{where}.metal.path")
-        _require(isinstance(source["sha256"], str)
-                 and re.fullmatch(r"[0-9a-f]{64}", source["sha256"]),
-                 f"{where}: invalid source digest")
+        if "metal" in case:
+            source = case["metal"]
+            _object(source, ("path", "sha256"), f"{where}.metal")
+            _string(source["path"], f"{where}.metal.path")
+            _require(isinstance(source["sha256"], str)
+                     and re.fullmatch(r"[0-9a-f]{64}", source["sha256"]),
+                     f"{where}: invalid source digest")
         vertex_entry = _string(case["vertex_entry"], f"{where}.vertex_entry")
         fragment_entry = _string(case["fragment_entry"], f"{where}.fragment_entry")
         _require(vertex_entry != fragment_entry,
@@ -2992,6 +3257,17 @@ def _render_plan(plan, suite):
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
+        # A stage-buffer case runs on the Vulkan trace rail alone in this
+        # increment (`research/docs/23` §3.3, v83-v86): the object API binds no
+        # stage buffers, the native rails translate no AIR and publish no
+        # render stage-buffer capability, and the Swift oracle compiles no AIR.
+        # Naming another rail would claim an observation that rail cannot
+        # report, so the marker is pinned here as well as in the two captures'
+        # own validators.
+        if case.get("stage_buffers"):
+            _require(rails == [VULKAN_TRACE_RAIL],
+                     f"{where}: a stage-buffer case runs on the Vulkan trace rail alone, so its "
+                     "capture_rails has to be [\"vulkan\"]")
 
         # Every attachment resolves against the declaring case's own table:
         # one of its declared views has to be the attachment, it has to be
@@ -3134,6 +3410,25 @@ def _render_plan(plan, suite):
                                len(stencil_expected)))
             written.add(stencil_allocation)
             touched.add(stencil_allocation)
+        # The stage-buffer landings (`research/docs/23` §3.3, v83-v86) follow
+        # the colour, depth and stencil ones, in the order the rails report
+        # them. A stage buffer's own bytes travel through the render input
+        # channel — the host-visible upload a vertex stream or index buffer
+        # takes — so a slot moves no device-buffer copy counter, whether its
+        # bytes are trace-owned, staged or borrowed (`research/docs/23` §90):
+        # the landed allocation is one more *written* allocation, and the
+        # touched set stays the declaring pass's own.
+        stage_writes, stage_images, stage_views, stage_written, stage_modes = (
+            _stage_buffer_section(case, by_id[declaring], plan[declaring][1], where))
+        writes.extend(stage_writes)
+        images.update(stage_images)
+        written = written | stage_written
+        # The landing identities carry the same four fields an attachment's
+        # does — identity, range and the byte count the writeback covers — so
+        # the set and order rules below read one list for both kinds of
+        # landing.
+        identities.extend((allocation, view, offset, len(payload))
+                          for (allocation, view, offset), payload in stage_writes)
         # The wildcard claims are stated once per observed attachment, in the
         # absolute byte offsets of its allocation, so the writeback comparison
         # and the allocation-image comparison read the same map. A free byte
@@ -3185,7 +3480,11 @@ def _render_plan(plan, suite):
             filter=requires_filter,
             stencil_filter=requires_stencil_filter,
             sample_count_gate=requires_sample_count,
-            rule=rule_expectation)
+            rule=rule_expectation,
+            # The lease face of a stage-buffer case (`research/docs/23` §90,
+            # R9i): the source arm each of its slots ran with, or `None` for a
+            # case whose slots are all trace-owned.
+            stage_buffer_modes=stage_modes)
     return render_plan
 
 
@@ -3360,6 +3659,25 @@ def validate_capture(suite, digest, report, required_backend=None):
                          f"{where}: {report['backend']} has to report the replayed indirect "
                          "command the suite declares")
                 _icb_observation(result["icb"], expectation.icb, where)
+            # The stage-buffer lease face (`research/docs/23` §90, R9i): a case
+            # whose slots name a source arm other than owned bytes owes the arm
+            # each of them ran with, exactly as a compute case's lease section
+            # does. The Swift reference oracle is not a provider — it places the
+            # same bytes in its own buffer — so it reports no arms, and a case
+            # that names one is not owed by the rails that cannot.
+            if expectation.stage_buffer_modes is None:
+                _require("storage_modes" not in result,
+                         f"{where}: the suite declares no lease arm for this case")
+            elif provider_backend:
+                _require("storage_modes" in result,
+                         f"{where}: a case whose stage buffers declare a lease arm has to "
+                         "report the source arm each of them ran with")
+                _storage_modes_observation(result["storage_modes"],
+                                           expectation.stage_buffer_modes, where)
+            else:
+                _require("storage_modes" not in result,
+                         f"{where}: {report['backend']} is not a provider, so it cannot report "
+                         "a source arm it did not execute")
         else:
             (expected_writes, expected_allocations, texture_count, group_expectations,
              heap, icb, case_rails, declared_modes, borrowed_allocations) = plan[case_id]
