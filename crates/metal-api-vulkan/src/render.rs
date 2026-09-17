@@ -2906,12 +2906,21 @@ fn affine_access_set(accesses: &[AffineAccess]) -> Vec<NormalizedAffineAccess> {
 /// shape of the shader's own read. The arithmetic width is not part of the
 /// question: a `half2` read of a two-component stream is the same interface as
 /// its `float2` sibling, because the contract's format is what the pipeline's
-/// vertex input state is built from either way.
+/// vertex input state is built from either way. Neither is the *storage* width:
+/// a normalized 8- or 16-bit stream is read by the very same `float2`/`float4`
+/// member, because the format is what states the normalization
+/// (`research/docs/23` §103, E-VF1), so the normalized formats share their
+/// shape check with their `float32` siblings rather than spelling a second
+/// type name.
 fn air_type_name_names_vertex_format(type_name: Option<&str>, format: VertexFormat) -> bool {
     match format {
-        VertexFormat::Float32x2 => matches!(type_name, Some("float2" | "half2")),
+        VertexFormat::Float32x2 | VertexFormat::Unorm8x2 | VertexFormat::Unorm16x2 => {
+            matches!(type_name, Some("float2" | "half2"))
+        }
         VertexFormat::Float32x3 => matches!(type_name, Some("float3" | "half3")),
-        VertexFormat::Float32x4 => matches!(type_name, Some("float4" | "half4")),
+        VertexFormat::Float32x4 | VertexFormat::Unorm8x4 | VertexFormat::Unorm16x4 => {
+            matches!(type_name, Some("float4" | "half4"))
+        }
         VertexFormat::Uint32 => matches!(type_name, Some("uint" | "uint1")),
     }
 }
@@ -4809,12 +4818,24 @@ fn indices_format(format: IndexFormat) -> vk::IndexType {
 /// Like [`indices_format`], this is a closed translation with no default arm:
 /// a contract format that gains no arm here is a compile error rather than a
 /// silently misread stream.
+///
+/// The four normalized storages are Vulkan's *required* vertex input formats
+/// (`VK_FORMAT_R8G8_UNORM`, `VK_FORMAT_R8G8B8A8_UNORM`,
+/// `VK_FORMAT_R16G16_UNORM`, `VK_FORMAT_R16G16B16A16_UNORM`), so this table
+/// needs no device probe beside it: a driver that failed one of these would not
+/// be a Vulkan implementation. The optional three-channel 8- and 16-bit
+/// formats are exactly the ones this contract does not name
+/// (`research/docs/23` §103).
 fn vertex_vk_format(format: VertexFormat) -> Result<vk::Format, ProviderError> {
     Ok(match format {
         VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
         VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
         VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
         VertexFormat::Uint32 => vk::Format::R32_UINT,
+        VertexFormat::Unorm8x2 => vk::Format::R8G8_UNORM,
+        VertexFormat::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
+        VertexFormat::Unorm16x2 => vk::Format::R16G16_UNORM,
+        VertexFormat::Unorm16x4 => vk::Format::R16G16B16A16_UNORM,
     })
 }
 
@@ -13355,6 +13376,72 @@ mod tests {
             attachment_vk_format(AttachmentFormat::Rgba16Float).map(vk::Format::as_raw),
             Ok(vk::Format::R16G16B16A16_SFLOAT.as_raw())
         );
+    }
+
+    /// Every contract vertex format names a `VkFormat`, and the four normalized
+    /// storages name Vulkan's own required vertex input formats — no optional
+    /// three-channel spelling among them (`research/docs/23` §103, E-VF1).
+    #[test]
+    fn every_admitted_vertex_format_names_a_required_vulkan_format() {
+        for (format, expected) in [
+            (VertexFormat::Float32x2, vk::Format::R32G32_SFLOAT),
+            (VertexFormat::Float32x3, vk::Format::R32G32B32_SFLOAT),
+            (VertexFormat::Float32x4, vk::Format::R32G32B32A32_SFLOAT),
+            (VertexFormat::Uint32, vk::Format::R32_UINT),
+            (VertexFormat::Unorm8x2, vk::Format::R8G8_UNORM),
+            (VertexFormat::Unorm8x4, vk::Format::R8G8B8A8_UNORM),
+            (VertexFormat::Unorm16x2, vk::Format::R16G16_UNORM),
+            (VertexFormat::Unorm16x4, vk::Format::R16G16B16A16_UNORM),
+        ] {
+            assert_eq!(
+                vertex_vk_format(format).map(vk::Format::as_raw),
+                Ok(expected.as_raw()),
+                "{format:?}"
+            );
+            assert!(VertexFormat::ADMITTED.contains(&format), "{format:?}");
+        }
+        assert_eq!(VertexFormat::ADMITTED.len(), 8);
+    }
+
+    /// The AIR type-name rule pairs a storage with the component shape its
+    /// shader member reads: the normalized storages share their `float32`
+    /// siblings' shapes, and a storage declared over a shape the member does not
+    /// read is refused (the refusal the e2e test reads out with its fields).
+    #[test]
+    fn the_normalized_storages_pair_with_their_component_shapes() {
+        for (format, shape) in [
+            (VertexFormat::Unorm8x2, "float2"),
+            (VertexFormat::Unorm8x4, "float4"),
+            (VertexFormat::Unorm16x2, "float2"),
+            (VertexFormat::Unorm16x4, "float4"),
+        ] {
+            assert!(
+                air_type_name_names_vertex_format(Some(shape), format),
+                "{format:?} is read by a {shape} member"
+            );
+            assert!(
+                air_type_name_names_vertex_format(Some("half2"), format) == (shape == "float2"),
+                "{format:?} pairs by component count, not by arithmetic width"
+            );
+        }
+        // A four-component storage over a two-component member, and the
+        // converse: both are refusals rather than a silently narrower read.
+        assert!(!air_type_name_names_vertex_format(
+            Some("float2"),
+            VertexFormat::Unorm16x4
+        ));
+        assert!(!air_type_name_names_vertex_format(
+            Some("float4"),
+            VertexFormat::Unorm16x2
+        ));
+        assert!(!air_type_name_names_vertex_format(
+            Some("uint4"),
+            VertexFormat::Unorm16x4
+        ));
+        assert!(air_type_name_names_vertex_format(
+            Some("uint"),
+            VertexFormat::Uint32
+        ));
     }
 
     #[test]
