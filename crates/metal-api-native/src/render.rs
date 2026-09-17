@@ -24,6 +24,16 @@
 //! selects which one may compile, so a trace cannot reach source the rail did not
 //! review.
 //!
+//! The lease increment (`docs/23` §72, R3d) widens where those streams' bytes
+//! may come from, to the same three arms the Vulkan rail resolves (R3c):
+//! declared bytes ([`BufferSource::OwnedBytes`], unchanged), the provider's own
+//! staged copy ([`BufferSource::StagedLease`]) and the owner's mapping
+//! ([`BufferSource::BorrowedNoCopy`], mapped with `newBufferWithBytesNoCopy:`
+//! instead of copied). [`resolve_render_input`] decides the arm before any
+//! Metal object exists, [`RenderInputRetains`] holds every imported no-copy
+//! lease from that decision until the pass's command buffer is terminal, and
+//! every unreadable arm is refused by name.
+//!
 //! **The encoder body has still never run on an Apple GPU.** What is
 //! different from the pre-flip state is the evidence: CI run `34774478149`
 //! (`native-oracle-build`, commit `fb4f8da`) ran the oracle's `--render-selftest`
@@ -49,15 +59,17 @@
 use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
-    AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
-    ContractError, DepthResolveFilter, DepthStoreOp, DepthTest, FieldValue, IndexBufferBinding,
-    IndexFormat, IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode,
-    ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, SampleCount, StencilResolveFilter, StencilTest,
+    AttachmentFormat, BorrowedLeaseRegistry, BorrowedView, BufferSource, BufferView,
+    BufferWriteback, ClearColor, ComputeTrace, ContractError, DepthResolveFilter, DepthStoreOp,
+    DepthTest, DeviceEpoch, FieldValue, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor,
+    LeaseId, LeaseRegistry, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, SampleCount, StencilResolveFilter, StencilTest,
     StoreOp, TextureFormat, TextureSource, TextureType, TracePass, VertexFormat, VertexLayout,
     VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 // The depth compare function is only named by the encoder body, which exists
 // on macOS alone; the plan's own `DepthTest` travels unchanged everywhere.
@@ -1254,10 +1266,24 @@ pub(crate) struct PlannedVertexStream<'a> {
     pub(crate) step: RenderVertexStep,
     /// Attributes this stream is read through.
     pub(crate) attributes: Vec<PlannedVertexAttribute>,
-    /// The view's own bytes.
-    pub(crate) bytes: &'a [u8],
+    /// Where this stream's bytes come from (`research/docs/23` §72, R3d): the
+    /// bytes the view declares, the provider's staged copy of the owner's
+    /// lease, or the owner's own mapping.
+    pub(crate) source: PlannedInputSource<'a>,
     /// The view's offset inside its allocation.
     pub(crate) offset: u64,
+}
+
+impl PlannedVertexStream<'_> {
+    /// The offset the encoder binds this stream at.
+    ///
+    /// An uploaded stream is bound at the view's own offset inside its
+    /// allocation; a no-copy stream is bound at its offset inside the owner
+    /// reservation the encoder maps. Either way the binding starts on the first
+    /// byte the trace named.
+    pub(crate) fn binding_offset(&self) -> u64 {
+        source_binding_offset(&self.source, self.offset)
+    }
 }
 
 /// The index buffer the pass draws through, resolved the same way.
@@ -1265,8 +1291,8 @@ pub(crate) struct PlannedVertexStream<'a> {
 pub(crate) struct PlannedIndexStream<'a> {
     /// The view the indices come from.
     pub(crate) view_id: ViewId,
-    /// The view's own bytes.
-    pub(crate) bytes: &'a [u8],
+    /// Where this stream's bytes come from, exactly as a vertex stream's do.
+    pub(crate) source: PlannedInputSource<'a>,
     /// The view's offset inside its allocation.
     pub(crate) offset: u64,
     /// The translated index width.
@@ -1284,6 +1310,14 @@ pub(crate) struct PlannedIndexStream<'a> {
     pub(crate) base_vertex: u64,
 }
 
+impl PlannedIndexStream<'_> {
+    /// The offset the encoder binds the index buffer at, by the same rule the
+    /// vertex streams use.
+    pub(crate) fn binding_offset(&self) -> u64 {
+        source_binding_offset(&self.source, self.offset)
+    }
+}
+
 /// Resolve a pass's vertex streams and index buffer from the pass itself.
 ///
 /// A render input declares its own bytes (`research/docs/23` §3.6): entry `i` of
@@ -1295,15 +1329,22 @@ pub(crate) struct PlannedIndexStream<'a> {
 /// Two rules are checked here because a driver answers both with undefined
 /// behaviour instead of an error:
 ///
-/// * the stream's bytes are ones this rail holds (`BufferSource::OwnedBytes`).
-///   The compute rail resolves leases; this one has no lease path, so a leased
-///   stream is refused instead of uploaded from bytes the rail does not have;
+/// * the stream's bytes are ones this rail can read
+///   ([`resolve_render_input`]): the bytes the view declares, the provider's
+///   staged copy of an owner lease, or the owner's own mapping when the device
+///   can take one. Nothing else has a path through this rail, so an arm this
+///   rail cannot resolve is refused instead of executed against bytes the rail
+///   does not have;
 /// * the declared range covers every vertex and index the draw reads (the
 ///   footprint proof `research/docs/23` §3.3 asks for: Metal would read past the
 ///   buffer, or index a stream out of range, without refusing). Which count the
 ///   proof is against depends on the draw: a non-indexed draw reads its vertex
 ///   count in order, while an indexed draw reads the vertices its index values
 ///   select, so the refusal names the index rather than the stream in that case.
+///
+/// The proof reads the resolved window, which for a no-copy input is the
+/// owner's own pages: a footprint proved over a copy of them could pass while
+/// the device reads different bytes.
 ///
 /// What is *not* checked here is the binding label: the entry's position is the
 /// binding index both rails use, and core admission already holds each view's
@@ -1312,6 +1353,7 @@ pub(crate) struct PlannedIndexStream<'a> {
 fn plan_vertex_input<'a>(
     pass: &'a RenderPassDescriptor,
     pipeline: &RenderPipelineContract,
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<(Vec<PlannedVertexStream<'a>>, Option<PlannedIndexStream<'a>>), ProviderError> {
     let mut streams = Vec::with_capacity(pass.vertex_buffers.len());
     // One layout entry per bound stream, in binding order; core admission
@@ -1324,7 +1366,7 @@ fn plan_vertex_input<'a>(
         .zip(pipeline.vertex_layout.buffers())
         .enumerate()
     {
-        let bytes = stream_bytes(view, VERTEX_SLUG)?;
+        let source = resolve_render_input(view, leases, RenderInputRole::Vertex)?;
         streams.push(PlannedVertexStream {
             buffer_index: u32::try_from(buffer_index)
                 .map_err(|_| capability_refusal("vertex_buffer_limit"))?,
@@ -1339,7 +1381,7 @@ fn plan_vertex_input<'a>(
                     format: vertex_format(attribute.format),
                 })
                 .collect(),
-            bytes,
+            source,
             offset: view.offset,
         });
     }
@@ -1356,12 +1398,12 @@ fn plan_vertex_input<'a>(
         // Saturating for the same reason the per-vertex proof is: the product
         // only has to decide whether the stream covers the count.
         let required = instance_count.saturating_mul(stream.stride);
-        if u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX) < required {
+        if u64::try_from(stream.source.len()).unwrap_or(u64::MAX) < required {
             return Err(vertex_footprint_refusal(
                 buffer_index,
                 stream.stride,
                 required,
-                stream.bytes.len(),
+                stream.source.len(),
             )
             .with_field("step", FieldValue::Text(stream.step.name().to_owned()))
             .with_detail("a per-instance stream has to cover one record per instance"));
@@ -1373,6 +1415,7 @@ fn plan_vertex_input<'a>(
             binding,
             pass.vertices,
             u64::from(pass.base_vertex),
+            leases,
         )?),
     };
     match &indices {
@@ -1396,7 +1439,7 @@ fn plan_vertex_input<'a>(
                 // validator), so `checked_div` is only the safe spelling of the
                 // quotient: a zero stride would be refused upstairs rather than
                 // read as an unbounded stream.
-                let covered = u64::try_from(stream.bytes.len())
+                let covered = u64::try_from(stream.source.len())
                     .unwrap_or(u64::MAX)
                     .checked_div(stream.stride)
                     .unwrap_or(0);
@@ -1438,12 +1481,12 @@ fn plan_vertex_input<'a>(
                 // stream covers the count: an unrepresentable product is by
                 // definition larger than any buffer this provider admits.
                 let required = u64::from(pass.vertices).saturating_mul(stream.stride);
-                if u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX) < required {
+                if u64::try_from(stream.source.len()).unwrap_or(u64::MAX) < required {
                     return Err(vertex_footprint_refusal(
                         buffer_index,
                         stream.stride,
                         required,
-                        stream.bytes.len(),
+                        stream.source.len(),
                     ));
                 }
             }
@@ -1461,14 +1504,17 @@ fn highest_index(vertex_span: u64) -> u32 {
 ///
 /// The bytes are the binding's own view, exactly as a vertex stream's are
 /// ([`plan_vertex_input`]): an index buffer declares its source instead of
-/// naming a view a compute pass happens to carry.
+/// naming a view a compute pass happens to carry, and [`resolve_render_input`]
+/// decides which of the three sources that declaration is.
 fn plan_index_stream<'a>(
     binding: &'a IndexBufferBinding,
     index_count: u32,
     base_vertex: u64,
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<PlannedIndexStream<'a>, ProviderError> {
     let view = &binding.view;
-    let bytes = stream_bytes(view, INDEX_SLUG)?;
+    let source = resolve_render_input(view, leases, RenderInputRole::Index)?;
+    let bytes = source.proof_bytes();
     let format = index_type(binding.format);
     let width = usize::try_from(format.bytes()).unwrap_or(usize::MAX);
     let needed = usize::try_from(index_count)
@@ -1498,7 +1544,7 @@ fn plan_index_stream<'a>(
     Ok(PlannedIndexStream {
         base_vertex,
         view_id: view.view_id,
-        bytes,
+        source,
         offset: view.offset,
         format,
         index_count,
@@ -1506,21 +1552,243 @@ fn plan_index_stream<'a>(
     })
 }
 
-/// The bytes of a stream view, or the refusal that names the storage this rail
-/// cannot read.
-fn stream_bytes<'a>(view: &'a BufferView, slug: &'static str) -> Result<&'a [u8], ProviderError> {
+/// One render input whose source this rail cannot read (`research/docs/23`
+/// §72, R3d), refused under the name this rail published before the lease
+/// channel existed.
+fn render_input_refusal(
+    role: RenderInputRole,
+    view: &BufferView,
+    storage_mode: &'static str,
+    detail: &'static str,
+) -> ProviderError {
+    capability_refusal(role.slug())
+        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+        .with_field("storage_mode", FieldValue::Text(storage_mode.to_owned()))
+        .with_detail(detail)
+}
+
+/// Which of a pass's two render inputs a refusal is about.
+#[derive(Clone, Copy)]
+enum RenderInputRole {
+    /// A vertex stream of the pass's layout.
+    Vertex,
+    /// The pass's index buffer.
+    Index,
+}
+
+impl RenderInputRole {
+    /// The capability slug this role's unreadable source is refused with. The
+    /// two names are the ones this rail published before the lease channel
+    /// existed, so a capture that could not read a stream keeps its slug.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Vertex => VERTEX_SLUG,
+            Self::Index => INDEX_SLUG,
+        }
+    }
+}
+
+/// The lease channel one render plan resolves its inputs through
+/// (`research/docs/23` §72, R3d).
+///
+/// The two registries are the provider's own — the same pair the compute rail
+/// resolves its pool views through, so an imported lease is one object with one
+/// retain count — and the admitted snapshot is the authority on which
+/// reservations exist: [`LeaseRegistry::view_bytes`] and
+/// [`BorrowedLeaseRegistry::view_pointer`] compare the imported reservation
+/// against it and refuse a view that falls outside it. The alignment is the
+/// device's own `newBufferWithBytesNoCopy:` requirement, or zero when this
+/// device cannot map an owner window at all.
+pub(crate) struct RenderLeaseContext<'a> {
+    pub(crate) staging: &'a LeaseRegistry,
+    pub(crate) borrowed: &'a Arc<BorrowedLeaseRegistry>,
+    pub(crate) resources: &'a ResourceTableSnapshot,
+    pub(crate) device_epoch: DeviceEpoch,
+    pub(crate) host_import_alignment: u64,
+}
+
+/// Where one render input's bytes come from (`research/docs/23` §72, R3d).
+#[derive(Debug)]
+pub(crate) enum PlannedInputSource<'a> {
+    /// The bytes the view itself declares (`BufferSource::OwnedBytes`),
+    /// unchanged from the pre-lease increments. The encoder uploads them into a
+    /// buffer that starts at the view.
+    Declared(&'a [u8]),
+    /// The provider's staged copy of an owner lease
+    /// (`BufferSource::StagedLease`); the encoder uploads it exactly like
+    /// declared bytes, but the bytes are one submission's copy of the owner's
+    /// window rather than the trace's own.
+    Staged(Vec<u8>),
+    /// The owner's own mapping (`BufferSource::BorrowedNoCopy`): the encoder
+    /// maps the whole reservation with `newBufferWithBytesNoCopy:` and binds
+    /// this view at [`BorrowedView::offset`] inside it, so no byte is copied.
+    NoCopy {
+        lease: LeaseId,
+        window: BorrowedView,
+    },
+}
+
+impl PlannedInputSource<'_> {
+    /// The bytes the rail's footprint proof reads.
+    ///
+    /// A no-copy window is read through the owner's mapping, because that is
+    /// where the proof's bytes are: the import contract keeps the mapping
+    /// readable at this address until the provider releases the import, so this
+    /// reads the same bytes the device will read rather than a copy of them.
+    /// A snapshot-style implementation cannot pass a proof taken this way.
+    fn proof_bytes(&self) -> &[u8] {
+        match self {
+            Self::Declared(bytes) => bytes,
+            Self::Staged(bytes) => bytes,
+            // SAFETY: the window was resolved by the no-copy registry for an
+            // imported lease, whose contract keeps the owner's mapping readable
+            // over exactly this window until the import is released.
+            Self::NoCopy { window, .. } => unsafe {
+                std::slice::from_raw_parts(window.pointer as *const u8, window.len)
+            },
+        }
+    }
+
+    /// The length of the window this input binds.
+    fn len(&self) -> usize {
+        match self {
+            Self::Declared(bytes) => bytes.len(),
+            Self::Staged(bytes) => bytes.len(),
+            Self::NoCopy { window, .. } => window.len,
+        }
+    }
+
+    /// The no-copy lease this input reads, when it is one. Every other arm has
+    /// no owner mapping to retain.
+    const fn borrowed_lease(&self) -> Option<LeaseId> {
+        match self {
+            Self::Declared(_) | Self::Staged(_) => None,
+            Self::NoCopy { lease, .. } => Some(*lease),
+        }
+    }
+}
+
+/// The offset the encoder binds one input at.
+///
+/// An uploaded input carries the view's bytes placed at the view's own offset
+/// inside its allocation, and the binding uses that same offset — the
+/// convention the compute pool's merged images follow (`native.rs`: an
+/// allocation image is bound at `view.offset`). A no-copy input is bound at its
+/// offset inside the owner reservation the encoder maps, because that mapping
+/// (not the view) is what starts at address zero. Both arms therefore start the
+/// binding on the first byte the trace named instead of re-basing it at zero.
+fn source_binding_offset(source: &PlannedInputSource<'_>, view_offset: u64) -> u64 {
+    match source {
+        PlannedInputSource::Declared(_) | PlannedInputSource::Staged(_) => view_offset,
+        PlannedInputSource::NoCopy { window, .. } => {
+            u64::try_from(window.offset).unwrap_or(u64::MAX)
+        }
+    }
+}
+
+/// Resolve one render input's source into the bytes the rail will bind
+/// (`research/docs/23` §72, R3d).
+///
+/// `OwnedBytes` resolves to the view's own bytes exactly as before. A
+/// `StagedLease` resolves through the provider's [`LeaseRegistry`], which holds
+/// the owner's staged copy; the rail uploads those bytes into a buffer of its
+/// own. A `BorrowedNoCopy` resolves through the shared
+/// [`BorrowedLeaseRegistry`], which hands back the owner's address and never
+/// copies. Every unresolvable arm is refused by name before any Metal object
+/// exists: a submission with no lease channel, a device that cannot map owner
+/// memory, a reservation or mapping that misses the import's alignment rules,
+/// and the registry's own `lease_not_imported` / `lease_not_admitted` /
+/// `lease_snapshot_mismatch` / `lease_epoch_mismatch` /
+/// `lease_range_out_of_bounds`.
+fn resolve_render_input<'a>(
+    view: &'a BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    role: RenderInputRole,
+) -> Result<PlannedInputSource<'a>, ProviderError> {
     match &view.source {
-        BufferSource::OwnedBytes(bytes) => Ok(bytes),
-        other => Err(capability_refusal(slug)
-            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
-            .with_field(
-                "storage_mode",
-                FieldValue::Text(storage_mode_name(other).to_owned()),
-            )
-            .with_detail(
-                "the render rail binds the bytes a view declares as `OwnedBytes`; a leased \
-                 stream has no path through this rail",
-            )),
+        BufferSource::OwnedBytes(bytes) => Ok(PlannedInputSource::Declared(bytes)),
+        BufferSource::StagedLease(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                render_input_refusal(
+                    role,
+                    view,
+                    "staged_lease",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     input cannot be read",
+                )
+            })?;
+            let bytes = leases.staging.view_bytes(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            Ok(PlannedInputSource::Staged(bytes))
+        }
+        BufferSource::BorrowedNoCopy(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                render_input_refusal(
+                    role,
+                    view,
+                    "borrowed_no_copy",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     input cannot be read",
+                )
+            })?;
+            if leases.host_import_alignment == 0 {
+                return Err(capability_refusal("storage_mode_unsupported")
+                    .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+                    .with_field(
+                        "storage_mode",
+                        FieldValue::Text("borrowed_no_copy".to_owned()),
+                    )
+                    .with_detail(
+                        "this device cannot map an owner window, so a no-copy render input has \
+                         no path through this rail",
+                    ));
+            }
+            let window = leases.borrowed.view_pointer(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            // `newBufferWithBytesNoCopy:` maps whole pages: the reservation's
+            // base address and length have to sit on the device's import
+            // alignment, and the view inside it on the 4-byte rule the compute
+            // rail states for the same mapping. The first two are also what
+            // `import_borrowed_lease` checked for this provider; re-asking them
+            // here keeps the refusal beside the window that would be mapped, and
+            // the checks are the ones the encoder body depends on.
+            if !u64::try_from(window.base_len)
+                .unwrap_or(u64::MAX)
+                .is_multiple_of(leases.host_import_alignment)
+            {
+                return Err(crate::lease_length_refusal(
+                    *lease_id,
+                    u64::try_from(window.base_len).unwrap_or(u64::MAX),
+                    leases.host_import_alignment,
+                ));
+            }
+            let alignment = usize::try_from(leases.host_import_alignment).unwrap_or(usize::MAX);
+            if !window.base_pointer.is_multiple_of(alignment) {
+                return Err(crate::lease_alignment_refusal(
+                    *lease_id,
+                    window.base_pointer,
+                    leases.host_import_alignment,
+                ));
+            }
+            if !window.offset.is_multiple_of(4) {
+                return Err(crate::lease_offset_refusal(
+                    *lease_id,
+                    u64::try_from(window.offset).unwrap_or(u64::MAX),
+                ));
+            }
+            Ok(PlannedInputSource::NoCopy {
+                lease: *lease_id,
+                window,
+            })
+        }
     }
 }
 
@@ -1682,8 +1950,8 @@ pub(crate) struct RenderPlan<'a> {
     /// `drawPrimitives(vertexCount:instanceCount:)` second count. `1` for every
     /// pre-v31 pass.
     pub(crate) instance_count: u32,
-    /// One entry per bound vertex stream, in binding order, with the bytes and
-    /// footprints [`plan_vertex_input`] proved.
+    /// One entry per bound vertex stream, in binding order, with the sources and
+    /// footprints [`plan_vertex_input`] resolved and proved.
     pub(crate) vertex_streams: Vec<PlannedVertexStream<'a>>,
     /// The index buffer of an indexed draw, resolved from the pass's own view.
     pub(crate) indices: Option<PlannedIndexStream<'a>>,
@@ -1695,6 +1963,30 @@ pub(crate) struct RenderPlan<'a> {
     /// Bytes per attachment row of the same shared shape (`research/docs/23`
     /// §3.5).
     pub(crate) row_pitch: usize,
+}
+
+impl RenderPlan<'_> {
+    /// The no-copy leases this pass's inputs read, in binding order
+    /// (`research/docs/23` §72, R3d).
+    ///
+    /// The list a submission retains before it maps a single owner window and
+    /// retires once the pass's command buffer is terminal. One lease named by
+    /// two streams appears twice, which is the retain count the registry needs:
+    /// both bindings read the same mapping.
+    pub(crate) fn borrowed_leases(&self) -> Vec<LeaseId> {
+        let mut leases = Vec::new();
+        for stream in &self.vertex_streams {
+            if let Some(lease) = stream.source.borrowed_lease() {
+                leases.push(lease);
+            }
+        }
+        if let Some(index) = &self.indices {
+            if let Some(lease) = index.source.borrowed_lease() {
+                leases.push(lease);
+            }
+        }
+        leases
+    }
 }
 
 /// The depth attachment a plan opens (`research/docs/23` §3.3, v36/v43).
@@ -1791,6 +2083,23 @@ pub(crate) struct PlannedAttachment<'a> {
 /// request.
 pub(crate) fn plan<'a>(
     request: &OffscreenRenderRequest<'a>,
+    depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
+) -> Result<RenderPlan<'a>, ProviderError> {
+    plan_with_leases(request, None, depth_resolve_modes, stencil_resolve_modes)
+}
+
+/// Validate a render request against the contract and the rail's own allowlist,
+/// resolving the pass's vertex and index inputs through `leases`.
+///
+/// The trace path's entry point: a render input may declare its bytes, name a
+/// staged lease or name an owner window to map, and only this call has the
+/// registries that can resolve the last two (`research/docs/23` §72, R3d).
+/// [`plan`] is the same decision with no lease channel, which is the
+/// device-level helper's shape and every test that plans declared bytes.
+pub(crate) fn plan_with_leases<'a>(
+    request: &OffscreenRenderRequest<'a>,
+    leases: Option<&RenderLeaseContext<'_>>,
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
 ) -> Result<RenderPlan<'a>, ProviderError> {
@@ -2025,7 +2334,7 @@ pub(crate) fn plan<'a>(
     // The vertex-input half: the streams with their bytes and their footprints.
     // Planned after the attachment because a stream is the draw's own input,
     // exactly as the attachment is its output.
-    let (vertex_streams, indices) = plan_vertex_input(request.pass, request.pipeline)?;
+    let (vertex_streams, indices) = plan_vertex_input(request.pass, request.pipeline, leases)?;
     if request.initial.len() != attachments.len() {
         return Err(
             args_refusal("render_attachment_initial_mismatch").with_detail(format!(
@@ -2821,6 +3130,32 @@ pub(crate) fn plan_trace<'a>(
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
 ) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
+    plan_trace_with_leases(
+        trace,
+        pool,
+        contracts,
+        None,
+        depth_resolve_modes,
+        stencil_resolve_modes,
+    )
+}
+
+/// Plan every render pass of a trace, resolving lease-backed inputs through
+/// `leases` (`research/docs/23` §72, R3d).
+///
+/// The trace path's entry point: `native.rs` hands the provider's own lease
+/// channel in, so a pass whose vertex or index view names a staged lease or an
+/// owner window is resolved before the first Metal object exists. [`plan_trace`]
+/// is the same plan with no channel, which refuses those two arms by name —
+/// the shape a caller with no registries gets.
+pub(crate) fn plan_trace_with_leases<'a>(
+    trace: &'a ComputeTrace,
+    pool: &'a [BufferView],
+    contracts: &'a BTreeMap<PipelineId, RenderPipelineContract>,
+    leases: Option<&RenderLeaseContext<'_>>,
+    depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
+) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
     if !trace.has_render_passes() {
         return Ok(Vec::new());
     }
@@ -2951,13 +3286,14 @@ pub(crate) fn plan_trace<'a>(
             },
             None => None,
         };
-        let plan_of_pass = plan(
+        let plan_of_pass = plan_with_leases(
             &OffscreenRenderRequest {
                 pass,
                 pipeline: contract,
                 source: reviewed_module_for(contract).map_or("", |module| module.source),
                 initial: previous,
             },
+            leases,
             depth_resolve_modes,
             stencil_resolve_modes,
         )?;
@@ -3007,6 +3343,54 @@ pub(crate) fn merge_writebacks(
         merged.insert((writeback.allocation_id, writeback.view_id), writeback);
     }
     merged.into_values().collect()
+}
+
+/// Keeps every owner mapping one planned pass reads imported until that pass's
+/// command buffer is terminal (`research/docs/23` §72, R3d).
+///
+/// The order is the compute rail's: retain before the first mapping is made,
+/// retire once Metal has retired the work. This rail is synchronous —
+/// `encode_into_and_readback` commits and waits before it returns — so every
+/// exit from the encode call is a retirement point: the caller drops this guard
+/// at the end of the pass it belongs to, after the wait. A failure that never
+/// reached the queue drops it too; nothing was queued to read the mapping, and
+/// the retain is this rail's own, so releasing it blocks nobody.
+pub(crate) struct RenderInputRetains {
+    registry: Arc<BorrowedLeaseRegistry>,
+    lease_ids: Vec<LeaseId>,
+    /// Whether the holds are still outstanding. Cleared by [`Self::retire`].
+    armed: bool,
+}
+
+impl RenderInputRetains {
+    /// Retain every no-copy lease the plan reads, before a single buffer is
+    /// mapped. A plan whose inputs are all uploaded bytes retains nothing.
+    pub(crate) fn retain(
+        registry: &Arc<BorrowedLeaseRegistry>,
+        plan: &RenderPlan<'_>,
+    ) -> Result<Self, ProviderError> {
+        let lease_ids = plan.borrowed_leases();
+        registry.retain_all(&lease_ids)?;
+        Ok(Self {
+            registry: Arc::clone(registry),
+            lease_ids,
+            armed: true,
+        })
+    }
+
+    /// Metal can no longer read the owner's mappings: drop every hold.
+    pub(crate) fn retire(&mut self) {
+        if self.armed {
+            self.registry.retire_all(&self.lease_ids);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for RenderInputRetains {
+    fn drop(&mut self) {
+        self.retire();
+    }
 }
 
 /// The texels one offscreen render pass hands back (`research/docs/23` §3.3,
@@ -3477,8 +3861,8 @@ fn encode_into_and_readback(
     // plan's bytes do not.
     let mut stream_buffers = Vec::with_capacity(planned.vertex_streams.len() + 1);
     for stream in &planned.vertex_streams {
-        let offset = NSUInteger::try_from(stream.offset).unwrap_or(NSUInteger::MAX);
-        let buffer = stream_buffer(device, stream.offset, stream.bytes)?;
+        let offset = NSUInteger::try_from(stream.binding_offset()).unwrap_or(NSUInteger::MAX);
+        let buffer = stream_buffer(device, &stream.source, stream.binding_offset())?;
         encoder.set_vertex_buffer(
             NSUInteger::from(stream.buffer_index),
             Some(buffer.as_ref()),
@@ -3525,8 +3909,9 @@ fn encode_into_and_readback(
             // indexBufferOffset:)`, with the count the pass carries in the
             // indexed shape.
             Some(indices) => {
-                let offset = NSUInteger::try_from(indices.offset).unwrap_or(NSUInteger::MAX);
-                let buffer = stream_buffer(device, indices.offset, indices.bytes)?;
+                let offset =
+                    NSUInteger::try_from(indices.binding_offset()).unwrap_or(NSUInteger::MAX);
+                let buffer = stream_buffer(device, &indices.source, indices.binding_offset())?;
                 if indices.base_vertex == 0 {
                     encoder.draw_indexed_primitives_instanced(
                         MTLPrimitiveType::Triangle,
@@ -3968,15 +4353,54 @@ fn combined_depth_stencil_surface(
 
 /// One MTLBuffer holding a stream view's bytes, for a vertex or index binding.
 ///
-/// The image is the view's bytes placed at the view's own offset inside its
-/// allocation, and the binding uses that same offset — the convention the
-/// compute pool's merged images follow (`native.rs`: an allocation image is
-/// bound at `view.offset`). For the reviewed fixture the offset is zero, so the
-/// image is exactly the declared bytes; for a view that starts above the
-/// allocation's first byte the stream still reads the byte range the trace
-/// named instead of being silently re-based at zero.
+/// The two upload arms build the image this rail built before the lease channel
+/// existed: the view's bytes placed at `offset` (the view's own offset inside
+/// its allocation) and bound at that same offset. For the reviewed fixture the
+/// offset is zero, so the image is exactly the declared bytes; for a view that
+/// starts above the allocation's first byte the stream still reads the byte
+/// range the trace named instead of being silently re-based at zero.
+///
+/// The third arm maps the owner's reservation instead of copying anything: the
+/// mapping is what starts at address zero, and the caller binds it at the
+/// view's offset inside it (`PlannedInputSource::NoCopy`, `native.rs`'s
+/// `ResolvedBuffer::Borrowed` bindings).
 #[cfg(target_os = "macos")]
-fn stream_buffer(device: &Device, offset: u64, bytes: &[u8]) -> Result<Buffer, ProviderError> {
+fn stream_buffer(
+    device: &Device,
+    source: &PlannedInputSource<'_>,
+    offset: u64,
+) -> Result<Buffer, ProviderError> {
+    let PlannedInputSource::NoCopy { window, .. } = source else {
+        return upload_stream_buffer(device, offset, source.proof_bytes());
+    };
+    // SAFETY: the window was resolved by the provider's no-copy registry for an
+    // imported lease, whose contract keeps the owner's mapping readable at this
+    // address until the provider releases the import — which this rail does not
+    // do before the pass's command buffer reached a terminal status
+    // (`RenderInputRetains`). A nil deallocator leaves the owner responsible for
+    // its own pages.
+    let pointer: *mut metal::MTLBuffer = unsafe {
+        msg_send![device.as_ref(),
+            newBufferWithBytesNoCopy:window.base_pointer as *mut std::ffi::c_void
+            length:window.base_len
+            options:MTLResourceOptions::StorageModeShared
+            deallocator:std::ptr::null::<std::ffi::c_void>()]
+    };
+    if pointer.is_null() {
+        return Err(resource_refusal(
+            "metal_render_no_copy_stream_buffer_failed",
+        ));
+    }
+    Ok(unsafe { Buffer::from_ptr(pointer) })
+}
+
+/// One MTLBuffer holding uploaded bytes at the offset the binding uses.
+#[cfg(target_os = "macos")]
+fn upload_stream_buffer(
+    device: &Device,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<Buffer, ProviderError> {
     let start = usize::try_from(offset)
         .map_err(|_| resource_refusal("metal_render_stream_offset_overflow"))?;
     let end = start
@@ -4299,18 +4723,18 @@ fn resource_refusal(slug: &'static str) -> ProviderError {
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BufferAccess,
-        BufferBindingContract, BufferSource, CompareFunction, CompiledComputePipeline,
+        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BorrowedLease, BufferAccess,
+        BufferBindingContract, BufferLease, BufferSource, CompareFunction, CompiledComputePipeline,
         CompletionPolicy, ComputePass, DepthFormat, DepthLoadOp, DepthStoreOp, DeviceEpoch,
         Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
         IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
-        IndirectCommandRange, InitialState, LeaseId, MultisampleDepthResolve, MultisampleState,
-        MultisampleStencilResolve, OperationId, PipelineContract, PresentTarget,
-        ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest,
-        StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
-        StorageMode, TextureAccess, VertexAttribute, VertexBufferLayout, VertexLayout, ViewId,
-        PROVIDER_SCHEMA_VERSION,
+        IndirectCommandRange, InitialState, LeaseId, LeaseRegistry, LeaseReservation,
+        MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
+        PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
+        RenderDepthAttachment, RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity,
+        ResourceTableSnapshot, SemanticDigest, StagedLease, StencilCompare, StencilFormat,
+        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, TextureAccess,
+        VertexAttribute, VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -6222,6 +6646,168 @@ mod tests {
         }
     }
 
+    /// The alignment the native rail's no-copy mapping needs from an owner
+    /// window: `newBufferWithBytesNoCopy:` maps whole pages, so the reservation
+    /// and its base address are held to this value. The tests spell it once
+    /// instead of reading the platform's page size, so every host says the same
+    /// thing.
+    const OWNER_ALIGNMENT: u64 = 4096;
+
+    /// A page-aligned owner mapping for the no-copy arm, freed when it drops.
+    ///
+    /// The owner of a window is outside the provider: this stands in for the
+    /// owner's own pages, which the rail must read rather than copy.
+    struct OwnerPages {
+        pointer: *mut u8,
+        length: usize,
+        layout: std::alloc::Layout,
+    }
+
+    impl OwnerPages {
+        /// One zeroed `length`-byte mapping at `alignment`.
+        fn new(length: usize, alignment: usize) -> Self {
+            let layout = std::alloc::Layout::from_size_align(length, alignment)
+                .expect("the owner layout is well formed");
+            // SAFETY: the layout is non-zero, and `Drop` frees the same layout.
+            let pointer = unsafe { std::alloc::alloc(layout) };
+            assert!(!pointer.is_null(), "page-aligned owner allocation failed");
+            // SAFETY: the mapping covers `length` writable bytes.
+            unsafe { std::ptr::write_bytes(pointer, 0, length) };
+            Self {
+                pointer,
+                length,
+                layout,
+            }
+        }
+
+        /// The owner's address, as the no-copy registry is handed it.
+        fn as_ptr(&self) -> usize {
+            self.pointer as usize
+        }
+
+        /// Write the mapping's leading bytes, as an owner that writes its pages
+        /// before or after the import does.
+        fn write(&mut self, bytes: &[u8]) {
+            assert!(
+                bytes.len() <= self.length,
+                "an owner write fits its own mapping"
+            );
+            // SAFETY: the mapping covers `bytes.len()` writable bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, bytes.len());
+            }
+        }
+
+        /// The leading bytes of the mapping, as the rail's proofs read them.
+        fn leading(&self, length: usize) -> &[u8] {
+            // SAFETY: the mapping covers `length` readable bytes.
+            unsafe { std::slice::from_raw_parts(self.pointer, length) }
+        }
+    }
+
+    impl Drop for OwnerPages {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from `alloc` with this exact layout, and
+            // the owner frees its pages only after the import is released.
+            unsafe { std::alloc::dealloc(self.pointer, self.layout) };
+        }
+    }
+
+    /// One lease over `allocation`'s first `length` bytes.
+    fn lease_registration(
+        lease_id: LeaseId,
+        allocation: AllocationId,
+        length: u64,
+        epoch: DeviceEpoch,
+    ) -> LeaseReservation {
+        LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: allocation,
+                owner_epoch: epoch,
+            },
+            offset: 0,
+            length,
+        }
+    }
+
+    /// The reviewed indexed pass with both of its inputs naming leases.
+    fn leased_quad_pass(vertex: BufferSource, index: BufferSource) -> RenderPassDescriptor {
+        let mut pass = quad_pass();
+        pass.vertex_buffers[0].source = vertex;
+        pass.indices
+            .as_mut()
+            .expect("the fixture is indexed")
+            .view
+            .source = index;
+        pass
+    }
+
+    /// The vertex-input fixture's stream views, with the sources a lease test
+    /// hands them.
+    ///
+    /// The declaration pass and the render pass name the same two view ids, and
+    /// a serial trace refuses two declarations of one view that disagree about
+    /// its bytes (`SerialBufferRebinding`), so both passes spell the same
+    /// source — which is exactly the invariant the trace contract states.
+    fn lease_the_quad_trace(trace: &mut ComputeTrace, vertex: BufferSource, index: BufferSource) {
+        for pass in &mut trace.passes {
+            match pass {
+                TracePass::Compute(pass) => {
+                    for view in &mut pass.buffers {
+                        if view.view_id == QUAD_VERTEX_VIEW {
+                            view.source = vertex.clone();
+                        } else if view.view_id == QUAD_INDEX_VIEW {
+                            view.source = index.clone();
+                        }
+                    }
+                }
+                TracePass::Render(pass) => {
+                    for view in &mut pass.vertex_buffers {
+                        if view.view_id == QUAD_VERTEX_VIEW {
+                            view.source = vertex.clone();
+                        }
+                    }
+                    if let Some(indices) = &mut pass.indices {
+                        indices.view.source = index.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A snapshot carrying the quad's two allocations at whole-page size, plus
+    /// the two reservations drawn from their first bytes.
+    ///
+    /// The no-copy arm maps the reservation, not the view, so the fixture's
+    /// reservations are page-sized exactly as the production rail's are — at
+    /// the alignment the mapping itself needs, which a device test reads from
+    /// the device.
+    fn owner_resources(
+        epoch: DeviceEpoch,
+        vertex: LeaseReservation,
+        index: LeaseReservation,
+        alignment: u64,
+    ) -> ResourceTableSnapshot {
+        let mut resources = ResourceTableSnapshot::new();
+        for allocation in [QUAD_VERTEX_ALLOCATION, QUAD_INDEX_ALLOCATION] {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: allocation,
+                    owner_epoch: epoch,
+                    size: alignment,
+                })
+                .expect("the fixture allocation is well formed");
+        }
+        resources
+            .insert_lease(vertex)
+            .expect("the vertex reservation covers its view");
+        resources
+            .insert_lease(index)
+            .expect("the index reservation covers its view");
+        resources
+    }
+
     /// The stencil fixture's reviewed state: the v47 fixture's own values —
     /// `equal 0` with reference 0, both failure operations `keep`, and
     /// `increment_wrap` on success, over the full read and write masks
@@ -7541,14 +8127,14 @@ mod tests {
             }]
         );
         assert_eq!(stream.offset, 0);
-        assert_eq!(stream.bytes, quad_vertex_bytes());
+        assert_eq!(stream.source.proof_bytes(), quad_vertex_bytes());
 
         let indices = planned.indices.as_ref().expect("the pass is indexed");
         assert_eq!(indices.format, RenderIndexType::Uint16);
         assert_eq!(indices.index_count, 6);
         assert_eq!(indices.vertex_span, 4);
         assert_eq!(indices.offset, 0);
-        assert_eq!(indices.bytes, quad_index_bytes());
+        assert_eq!(indices.source.proof_bytes(), quad_index_bytes());
 
         // The format mappings the encoder reads these values through.
         for (format, expected) in [
@@ -7577,7 +8163,10 @@ mod tests {
 
     /// A stream's bytes travel with the pass, so the rail needs no compute
     /// declaration to read them (`research/docs/23` §3.6) — what it does need is
-    /// bytes it holds, which a lease-backed view does not carry here.
+    /// a source it can resolve, which a lease-backed view only is when the
+    /// submission carries a lease channel (`research/docs/23` §72, R3d). A pass
+    /// planned through [`plan`] has none, so both lease arms keep the slugs this
+    /// rail published before the channel existed.
     #[test]
     fn plan_refuses_a_stream_whose_bytes_this_rail_does_not_hold() {
         // The reviewed pass with its stream bytes declared by no pass at all: the
@@ -7586,18 +8175,25 @@ mod tests {
         let pipeline = quad_pipeline();
         let planned = plan_pass(&quad_request(&pass, &pipeline))
             .expect("a render input carries its own bytes");
-        assert_eq!(planned.vertex_streams[0].bytes, quad_vertex_bytes());
         assert_eq!(
-            planned.indices.as_ref().map(|indices| indices.bytes),
+            planned.vertex_streams[0].source.proof_bytes(),
+            quad_vertex_bytes()
+        );
+        assert_eq!(
+            planned
+                .indices
+                .as_ref()
+                .map(|indices| indices.source.proof_bytes()),
             Some(quad_index_bytes().as_slice())
         );
 
-        // A lease-backed view carries bytes this rail does not hold: the render
-        // path has no lease resolver, so the stream is refused by name and the
+        // A lease-backed view has no bytes of its own, and this plan carries no
+        // registries to resolve them from: the stream is refused by name and the
         // storage mode it arrived with is part of the refusal.
         let mut leased_pass = quad_pass();
         leased_pass.vertex_buffers[0].source = BufferSource::StagedLease(LeaseId::new(5));
         let error = plan(&quad_request(&leased_pass, &quad_pipeline()), 0, 0).unwrap_err();
+        eprintln!("no channel: {error:?}");
         assert_eq!(error.slug, "render_vertex_buffer_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -7616,11 +8212,613 @@ mod tests {
         borrowed_pass.indices.as_mut().unwrap().view.source =
             BufferSource::BorrowedNoCopy(LeaseId::new(6));
         let error = plan(&quad_request(&borrowed_pass, &quad_pipeline()), 0, 0).unwrap_err();
+        eprintln!("no channel: {error:?}");
         assert_eq!(error.slug, "render_index_buffer_unsupported");
         assert_eq!(
             error.fields.get("storage_mode"),
             Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
         );
+    }
+
+    /// A staged lease resolves into the provider's own copy of the owner's
+    /// window (`research/docs/23` §72, R3d).
+    ///
+    /// The trace path's plan is handed the same pair of registries the compute
+    /// rail resolves through, so a pass whose streams name staged leases plans
+    /// exactly as one that declares its own bytes — and, with no no-copy stream
+    /// among them, names no lease to retain. Releasing the staged copy is what
+    /// makes the same declaration unreadable, under the registry's own name.
+    #[test]
+    fn plan_trace_resolves_a_staged_lease_stream_into_the_providers_copy() {
+        let epoch = DeviceEpoch::new(3);
+        let vertex_lease = LeaseId::new(31);
+        let index_lease = LeaseId::new(32);
+        let vertex_reservation =
+            lease_registration(vertex_lease, QUAD_VERTEX_ALLOCATION, 32, epoch);
+        let index_reservation = lease_registration(index_lease, QUAD_INDEX_ALLOCATION, 12, epoch);
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(vertex_reservation, quad_vertex_bytes())
+                    .expect("the staged vertex window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        staging
+            .import(
+                StagedLease::new(index_reservation, quad_index_bytes())
+                    .expect("the staged index window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+
+        let (mut trace, mut resources) = quad_trace();
+        lease_the_quad_trace(
+            &mut trace,
+            BufferSource::StagedLease(vertex_lease),
+            BufferSource::StagedLease(index_lease),
+        );
+        resources
+            .insert_lease(vertex_reservation)
+            .expect("the vertex reservation covers its view");
+        resources
+            .insert_lease(index_reservation)
+            .expect("the index reservation covers its view");
+
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = quad_contracts();
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect("the staged windows hold the reviewed quad");
+        let [planned] = planned.as_slice() else {
+            panic!("the vertex-input trace carries one render pass");
+        };
+        let [stream] = planned.plan.vertex_streams.as_slice() else {
+            panic!("the reviewed layout binds one stream");
+        };
+        assert!(
+            matches!(stream.source, PlannedInputSource::Staged(_)),
+            "a staged lease resolves into the provider's own copy: {:?}",
+            stream.source
+        );
+        assert_eq!(stream.source.proof_bytes(), quad_vertex_bytes());
+        let indices = planned.plan.indices.as_ref().expect("the pass is indexed");
+        assert!(matches!(indices.source, PlannedInputSource::Staged(_)));
+        assert_eq!(indices.source.proof_bytes(), quad_index_bytes());
+        assert!(
+            planned.plan.borrowed_leases().is_empty(),
+            "a staged arm has no owner mapping to retain"
+        );
+
+        // The staged copy is the provider's; releasing it is the owner's
+        // `LeaseLedger` decision, and the same declaration is refused by name
+        // until it is imported again.
+        staging
+            .release(vertex_lease)
+            .expect("the fixture import is released");
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect_err("a released staged lease cannot be read");
+        eprintln!("released staged lease refused: {error:?}");
+        assert_eq!(error.slug, "lease_not_imported");
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("lease"),
+            Some(&FieldValue::Unsigned(vertex_lease.get()))
+        );
+    }
+
+    /// A no-copy lease resolves into the owner's own pages (`research/docs/23`
+    /// §72, R3d).
+    ///
+    /// The plan maps the owner's reservation instead of copying it, the
+    /// footprint proof reads the owner's bytes — an owner that rewrites its own
+    /// index page changes what the proof sees, which a snapshot-style import
+    /// could not — and the plan names the leases a submission has to retain. The
+    /// guard takes one hold per lease and retires them when it drops, which is
+    /// the retirement point this synchronous rail has.
+    #[test]
+    fn plan_resolves_a_borrowed_lease_stream_into_the_owners_pages() {
+        let epoch = DeviceEpoch::new(3);
+        let vertex_lease = LeaseId::new(41);
+        let index_lease = LeaseId::new(42);
+        let vertex_reservation =
+            lease_registration(vertex_lease, QUAD_VERTEX_ALLOCATION, OWNER_ALIGNMENT, epoch);
+        let index_reservation =
+            lease_registration(index_lease, QUAD_INDEX_ALLOCATION, OWNER_ALIGNMENT, epoch);
+        let mut owner_vertices =
+            OwnerPages::new(OWNER_ALIGNMENT as usize, OWNER_ALIGNMENT as usize);
+        owner_vertices.write(&quad_vertex_bytes());
+        let mut owner_indices = OwnerPages::new(OWNER_ALIGNMENT as usize, OWNER_ALIGNMENT as usize);
+        owner_indices.write(&quad_index_bytes());
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        // Both owner mappings outlive the two imports below and are released
+        // after every retain is back to zero, which is what the no-copy
+        // registry's contract asks of its caller.
+        borrowed
+            .import(
+                BorrowedLease::new(vertex_reservation, owner_vertices.as_ptr())
+                    .expect("the owner's vertex window is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        borrowed
+            .import(
+                BorrowedLease::new(index_reservation, owner_indices.as_ptr())
+                    .expect("the owner's index window is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let resources = owner_resources(
+            epoch,
+            vertex_reservation,
+            index_reservation,
+            OWNER_ALIGNMENT,
+        );
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let pass = leased_quad_pass(
+            BufferSource::BorrowedNoCopy(vertex_lease),
+            BufferSource::BorrowedNoCopy(index_lease),
+        );
+        let pipeline = quad_pipeline();
+        let request = quad_request(&pass, &pipeline);
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the owner's pages hold the reviewed quad");
+        let [stream] = plan.vertex_streams.as_slice() else {
+            panic!("the reviewed layout binds one stream");
+        };
+        let PlannedInputSource::NoCopy { lease, window } = &stream.source else {
+            panic!(
+                "a no-copy lease resolves into the owner's mapping: {:?}",
+                stream.source
+            );
+        };
+        assert_eq!(*lease, vertex_lease);
+        assert_eq!(
+            window.offset, 0,
+            "the view starts at the reservation's base"
+        );
+        assert_eq!(window.len, quad_vertex_bytes().len());
+        assert_eq!(window.base_len, OWNER_ALIGNMENT as usize);
+        assert_eq!(stream.binding_offset(), 0);
+        assert_eq!(stream.source.proof_bytes(), quad_vertex_bytes());
+        let indices = plan.indices.as_ref().expect("the pass is indexed");
+        assert!(matches!(
+            indices.source,
+            PlannedInputSource::NoCopy { lease, .. } if lease == index_lease
+        ));
+        assert_eq!(indices.source.proof_bytes(), quad_index_bytes());
+        assert_eq!(
+            plan.borrowed_leases(),
+            vec![vertex_lease, index_lease],
+            "the plan names one hold per no-copy stream, in binding order"
+        );
+
+        // The probe: the owner rewrites its own index page after the import, and
+        // the proof reads those bytes instead of a copy taken at import time —
+        // the same falsification the Vulkan rail's e2e states with a device.
+        owner_indices.write(
+            &[0_u16, 1, 2, 2, 1, 37]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        );
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("an index the streams do not cover is refused");
+        eprintln!("owner-rewritten index window refused: {error:?}");
+        assert_eq!(error.slug, "render_index_value_out_of_range");
+        assert_eq!(
+            error.fields.get("highest_index"),
+            Some(&FieldValue::Unsigned(37))
+        );
+        owner_indices.write(&quad_index_bytes());
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the restored owner window holds the reviewed quad again");
+
+        // One hold per lease while the pass is in flight, and none once Metal
+        // has retired it. Both spellings count: an explicit retire and the
+        // guard's own drop, which is what an early return after the queue would
+        // take.
+        let mut retains =
+            RenderInputRetains::retain(&borrowed, &plan).expect("both holds are taken");
+        assert_eq!(borrowed.outstanding(vertex_lease), Some(1));
+        assert_eq!(borrowed.outstanding(index_lease), Some(1));
+        retains.retire();
+        assert_eq!(borrowed.outstanding(vertex_lease), Some(0));
+        assert_eq!(borrowed.outstanding(index_lease), Some(0));
+        let retains = RenderInputRetains::retain(&borrowed, &plan).expect("both holds are taken");
+        drop(retains);
+        assert_eq!(borrowed.outstanding(vertex_lease), Some(0));
+        assert_eq!(borrowed.outstanding(index_lease), Some(0));
+
+        // A released import is refused by the registry's own name, exactly as a
+        // released staged lease is.
+        borrowed
+            .release(vertex_lease)
+            .expect("the fixture import is released");
+        borrowed
+            .release(index_lease)
+            .expect("the fixture import is released");
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a released no-copy import cannot be resolved");
+        eprintln!("released borrowed lease refused: {error:?}");
+        assert_eq!(error.slug, "lease_not_imported");
+    }
+
+    /// The reviewed stream collapsed onto one corner.
+    ///
+    /// Every fragment is degenerate, so the draw covers no texel and the
+    /// attachment keeps the clear sentinel. That is the observation an owner
+    /// rewrite gives a device: a rail that had snapshotted the owner's pages at
+    /// import time would still draw the original quad.
+    fn collapsed_quad_vertex_bytes() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        for _ in 0..4 {
+            bytes.extend_from_slice(&(-1.0_f32).to_le_bytes());
+            bytes.extend_from_slice(&(-1.0_f32).to_le_bytes());
+        }
+        bytes
+    }
+
+    /// A byte string as the evidence logs spell it.
+    #[cfg(target_os = "macos")]
+    fn hex(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The default Metal device a device-only test may run on, or `None` on a
+    /// host whose device is not the unified-memory Apple GPU the provider
+    /// requires (`native.rs::new`). The macOS CI job is where this returns
+    /// `Some`; every other host prints the skip and returns.
+    #[cfg(target_os = "macos")]
+    fn eligible_apple_device() -> Option<Device> {
+        let device = Device::system_default()?;
+        if device.name().trim().is_empty()
+            || !device.has_unified_memory()
+            || !device.supports_family(metal::MTLGPUFamily::Apple4)
+        {
+            return None;
+        }
+        Some(device)
+    }
+
+    /// The no-copy render input on a real Metal device (`research/docs/23` §72,
+    /// R3d).
+    ///
+    /// Device-only, so the macOS CI job's `cargo test -p metal-api-native` is the
+    /// observation: the check is the attachment's own texels, which no host
+    /// without Metal can produce. Three facts are measured here that the
+    /// host-side tests cannot reach — `newBufferWithBytesNoCopy:` maps the
+    /// owner's reservation, the draw reads those pages (`0x40 0x80 0xc0 0xff`
+    /// over the 2x2 attachment, byte for byte the value the declared-bytes
+    /// fixture lands), and an owner rewrite afterwards changes the draw's output
+    /// instead of leaving the import's bytes behind. The retain guard is
+    /// measured with the registry: both holds are back to zero once the pass's
+    /// command buffer is terminal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_borrowed_lease_stream_draws_the_owners_pages_on_a_device() {
+        let Some(device) = eligible_apple_device() else {
+            eprintln!("skipping native render-lease test: no eligible Metal device");
+            return;
+        };
+        let queue = device.new_command_queue();
+        // The mapping's own alignment is the device's page size, which is what
+        // `no_copy_alignment` publishes and `import_borrowed_lease` checks; the
+        // host-side tests use 4 KiB because they never map anything.
+        let alignment = crate::native::page_size();
+        if alignment == 0 {
+            eprintln!("skipping native render-lease test: the device reports no page size");
+            return;
+        }
+        let epoch = DeviceEpoch::new(3);
+        let vertex_lease = LeaseId::new(71);
+        let index_lease = LeaseId::new(72);
+        let vertex_reservation =
+            lease_registration(vertex_lease, QUAD_VERTEX_ALLOCATION, alignment, epoch);
+        let index_reservation =
+            lease_registration(index_lease, QUAD_INDEX_ALLOCATION, alignment, epoch);
+        let mut owner_vertices = OwnerPages::new(alignment as usize, alignment as usize);
+        owner_vertices.write(&quad_vertex_bytes());
+        let mut owner_indices = OwnerPages::new(alignment as usize, alignment as usize);
+        owner_indices.write(&quad_index_bytes());
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(vertex_reservation, owner_vertices.as_ptr())
+                    .expect("the owner's vertex window is a valid reservation"),
+            )
+            .expect("the owner's vertex window is imported");
+        borrowed
+            .import(
+                BorrowedLease::new(index_reservation, owner_indices.as_ptr())
+                    .expect("the owner's index window is a valid reservation"),
+            )
+            .expect("the owner's index window is imported");
+        let resources = owner_resources(epoch, vertex_reservation, index_reservation, alignment);
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: alignment,
+        };
+        let pass = leased_quad_pass(
+            BufferSource::BorrowedNoCopy(vertex_lease),
+            BufferSource::BorrowedNoCopy(index_lease),
+        );
+        let pipeline = quad_pipeline();
+        let request = quad_request(&pass, &pipeline);
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the owner's pages hold the reviewed quad");
+        assert_eq!(plan.borrowed_leases(), vec![vertex_lease, index_lease]);
+
+        // The pass is synchronous, so dropping the guard after the encoder
+        // returns is the retirement point the provider's own `execute_render_passes`
+        // takes: nothing else holds the owner's mapping when the texels arrive.
+        let retains = RenderInputRetains::retain(&borrowed, &plan).expect("both holds are taken");
+        assert_eq!(borrowed.outstanding(vertex_lease), Some(1));
+        let readback = encode_offscreen_render(&device, &queue, &plan)
+            .expect("the no-copy mapping draws the reviewed quad");
+        drop(retains);
+        let attachment = readback
+            .attachments
+            .into_iter()
+            .next()
+            .expect("the pass stores its one attachment");
+        eprintln!("borrowed lease attachment: {}", hex(&attachment));
+        assert_eq!(
+            attachment,
+            EXPECTED_TEXEL_BYTES.repeat(4),
+            "the device draws the owner's pages through the mapping"
+        );
+        assert_eq!(
+            borrowed.outstanding(vertex_lease),
+            Some(0),
+            "the vertex hold is retired once the pass is terminal"
+        );
+        assert_eq!(borrowed.outstanding(index_lease), Some(0));
+
+        // The owner rewrites its own vertex page: a rail that had snapshotted
+        // the window at import time would still draw the original quad, while
+        // the mapping reads the pages the device reads.
+        owner_vertices.write(&collapsed_quad_vertex_bytes());
+        let retains = RenderInputRetains::retain(&borrowed, &plan).expect("both holds are taken");
+        let readback = encode_offscreen_render(&device, &queue, &plan)
+            .expect("the rewritten window still maps");
+        drop(retains);
+        let collapsed = readback
+            .attachments
+            .into_iter()
+            .next()
+            .expect("the pass stores its one attachment");
+        eprintln!(
+            "owner-rewritten vertex window readback: {}",
+            hex(&collapsed)
+        );
+        assert_eq!(
+            collapsed,
+            [0xfe_u8; 4].repeat(4),
+            "the draw follows the owner's rewritten pages down to the clear sentinel"
+        );
+
+        // A released import is the registry's own refusal, the same name the
+        // host-side tests assert without a device.
+        borrowed
+            .release(vertex_lease)
+            .expect("the owner's vertex window is released");
+        borrowed
+            .release(index_lease)
+            .expect("the owner's index window is released");
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a released no-copy import cannot be resolved");
+        assert_eq!(error.slug, "lease_not_imported");
+    }
+
+    /// A device that cannot map an owner window refuses a no-copy render input
+    /// under the name core admission and the compute rail publish for the same
+    /// fact (`research/docs/23` §72, R3d): `storage_mode_unsupported`, with the
+    /// storage mode the view arrived under.
+    #[test]
+    fn a_borrowed_render_input_is_refused_without_host_mapping() {
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = ResourceTableSnapshot::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: DeviceEpoch::new(3),
+            host_import_alignment: 0,
+        };
+        let pass = leased_quad_pass(
+            BufferSource::BorrowedNoCopy(LeaseId::new(51)),
+            quad_index_view().source,
+        );
+        let pipeline = quad_pipeline();
+        let error = plan_with_leases(&quad_request(&pass, &pipeline), Some(&leases), 0, 0)
+            .expect_err("a device without a no-copy path cannot bind the owner's window");
+        eprintln!("no host mapping: {error:?}");
+        assert_eq!(error.slug, "storage_mode_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(QUAD_VERTEX_VIEW.get()))
+        );
+    }
+
+    /// An owner window that misses one of the mapping's own rules is refused by
+    /// name before a single page is mapped (`research/docs/23` §72, R3d).
+    ///
+    /// Metal maps whole pages, so the reservation's base and length are held to
+    /// the import alignment and the view inside it to the 4-byte rule a binding
+    /// uses; all three are the checks the compute rail states for the same
+    /// mapping, spelled once in `lib.rs`.
+    #[test]
+    fn a_borrowed_render_input_is_refused_when_its_window_misses_the_mapping_rules() {
+        let epoch = DeviceEpoch::new(3);
+        let staging = LeaseRegistry::new();
+
+        // A base address one byte past the alignment.
+        let lease_id = LeaseId::new(61);
+        let reservation =
+            lease_registration(lease_id, QUAD_VERTEX_ALLOCATION, OWNER_ALIGNMENT, epoch);
+        let resources = owner_resources(
+            epoch,
+            reservation,
+            lease_registration(
+                LeaseId::new(62),
+                QUAD_INDEX_ALLOCATION,
+                OWNER_ALIGNMENT,
+                epoch,
+            ),
+            OWNER_ALIGNMENT,
+        );
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, 0x2000 + 1)
+                    .expect("a non-null owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let pass = leased_quad_pass(
+            BufferSource::BorrowedNoCopy(lease_id),
+            quad_index_view().source,
+        );
+        let pipeline = quad_pipeline();
+        let error = plan_with_leases(&quad_request(&pass, &pipeline), Some(&leases), 0, 0)
+            .expect_err("a misaligned owner base cannot be mapped");
+        eprintln!("misaligned owner window refused: {error:?}");
+        assert_eq!(error.slug, "lease_alignment_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("pointer"),
+            Some(&FieldValue::Unsigned(0x2000 + 1))
+        );
+        assert_eq!(
+            error.fields.get("alignment"),
+            Some(&FieldValue::Unsigned(OWNER_ALIGNMENT))
+        );
+        assert_eq!(
+            error.fields.get("lease"),
+            Some(&FieldValue::Unsigned(lease_id.get()))
+        );
+
+        // A reservation that is not a whole number of pages.
+        let short = lease_registration(lease_id, QUAD_VERTEX_ALLOCATION, 32, epoch);
+        let mut short_resources = ResourceTableSnapshot::new();
+        short_resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: QUAD_VERTEX_ALLOCATION,
+                owner_epoch: epoch,
+                size: 32,
+            })
+            .expect("the short fixture allocation is well formed");
+        short_resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: QUAD_INDEX_ALLOCATION,
+                owner_epoch: epoch,
+                size: OWNER_ALIGNMENT,
+            })
+            .expect("the index fixture allocation is well formed");
+        short_resources
+            .insert_lease(short)
+            .expect("the short reservation covers its view");
+        short_resources
+            .insert_lease(lease_registration(
+                LeaseId::new(62),
+                QUAD_INDEX_ALLOCATION,
+                OWNER_ALIGNMENT,
+                epoch,
+            ))
+            .expect("the index reservation covers its view");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(short, 0x2000)
+                    .expect("a page-aligned owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &short_resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let error = plan_with_leases(&quad_request(&pass, &pipeline), Some(&leases), 0, 0)
+            .expect_err("a reservation that is not a page multiple cannot be mapped");
+        eprintln!("non-page reservation refused: {error:?}");
+        assert_eq!(error.slug, "lease_length_unsupported");
+        assert_eq!(error.fields.get("length"), Some(&FieldValue::Unsigned(32)));
+        assert_eq!(
+            error.fields.get("alignment"),
+            Some(&FieldValue::Unsigned(OWNER_ALIGNMENT))
+        );
+
+        // A view that starts off the 4-byte grid inside the reservation.
+        let page = lease_registration(lease_id, QUAD_VERTEX_ALLOCATION, OWNER_ALIGNMENT, epoch);
+        let resources = owner_resources(
+            epoch,
+            page,
+            lease_registration(
+                LeaseId::new(62),
+                QUAD_INDEX_ALLOCATION,
+                OWNER_ALIGNMENT,
+                epoch,
+            ),
+            OWNER_ALIGNMENT,
+        );
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(page, 0x2000)
+                    .expect("a page-aligned owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let mut pass = leased_quad_pass(
+            BufferSource::BorrowedNoCopy(lease_id),
+            quad_index_view().source,
+        );
+        pass.vertex_buffers[0].offset = 2;
+        let error = plan_with_leases(&quad_request(&pass, &pipeline), Some(&leases), 0, 0)
+            .expect_err("a view off the 4-byte grid cannot be bound");
+        eprintln!("off-grid window refused: {error:?}");
+        assert_eq!(error.slug, "lease_offset_unsupported");
+        assert_eq!(error.fields.get("offset"), Some(&FieldValue::Unsigned(2)));
     }
 
     /// The footprint proof `research/docs/23` §3.3 asks for: every vertex and
@@ -7759,7 +8957,10 @@ mod tests {
         assert_eq!(planned.contract, &quad_pipeline());
         assert_eq!(planned.plan.vertices, 6);
         assert_eq!(planned.plan.vertex_streams.len(), 1);
-        assert_eq!(planned.plan.vertex_streams[0].bytes, quad_vertex_bytes());
+        assert_eq!(
+            planned.plan.vertex_streams[0].source.proof_bytes(),
+            quad_vertex_bytes()
+        );
         assert_eq!(
             planned
                 .plan
@@ -7943,9 +9144,16 @@ mod tests {
         let [planned] = planned.as_slice() else {
             panic!("the vertex-input trace carries one render pass");
         };
-        assert_eq!(planned.plan.vertex_streams[0].bytes, quad_vertex_bytes());
         assert_eq!(
-            planned.plan.indices.as_ref().map(|indices| indices.bytes),
+            planned.plan.vertex_streams[0].source.proof_bytes(),
+            quad_vertex_bytes()
+        );
+        assert_eq!(
+            planned
+                .plan
+                .indices
+                .as_ref()
+                .map(|indices| indices.source.proof_bytes()),
             Some(quad_index_bytes().as_slice())
         );
     }
