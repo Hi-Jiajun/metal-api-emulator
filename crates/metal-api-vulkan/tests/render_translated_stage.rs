@@ -24,15 +24,16 @@
 //!   refused here can be submitted at all — the id sequence is what makes that
 //!   measurable from the outside.
 
+use metal2vulkan::reflect::{DescriptorLayout, ResourceAccess, ResourceKind};
 use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
-    InitialState, LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderError, ProviderErrorClass, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    FootprintProof, InitialState, LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode,
+    PresentTarget, ProviderError, ProviderErrorClass, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SemanticDigest,
+    StageBufferBinding, StoreOp, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout, VertexStep, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -57,6 +58,22 @@ const ASYMMETRIC_VERTEX_ENTRY: &str = "render_ndc_y_asymmetric";
 /// The counterexample's fragment stage: the same render target, plus one Metal
 /// buffer binding the rail's render stages do not bind.
 const BUFFERED_FRAGMENT_AIR: &str = include_str!("fixtures/render_offscreen_2x2_buffered.frag.ll");
+
+/// The *declared-slot* fragment stage of the stage-buffer increment (R9c): the
+/// same render target and the same `[[buffer(0)]]` argument as
+/// [`BUFFERED_FRAGMENT_AIR`], this time as the stage a contract declares the
+/// slot for — one 16-byte `float4` read whose bytes are what the attachment
+/// lands.
+const STAGE_BUFFER_FRAGMENT_AIR: &str = include_str!("fixtures/render_stage_buffer_tint.frag.ll");
+const STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_stage_buffer_rgba8";
+
+/// The same argument declared and never dereferenced: the metadata says
+/// `air.read`, the emitted module never touches the pointer, and the reflection
+/// reports the refined classification `Unused` — the access the render contract
+/// does not admit.
+const UNUSED_STAGE_BUFFER_FRAGMENT_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_unused.frag.ll");
+const UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_stage_buffer_unused_rgba8";
 
 /// The linkage counterexample's fragment stage: it consumes a `stage_in`
 /// varying the fixture's vertex stage never produces.
@@ -212,6 +229,34 @@ fn translated_contract(color_formats: Vec<AttachmentFormat>) -> RenderPipelineCo
     }
 }
 
+/// The contract a translated stage-buffer registration states (R9c): the
+/// fixture's own entries, one `Rgba8Unorm` attachment, no vertex stream, and
+/// the stage-buffer declarations the test names.
+fn stage_buffer_contract(
+    fragment_entry: &str,
+    stage_buffers: Vec<StageBufferBinding>,
+) -> RenderPipelineContract {
+    RenderPipelineContract {
+        stage_buffers,
+        vertex_entry: VERTEX_ENTRY.to_owned(),
+        fragment_entry: fragment_entry.to_owned(),
+        color_formats: vec![AttachmentFormat::Rgba8Unorm],
+        vertex_layout: VertexLayout::None,
+    }
+}
+
+/// The fragment stage's one slot, with the extent the test states: `index 0`
+/// is the fixture's `[[buffer(0)]]` and `max_bytes` is what the contract
+/// declares the stage reaches there.
+fn stage_buffer_tint_declaration(max_bytes: u64) -> StageBufferBinding {
+    StageBufferBinding {
+        stage: RenderPipelineStage::Fragment,
+        index: 0,
+        access: BufferAccess::Read,
+        footprint: FootprintProof::Static { max_bytes },
+    }
+}
+
 /// The contract the reviewed pair registers under: the entries the reviewed
 /// modules declare, same attachment shape.
 fn reviewed_contract() -> RenderPipelineContract {
@@ -287,6 +332,33 @@ fn translate_fragment(
     let function = library.function(entry).expect("the fragment entry exists");
     TranslatedRenderStage::translate(RenderStage::Fragment, &function)
         .expect("the fragment stage translates")
+}
+
+/// Translate the stage-buffer fragment fixture into one descriptor set: the
+/// layout the caller names is the module's own Vulkan ABI, and the rail reads
+/// the slot back out of the reflection the translation returns
+/// (`research/docs/23` §3.3, v84).
+fn translate_stage_buffer_fragment_in_set(
+    executor: &Arc<VulkanExecutor>,
+    set: u32,
+) -> TranslatedRenderStage {
+    let device = Device::new(Arc::clone(executor) as Arc<dyn ComputeExecutor>);
+    let library = device
+        .new_library_with_air(STAGE_BUFFER_FRAGMENT_AIR)
+        .expect("the stage-buffer fragment fixture loads");
+    let function = library
+        .function(STAGE_BUFFER_FRAGMENT_ENTRY)
+        .expect("the stage-buffer fragment entry exists");
+    TranslatedRenderStage::translate_with_policy_and_layout(
+        RenderStage::Fragment,
+        &function,
+        executor.spirv_feature_policy(),
+        DescriptorLayout {
+            set,
+            ..DescriptorLayout::default()
+        },
+    )
+    .expect("the stage-buffer fragment translates under the layout")
 }
 
 /// Compile the declaring compute kernel (`copy_word`) on this provider.
@@ -760,9 +832,10 @@ fn a_translation_with_fewer_render_targets_than_the_contract_is_refused() {
     );
 }
 
-/// The rail's render stages bind no descriptor set, so a translation that names
-/// a Metal buffer is refused by name rather than executed with the binding
-/// silently dropped.
+/// A translation that names a Metal buffer the contract declares no slot for
+/// is refused by name rather than executed with the binding silently dropped
+/// (`research/docs/23` §3.3, v84): the slot's bytes are what the contract's
+/// `stage_buffers` list states, so an undeclared slot has nothing to bind.
 #[test]
 fn a_translation_with_a_buffer_binding_is_refused() {
     let Some((executor, provider)) = provider_with_device() else {
@@ -776,18 +849,12 @@ fn a_translation_with_a_buffer_binding_is_refused() {
             .reflection()
             .bindings
             .iter()
-            .map(|binding| (binding.metal_index, binding.kind))
+            .map(|binding| (binding.metal_index, binding.kind, binding.access))
             .collect::<Vec<_>>()
     );
     let refused = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
-            contract: RenderPipelineContract {
-                stage_buffers: Vec::new(),
-                vertex_entry: VERTEX_ENTRY.to_owned(),
-                fragment_entry: BUFFERED_FRAGMENT_ENTRY.to_owned(),
-                color_formats: vec![AttachmentFormat::Rgba8Unorm],
-                vertex_layout: VertexLayout::None,
-            },
+            contract: stage_buffer_contract(BUFFERED_FRAGMENT_ENTRY, Vec::new()),
             vertex,
             fragment,
             logical_digest: digest(b"translated-buffer-binding"),
@@ -803,6 +870,288 @@ fn a_translation_with_a_buffer_binding_is_refused() {
         refused.fields.get("field"),
         Some(&FieldValue::Text("bindings".to_owned()))
     );
+    assert_eq!(
+        refused.fields.get("index"),
+        Some(&FieldValue::Unsigned(0)),
+        "the refusal names the slot the translation reads: {refused:?}"
+    );
+}
+
+/// The declared-slot twin of the refusal above (`research/docs/23` §3.3,
+/// v84): the same argument registers once the contract declares the slot, and
+/// the reflection's own values are the ones the pairing reads — the
+/// translator's default descriptor layout (`set 0`, `binding 0`), a read-only
+/// access and the 16 bytes one `float4` load reaches.
+#[test]
+fn a_declared_stage_buffer_slot_registers_against_the_translation() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_fragment(
+        &executor,
+        STAGE_BUFFER_FRAGMENT_AIR,
+        STAGE_BUFFER_FRAGMENT_ENTRY,
+    );
+    let binding = fragment
+        .reflection()
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Buffer)
+        .expect("the fixture declares one Metal buffer");
+    let descriptor = binding
+        .descriptor
+        .expect("the declared buffer consumes a descriptor");
+    let footprint = binding
+        .footprint
+        .as_ref()
+        .expect("the declared buffer carries a footprint");
+    let reflected_bytes = footprint
+        .static_ranges
+        .iter()
+        .map(|range| range.offset + range.size)
+        .max();
+    eprintln!(
+        "stage-buffer fragment reflection: index {} descriptor set {} binding {} count {} \
+         access {:?} unbounded {} strided {} static ranges {:?}",
+        binding.metal_index,
+        descriptor.set,
+        descriptor.binding,
+        descriptor.count,
+        binding.access,
+        footprint.has_unbounded_access,
+        footprint.strided_accesses.len(),
+        footprint.static_ranges,
+    );
+    assert_eq!(binding.metal_index, 0);
+    assert_eq!(
+        (descriptor.set, descriptor.binding, descriptor.count),
+        (0, 0, 1)
+    );
+    assert_eq!(binding.access, Some(ResourceAccess::ReadOnly));
+    assert!(!footprint.has_unbounded_access);
+    assert!(footprint.strided_accesses.is_empty());
+    assert_eq!(reflected_bytes, Some(16));
+    let registered = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                STAGE_BUFFER_FRAGMENT_ENTRY,
+                vec![stage_buffer_tint_declaration(16)],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"declared-translated-buffer-binding"),
+        })
+        .expect("the declared slot registers against the translation that reads it");
+    eprintln!(
+        "registered the declared stage buffer as pipeline {:?}",
+        registered.pipeline_id
+    );
+}
+
+/// The slot is the module's own (`research/docs/23` §3.3, v84): the same
+/// fragment fixture translated into set 2 registers, and the reflection the
+/// rail reads reports that set — the arrangement that keeps the two stages'
+/// buffer namespaces apart (the reviewed pair's layout: the vertex stage's
+/// buffers in set 1, the fragment stage's in set 2).
+#[test]
+fn a_translation_in_the_fragment_set_registers_with_that_slot() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_stage_buffer_fragment_in_set(&executor, 2);
+    let descriptor = fragment
+        .reflection()
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Buffer)
+        .and_then(|binding| binding.descriptor)
+        .expect("the fixture's buffer consumes a descriptor");
+    eprintln!("fragment-set descriptor: {descriptor:?}");
+    assert_eq!(
+        (descriptor.set, descriptor.binding, descriptor.count),
+        (2, 0, 1)
+    );
+    let registered = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                STAGE_BUFFER_FRAGMENT_ENTRY,
+                vec![stage_buffer_tint_declaration(16)],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"fragment-set-translated-buffer-binding"),
+        })
+        .expect("the slot in set 2 is the module's own and the contract declares it");
+    eprintln!(
+        "registered the set-2 stage buffer as pipeline {:?}",
+        registered.pipeline_id
+    );
+}
+
+/// The ceiling arm of the layout question (`research/docs/23` §3.3, v84): the
+/// rail's pipeline layout names sets 0 to 2 (the sampled pipeline's own set,
+/// the vertex stage's buffers, the fragment stage's), so a translation whose
+/// buffer lives above them is refused by name at registration instead of
+/// executed through a layout the rail would have to pad with sets no module
+/// asked for.
+#[test]
+fn a_translation_above_the_rails_set_ceiling_is_refused() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_stage_buffer_fragment_in_set(&executor, 3);
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                STAGE_BUFFER_FRAGMENT_ENTRY,
+                vec![stage_buffer_tint_declaration(16)],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"above-ceiling-translated-buffer-binding"),
+        })
+        .expect_err("the rail's layout does not name set 3");
+    eprintln!("refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_unsupported_interface");
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned()))
+    );
+    assert_eq!(refused.fields.get("set"), Some(&FieldValue::Unsigned(3)));
+    assert_eq!(
+        refused.fields.get("set_ceiling"),
+        Some(&FieldValue::Unsigned(2))
+    );
+}
+
+/// The access arm of the pairing (`research/docs/23` §3.3, v84): a stage that
+/// declares the argument and never dereferences it reports `Unused`, and the
+/// contract admits `Read` alone — so the registration is refused by name
+/// instead of binding bytes the module's own interface does not classify as
+/// read.
+#[test]
+fn a_stage_buffer_the_translation_never_reads_is_refused() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_fragment(
+        &executor,
+        UNUSED_STAGE_BUFFER_FRAGMENT_AIR,
+        UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY,
+    );
+    eprintln!(
+        "unused stage-buffer reflection bindings: {:?}",
+        fragment
+            .reflection()
+            .bindings
+            .iter()
+            .map(|binding| (binding.metal_index, binding.kind, binding.access))
+            .collect::<Vec<_>>()
+    );
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY,
+                vec![stage_buffer_tint_declaration(16)],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"unused-translated-buffer-binding"),
+        })
+        .expect_err("the contract declares a read the module does not state");
+    eprintln!("refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned()))
+    );
+    assert_eq!(refused.fields.get("index"), Some(&FieldValue::Unsigned(0)));
+    assert_eq!(
+        refused.fields.get("declared_access"),
+        Some(&FieldValue::Text("read".to_owned()))
+    );
+    assert_eq!(
+        refused.fields.get("reflected_access"),
+        Some(&FieldValue::Text("unused".to_owned()))
+    );
+}
+
+/// The footprint arm of the pairing (`research/docs/23` §3.3, v84): the
+/// declaration's static extent is the ceiling the pass's view is proven
+/// against, so a translation whose load reaches past it is refused rather than
+/// executed under a declaration that does not cover its read.
+#[test]
+fn a_stage_buffer_reaching_past_the_declared_extent_is_refused() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_fragment(
+        &executor,
+        STAGE_BUFFER_FRAGMENT_AIR,
+        STAGE_BUFFER_FRAGMENT_ENTRY,
+    );
+    // The module loads one 16-byte `float4`; the contract declares half of it.
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                STAGE_BUFFER_FRAGMENT_ENTRY,
+                vec![stage_buffer_tint_declaration(8)],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"overreaching-translated-buffer-binding"),
+        })
+        .expect_err("the declared extent does not cover the module's load");
+    eprintln!("refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned()))
+    );
+    assert_eq!(
+        refused.fields.get("declared_bytes"),
+        Some(&FieldValue::Unsigned(8))
+    );
+    assert_eq!(
+        refused.fields.get("reflected_bytes"),
+        Some(&FieldValue::Unsigned(16))
+    );
+}
+
+/// The other direction of the same pairing (`research/docs/23` §3.3, v84): a
+/// contract that declares a slot this stage's translation never reaches
+/// describes a different interface, so it is refused instead of executed with
+/// a binding the module does not read — and, beside it, the pass's own pair
+/// rules would be asked for bytes the module has no slot for.
+#[test]
+fn a_declared_slot_the_translation_never_reaches_is_refused() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let (vertex, fragment) = translated_pair(&executor);
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                FRAGMENT_ENTRY,
+                vec![stage_buffer_tint_declaration(16)],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"unreached-translated-buffer-binding"),
+        })
+        .expect_err("the contract declares a slot the translation never reads");
+    eprintln!("refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned()))
+    );
+    assert_eq!(refused.fields.get("index"), Some(&FieldValue::Unsigned(0)));
 }
 
 /// A module the rail has no account of — the translated vertex module handed to

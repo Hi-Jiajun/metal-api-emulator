@@ -10,8 +10,9 @@ use ash::khr::shader_float_controls2;
 use ash::{vk, Device as AshDevice, Entry, Instance};
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
-    BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, KernelDispatchPlan,
-    ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
+    BufferExtent, BufferFootprint, BufferIndexSource, DescriptorLayout, KernelDispatch,
+    KernelDispatchPlan, ResourceAccess, ResourceKind, ShaderReflection, ShaderStage,
+    KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
 use metal_api_core::completion::AbandonmentOutcome;
 use metal_api_core::provider::{
@@ -745,16 +746,55 @@ impl TranslatedRenderStage {
     /// re-asks it at registration, so a module translated against another
     /// device's policy is refused where the pipeline would be minted rather
     /// than where the module is decoded.
+    ///
+    /// The descriptor layout is the translator's default — every Metal
+    /// resource in set 0. A caller that wants the two stages' buffer
+    /// namespaces to stay apart hands its own layout to
+    /// [`Self::translate_with_policy_and_layout`].
     pub fn translate_with_policy(
         stage: RenderStage,
         function: &Function,
         policy: SpirvFeaturePolicy,
     ) -> Result<Self, ExecutorError> {
+        Self::translate_with_policy_and_layout(stage, function, policy, DescriptorLayout::default())
+    }
+
+    /// Translate one render stage under one device's capability policy and one
+    /// descriptor layout.
+    ///
+    /// The layout is the Vulkan ABI the module is emitted against: it decides
+    /// which set and binding every `[[buffer(n)]]` argument lands in, and the
+    /// rail reads that slot back out of the returned reflection when it binds
+    /// the pass's stage buffers (`research/docs/23` §3.3, v84). The translator's
+    /// default puts every Metal resource in set 0, which is all one stage
+    /// needs; a caller whose two stages read `[[buffer(N)]]` arguments wants
+    /// the reviewed stage-buffer pair's arrangement instead — the vertex
+    /// stage's buffers in set 1, the fragment stage's in set 2 — because the
+    /// two stages' Metal buffer index spaces are independent
+    /// (`setVertexBuffer(_:offset:index:)` and
+    /// `setFragmentBuffer(_:offset:index:)`), so one set cannot carry both
+    /// without one stage's slot overwriting the other's.
+    pub fn translate_with_policy_and_layout(
+        stage: RenderStage,
+        function: &Function,
+        policy: SpirvFeaturePolicy,
+        descriptor_layout: DescriptorLayout,
+    ) -> Result<Self, ExecutorError> {
         // The kernel options do not apply to a graphics stage: `TransformOptions`
         // defaults carry the API's own defaults (amplification 1, no sampled
         // raster count, no specialized sampler), and the render rail supplies
-        // its pipeline state itself.
-        let options = TransformOptions::default();
+        // its pipeline state itself. The descriptor layout is the one option
+        // that does apply — it is the module's own Vulkan ABI, not pipeline
+        // state.
+        let options = TransformOptions::default()
+            .with_descriptor_layout(descriptor_layout)
+            .map_err(|error| {
+                failure(format!(
+                    "translate {} {}: descriptor layout: {error}",
+                    stage.name(),
+                    function.name()
+                ))
+            })?;
         let scratch = ScratchDir::new()?;
         let translated = match function.air_source() {
             AirSource::SanitizedLl(source) => metal2vulkan::translate_sanitized_native_reflected(
