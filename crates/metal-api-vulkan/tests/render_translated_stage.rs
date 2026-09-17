@@ -47,6 +47,13 @@ use std::sync::Arc;
 const VERTEX_AIR: &str = include_str!("fixtures/render_offscreen_2x2.vert.ll");
 const FRAGMENT_AIR: &str = include_str!("fixtures/render_offscreen_2x2.frag.ll");
 
+/// The strictly asymmetric fixture the NDC-y alignment is measured on: the
+/// triangle `(-1,0) (1,0) (-1,1)`, which Metal's +y-up clip space maps to the
+/// attachment's top half and Vulkan's +y-down clip space mirrors to its
+/// bottom half (`research/docs/23` §40).
+const ASYMMETRIC_VERTEX_AIR: &str = include_str!("fixtures/render_ndc_y_asymmetric.vert.ll");
+const ASYMMETRIC_VERTEX_ENTRY: &str = "render_ndc_y_asymmetric";
+
 /// The counterexample's fragment stage: the same render target, plus one Metal
 /// buffer binding the rail's render stages do not bind.
 const BUFFERED_FRAGMENT_AIR: &str = include_str!("fixtures/render_offscreen_2x2_buffered.frag.ll");
@@ -119,6 +126,43 @@ const ATTACHMENT_WORD: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
 const EXPECTED_RGBA8_TEXELS: [u8; 16] = [
     0x40, 0x80, 0xc0, 0xff, 0x40, 0x80, 0xc0, 0xff, 0x40, 0x80, 0xc0, 0xff, 0x40, 0x80, 0xc0, 0xff,
 ];
+
+/// The coverage the asymmetric fixture's `(-1,0) (1,0) (-1,1)` triangle has
+/// under Metal's +y-up NDC on an 8x4 attachment, derived from the vertex
+/// positions and the pixel-centre rule rather than from any rail's readback:
+/// two texels on the top row (left of the hypotenuse) and six on the second.
+/// The shape is asymmetric under the y flip, so the mirrored frame is a
+/// different byte string — which is what lets this fixture see a lost
+/// alignment.
+const ASYMMETRIC_METAL_COVERAGE: [&str; 4] = ["##......", "######..", "........", "........"];
+
+/// The 8x4 frame the coverage above describes, in the fixture's own bytes: the
+/// fragment stage's `40 80 c0 ff` where covered, the clear sentinel elsewhere.
+fn asymmetric_metal_frame() -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 * 4 * 4);
+    for row in ASYMMETRIC_METAL_COVERAGE {
+        for texel in row.chars() {
+            if texel == '#' {
+                frame.extend_from_slice(&EXPECTED_RGBA8_TEXELS[..4]);
+            } else {
+                frame.extend_from_slice(&CLEAR_SENTINEL);
+            }
+        }
+    }
+    frame
+}
+
+/// Flip a `width x 4` frame's rows: the frame a rail lands when it forgets the
+/// Metal-to-Vulkan y alignment.
+fn mirror_rows(frame: &[u8], width: usize) -> Vec<u8> {
+    let row_bytes = width * 4;
+    let rows = frame.len() / row_bytes;
+    let mut mirrored = Vec::with_capacity(frame.len());
+    for row in (0..rows).rev() {
+        mirrored.extend_from_slice(&frame[row * row_bytes..(row + 1) * row_bytes]);
+    }
+    mirrored
+}
 
 const ATTACHMENT_VIEW: ViewId = ViewId::new(901);
 const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(902);
@@ -260,6 +304,18 @@ fn compile_declaring_kernel(
 }
 
 fn render_pass(pipeline: PipelineId, present: Option<PresentDescriptor>) -> RenderPassDescriptor {
+    render_pass_sized(pipeline, present, 2, 2)
+}
+
+/// One render pass over a `width x height` attachment: the pass the 2x2
+/// milestone fixtures use, and the larger one the asymmetric NDC-y fixture
+/// needs to see which rows are covered.
+fn render_pass_sized(
+    pipeline: PipelineId,
+    present: Option<PresentDescriptor>,
+    width: u32,
+    height: u32,
+) -> RenderPassDescriptor {
     RenderPassDescriptor {
         blend: None,
         multisample: None,
@@ -276,12 +332,12 @@ fn render_pass(pipeline: PipelineId, present: Option<PresentDescriptor>) -> Rend
             view_id: ATTACHMENT_VIEW,
             allocation_id: ATTACHMENT_ALLOCATION,
             format: AttachmentFormat::Rgba8Unorm,
-            width: 2,
-            height: 2,
+            width: u64::from(width),
+            height: u64::from(height),
             load: LoadOp::Clear(ClearColor::new(CLEAR_SENTINEL)),
             store: StoreOp::Store,
         }],
-        viewport: [0, 0, 2, 2],
+        viewport: [0, 0, width, height],
         scissor: None,
         vertices: 3,
         vertex_buffers: Vec::new(),
@@ -313,13 +369,18 @@ fn present_tail() -> PresentDescriptor {
 }
 
 /// One trace carrying the declaring compute pass and one render pass that names
-/// `render`, plus the resource table it has to be admitted against.
-fn trace_for(
+/// `render`, plus the resource table it has to be admitted against. The
+/// declaring compute pass reads the attachment's bytes, whose length follows
+/// the `width x height` attachment the render pass covers.
+fn trace_for_sized(
     provider: &VulkanComputeProvider,
     compute: &CompiledComputePipeline,
     render: &CompiledComputePipeline,
     present: Option<PresentDescriptor>,
+    width: u32,
+    height: u32,
 ) -> (ComputeTrace, ResourceTableSnapshot) {
+    let attachment_bytes = u64::from(width) * u64::from(height) * 4;
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: provider.device_epoch(),
@@ -335,10 +396,12 @@ fn trace_for(
                         metal_binding: 0,
                         allocation_id: ATTACHMENT_ALLOCATION,
                         offset: 0,
-                        length: 16,
+                        length: attachment_bytes,
                         access: BufferAccess::Read,
                         attribute_stride: None,
-                        source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                        source: BufferSource::OwnedBytes(
+                            ATTACHMENT_WORD.repeat(attachment_bytes as usize / 4),
+                        ),
                     },
                     BufferView {
                         view_id: SCRATCH_VIEW,
@@ -358,7 +421,12 @@ fn trace_for(
                     threads_per_threadgroup: [1, 1, 1],
                 },
             }),
-            TracePass::Render(render_pass(render.pipeline_id, present)),
+            TracePass::Render(render_pass_sized(
+                render.pipeline_id,
+                present,
+                width,
+                height,
+            )),
         ],
         completion_policy: CompletionPolicy::HostReadback,
         heap: None,
@@ -369,7 +437,7 @@ fn trace_for(
         .insert_allocation(AllocationRecord {
             allocation_id: ATTACHMENT_ALLOCATION,
             owner_epoch: provider.device_epoch(),
-            size: 16,
+            size: attachment_bytes,
         })
         .expect("attachment allocation");
     resources
@@ -390,7 +458,21 @@ fn submit_for_readback(
     present: Option<PresentDescriptor>,
     what: &str,
 ) -> Vec<u8> {
-    let (trace, resources) = trace_for(provider, compute, render, present);
+    submit_sized_for_readback(provider, compute, render, present, 2, 2, what)
+}
+
+/// The same submission over a `width x height` attachment.
+#[allow(clippy::too_many_arguments)]
+fn submit_sized_for_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    present: Option<PresentDescriptor>,
+    width: u32,
+    height: u32,
+    what: &str,
+) -> Vec<u8> {
+    let (trace, resources) = trace_for_sized(provider, compute, render, present, width, height);
     let admitted = provider
         .capabilities()
         .validate_trace(trace.clone(), resources)
@@ -441,6 +523,70 @@ fn translated_stages_land_the_same_bytes_as_the_reviewed_pair() {
     assert_eq!(
         translated_bytes, reviewed_bytes,
         "the translated pair has to land byte for byte what the reviewed pair lands"
+    );
+}
+
+/// The translated path's Metal-to-Vulkan y alignment (`research/docs/23` §40).
+///
+/// Metal's clip space is +y up, Vulkan's is +y down, so a guest AIR vertex
+/// module that writes its position unchanged lands a vertically mirrored frame
+/// on the Vulkan rail. Before this increment the asymmetric fixture's coverage
+/// sat on rows 2 and 3 of the 8x4 attachment instead of rows 0 and 1. The
+/// translation now negates the position's y for `RenderStage::Vertex` — the
+/// same `OpFNegate` the reviewed `render_spv/*.vert.spvasm` modules carry by
+/// hand (`research/docs/23` §32, v38) — so the translated path lands the Metal
+/// mapping. The expected frame is derived from the fixture's vertex positions,
+/// not from this rail's readback, and the fixture is asymmetric under the y
+/// flip, so a rail that lost the alignment lands different bytes.
+#[test]
+fn translated_vertex_stages_land_the_metal_ndc_mapping() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let vertex_library = device
+        .new_library_with_air(ASYMMETRIC_VERTEX_AIR)
+        .expect("the asymmetric fixture loads");
+    let vertex_function = vertex_library
+        .function(ASYMMETRIC_VERTEX_ENTRY)
+        .expect("the asymmetric entry exists");
+    let vertex = TranslatedRenderStage::translate(RenderStage::Vertex, &vertex_function)
+        .expect("the asymmetric vertex stage translates");
+    let fragment_library = device
+        .new_library_with_air(FRAGMENT_AIR)
+        .expect("the fragment fixture loads");
+    let fragment_function = fragment_library
+        .function(FRAGMENT_ENTRY)
+        .expect("the fragment entry exists");
+    let fragment = TranslatedRenderStage::translate(RenderStage::Fragment, &fragment_function)
+        .expect("the fragment stage translates");
+    let pipeline = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: ASYMMETRIC_VERTEX_ENTRY.to_owned(),
+                fragment_entry: FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+            },
+            vertex,
+            fragment,
+            logical_digest: digest(b"translated-ndc-y-asymmetric-8x4"),
+        })
+        .expect("the asymmetric pair registers");
+
+    let bytes =
+        submit_sized_for_readback(&provider, &compute, &pipeline, None, 8, 4, "translated 8x4");
+    let expected = asymmetric_metal_frame();
+    eprintln!("expected (Metal mapping): {}", hex(&expected));
+    assert_ne!(
+        expected,
+        mirror_rows(&expected, 8),
+        "the fixture has to be asymmetric under the y flip, or the test could not see one"
+    );
+    assert_eq!(
+        bytes, expected,
+        "the translated vertex stage has to land the Metal NDC mapping, not its mirror"
     );
 }
 
