@@ -204,6 +204,7 @@ fn digest(case: &[u8]) -> SemanticDigest {
 /// alone).
 fn translated_contract(color_formats: Vec<AttachmentFormat>) -> RenderPipelineContract {
     RenderPipelineContract {
+        stage_buffers: Vec::new(),
         vertex_entry: VERTEX_ENTRY.to_owned(),
         fragment_entry: FRAGMENT_ENTRY.to_owned(),
         color_formats,
@@ -215,6 +216,7 @@ fn translated_contract(color_formats: Vec<AttachmentFormat>) -> RenderPipelineCo
 /// modules declare, same attachment shape.
 fn reviewed_contract() -> RenderPipelineContract {
     RenderPipelineContract {
+        stage_buffers: Vec::new(),
         vertex_entry: REVIEWED_VERTEX_ENTRY.to_owned(),
         fragment_entry: REVIEWED_FRAGMENT_ENTRY.to_owned(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -317,6 +319,7 @@ fn render_pass_sized(
     height: u32,
 ) -> RenderPassDescriptor {
     RenderPassDescriptor {
+        stage_buffers: Vec::new(),
         blend: None,
         multisample: None,
         depth_resolve: None,
@@ -564,6 +567,7 @@ fn translated_vertex_stages_land_the_metal_ndc_mapping() {
     let pipeline = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: ASYMMETRIC_VERTEX_ENTRY.to_owned(),
                 fragment_entry: FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -778,6 +782,7 @@ fn a_translation_with_a_buffer_binding_is_refused() {
     let refused = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: VERTEX_ENTRY.to_owned(),
                 fragment_entry: BUFFERED_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -846,6 +851,7 @@ fn a_translation_consuming_an_unproduced_varying_is_refused() {
     let refused = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: VERTEX_ENTRY.to_owned(),
                 fragment_entry: VARYING_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -961,6 +967,7 @@ fn two_stream_layout() -> VertexLayout {
 /// layout.
 fn two_stream_contract() -> RenderPipelineContract {
     RenderPipelineContract {
+        stage_buffers: Vec::new(),
         vertex_entry: TWO_STREAM_VERTEX_ENTRY.to_owned(),
         fragment_entry: FRAGMENT_ENTRY.to_owned(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],

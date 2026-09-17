@@ -311,6 +311,16 @@ impl NativeMetalProvider {
             // snapshot and the flip condition cannot drift.
             let icb_bits = icb::icb_capability_bits();
             let capabilities = ProviderCapabilities {
+                // The stage-buffer face stays closed on this rail
+                // (`research/docs/23` §3.3, v83): the reviewed MSL modules
+                // carry no buffer argument, so a pass that binds one is
+                // refused by name in `render::plan_with_leases` (and a
+                // contract that declares one in `render::review_contract`)
+                // instead of being executed with the binding silently
+                // dropped. This is the boundary the increment records, not a
+                // device fact.
+                supports_render_stage_buffers: false,
+                max_render_stage_buffers: 0,
                 max_passes: 8,
                 supports_threads_exact: true,
                 supports_threadgroups: false,
@@ -2802,6 +2812,7 @@ mod tests {
         provider
             .register_render_pipeline(NativeRenderPipelineRequest {
                 contract: RenderPipelineContract {
+                    stage_buffers: Vec::new(),
                     vertex_entry: render::QUAD_VERTEX_ENTRY.to_owned(),
                     fragment_entry: render::FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -2964,6 +2975,7 @@ mod tests {
         vertices: &[u8],
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -3358,6 +3370,7 @@ mod tests {
         let wide = provider
             .register_render_pipeline(NativeRenderPipelineRequest {
                 contract: RenderPipelineContract {
+                    stage_buffers: Vec::new(),
                     vertex_entry: render::VERTEX_ENTRY.to_owned(),
                     fragment_entry: render::FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba16Float],

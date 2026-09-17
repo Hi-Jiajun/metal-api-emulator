@@ -308,6 +308,7 @@ mod tests {
 
     fn render_pass() -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -397,6 +398,8 @@ mod tests {
 
     fn capabilities(bits: &IcbCapabilityBits) -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_stage_buffers: false,
+            max_render_stage_buffers: 0,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,

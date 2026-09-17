@@ -1476,6 +1476,26 @@ pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 /// many of those bindings it can execute today (`docs/23` §4.2).
 pub const MAX_RENDER_TEXTURES: usize = 1;
 
+/// Stage buffer bindings a render pass may declare, across both stages
+/// (`research/docs/23` §3.3, v83): four, one per binding the reviewed chain
+/// shape reads, and the same first-increment cap the vertex-input face states
+/// for its streams. A provider's `ProviderCapabilities::max_render_stage_buffers`
+/// stays independent of this value: the contract admits the shape, while each
+/// rail declares how many of those bindings it can execute today.
+pub const MAX_RENDER_STAGE_BUFFERS: usize = 4;
+
+/// The highest binding index a stage buffer binding may carry
+/// (`research/docs/23` §3.3, v83).
+///
+/// A stage buffer is addressed inside its stage's own Metal buffer index space
+/// (`[[buffer(N)]]` for a vertex or fragment function argument), and the
+/// translator's chain shapes use the low indices a descriptor set can hold
+/// without a per-stage descriptor-count question. The bound is a first
+/// increment narrowing, not a device limit: a trace above it is refused by name
+/// rather than handed to a rail whose descriptor layout the review did not
+/// cover.
+pub const MAX_RENDER_STAGE_BUFFER_INDEX: u32 = 16;
+
 /// Vertices in the first milestone's single non-indexed draw: the full-screen
 /// triangle generated from `vertex_id` (`research/docs/23` §1.2).
 pub const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
@@ -1844,6 +1864,12 @@ pub fn validate_render_texture_binding(
 pub enum RenderInputKind {
     VertexBuffer,
     IndexBuffer,
+    /// A stage buffer binding read by the vertex or fragment stage
+    /// (`research/docs/23` §3.3, v83). The refusal names the kind without the
+    /// stage: the access rule is the same one the two streams state, and the
+    /// binding number the refusal carries is the slot inside whichever stage
+    /// declared it.
+    StageBuffer,
 }
 
 impl RenderInputKind {
@@ -1852,6 +1878,7 @@ impl RenderInputKind {
         match self {
             Self::VertexBuffer => "vertex buffer",
             Self::IndexBuffer => "index buffer",
+            Self::StageBuffer => "stage buffer",
         }
     }
 }
@@ -2979,6 +3006,19 @@ pub struct RenderPassDescriptor {
     /// one single-sample 2D surface. A pass that binds none keeps the exact
     /// pre-v70 bytes.
     pub textures: Vec<TextureView>,
+    /// Buffers the pass's stages read directly, in canonical order
+    /// (`research/docs/23` §3.3, v83): vertex bindings first by index, then
+    /// fragment bindings by index.
+    ///
+    /// Each entry is a read-only [`BufferView`] that carries its own bytes or
+    /// names the lease they come from, exactly as the pass's vertex streams
+    /// and sampled textures do, and the view's own `metal_binding` is the
+    /// binding inside its stage. The pipeline's
+    /// [`StageBufferBinding`] list is the other half: a pass that declares an
+    /// entry the pipeline does not, or leaves a declared one unbound, is
+    /// refused by [`RenderPipelineContract::validate_against`]. A pass that
+    /// binds none keeps the exact pre-v83 bytes.
+    pub stage_buffers: Vec<StageBufferView>,
 }
 
 impl RenderPassDescriptor {
@@ -3204,6 +3244,57 @@ impl RenderPassDescriptor {
                 requested: self.vertex_buffers.len(),
                 maximum: MAX_VERTEX_BUFFERS,
             });
+        }
+        // Stage buffer bindings (`research/docs/23` §3.3, v83): the pass half
+        // of the pipeline-level face. The list is canonical and carries no
+        // slot twice, and every entry is a read-only view — the writeback
+        // landing a writable binding would need is the increment after this
+        // one. Whether the pipeline declares the slot is the pair rule
+        // `validate_against` holds; this walk answers only what a pass can
+        // answer on its own.
+        if self.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+            return Err(ContractError::RenderStageBufferLimitExceeded {
+                requested: self.stage_buffers.len(),
+                maximum: MAX_RENDER_STAGE_BUFFERS,
+            });
+        }
+        let mut stage_slots = BTreeMap::new();
+        let mut previous_stage_slot = None;
+        for stage in &self.stage_buffers {
+            stage.view.validate_shape()?;
+            let slot = (stage.stage.code(), stage.view.metal_binding);
+            if previous_stage_slot.is_some_and(|previous| previous >= slot) {
+                if previous_stage_slot == Some(slot) {
+                    return Err(ContractError::DuplicateStageBufferBinding {
+                        stage: stage.stage,
+                        index: stage.view.metal_binding,
+                    });
+                }
+                return Err(ContractError::NonCanonicalBindingOrder(
+                    "render stage buffers",
+                ));
+            }
+            previous_stage_slot = Some(slot);
+            if stage_slots.insert(slot, ()).is_some() {
+                return Err(ContractError::DuplicateStageBufferBinding {
+                    stage: stage.stage,
+                    index: stage.view.metal_binding,
+                });
+            }
+            if stage.view.metal_binding >= MAX_RENDER_STAGE_BUFFER_INDEX {
+                return Err(ContractError::RenderStageBufferIndexExceeded {
+                    stage: stage.stage,
+                    index: stage.view.metal_binding,
+                    maximum: MAX_RENDER_STAGE_BUFFER_INDEX,
+                });
+            }
+            if stage.view.access != BufferAccess::Read {
+                return Err(ContractError::RenderInputAccessUnsupported {
+                    kind: RenderInputKind::StageBuffer,
+                    binding: stage.view.metal_binding,
+                    access: stage.view.access,
+                });
+            }
         }
         for (index, binding) in self.vertex_buffers.iter().enumerate() {
             validate_vertex_buffer_binding(index, binding)?;
@@ -3446,6 +3537,90 @@ impl RenderPipelineStage {
             Self::Fragment => "fragment",
         }
     }
+
+    /// Stable ordinal used by the canonical-order rules of the stage-buffer
+    /// face (`research/docs/23` §3.3, v83): vertex before fragment, so one
+    /// list can carry both stages' bindings and still be compared with `<=`.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Vertex => 0,
+            Self::Fragment => 1,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage buffer contract (`research/docs/23` §3.3, v83).
+//
+// A render pass whose stages read buffers directly — a fragment function's
+// `[[buffer(N)]]` argument, or a vertex function reading a storage buffer
+// instead of `[[stage_in]]` streams — was the boundary the gate-3 census
+// measured as `render_provider_out_of_class_buffers` (97873/98580 draws): the
+// canonical render contract had no pipeline-level buffer binding face, so the
+// pass could only be refused whole. This block adds it, and nothing else.
+//
+// The two halves are the pipeline's declaration (which stage reads which
+// index, with what access and footprint) and the pass's binding (which view's
+// bytes fill that slot). The pair rules — one declaration per binding, one
+// binding per declaration, agreeing access, a footprint the view covers — run
+// in `RenderPipelineContract::validate_against`, the same place the colour
+// formats and the vertex layout pair with the pass.
+//
+// Deliberately absent, i.e. the features this increment does not schedule:
+// writable stage buffers (the writeback landing a `Write`/`ReadWrite` binding
+// would need), affine/unbounded footprints (the first increment proves a
+// static byte extent), and per-stage step rates or arrayed bindings. As
+// everywhere in the render contract, "not supported yet" is expressed by a
+// validator refusal rather than a default a trace could rely on.
+// ---------------------------------------------------------------------------
+
+/// One buffer binding of a render pipeline's stage
+/// (`research/docs/23` §3.3, v83).
+///
+/// `index` is the binding inside the stage's own Metal buffer index space, so
+/// a vertex binding `0` and a fragment binding `0` are two different bindings:
+/// the two stages' namespaces are independent, exactly as
+/// `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`
+/// state.
+///
+/// The declaration is not a second vertex layout: a
+/// [`VertexLayout::Buffers`] entry describes a stream the vertex input state
+/// assembles `[[stage_in]]` attributes from, while a stage buffer binding
+/// describes bytes the shader itself reads through a `[[buffer(N)]]`
+/// argument. The two cannot share one index — the vertex descriptor streams
+/// and the shader arguments address the same Metal binding — which is why
+/// [`RenderPipelineContract::validate`] refuses an index a layout entry
+/// already occupies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StageBufferBinding {
+    /// Which stage reads the binding.
+    pub stage: RenderPipelineStage,
+    /// The binding inside that stage's own buffer index space.
+    pub index: u32,
+    /// How the stage uses the bytes. The first increment admits
+    /// [`BufferAccess::Read`] and refuses the writable arms by name.
+    pub access: BufferAccess,
+    /// The byte extent the stage reaches. The first increment admits
+    /// [`FootprintProof::Static`] and refuses the other two arms by name;
+    /// the pass's own view has to cover the accepted extent.
+    pub footprint: FootprintProof,
+}
+
+/// One caller-held buffer bound to a stage buffer slot
+/// (`research/docs/23` §3.3, v83).
+///
+/// The entry names its stage explicitly, unlike the pass's vertex streams and
+/// sampled textures whose position is their binding: two stages' index spaces
+/// overlap, so a position cannot say which namespace it fills. The view's own
+/// `metal_binding` is the index inside that stage, held to the pipeline's
+/// declaration by [`RenderPipelineContract::validate_against`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StageBufferView {
+    /// Which stage the binding fills.
+    pub stage: RenderPipelineStage,
+    /// The bytes, their range and their source. The view's own
+    /// `metal_binding` is the binding inside `stage`.
+    pub view: BufferView,
 }
 
 /// How the vertex stage of a [`RenderPipelineContract`] receives its vertices.
@@ -3515,6 +3690,16 @@ pub struct RenderPipelineContract {
     pub color_formats: Vec<AttachmentFormat>,
     /// The vertex input shape the vertex stage was compiled for.
     pub vertex_layout: VertexLayout,
+    /// Buffers the two stages read directly, in canonical order
+    /// (`research/docs/23` §3.3, v83): vertex bindings first by index, then
+    /// fragment bindings by index.
+    ///
+    /// This is the pipeline-level half of the pass's
+    /// [`RenderPassDescriptor::stage_buffers`]. A pipeline that declares none
+    /// — every pre-v83 registration — keeps the exact bytes it had, and its
+    /// passes bind none either, because
+    /// [`Self::validate_against`] holds the two lists to each other.
+    pub stage_buffers: Vec<StageBufferBinding>,
 }
 
 impl RenderPipelineContract {
@@ -3556,6 +3741,7 @@ impl RenderPipelineContract {
         if let VertexLayout::Buffers(buffers) = &self.vertex_layout {
             validate_vertex_layout(buffers)?;
         }
+        validate_stage_buffer_bindings(&self.stage_buffers, &self.vertex_layout)?;
         Ok(())
     }
 
@@ -3599,8 +3785,120 @@ impl RenderPipelineContract {
                 pass_buffers: pass.vertex_buffers.len(),
             });
         }
+        // The stage buffers pair the same way one level down
+        // (`research/docs/23` §3.3, v83): every declared binding is bound
+        // exactly once, every bound one is declared, and the two sides agree
+        // about the access and the bytes the stage reaches. An unbound
+        // declaration would leave a descriptor the shader reads undefined; a
+        // binding without a declaration would fill a slot the pipeline never
+        // said how to read.
+        for declared in &self.stage_buffers {
+            let Some(bound) = pass.stage_buffers.iter().find(|stage| {
+                stage.stage == declared.stage && stage.view.metal_binding == declared.index
+            }) else {
+                return Err(ContractError::MissingStageBufferBinding {
+                    stage: declared.stage,
+                    index: declared.index,
+                });
+            };
+            if bound.view.access != declared.access {
+                return Err(ContractError::StageBufferAccessMismatch {
+                    stage: declared.stage,
+                    index: declared.index,
+                    expected: declared.access,
+                    actual: bound.view.access,
+                });
+            }
+            if let FootprintProof::Static { max_bytes } = &declared.footprint {
+                if *max_bytes > bound.view.length {
+                    return Err(ContractError::StageBufferFootprintExceeded {
+                        stage: declared.stage,
+                        index: declared.index,
+                        required: *max_bytes,
+                        declared: bound.view.length,
+                    });
+                }
+            }
+        }
+        for bound in &pass.stage_buffers {
+            if !self.stage_buffers.iter().any(|declared| {
+                declared.stage == bound.stage && declared.index == bound.view.metal_binding
+            }) {
+                return Err(ContractError::UndeclaredStageBufferBinding {
+                    stage: bound.stage,
+                    index: bound.view.metal_binding,
+                });
+            }
+        }
         Ok(())
     }
+}
+
+/// Structural validation of a [`RenderPipelineContract`]'s stage buffer
+/// declarations, shared by the contract and its tests
+/// (`research/docs/23` §3.3, v83).
+///
+/// Every rule is a fact the declarations and the layout alone can answer: the
+/// count stays inside the first increment's cap, the list is canonical
+/// (vertex bindings before fragment bindings, ascending inside each stage)
+/// with no slot named twice, every binding is read with a static footprint,
+/// and no vertex-stage binding occupies an index a
+/// [`VertexLayout::Buffers`] stream already fills — the two would be one
+/// Metal binding described twice.
+fn validate_stage_buffer_bindings(
+    bindings: &[StageBufferBinding],
+    layout: &VertexLayout,
+) -> Result<(), ContractError> {
+    if bindings.len() > MAX_RENDER_STAGE_BUFFERS {
+        return Err(ContractError::RenderStageBufferLimitExceeded {
+            requested: bindings.len(),
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
+    let stream_indices = layout.buffers().len();
+    let mut previous: Option<(u8, u32)> = None;
+    for binding in bindings {
+        if binding.index >= MAX_RENDER_STAGE_BUFFER_INDEX {
+            return Err(ContractError::RenderStageBufferIndexExceeded {
+                stage: binding.stage,
+                index: binding.index,
+                maximum: MAX_RENDER_STAGE_BUFFER_INDEX,
+            });
+        }
+        let slot = (binding.stage.code(), binding.index);
+        if previous.is_some_and(|previous| previous >= slot) {
+            if previous == Some(slot) {
+                return Err(ContractError::DuplicateStageBufferBinding {
+                    stage: binding.stage,
+                    index: binding.index,
+                });
+            }
+            return Err(ContractError::NonCanonicalBindingOrder(
+                "stage buffer bindings",
+            ));
+        }
+        previous = Some(slot);
+        if binding.access != BufferAccess::Read {
+            return Err(ContractError::RenderInputAccessUnsupported {
+                kind: RenderInputKind::StageBuffer,
+                binding: binding.index,
+                access: binding.access,
+            });
+        }
+        if !matches!(binding.footprint, FootprintProof::Static { .. }) {
+            return Err(ContractError::StageBufferFootprintProofUnsupported {
+                stage: binding.stage,
+                index: binding.index,
+            });
+        }
+        if binding.stage == RenderPipelineStage::Vertex && (binding.index as usize) < stream_indices
+        {
+            return Err(ContractError::StageBufferVertexLayoutConflict {
+                index: binding.index,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Structural validation of one [`VertexLayout::Buffers`] list, shared by the
@@ -6132,11 +6430,14 @@ impl ComputeTrace {
                 },
             )?;
         }
-        // Render vertex and index buffers declare their own bytes, so the only
-        // questions left are the ones an ordering rule answers: no compute
-        // binding may write bytes the draw reads, and no compute pass after the
-        // render pass may bind overlapping bytes (`research/docs/23` §3.6). They
-        // join the same pool budget the declared views and attachments spend.
+        // Render vertex, index and stage buffers declare their own bytes, so
+        // the only questions left are the ones an ordering rule answers: no
+        // compute binding may write bytes the draw reads, and no compute pass
+        // after the render pass may bind overlapping bytes
+        // (`research/docs/23` §3.6). A stage buffer joins the same walk as the
+        // streams (`research/docs/23` §3.3, v83): the bytes a stage reads are
+        // the bytes the draw reads, whichever stage reaches them. They join the
+        // same pool budget the declared views and attachments spend.
         for (pass_index, pass) in self.passes.iter().enumerate() {
             let Some(pass) = pass.as_render() else {
                 continue;
@@ -6149,6 +6450,11 @@ impl ComputeTrace {
                     pass.indices
                         .iter()
                         .map(|indices| (RenderInputKind::IndexBuffer, &indices.view)),
+                )
+                .chain(
+                    pass.stage_buffers
+                        .iter()
+                        .map(|stage| (RenderInputKind::StageBuffer, &stage.view)),
                 );
             for (kind, view) in inputs {
                 let range = BufferRange::new(view.allocation_id, view.offset, view.length);
@@ -6290,19 +6596,20 @@ impl ComputeTrace {
                 BufferAccess::Write | BufferAccess::ReadWrite => resource.access,
             };
         }
-        // Render vertex and index buffers read their views, so a view a compute
-        // pass already declared has to become readable before the pool is
-        // uploaded: a view that cannot read uploads nothing, and a compute
+        // Render vertex, index and stage buffers read their views, so a view a
+        // compute pass already declared has to become readable before the pool
+        // is uploaded: a view that cannot read uploads nothing, and a compute
         // binding that happens to be the same view would leave the render rail
         // reading a buffer it never uploaded. A stream no compute binding
         // declares stays out of this pool on purpose — the render rail uploads
         // the pass's own bytes, and the pool is the compute rail's binding set
-        // (`research/docs/23` §3.6).
+        // (`research/docs/23` §3.6, §3.3 v83).
         for pass in self.render_passes() {
             let inputs = pass
                 .vertex_buffers
                 .iter()
-                .chain(pass.indices.iter().map(|indices| &indices.view));
+                .chain(pass.indices.iter().map(|indices| &indices.view))
+                .chain(pass.stage_buffers.iter().map(|stage| &stage.view));
             for view in inputs {
                 let Some(&position) = positions.get(&view.view_id) else {
                     continue;
@@ -6912,6 +7219,21 @@ pub struct ProviderCapabilities {
     /// code so the contract's own enum is the single vocabulary, exactly as
     /// [`Self::supported_color_formats`] is.
     pub supported_render_texture_formats: Vec<TextureFormat>,
+    /// Whether this snapshot can execute a render pass whose stage binds a
+    /// buffer directly (`research/docs/23` §3.3, v83). Defaults to `false`: a
+    /// snapshot whose rail cannot fill a stage buffer slot refuses the pass
+    /// during admission instead of executing it against undefined descriptor
+    /// bytes the trace never declared.
+    ///
+    /// The native rail keeps the default — it refuses the shape by name and
+    /// records the boundary in `research/docs/23` §83 — while the Vulkan rail
+    /// publishes the shape it executes.
+    pub supports_render_stage_buffers: bool,
+    /// Stage buffer bindings one render pass may declare. `0` means the
+    /// snapshot cannot execute the shape at all; the field stays at that
+    /// default for a snapshot whose bit above is false, so a caller reading
+    /// the limit without checking the bit cannot read one as an admission.
+    pub max_render_stage_buffers: u32,
     /// Whether this snapshot can execute the present action of
     /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
     /// contract and the refusals, while the Vulkan "readable swapchain
@@ -7125,6 +7447,16 @@ impl ProviderCapabilities {
         // ask for. The pass's own access/shape rules already ran in
         // `trace.validate()` above.
         self.admit_render_texture_inputs(trace)?;
+
+        // Stage buffer admission is the third render gate and sits in the same
+        // walk (`research/docs/23` §3.3, v83): a pass that binds bytes its
+        // stages read directly is refused here — bit, count, then source — so
+        // a rail that cannot fill the slot refuses the whole trace instead of
+        // running the draw against descriptor bytes nobody declared. The
+        // pass's own canonical-order and read-only rules already ran in
+        // `trace.validate()`, and the pipeline/pass pair rules ran in
+        // `admit_render_passes` above.
+        self.admit_render_stage_buffer_inputs(trace)?;
 
         // Present admission is the next gate and sits just as early
         // (`research/docs/24` §4.2): Step 2 publishes the contract and the
@@ -7648,6 +7980,73 @@ impl ProviderCapabilities {
         Ok(())
     }
 
+    /// Stage buffer admission, the third render gate (`research/docs/23`
+    /// §3.3, v83).
+    ///
+    /// The order repeats the two gates beside it: the bit a snapshot answers
+    /// on its own comes first, then the count, then the per-binding source
+    /// mode. A trace whose render passes bind no stage buffer never enters the
+    /// walk, so every pre-v83 trace keeps the admission path it had.
+    ///
+    /// The pipeline/pass pair rules — declared, bound, agreeing access, a
+    /// footprint the view covers — already ran in
+    /// [`RenderPipelineContract::validate_against`], which
+    /// [`Self::admit_render_passes`] calls, so this gate answers only what the
+    /// snapshot knows: whether it executes the shape at all, how many bindings
+    /// it admits, and which storage modes it can read the bytes from. The
+    /// storage-mode question is the same one the compute walk asks of its
+    /// buffers, because a stage buffer's bytes come from the same three
+    /// [`BufferSource`] arms.
+    fn admit_render_stage_buffer_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        for (pass_index, entry) in trace.passes.iter().enumerate() {
+            let Some(pass) = entry.as_render() else {
+                continue;
+            };
+            if pass.stage_buffers.is_empty() {
+                continue;
+            }
+            if !self.supports_render_stage_buffers {
+                return Err(capability_error("render_stage_buffer_unsupported")
+                    .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                    .with_field(
+                        "bindings",
+                        FieldValue::Unsigned(pass.stage_buffers.len() as u64),
+                    ));
+            }
+            if pass.stage_buffers.len() > self.max_render_stage_buffers as usize {
+                return Err(capability_error("render_stage_buffer_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(pass.stage_buffers.len() as u64),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(self.max_render_stage_buffers as u64),
+                    ));
+            }
+            for stage in &pass.stage_buffers {
+                let mode = match &stage.view.source {
+                    BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
+                    BufferSource::StagedLease(_) => StorageMode::StagedLease,
+                    BufferSource::BorrowedNoCopy(_) => StorageMode::BorrowedNoCopy,
+                };
+                if !self.storage_modes.contains(&mode) {
+                    return Err(capability_error("storage_mode_unsupported")
+                        .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                        .with_field(
+                            "binding",
+                            FieldValue::Unsigned(u64::from(stage.view.metal_binding)),
+                        )
+                        .with_field(
+                            "storage_mode",
+                            FieldValue::Text(format!("{mode:?}").to_lowercase()),
+                        ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Present admission, the second capability gate (`research/docs/24` §4.2).
     ///
     /// The order repeats the render gate's deliberate choice: the bits a
@@ -7968,6 +8367,27 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::RenderTextureSampleCountUnsupported { .. } => {
             (ProviderErrorClass::Args, "texture_shape_mismatch")
         },
+        // Stage buffer contract (`research/docs/23` §3.3, v83). The cap, the
+        // index bound and the admitted proof are first-increment narrowings on
+        // a well-formed request, so they keep the same class and shape the
+        // vertex-input and sampler narrowings have; the pair rules are
+        // caller-fixable trace structure.
+        E::RenderStageBufferLimitExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_stage_buffer_limit",
+        ),
+        E::RenderStageBufferIndexExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_stage_buffer_index_unsupported",
+        ),
+        E::StageBufferFootprintProofUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "render_stage_buffer_footprint_unsupported",
+        ),
+        E::StageBufferFootprintExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_stage_buffer_footprint_unsupported",
+        ),
         E::EmptyVertexLayout
         | E::ZeroVertexStride { .. }
         | E::EmptyVertexBufferLayout { .. }
@@ -7979,6 +8399,11 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::IndexBufferBindingMismatch { .. }
         | E::RenderTextureBindingMismatch { .. }
         | E::RenderTextureAttachmentConflict { .. }
+        | E::DuplicateStageBufferBinding { .. }
+        | E::MissingStageBufferBinding { .. }
+        | E::UndeclaredStageBufferBinding { .. }
+        | E::StageBufferAccessMismatch { .. }
+        | E::StageBufferVertexLayoutConflict { .. }
         | E::RenderInputComputeConflict { .. } => (
             ProviderErrorClass::Args,
             "trace_contract_invalid",
@@ -9818,6 +10243,68 @@ pub enum ContractError {
     RenderTextureAttachmentConflict {
         view: ViewId,
     },
+    // Stage buffer contract (`research/docs/23` §3.3, v83). The count, the
+    // index bound and the footprint proof are first-increment narrowings on a
+    // well-formed request; the missing, undeclared, mismatched and
+    // conflicting slots are caller-fixable structure, and the pair rules name
+    // the stage as well as the slot so a fix needs no second lookup.
+    /// A render pass or pipeline declares more stage buffer bindings than
+    /// [`MAX_RENDER_STAGE_BUFFERS`].
+    RenderStageBufferLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
+    /// A stage buffer binding carries an index at or above
+    /// [`MAX_RENDER_STAGE_BUFFER_INDEX`].
+    RenderStageBufferIndexExceeded {
+        stage: RenderPipelineStage,
+        index: u32,
+        maximum: u32,
+    },
+    /// One stage's binding list names the same slot twice.
+    DuplicateStageBufferBinding {
+        stage: RenderPipelineStage,
+        index: u32,
+    },
+    /// A pipeline declares a stage buffer binding the pass does not bind, so
+    /// the shader would read an undefined descriptor.
+    MissingStageBufferBinding {
+        stage: RenderPipelineStage,
+        index: u32,
+    },
+    /// A pass binds a stage buffer slot the pipeline never declared.
+    UndeclaredStageBufferBinding {
+        stage: RenderPipelineStage,
+        index: u32,
+    },
+    /// A bound stage buffer's access disagrees with the pipeline's
+    /// declaration.
+    StageBufferAccessMismatch {
+        stage: RenderPipelineStage,
+        index: u32,
+        expected: BufferAccess,
+        actual: BufferAccess,
+    },
+    /// The pass's view is shorter than the byte extent the pipeline's static
+    /// footprint proof declares.
+    StageBufferFootprintExceeded {
+        stage: RenderPipelineStage,
+        index: u32,
+        required: u64,
+        declared: u64,
+    },
+    /// A pipeline declares an affine or unbounded stage buffer footprint,
+    /// which the first increment does not prove.
+    StageBufferFootprintProofUnsupported {
+        stage: RenderPipelineStage,
+        index: u32,
+    },
+    /// A vertex-stage buffer binding occupies a Metal index a
+    /// [`VertexLayout::Buffers`] stream already fills: the two are one binding
+    /// described twice.
+    StageBufferVertexLayoutConflict {
+        index: u32,
+    },
     /// A compute binding writes bytes the draw reads, so the draw would observe
     /// a value the trace's order does not define.
     RenderInputComputeConflict {
@@ -10485,6 +10972,66 @@ impl fmt::Display for ContractError {
             Self::RenderTextureAttachmentConflict { view } => write!(
                 formatter,
                 "render pass samples view {view:?} through a texture binding while writing it as an attachment"
+            ),
+            Self::RenderStageBufferLimitExceeded {
+                requested,
+                maximum,
+            } => write!(
+                formatter,
+                "render pass declares {requested} stage buffer bindings, above the contract maximum {maximum}"
+            ),
+            Self::RenderStageBufferIndexExceeded {
+                stage,
+                index,
+                maximum,
+            } => write!(
+                formatter,
+                "{} stage buffer {index} is at or above the contract's binding index bound {maximum}",
+                stage.name()
+            ),
+            Self::DuplicateStageBufferBinding { stage, index } => write!(
+                formatter,
+                "{} stage buffer {index} is declared twice",
+                stage.name()
+            ),
+            Self::MissingStageBufferBinding { stage, index } => write!(
+                formatter,
+                "render pipeline declares a {} stage buffer at {index}, but the pass binds none there",
+                stage.name()
+            ),
+            Self::UndeclaredStageBufferBinding { stage, index } => write!(
+                formatter,
+                "render pass binds a {} stage buffer at {index} the pipeline never declared",
+                stage.name()
+            ),
+            Self::StageBufferAccessMismatch {
+                stage,
+                index,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{} stage buffer {index} is bound {actual:?}, but the pipeline declares {expected:?}",
+                stage.name()
+            ),
+            Self::StageBufferFootprintExceeded {
+                stage,
+                index,
+                required,
+                declared,
+            } => write!(
+                formatter,
+                "{} stage buffer {index} reads {required} bytes, but the bound view declares {declared}",
+                stage.name()
+            ),
+            Self::StageBufferFootprintProofUnsupported { stage, index } => write!(
+                formatter,
+                "{} stage buffer {index} declares a footprint proof the first stage-buffer increment does not evaluate",
+                stage.name()
+            ),
+            Self::StageBufferVertexLayoutConflict { index } => write!(
+                formatter,
+                "vertex stage buffer {index} shares its binding with a vertex layout stream"
             ),
             Self::RenderInputComputeConflict {
                 pass_index,
@@ -11552,6 +12099,7 @@ mod tests {
 
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -11795,6 +12343,8 @@ mod tests {
 
     fn capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_stage_buffers: false,
+            max_render_stage_buffers: 0,
             max_passes: 1,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -14580,6 +15130,8 @@ mod tests {
 
     fn ranged_capabilities(alias_mode: AliasMode) -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_stage_buffers: false,
+            max_render_stage_buffers: 0,
             max_passes: 8,
             alias_mode,
             ..capabilities()
@@ -14951,6 +15503,7 @@ mod tests {
 
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -16076,6 +16629,7 @@ mod tests {
     fn vertex_layout_accepts_the_reviewed_quad_shape() {
         let layout = quad_layout();
         let contract = RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_layout: layout.clone(),
             ..render_pipeline_contract()
         };
@@ -16110,6 +16664,7 @@ mod tests {
         buffers[0].stride = 0;
         assert_eq!(
             RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_layout: zero_stride,
                 ..render_pipeline_contract()
             }
@@ -16124,6 +16679,7 @@ mod tests {
         buffers[0].attributes.clear();
         assert_eq!(
             RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_layout: empty_attributes,
                 ..render_pipeline_contract()
             }
@@ -16138,6 +16694,7 @@ mod tests {
         buffers.clear();
         assert_eq!(
             RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_layout: no_streams,
                 ..render_pipeline_contract()
             }
@@ -16154,6 +16711,7 @@ mod tests {
         buffers[0].attributes[0].offset = 4;
         assert_eq!(
             RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_layout: out_of_range,
                 ..render_pipeline_contract()
             }
@@ -16180,6 +16738,7 @@ mod tests {
         });
         assert_eq!(
             RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_layout: duplicate,
                 ..render_pipeline_contract()
             }
@@ -16200,6 +16759,7 @@ mod tests {
             .collect();
         assert_eq!(
             RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_layout: too_many,
                 ..render_pipeline_contract()
             }
@@ -16218,6 +16778,7 @@ mod tests {
         pass.validate()
             .expect("the indexed quad pass is well formed");
         let contract = RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_layout: quad_layout(),
             ..render_pipeline_contract()
         };
@@ -16379,8 +16940,313 @@ mod tests {
     // is referenced by no trace and no provider yet, so these tests pin the field
     // set and the refusals; execution stays unpinned.
 
+    /// The stage-buffer face's declaring half (`research/docs/23` §3.3, v83):
+    /// the two slots the reviewed pair reads, in canonical order.
+    fn stage_buffer_declarations() -> Vec<StageBufferBinding> {
+        vec![
+            StageBufferBinding {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 24 },
+            },
+            StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 16 },
+            },
+        ]
+    }
+
+    /// The render snapshot with the stage-buffer bits declared on top of the
+    /// render bits, exactly as the Vulkan rail publishes them.
+    fn stage_buffer_capabilities() -> ProviderCapabilities {
+        let mut provider = render_capabilities();
+        provider.supports_render_stage_buffers = true;
+        provider.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        provider
+    }
+
+    /// The attachment fixture extended with the two stage buffers: the
+    /// declaring pass's compute view is untouched, and the render pass binds
+    /// the slots its pipeline declares.
+    fn stage_buffer_trace() -> ComputeTrace {
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        value.pipelines[0]
+            .render
+            .as_mut()
+            .expect("the fixture declares the render half")
+            .stage_buffers = stage_buffer_declarations();
+        let pass = render_entry(&mut value);
+        pass.stage_buffers = vec![
+            StageBufferView {
+                stage: RenderPipelineStage::Vertex,
+                view: stream_view(51, 0, 53, 24),
+            },
+            StageBufferView {
+                stage: RenderPipelineStage::Fragment,
+                view: stream_view(55, 0, 57, 16),
+            },
+        ];
+        value
+    }
+
+    #[test]
+    fn render_stage_buffers_pair_the_pipeline_declaration_with_the_pass() {
+        // The control: the pass binds exactly the two slots the pipeline
+        // declares, so admission accepts the trace.
+        let declared = stage_buffer_trace();
+        stage_buffer_capabilities()
+            .admit(&declared, &landing_resources())
+            .expect("a pass binding its declared slots is admitted");
+        assert_eq!(
+            declared
+                .passes
+                .last()
+                .expect("a render pass")
+                .as_render()
+                .map(|pass| pass.stage_buffers.len()),
+            Some(2)
+        );
+
+        // The capability bit: a snapshot that does not declare the shape
+        // refuses it by name before any resource action.
+        let refusal = render_capabilities()
+            .admit(&declared, &landing_resources())
+            .expect_err("a snapshot without the stage-buffer bit refuses the pass");
+        assert_eq!(refusal.slug, "render_stage_buffer_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("bindings"),
+            Some(&FieldValue::Unsigned(2))
+        );
+
+        // The count: one binding above the contract's cap is a capability
+        // narrowing, not a trace that reads out of range.
+        let mut wide = stage_buffer_trace();
+        {
+            let contract = wide.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers = (0..=MAX_RENDER_STAGE_BUFFERS as u32)
+                .map(|index| StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                })
+                .collect();
+            let pass = render_entry(&mut wide);
+            pass.stage_buffers = (0..=MAX_RENDER_STAGE_BUFFERS as u32)
+                .map(|index| StageBufferView {
+                    stage: RenderPipelineStage::Fragment,
+                    view: stream_view(60 + u64::from(index), index, 70 + u64::from(index), 16),
+                })
+                .collect();
+        }
+        // The pass's own list is canonical by construction; the contract's is
+        // too. The refusal is the snapshot's limit, because the contract's cap
+        // is the same number and the pass validator reaches it first.
+        assert_eq!(
+            wide.passes
+                .last()
+                .and_then(TracePass::as_render)
+                .expect("the render pass")
+                .validate(),
+            Err(ContractError::RenderStageBufferLimitExceeded {
+                requested: MAX_RENDER_STAGE_BUFFERS + 1,
+                maximum: MAX_RENDER_STAGE_BUFFERS,
+            })
+        );
+
+        // A declaration the pass never binds leaves a descriptor the shader
+        // would read: refused by name.
+        let mut unbound = stage_buffer_trace();
+        render_entry(&mut unbound).stage_buffers.pop();
+        let refusal = stage_buffer_capabilities()
+            .admit(&unbound, &landing_resources())
+            .expect_err("a declared slot the pass does not bind is refused");
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+
+        // A bound slot the pipeline never declared fills a binding whose read
+        // the contract does not describe.
+        let mut undeclared = stage_buffer_trace();
+        {
+            let contract = undeclared.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers.truncate(1);
+            let pass = render_entry(&mut undeclared);
+            pass.stage_buffers.truncate(1);
+            pass.stage_buffers.push(StageBufferView {
+                stage: RenderPipelineStage::Fragment,
+                view: stream_view(61, 1, 63, 16),
+            });
+        }
+        let refusal = stage_buffer_capabilities()
+            .admit(&undeclared, &landing_resources())
+            .expect_err("a bound slot the pipeline never declared is refused");
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+
+        // A writable binding is the shape this increment does not land: the
+        // pass refuses it with the render-input family's own slug.
+        let mut writable = stage_buffer_trace();
+        render_entry(&mut writable).stage_buffers[1].view.access = BufferAccess::Write;
+        let refusal = writable.validate().expect_err("a writable stage buffer");
+        assert_eq!(
+            refusal,
+            ContractError::RenderInputAccessUnsupported {
+                kind: RenderInputKind::StageBuffer,
+                binding: 0,
+                access: BufferAccess::Write,
+            }
+        );
+        assert_eq!(
+            contract_error_refusal(refusal).slug,
+            "render_input_access_unsupported"
+        );
+
+        // A view shorter than the declared static footprint cannot carry the
+        // bytes the shader reads: the pair rule reports both numbers. The
+        // view's own bytes stay consistent with its length, so the refusal is
+        // the footprint rule rather than the source-length check.
+        let mut short = stage_buffer_trace();
+        render_entry(&mut short).stage_buffers[0].view = stream_view(51, 0, 53, 8);
+        let refusal = stage_buffer_capabilities()
+            .admit(&short, &landing_resources())
+            .expect_err("a view shorter than the footprint is refused");
+        assert_eq!(refusal.slug, "render_stage_buffer_footprint_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+        // Fragment before vertex is not the canonical order the contract
+        // publishes, so the pass's own validator refuses it.
+        let mut unordered = stage_buffer_trace();
+        render_entry(&mut unordered).stage_buffers.reverse();
+        assert_eq!(
+            unordered.validate(),
+            Err(ContractError::NonCanonicalBindingOrder(
+                "render stage buffers"
+            ))
+        );
+
+        // The same slot twice is a duplicate, not a second binding.
+        let mut duplicated = stage_buffer_trace();
+        {
+            let pass = render_entry(&mut duplicated);
+            let again = pass.stage_buffers[0].clone();
+            // Keep the list canonical so the duplicate, not the order, is
+            // what the walk reports: vertex 0 appears twice in a row.
+            pass.stage_buffers.insert(1, again);
+        }
+        assert_eq!(
+            duplicated.validate(),
+            Err(ContractError::DuplicateStageBufferBinding {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+            })
+        );
+
+        // An index at the contract's own bound names the bound it missed.
+        let mut beyond = stage_buffer_trace();
+        {
+            let contract = beyond.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers[0].index = MAX_RENDER_STAGE_BUFFER_INDEX;
+            let pass = render_entry(&mut beyond);
+            pass.stage_buffers[0].view.metal_binding = MAX_RENDER_STAGE_BUFFER_INDEX;
+        }
+        let refusal = beyond.validate().expect_err("an index at the bound");
+        assert_eq!(
+            refusal,
+            ContractError::RenderStageBufferIndexExceeded {
+                stage: RenderPipelineStage::Vertex,
+                index: MAX_RENDER_STAGE_BUFFER_INDEX,
+                maximum: MAX_RENDER_STAGE_BUFFER_INDEX,
+            }
+        );
+        assert_eq!(
+            contract_error_refusal(refusal).slug,
+            "render_stage_buffer_index_unsupported"
+        );
+
+        // A vertex-stage binding that occupies a stream's index would be one
+        // Metal binding described twice: refused as caller-fixable structure.
+        let mut colliding = stage_buffer_trace();
+        {
+            let contract = colliding.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.vertex_layout = quad_layout();
+            let pass = render_entry(&mut colliding);
+            pass.vertices = 6;
+            pass.vertex_buffers = vec![stream_view(41, 0, 43, 32)];
+            pass.indices = Some(IndexBufferBinding {
+                view: stream_view(45, 0, 47, 12),
+                format: IndexFormat::Uint16,
+            });
+        }
+        let refusal = colliding.pipelines[0]
+            .render
+            .as_ref()
+            .expect("render half")
+            .validate()
+            .expect_err("a vertex stage buffer sharing a stream index");
+        assert_eq!(
+            refusal,
+            ContractError::StageBufferVertexLayoutConflict { index: 0 }
+        );
+        assert_eq!(
+            contract_error_refusal(refusal).slug,
+            "trace_contract_invalid"
+        );
+    }
+
+    #[test]
+    fn a_compute_write_over_a_stage_buffer_is_refused_by_the_render_input_family() {
+        // A compute binding that writes bytes a stage reads is the same hazard
+        // the vertex streams state (`research/docs/23` §3.6, §3.3 v83): the
+        // refusal names the stage-buffer kind instead of executing the draw
+        // against a value no ordering rule defines.
+        let mut value = stage_buffer_trace();
+        let mut overlapping = stream_view(51, 1, 53, 24);
+        overlapping.access = BufferAccess::ReadWrite;
+        value.passes[0]
+            .as_compute_mut()
+            .expect("the fixture's first pass is compute")
+            .buffers
+            .push(overlapping);
+        value.pipelines[0]
+            .contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                access: BufferAccess::ReadWrite,
+                footprint: FootprintProof::Affine {
+                    accesses: Vec::new(),
+                },
+            });
+        assert_eq!(
+            value.serial_resources(),
+            Err(ContractError::RenderInputComputeConflict {
+                pass_index: 1,
+                view: ViewId::new(51),
+                kind: RenderInputKind::StageBuffer,
+                compute_view: ViewId::new(51),
+                compute_pass: 0,
+            })
+        );
+    }
+
     fn render_pipeline_contract() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: "full_screen_vertex".to_owned(),
             fragment_entry: "solid_color_fragment".to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -16436,6 +17302,7 @@ mod tests {
 
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,

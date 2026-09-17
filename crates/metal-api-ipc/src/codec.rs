@@ -181,6 +181,13 @@ pub enum CodecError {
         count: usize,
         maximum: usize,
     },
+    /// A render pass bound stage buffers, a face this frame layout has no
+    /// section for yet (`research/docs/23` §3.3, v83). The narrow feature byte
+    /// and the wide feature word are both full, so the encoder refuses the
+    /// frame rather than writing bytes no decoder would read as the block.
+    StageBufferUnsupported {
+        bindings: usize,
+    },
     /// A wide feature that describes the depth attachment arrived without one.
     /// The store action and the identity are properties *of* the depth
     /// attachment, so either bit without the depth section names a surface the
@@ -328,6 +335,10 @@ impl fmt::Display for CodecError {
             Self::RenderTextureFormatCount { count, maximum } => write!(
                 formatter,
                 "capability snapshot names {count} render texture formats, maximum {maximum}"
+            ),
+            Self::StageBufferUnsupported { bindings } => write!(
+                formatter,
+                "render pass binds {bindings} stage buffers, a face this frame layout cannot carry yet"
             ),
             Self::DepthFeatureWithoutAttachment(features) => write!(
                 formatter,

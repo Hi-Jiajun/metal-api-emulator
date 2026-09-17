@@ -3389,6 +3389,7 @@ mod tests {
 
     fn ordering_render_pass(view: u64) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,

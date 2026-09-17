@@ -1431,14 +1431,14 @@ mod tests {
         ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
         ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
         RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-        RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
-        ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest, ShaderSource,
-        StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter,
-        StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
-        TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
-        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
-        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment,
+        RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest,
+        ShaderSource, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+        StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
+        TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+        ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+        ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
+        MAX_PRESENT_IMAGE_COUNT, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1577,6 +1577,7 @@ mod tests {
     /// compiled for.
     fn render_contract() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: "full_screen_vertex".into(),
             fragment_entry: "solid_color_fragment".into(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -1590,6 +1591,7 @@ mod tests {
         height: u64,
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -1705,6 +1707,7 @@ mod tests {
             .expect("one eight-byte texel");
         let mut compiled = pipeline(&compile_request());
         compiled.render = Some(RenderPipelineContract {
+            stage_buffers: Vec::new(),
             color_formats: vec![AttachmentFormat::Rgba16Float],
             ..render_contract()
         });
@@ -2245,6 +2248,7 @@ mod tests {
     /// layout (`research/docs/23` §3.3).
     fn vertex_input_render_contract() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
                 stride: 8,
                 step: metal_api_core::provider::VertexStep::PerVertex,
@@ -2273,6 +2277,33 @@ mod tests {
             format: IndexFormat::Uint16,
         });
         trace
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_is_refused_by_the_frame_encoder() {
+        // The face has no section in this frame layout yet
+        // (`research/docs/23` §3.3, v83): the encoder refuses the frame
+        // instead of writing bytes that would be read as the next pass, and
+        // the decoder's own pass keeps the empty list every pre-v83 frame
+        // states.
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.stage_buffers = vec![StageBufferView {
+            stage: RenderPipelineStage::Fragment,
+            view: vertex_stream_view(),
+        }];
+        let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        })
+        .expect_err("a stage-buffer pass has no section in this frame");
+        assert!(matches!(
+            refused,
+            CodecError::StageBufferUnsupported { bindings: 1 }
+        ));
+        eprintln!("stage-buffer frame refused: {refused}");
     }
 
     #[test]
@@ -2325,6 +2356,7 @@ mod tests {
     /// once per instance (`research/docs/23` §3.3, v31).
     fn instanced_render_contract() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_layout: VertexLayout::Buffers(vec![
                 VertexBufferLayout {
                     stride: 8,
@@ -4732,6 +4764,8 @@ mod tests {
             CommandResponse::Capabilities {
                 epoch: DeviceEpoch::new(7),
                 capabilities: ProviderCapabilities {
+                    supports_render_stage_buffers: false,
+                    max_render_stage_buffers: 0,
                     max_passes: 2,
                     supports_threads_exact: true,
                     supports_threadgroups: false,
@@ -5106,6 +5140,8 @@ mod tests {
 
     fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_stage_buffers: false,
+            max_render_stage_buffers: 0,
             max_passes: 1,
             supports_threads_exact: true,
             supports_threadgroups: false,

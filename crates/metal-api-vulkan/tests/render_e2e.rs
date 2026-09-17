@@ -30,15 +30,16 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BorrowedLease, BufferAccess,
     BufferLease, BufferSource, BufferView, ClearColor, CompiledComputePipeline,
     CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
-    DispatchKind, DispatchType, FieldValue, IndexBufferBinding, IndexFormat,
+    DispatchKind, DispatchType, FieldValue, FootprintProof, IndexBufferBinding, IndexFormat,
     IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
     LeaseReservation, LoadOp, NoCopyLeaseImporter, OperationId, PipelineId, PresentDescriptor,
     PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderPhase, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
-    ResourceTableSnapshot, SemanticDigest, StagedLease, StoreOp, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    RenderPipelineStage, ResourceTableSnapshot, SemanticDigest, StageBufferBinding,
+    StageBufferView, StagedLease, StoreOp, TextureAccess, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -203,6 +204,7 @@ fn render_pass(
     height: u64,
 ) -> RenderPassDescriptor {
     RenderPassDescriptor {
+        stage_buffers: Vec::new(),
         blend: None,
         multisample: None,
         depth_resolve: None,
@@ -256,6 +258,7 @@ fn register_render(
 ) -> Result<CompiledComputePipeline, ProviderError> {
     provider.register_render_pipeline(RenderPipelineRequest {
         contract: RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: "vertex_main".to_owned(),
             fragment_entry: "fragment_main".to_owned(),
             color_formats: vec![format],
@@ -548,6 +551,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
     let render = provider
         .register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: "vertex_main".to_owned(),
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
@@ -643,6 +647,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 },
             }),
             TracePass::Render(RenderPassDescriptor {
+                stage_buffers: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -758,6 +763,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
     let render = provider
         .register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: "vertex_main".to_owned(),
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
@@ -834,6 +840,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 SECOND_SCRATCH_ALLOCATION,
             )),
             TracePass::Render(RenderPassDescriptor {
+                stage_buffers: Vec::new(),
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
@@ -1920,6 +1927,7 @@ fn vertex_input_fixture_with_load(
     let render = provider
         .register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: "vertex_buffer_main".to_owned(),
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -2797,6 +2805,7 @@ fn sampled_fixture() -> Option<(
     let render = provider
         .register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: "vertex_main".to_owned(),
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -3727,6 +3736,7 @@ fn a_device_loss_rebuild_retires_resident_targets() {
         provider
             .register_render_pipeline(RenderPipelineRequest {
                 contract: RenderPipelineContract {
+                    stage_buffers: Vec::new(),
                     vertex_entry: "vertex_buffer_main".to_owned(),
                     fragment_entry: "fragment_main".to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -3925,4 +3935,399 @@ fn quad_pass(
         format: IndexFormat::Uint16,
     });
     pass
+}
+
+/// The reviewed stage-buffer pair (`research/docs/23` §3.3, v83): the vertex
+/// stage reads its three positions from `DescriptorSet 1 / Binding 0` and the
+/// fragment stage reads its colour from `DescriptorSet 2 / Binding 0`, so both
+/// stages' bytes move the pass's observable output.
+const STAGE_BUFFER_POSITIONS_VERT_SPV: &[u8] =
+    include_bytes!("../src/render_spv/stage_buffer_positions.vert.spv");
+const STAGE_BUFFER_TINT_FRAG_SPV: &[u8] =
+    include_bytes!("../src/render_spv/stage_buffer_tint.frag.spv");
+
+const STAGE_BUFFER_POSITION_VIEW: ViewId = ViewId::new(713);
+const STAGE_BUFFER_POSITION_ALLOCATION: AllocationId = AllocationId::new(813);
+const STAGE_BUFFER_TINT_VIEW: ViewId = ViewId::new(714);
+const STAGE_BUFFER_TINT_ALLOCATION: AllocationId = AllocationId::new(814);
+
+/// The three Metal-NDC `vec2` positions the reviewed vertex stage reads: a
+/// triangle whose vertices are `(-0.9, 0.9)`, `(0.0, 0.9)` and `(-0.9, 0.0)`.
+/// The module's y flip lands them in Vulkan NDC as `(-0.9, -0.9)`,
+/// `(0.0, -0.9)`, `(-0.9, 0.0)` — an area inside the top-left texel of a 2×2
+/// render area that contains that texel's centre, so exactly one texel carries
+/// the fragment stage's bytes and the other three keep the clear sentinel.
+fn stage_buffer_positions() -> Vec<u8> {
+    [-0.9_f32, 0.9, 0.0, 0.9, -0.9, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+/// The same buffer's coverage control: the milestone's full-screen triangle in
+/// Metal NDC (`(-1, -1)`, `(3, -1)`, `(-1, 3)`), which covers every texel of
+/// the 2×2 render area. A rail that read no bytes at all — or a fixture whose
+/// positions were silently replaced by the milestone geometry — would fill all
+/// four texels, which is what this control states.
+fn stage_buffer_full_cover_positions() -> Vec<u8> {
+    [-1.0_f32, -1.0, 3.0, -1.0, -1.0, 3.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+/// The one `vec4` the reviewed fragment stage reads: the same `(64/255,
+/// 128/255, 192/255, 1)` constants the solid stages store, so the covered
+/// texel's readback is `40 80 c0 ff` — the stage buffer's own payload with the
+/// format's quantisation an identity, rather than a new expectation.
+fn stage_buffer_tint() -> Vec<u8> {
+    [64.0_f32 / 255.0, 128.0 / 255.0, 192.0 / 255.0, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+/// The one view a pass binds at `stage`/`index`: the trace's own bytes, the
+/// shape every render input's declaring arm has.
+fn stage_buffer_view(
+    stage: RenderPipelineStage,
+    index: u32,
+    view_id: ViewId,
+    allocation_id: AllocationId,
+    bytes: &[u8],
+) -> StageBufferView {
+    StageBufferView {
+        stage,
+        view: BufferView {
+            view_id,
+            metal_binding: index,
+            allocation_id,
+            offset: 0,
+            length: u64::try_from(bytes.len()).expect("buffer length"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes.to_vec()),
+        },
+    }
+}
+
+/// The two slots the reviewed pair declares: the vertex stage's 24-byte
+/// positions and the fragment stage's 16-byte tint, each read once with a
+/// static footprint.
+fn stage_buffer_declarations() -> Vec<StageBufferBinding> {
+    vec![
+        StageBufferBinding {
+            stage: RenderPipelineStage::Vertex,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 24 },
+        },
+        StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 16 },
+        },
+    ]
+}
+
+/// The stage-buffer fixture's registrations: the declaring pass's compute
+/// kernel, the reviewed pair, and one milestone registration that declares the
+/// same slots without a module that reads them — the pairing the rail refuses
+/// by name.
+fn stage_buffer_fixture() -> Option<(
+    VulkanComputeProvider,
+    CompiledComputePipeline,
+    CompiledComputePipeline,
+    CompiledComputePipeline,
+)> {
+    let executor = executor()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_stage_buffer_compute"))
+        .expect("the compute pipeline registers");
+    let reviewed = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "stage_buffer_positions_main".to_owned(),
+                fragment_entry: "stage_buffer_tint_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: stage_buffer_declarations(),
+            },
+            vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
+            fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_stage_buffer_stages"),
+        })
+        .expect("the stage-buffer pair registers");
+    let other = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: stage_buffer_declarations(),
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_stage_buffer_other"),
+        })
+        .expect("the milestone pair registers beside the stage-buffer declaration");
+    Some((provider, compute, reviewed, other))
+}
+
+/// One render-bearing trace whose pass binds the two stage buffers the
+/// pipeline declares. The declaring compute pass is the sampled-texture
+/// fixture's shape: it is what puts the attachment view in the trace's
+/// resource namespace, and the render pass draws three vertices through the
+/// reviewed pair.
+fn stage_buffer_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    positions: &[u8],
+    tint: &[u8],
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = vec![
+        stage_buffer_view(
+            RenderPipelineStage::Vertex,
+            0,
+            STAGE_BUFFER_POSITION_VIEW,
+            STAGE_BUFFER_POSITION_ALLOCATION,
+            positions,
+        ),
+        stage_buffer_view(
+            RenderPipelineStage::Fragment,
+            0,
+            STAGE_BUFFER_TINT_VIEW,
+            STAGE_BUFFER_TINT_ALLOCATION,
+            tint,
+        ),
+    ];
+    stage_buffer_trace_with_pass(provider, compute, render, pass)
+}
+
+/// The same trace with a caller-built pass: the shape the refusal controls
+/// need, where the pass deliberately binds fewer (or other) stage buffers than
+/// the pipeline declares.
+fn stage_buffer_trace_with_pass(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    pass: RenderPassDescriptor,
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(12),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        // 2×2 texels of four bytes: exactly the extent the
+                        // render attachment restates.
+                        length: attachment_length(AttachmentFormat::Rgba8Unorm) as u64,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; 16]),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(pass),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [(ATTACHMENT_ALLOCATION, 16), (SCRATCH_ALLOCATION, 8)] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+    (trace, resources)
+}
+
+/// Submit one stage-buffer trace and return the attachment's readback.
+fn stage_buffer_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    positions: &[u8],
+    tint: &[u8],
+) -> Vec<u8> {
+    let (trace, resources) = stage_buffer_trace(provider, compute, render, positions, tint);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the stage-buffer trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    readback(&writebacks, ATTACHMENT_VIEW)
+}
+
+/// The whole chain for the stage buffers: a 2×2 attachment the two stages read
+/// their own bytes from. The falsification is the point — the fragment
+/// stage's payload is the covered texel, the vertex stage's positions decide
+/// *which* texel is covered, and the clear sentinel survives where the draw
+/// does not reach.
+#[test]
+fn a_render_pass_reads_its_stage_buffers_and_lands_their_bytes() {
+    let Some((provider, compute, reviewed, other)) = stage_buffer_fixture() else {
+        return;
+    };
+    let positions = stage_buffer_positions();
+    let tint = stage_buffer_tint();
+    let attachment = stage_buffer_readback(&provider, &compute, &reviewed, &positions, &tint);
+    eprintln!("stage-buffer attachment readback: {}", hex(&attachment));
+    eprintln!("positions: {}", hex(&positions));
+    eprintln!("tint: {}", hex(&tint));
+    assert_eq!(attachment.len(), 16);
+    assert_eq!(
+        &attachment[..4],
+        &[0x40, 0x80, 0xc0, 0xff],
+        "the covered texel is the fragment stage buffer's own payload"
+    );
+    assert!(
+        attachment[4..]
+            .chunks_exact(4)
+            .all(|texel| texel == CLEAR_SENTINEL),
+        "the positions buffer's triangle covers exactly one texel: {}",
+        hex(&attachment)
+    );
+
+    // Control one: the same pass with another fragment payload lands that
+    // payload's bytes in the covered texel, and nothing else moves.
+    let other_tint: Vec<u8> = [0.0_f32, 1.0, 0.0, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let green = stage_buffer_readback(&provider, &compute, &reviewed, &positions, &other_tint);
+    eprintln!("green readback: {}", hex(&green));
+    assert_eq!(&green[..4], &[0x00, 0xff, 0x00, 0xff]);
+    assert!(green[4..]
+        .chunks_exact(4)
+        .all(|texel| texel == CLEAR_SENTINEL));
+
+    // Control two: the same fragment payload with the full-cover positions
+    // fills all four texels, so the vertex stage's bytes — not the module's
+    // own geometry — are what selected the covered texel above.
+    let full = stage_buffer_readback(
+        &provider,
+        &compute,
+        &reviewed,
+        &stage_buffer_full_cover_positions(),
+        &tint,
+    );
+    eprintln!("full-cover readback: {}", hex(&full));
+    assert_eq!(full, [0x40, 0x80, 0xc0, 0xff].repeat(4));
+
+    // Control three: the same bindings under a pipeline whose modules read no
+    // stage buffer are refused by name instead of executed with the bindings
+    // dropped.
+    let (trace, resources) = stage_buffer_trace(&provider, &compute, &other, &positions, &tint);
+    let refused = match provider.capabilities().validate_trace(trace, resources) {
+        Ok(admitted) => provider
+            .submit(admitted)
+            .expect_err("the milestone pair reads no stage buffer"),
+        Err(error) => error,
+    };
+    eprintln!("stage buffers under the milestone pair refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_buffer_stage_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+/// A registration whose contract declares the stage-buffer pair's modules but
+/// no slots is refused at execution by name: the reviewed pair reads its own
+/// bindings, so a pass that binds none would draw from descriptors nobody
+/// filled (`research/docs/23` §3.3, v83).
+#[test]
+fn the_reviewed_stage_buffer_pair_requires_its_two_bindings() {
+    let Some(executor) = executor() else {
+        return;
+    };
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let unbound = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "stage_buffer_positions_main".to_owned(),
+                fragment_entry: "stage_buffer_tint_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: Vec::new(),
+            },
+            vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
+            fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_stage_buffer_unbound"),
+        })
+        .expect("the pair registers: the contract declares no slot");
+    let function = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>)
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(
+            &function,
+            digest(b"render_e2e_stage_buffer_unbound_compute"),
+        )
+        .expect("the compute pipeline registers");
+    let pass = render_pass(unbound.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    let (trace, resources) = stage_buffer_trace_with_pass(&provider, &compute, &unbound, pass);
+    let refused = match provider.capabilities().validate_trace(trace, resources) {
+        Ok(admitted) => provider
+            .submit(admitted)
+            .expect_err("the reviewed pair needs its two bindings"),
+        Err(error) => error,
+    };
+    eprintln!("unbound stage-buffer pair refused: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_buffer_binding_required");
 }

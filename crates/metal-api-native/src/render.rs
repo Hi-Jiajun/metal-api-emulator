@@ -3141,6 +3141,19 @@ pub(crate) fn layout_name(layout: &VertexLayout) -> &'static str {
 /// (`NativeMetalProvider::register_render_pipeline`) and [`plan`] both run it,
 /// so the refusal is reachable before a submission as well as inside one.
 pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), ProviderError> {
+    // A pipeline that declares stage buffer bindings is refused by name before
+    // the reviewed-module lookup (`research/docs/23` §3.3, v83): the reviewed
+    // MSL modules carry no `[[buffer(N)]]` argument, so accepting the contract
+    // would execute a pass whose bindings this rail silently ignores. The
+    // Vulkan rail executes the shape; this one records the boundary.
+    if !contract.stage_buffers.is_empty() {
+        return Err(
+            capability_refusal("render_stage_buffer_unsupported").with_detail(
+                "the reviewed native modules carry no stage buffer argument, so a pipeline that \
+                 declares one cannot be reviewed on this rail",
+            ),
+        );
+    }
     if reviewed_module_for(contract).is_some() {
         return Ok(());
     }
@@ -5447,10 +5460,11 @@ mod tests {
         IndirectCommandRange, InitialState, LeaseId, LeaseRegistry, LeaseReservation,
         MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
         PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity,
-        ResourceTableSnapshot, SemanticDigest, StagedLease, StencilCompare, StencilFormat,
-        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, TextureAccess,
-        VertexAttribute, VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        RenderDepthAttachment, RenderDepthIdentity, RenderPipelineStage, RenderStencilAttachment,
+        RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest, StageBufferBinding,
+        StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
+        StencilResolveFilter, StencilTest, StorageMode, TextureAccess, VertexAttribute,
+        VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -5460,6 +5474,7 @@ mod tests {
     /// as the full-screen triangle.
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -5491,8 +5506,80 @@ mod tests {
         }
     }
 
+    /// The stage-buffer face is the Vulkan rail's (`research/docs/23` §3.3,
+    /// v83): this rail's reviewed MSL modules carry no `[[buffer(N)]]`
+    /// argument, so a registration that declares one and a pass that binds one
+    /// are both refused by name instead of executed with the binding silently
+    /// dropped.
+    #[test]
+    fn the_stage_buffer_face_is_refused_by_name_on_the_native_rail() {
+        let declaration = StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 16 },
+        };
+        let declared = RenderPipelineContract {
+            stage_buffers: vec![declaration],
+            ..milestone_pipeline()
+        };
+        let refused = review_contract(&declared).expect_err("a stage-buffer declaration");
+        eprintln!("native stage-buffer registration refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_buffer_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+        // The binding half: a pass that binds a stage buffer under a reviewed
+        // contract never reaches this rail's own gates — `review_contract` is
+        // the first thing `plan_with_leases` calls, and a contract that
+        // declares the slot is exactly what it refuses. The pair rules refuse
+        // the complementary shape (bound but undeclared) with the contract
+        // family's own slug before that, so no ordering reaches an executed
+        // draw with the bindings dropped.
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.stage_buffers = vec![StageBufferView {
+            stage: RenderPipelineStage::Fragment,
+            view: BufferView {
+                view_id: ViewId::new(61),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(63),
+                offset: 0,
+                length: 16,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0; 16]),
+            },
+        }];
+        let milestone = milestone_pipeline();
+        let request = milestone_request(&pass, &milestone, None);
+        let refused = plan_pass(&request).expect_err("a pass that binds an undeclared slot");
+        eprintln!("native undeclared stage-buffer binding refused: {refused:?}");
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+
+        // The declaring contract beside a pass that binds its slot is what
+        // the rail itself refuses, so the two shapes together cover both
+        // orders: undeclared binding (pair rules) and declaring contract
+        // (`review_contract`, which `plan_with_leases` asks first for every
+        // contract that reaches it).
+        let request = milestone_request(&pass, &declared, None);
+        let refused = plan_pass(&request).expect_err("a declaring contract");
+        eprintln!("native declaring contract refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_buffer_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+        // The snapshot keeps the fail-closed default: the bit is off and the
+        // limit is zero, so core admission refuses the shape before this rail
+        // is even asked.
+        let bits = capability_bits(2048);
+        assert!(!bits.supports_render_passes || bits.max_color_attachments > 0);
+        let capabilities = capabilities(&bits);
+        assert!(!capabilities.supports_render_stage_buffers);
+        assert_eq!(capabilities.max_render_stage_buffers, 0);
+    }
+
     fn milestone_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: VERTEX_ENTRY.to_owned(),
             fragment_entry: FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -5511,6 +5598,7 @@ mod tests {
     /// (`research/docs/23` §3.3, v70).
     fn sampled_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: SAMPLED_VERTEX_ENTRY.to_owned(),
             fragment_entry: SAMPLED_FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -5600,6 +5688,7 @@ mod tests {
             Some("conformance/shaders/render_offscreen_2x2.metal")
         );
         let crossed = RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: VERTEX_ENTRY.to_owned(),
             fragment_entry: SAMPLED_FRAGMENT_ENTRY.to_owned(),
             ..sampled_pipeline()
@@ -5736,6 +5825,7 @@ mod tests {
     fn allowlist_refusal(source: &str, vertex: &str, fragment: &str) -> ProviderError {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
         let pipeline = RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: vertex.to_owned(),
             fragment_entry: fragment.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -6224,6 +6314,7 @@ mod tests {
             write: true,
         });
         let pipeline = RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: DEPTH_ONLY_VERTEX_ENTRY.to_owned(),
             fragment_entry: DEPTH_ONLY_FRAGMENT_ENTRY.to_owned(),
             color_formats: Vec::new(),
@@ -6936,6 +7027,7 @@ mod tests {
             },
             contract: render_table_contract(),
             render: Some(RenderPipelineContract {
+                stage_buffers: Vec::new(),
                 vertex_entry: VERTEX_ENTRY.to_owned(),
                 fragment_entry: FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -7112,6 +7204,8 @@ mod tests {
         vertex: &VertexInputCapabilityBits,
     ) -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_stage_buffers: false,
+            max_render_stage_buffers: 0,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -7249,6 +7343,7 @@ mod tests {
     /// `[[stage_in]]` positions.
     fn quad_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: QUAD_VERTEX_ENTRY.to_owned(),
             fragment_entry: FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -7268,6 +7363,7 @@ mod tests {
     /// bound stream.
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            stage_buffers: Vec::new(),
             blend: None,
             multisample: None,
             depth_resolve: None,
@@ -7692,6 +7788,7 @@ mod tests {
     /// (`research/docs/23` §3.3, v47).
     fn stencil_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: DEPTH_VERTEX_ENTRY.to_owned(),
             fragment_entry: DEPTH_FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -7844,6 +7941,7 @@ mod tests {
     /// attachments.
     fn dual_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
+            stage_buffers: Vec::new(),
             vertex_entry: QUAD_VERTEX_ENTRY.to_owned(),
             fragment_entry: DUAL_FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],

@@ -13,7 +13,7 @@ use metal_api_core::provider::{
     DepthResolveFilter, DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract,
     PresentMode, ProviderCapabilities, SemanticDigest, StencilResolveFilter, StorageMode,
     TextureFormat, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
-    MAX_RENDER_TEXTURES,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use metal_api_core::ExecutorError;
 
@@ -180,6 +180,19 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         supports_render_texture_sampling: true,
         max_render_textures: MAX_RENDER_TEXTURES as u32,
         supported_render_texture_formats: vec![TextureFormat::Rgba8Unorm],
+        // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
+        // `render.rs` uploads each bound view into a host-visible
+        // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1
+        // for the vertex stage's bindings, set 2 for the fragment stage's —
+        // before the draw. Evidence: the reviewed `stage_buffer_quad_2x2`
+        // fixture in `tests/render_e2e.rs` (the buffers' own bytes move the
+        // geometry and land in the attachment) and the rail's refusal tests
+        // for a pass whose stage binds a buffer the module does not read. The
+        // bit names the shape this increment reviewed — read-only, static
+        // footprint, indices below the contract bound — so a wider request is
+        // refused by core admission rather than silently narrowed.
+        supports_render_stage_buffers: true,
+        max_render_stage_buffers: MAX_RENDER_STAGE_BUFFERS as u32,
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

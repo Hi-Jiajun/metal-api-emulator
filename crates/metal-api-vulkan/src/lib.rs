@@ -5559,6 +5559,7 @@ mod tests {
         let render_metadata = provider
             .register_render_pipeline(RenderPipelineRequest {
                 contract: RenderPipelineContract {
+                    stage_buffers: Vec::new(),
                     vertex_entry: "vertex_main".to_owned(),
                     fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
@@ -5683,6 +5684,7 @@ mod tests {
         let render_metadata = provider
             .register_render_pipeline(RenderPipelineRequest {
                 contract: RenderPipelineContract {
+                    stage_buffers: Vec::new(),
                     vertex_entry: "vertex_main".to_owned(),
                     fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
