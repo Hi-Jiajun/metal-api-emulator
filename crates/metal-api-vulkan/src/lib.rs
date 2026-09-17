@@ -2224,6 +2224,9 @@ impl PendingExecution {
             .create_textures(tail.textures, dispatches)
             .map_err(encode_error)?;
         resources
+            .create_static_samplers(&translated)
+            .map_err(encode_error)?;
+        resources
             .create_descriptors(&translated, dispatches)
             .map_err(encode_error)?;
         if let Some(threadgroups) = tail.indirect_dispatch {
@@ -2609,17 +2612,32 @@ fn validate_descriptor_limits(
             .count(),
     )
     .map_err(|_| failure("reflected texture count overflows u32"))?;
+    // AIR static samplers and runtime `[[sampler(n)]]` bindings each consume
+    // one sampler descriptor (`research/docs/26` §21.3, C1b).
+    let sampler_count = u32::try_from(
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.kind,
+                    ResourceKind::StaticSampler | ResourceKind::Sampler
+                )
+            })
+            .count(),
+    )
+    .map_err(|_| failure("reflected sampler count overflows u32"))?;
     if limits.max_bound_descriptor_sets == 0
         || buffer_count > limits.max_per_stage_descriptor_storage_buffers
         || buffer_count > limits.max_descriptor_set_storage_buffers
         || sampled_count > limits.max_per_stage_descriptor_sampled_images
         || sampled_count > limits.max_descriptor_set_sampled_images
-        || sampled_count > limits.max_per_stage_descriptor_samplers
-        || sampled_count > limits.max_descriptor_set_samplers
+        || sampled_count.saturating_add(sampler_count) > limits.max_per_stage_descriptor_samplers
+        || sampled_count.saturating_add(sampler_count) > limits.max_descriptor_set_samplers
         || buffer_count.saturating_add(sampled_count) > limits.max_per_stage_resources
     {
         return Err(failure(format!(
-            "{buffer_count} storage buffers and {sampled_count} sampled textures exceed Vulkan descriptor limits per-stage-buffers={} per-set-buffers={} per-stage-images={} per-stage-samplers={} all-resources={} bound-sets={}",
+            "{buffer_count} storage buffers, {sampled_count} sampled textures and {sampler_count} samplers exceed Vulkan descriptor limits per-stage-buffers={} per-set-buffers={} per-stage-images={} per-stage-samplers={} all-resources={} bound-sets={}",
             limits.max_per_stage_descriptor_storage_buffers,
             limits.max_descriptor_set_storage_buffers,
             limits.max_per_stage_descriptor_sampled_images,
@@ -2634,13 +2652,126 @@ fn validate_descriptor_limits(
 /// Descriptor type one reflected binding needs. Sampled textures use a
 /// combined image sampler because the translator synthesizes the sampler and
 /// the provider supplies one per sampled image (`research/docs/16` §4.3).
+/// An AIR-embedded constexpr sampler (`ResourceKind::StaticSampler`) and a
+/// runtime `[[sampler(n)]]` (`ResourceKind::Sampler`) each own a `VkSampler`
+/// the provider creates from the reflected state and binds at the binding the
+/// reflection names (`research/docs/26` §21.3, C1b).
 fn descriptor_type_for_binding(
     binding: &metal2vulkan::reflect::ResourceBinding,
 ) -> vk::DescriptorType {
     match binding.kind {
         ResourceKind::Texture => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        ResourceKind::StaticSampler | ResourceKind::Sampler => vk::DescriptorType::SAMPLER,
         _ => vk::DescriptorType::STORAGE_BUFFER,
     }
+}
+
+/// Map one AIR-embedded constexpr sampler state onto the contract's closed
+/// sampler family (`research/docs/26` §21.3, C1b).
+///
+/// The reviewed family is `{nearest, linear} x {clamp-to-edge, repeat}` under
+/// normalized coordinates, no comparison function, no reduction mode and no
+/// anisotropy — exactly the states the contract's [`SamplerPolicy`] can name.
+/// Anything else is refused here rather than approximated, because a
+/// substituted sampler changes which texels a sample returns without changing
+/// the module the state came from.
+///
+/// [`SamplerPolicy`]: metal_api_core::provider::SamplerPolicy
+pub(crate) fn static_sampler_policy(
+    state: &metal2vulkan::reflect::StaticSamplerState,
+) -> Result<metal_api_core::provider::SamplerPolicy, ExecutorError> {
+    use metal2vulkan::reflect::{
+        SamplerAddressMode as AirAddress, SamplerCompareFunction, SamplerCoordinates,
+        SamplerFilter as AirFilter, SamplerMipFilter as AirMipFilter, SamplerReduction,
+    };
+
+    let filter = |filter: AirFilter| match filter {
+        AirFilter::Nearest => Ok(metal_api_core::provider::SamplerFilter::Nearest),
+        AirFilter::Linear => Ok(metal_api_core::provider::SamplerFilter::Linear),
+        AirFilter::Bicubic => Err(failure(
+            "the compute sampler family has no bicubic filter; refusing instead of substituting",
+        )),
+    };
+    let address = |address: AirAddress| {
+        match address {
+        AirAddress::ClampToEdge => Ok(metal_api_core::provider::SamplerAddressMode::ClampToEdge),
+        AirAddress::Repeat => Ok(metal_api_core::provider::SamplerAddressMode::Repeat),
+        other => Err(failure(format!(
+            "the compute sampler family has no {other:?} address mode; refusing instead of substituting"
+        ))),
+    }
+    };
+    if state.min_filter != state.mag_filter {
+        return Err(failure(format!(
+            "an AIR sampler whose min ({:?}) and mag ({:?}) filters differ is outside the reviewed family",
+            state.min_filter, state.mag_filter
+        )));
+    }
+    if state.address_mode_s != state.address_mode_t || state.address_mode_s != state.address_mode_r
+    {
+        return Err(failure(format!(
+            "an AIR sampler whose axes address differently (s {:?}, t {:?}, r {:?}) is outside the reviewed family",
+            state.address_mode_s, state.address_mode_t, state.address_mode_r
+        )));
+    }
+    if state.mip_filter != AirMipFilter::None {
+        return Err(failure(format!(
+            "an AIR sampler with a {:?} mip filter is outside the reviewed family",
+            state.mip_filter
+        )));
+    }
+    if state.coordinates != SamplerCoordinates::Normalized {
+        return Err(failure(
+            "an AIR sampler with pixel coordinates is outside the reviewed family",
+        ));
+    }
+    if state.compare_function != SamplerCompareFunction::Never {
+        return Err(failure(format!(
+            "an AIR sampler with compare function {:?} is outside the reviewed family",
+            state.compare_function
+        )));
+    }
+    if state.reduction != SamplerReduction::WeightedAverage {
+        return Err(failure(format!(
+            "an AIR sampler with {:?} reduction is outside the reviewed family",
+            state.reduction
+        )));
+    }
+    if state.max_anisotropy != 1 {
+        return Err(failure(format!(
+            "an AIR sampler with anisotropy {} is outside the reviewed family",
+            state.max_anisotropy
+        )));
+    }
+    Ok(metal_api_core::provider::SamplerPolicy {
+        filter: filter(state.min_filter)?,
+        address: address(state.address_mode_s)?,
+    })
+}
+
+/// The Vulkan create-info for one contract sampler policy.
+fn sampler_create_info(
+    policy: metal_api_core::provider::SamplerPolicy,
+) -> vk::SamplerCreateInfo<'static> {
+    use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+    let filter = match policy.filter {
+        SamplerFilter::Nearest => vk::Filter::NEAREST,
+        SamplerFilter::Linear => vk::Filter::LINEAR,
+    };
+    let address = match policy.address {
+        SamplerAddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        SamplerAddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
+    };
+    vk::SamplerCreateInfo::default()
+        .mag_filter(filter)
+        .min_filter(filter)
+        // The reviewed textures carry one mip level, so `mipmap_mode` is never
+        // consulted; the nearest mode keeps the create-info valid.
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(address)
+        .address_mode_v(address)
+        .address_mode_w(address)
 }
 
 fn validate_storage_buffer_size(
@@ -3108,18 +3239,26 @@ fn validate_pipeline_reflection(
     }
     let mut descriptor_bindings = BTreeSet::new();
     for binding in &reflection.bindings {
-        if binding.kind != ResourceKind::Buffer && binding.kind != ResourceKind::Texture {
+        // The reviewed compute face: Metal buffers, sampled textures, and the
+        // AIR-embedded constexpr samplers this increment executes
+        // (`research/docs/26` §21.3, C1b). Everything else — runtime
+        // `[[sampler(n)]]`, storage images, color inputs, imageblocks — stays
+        // outside the subset and is refused by name.
+        if !matches!(
+            binding.kind,
+            ResourceKind::Buffer | ResourceKind::Texture | ResourceKind::StaticSampler
+        ) {
             return Err(failure(format!(
-                "Phase 1 supports only Metal buffers and sampled textures, not {:?}",
+                "the compute texture subset supports Metal buffers, sampled textures and AIR static samplers, not {:?}",
                 binding.kind
             )));
         }
         // A texture and a buffer may share the Metal argument index; the
         // Vulkan descriptor binding is the unique key (checked below).
-        let what = if binding.kind == ResourceKind::Buffer {
-            "buffer"
-        } else {
-            "texture"
+        let what = match binding.kind {
+            ResourceKind::Buffer => "buffer",
+            ResourceKind::Texture => "texture",
+            _ => "static sampler",
         };
         let descriptor = binding.descriptor.ok_or_else(|| {
             failure(format!(
@@ -3152,6 +3291,13 @@ fn validate_pipeline_reflection(
                     binding.metal_index
                 )));
             }
+            continue;
+        }
+        if binding.kind == ResourceKind::StaticSampler {
+            // The state itself is checked where the pipeline contract is
+            // derived (`static_sampler_policy`); here only the descriptor
+            // location is checked, exactly as for the two resource kinds
+            // above.
             continue;
         }
         if binding.extent.is_none() {
@@ -3444,6 +3590,16 @@ struct GpuTexture {
     sampler: vk::Sampler,
 }
 
+/// One `VkSampler` created for an AIR-embedded constexpr sampler binding
+/// (`research/docs/26` §21.3, C1b). The module's own state is the create-info,
+/// so the sampler a pass executes with is the one its SPIR-V was lowered
+/// against.
+struct GpuStaticSampler {
+    /// The descriptor binding the reflection named for this sampler.
+    binding: u32,
+    sampler: vk::Sampler,
+}
+
 /// A pass owns every object derived from its shader's reflection. Keeping this
 /// ownership separate prevents using one shader's layout for a later shader.
 struct PipelineObjects {
@@ -3480,6 +3636,10 @@ struct ExecutionResources {
     heap_bytes: Option<u64>,
     /// Sampled textures addressed by their Metal argument index.
     textures: Vec<GpuTexture>,
+    /// Samplers created for the translated modules' AIR-embedded constexpr
+    /// samplers, addressed by their reflected descriptor binding
+    /// (`research/docs/26` §21.3, C1b).
+    static_samplers: Vec<GpuStaticSampler>,
     /// Pool key to its window in `buffers`. `research/docs/15` §3.
     /// Pool key (kind plus index) to its window in `buffers` or `textures`.
     view_windows: BTreeMap<PoolKey, ViewWindow>,
@@ -3855,6 +4015,7 @@ impl ExecutionResources {
             heap_memory: None,
             heap_bytes: None,
             textures: Vec::new(),
+            static_samplers: Vec::new(),
             view_windows: BTreeMap::new(),
             indirect_buffer: vk::Buffer::null(),
             indirect_memory: vk::DeviceMemory::null(),
@@ -4335,15 +4496,25 @@ impl ExecutionResources {
             let byte_length = texture
                 .expected_bytes()
                 .map_err(|error| failure(format!("texture {}: {error}", texture.metal_binding)))?;
+            let vk_format = match texture.format {
+                TextureFormat::R32Uint => vk::Format::R32_UINT,
+                TextureFormat::R32Float => vk::Format::R32_SFLOAT,
+                other => {
+                    return Err(failure(format!(
+                        "texture {} needs a D2 single-sample R32Uint or R32Float sampled texture, not {other:?}",
+                        texture.metal_binding
+                    ))
+                    .into())
+                }
+            };
             if texture.texture_type != TextureType::D2
-                || texture.format != TextureFormat::R32Uint
                 || texture.sample_count != 1
                 || texture.depth != 1
                 || texture.array_length != 1
                 || texture.access != TextureAccess::Sampled
             {
                 return Err(failure(format!(
-                    "texture {} needs a D2 single-sample R32Uint sampled texture",
+                    "texture {} needs a D2 single-sample R32Uint or R32Float sampled texture",
                     texture.metal_binding
                 ))
                 .into());
@@ -4372,7 +4543,7 @@ impl ExecutionResources {
             };
             let image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::R32_UINT)
+                .format(vk_format)
                 .extent(extent)
                 .mip_levels(1)
                 .array_layers(1)
@@ -4464,12 +4635,7 @@ impl ExecutionResources {
                 }
             }
             unsafe { self.context.device.unmap_memory(memory) };
-            let view = match create_color_image_view(
-                &self.context,
-                image,
-                vk::Format::R32_UINT,
-                "texture",
-            ) {
+            let view = match create_color_image_view(&self.context, image, vk_format, "texture") {
                 Ok(view) => view,
                 Err(error) => {
                     unsafe {
@@ -4784,6 +4950,85 @@ impl ExecutionResources {
         Ok(())
     }
 
+    /// Create one `VkSampler` per translated module's AIR-embedded constexpr
+    /// sampler (`research/docs/26` §21.3, C1b).
+    ///
+    /// The create-info comes from the module's own decoded state
+    /// ([`static_sampler_policy`]), never from a provider default: a rail that
+    /// substituted nearest/clamp here would change which texels
+    /// `air.sample_texture_*` returns without changing the request. A runtime
+    /// `[[sampler(n)]]` binding carries no AIR state and no request surface
+    /// this contract defines, so it is refused by name. A linear state also
+    /// requires the device to report linear filtering for the rail's sampled
+    /// float format; a device that cannot filter it is refused by name rather
+    /// than silently sampled nearest.
+    fn create_static_samplers(
+        &mut self,
+        translated: &[&TranslatedComputePipeline],
+    ) -> Result<(), ExecutionFailure> {
+        for pipeline in translated {
+            for binding in &pipeline.reflection().bindings {
+                if !matches!(
+                    binding.kind,
+                    ResourceKind::StaticSampler | ResourceKind::Sampler
+                ) {
+                    continue;
+                }
+                let descriptor = binding
+                    .descriptor
+                    .ok_or_else(|| failure("sampler binding has no descriptor location"))?;
+                if binding.kind == ResourceKind::Sampler {
+                    return Err(failure(format!(
+                        "runtime [[sampler({})]] is not part of the reviewed compute contract; \
+                         refusing instead of binding an unstated state",
+                        binding.metal_index
+                    ))
+                    .into());
+                }
+                let state = binding.static_sampler.ok_or_else(|| {
+                    failure(format!(
+                        "AIR static sampler at descriptor {} carries no decoded state",
+                        descriptor.binding
+                    ))
+                })?;
+                let policy = static_sampler_policy(&state)?;
+                if policy.filter == metal_api_core::provider::SamplerFilter::Linear {
+                    let features = unsafe {
+                        self.context.instance.get_physical_device_format_properties(
+                            self.context.physical,
+                            vk::Format::R32_SFLOAT,
+                        )
+                    };
+                    // The reviewed textures are linear-tiled images
+                    // (`create_textures`), so the device fact this checks is
+                    // the linear-tiling feature bit.
+                    let filter_features = features.linear_tiling_features;
+                    if !filter_features
+                        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+                    {
+                        return Err(failure(format!(
+                            "device reports no linear filtering for the sampled float format \
+                             (filter={:?} address={:?}); refusing instead of sampling nearest",
+                            policy.filter, policy.address
+                        ))
+                        .into());
+                    }
+                }
+                let info = sampler_create_info(policy);
+                let sampler = unsafe { self.context.device.create_sampler(&info, None) }.map_err(
+                    |error| {
+                        ExecutionFailure::vulkan(error, format!("create static sampler: {error}"))
+                    },
+                )?;
+                self.static_samplers.push(GpuStaticSampler {
+                    binding: descriptor.binding,
+                    sampler,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn create_descriptors(
         &mut self,
         translated: &[&TranslatedComputePipeline],
@@ -4793,10 +5038,12 @@ impl ExecutionResources {
             .map_err(|_| failure("descriptor set count overflows u32"))?;
         let mut storage_buffer_count = 0_u32;
         let mut sampled_image_count = 0_u32;
+        let mut sampler_count = 0_u32;
         for pipeline in translated {
             for binding in &pipeline.reflection().bindings {
                 let counter = match descriptor_type_for_binding(binding) {
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER => &mut sampled_image_count,
+                    vk::DescriptorType::SAMPLER => &mut sampler_count,
                     _ => &mut storage_buffer_count,
                 };
                 *counter = counter
@@ -4804,7 +5051,7 @@ impl ExecutionResources {
                     .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
             }
         }
-        let mut sizes = Vec::with_capacity(2);
+        let mut sizes = Vec::with_capacity(3);
         if storage_buffer_count > 0 {
             sizes.push(vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -4815,6 +5062,12 @@ impl ExecutionResources {
             sizes.push(vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: sampled_image_count,
+            });
+        }
+        if sampler_count > 0 {
+            sizes.push(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: sampler_count,
             });
         }
         let pool_info = vk::DescriptorPoolCreateInfo::default()
@@ -4846,7 +5099,27 @@ impl ExecutionResources {
             let mut writes = Vec::with_capacity(reflection.bindings.len());
             let mut buffer_infos = Vec::with_capacity(reflection.bindings.len());
             let mut image_infos = Vec::with_capacity(reflection.bindings.len());
+            let mut sampler_infos = Vec::with_capacity(reflection.bindings.len());
             for binding in &reflection.bindings {
+                if matches!(
+                    binding.kind,
+                    ResourceKind::StaticSampler | ResourceKind::Sampler
+                ) {
+                    let descriptor = binding.descriptor.expect("validated descriptor");
+                    let created = self
+                        .static_samplers
+                        .iter()
+                        .find(|sampler| sampler.binding == descriptor.binding)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "no sampler was created for descriptor {}",
+                                descriptor.binding
+                            ))
+                        })?;
+                    sampler_infos.push(vk::DescriptorImageInfo::default().sampler(created.sampler));
+                    writes.push(vk::WriteDescriptorSet::default());
+                    continue;
+                }
                 if binding.kind == ResourceKind::Texture {
                     let pool_key = dispatch
                         .bindings
@@ -4903,13 +5176,23 @@ impl ExecutionResources {
             // until `update_descriptor_sets` returns.
             let mut image_cursor = 0;
             let mut buffer_cursor = 0;
+            let mut sampler_cursor = 0;
             let writes = writes
                 .into_iter()
                 .zip(&reflection.bindings)
                 .map(|(write, binding)| {
                     let descriptor = binding.descriptor.expect("validated descriptor");
                     let write = write.dst_set(set).dst_binding(descriptor.binding);
-                    if binding.kind == ResourceKind::Texture {
+                    if matches!(
+                        binding.kind,
+                        ResourceKind::StaticSampler | ResourceKind::Sampler
+                    ) {
+                        let write = write
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(std::slice::from_ref(&sampler_infos[sampler_cursor]));
+                        sampler_cursor += 1;
+                        write
+                    } else if binding.kind == ResourceKind::Texture {
                         let write = write
                             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                             .image_info(std::slice::from_ref(&image_infos[image_cursor]));
@@ -5373,6 +5656,9 @@ impl Drop for ExecutionResources {
                 self.context.device.destroy_image_view(texture.view, None);
                 self.context.device.destroy_image(texture.image, None);
                 self.context.device.free_memory(texture.memory, None);
+            }
+            for sampler in &self.static_samplers {
+                self.context.device.destroy_sampler(sampler.sampler, None);
             }
             // The indirect buffer is unbound by construction (its memory is
             // freed right after), so destroy before free, matching the render

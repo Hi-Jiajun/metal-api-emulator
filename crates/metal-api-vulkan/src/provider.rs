@@ -92,10 +92,16 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // sampler. Evidence: the v11 case reads texel (0, 0) and the v12 cases
         // read every cell of a 4×4 texture in two dispatch shapes, on Lavapipe
         // and on the RTX 5060 (`research/docs/16` §4.5, §4.6). The bit names
-        // exactly that shape: one binding, one format.
+        // exactly that shape: one binding, one format. From C1b on a
+        // `R32Float` texture that pairs with the module's own AIR constexpr
+        // sampler is executed too (`create_static_samplers` creates the
+        // `VkSampler` from the module's decoded state and binds it at the
+        // reflected descriptor binding); the registration gate refuses a float
+        // texture with no static sampler, so the wider format list stays
+        // paired with that window (`research/docs/26` §21.3).
         supports_compute_texture_sampling: true,
         max_compute_textures: MAX_COMPUTE_TEXTURES as u32,
-        supported_compute_texture_formats: vec![TextureFormat::R32Uint],
+        supported_compute_texture_formats: vec![TextureFormat::R32Uint, TextureFormat::R32Float],
         max_buffer_range: u64::from(limits.max_storage_buffer_range),
         max_push_constant_bytes: limits.max_push_constants_size,
         alias_mode: AliasMode::Refused,
@@ -322,6 +328,41 @@ pub(crate) fn pipeline_contract(
         .and_then(KernelDispatch::push_constant_range)
         .map_or((0, 0), |range| (range.offset, range.size));
 
+    // AIR-embedded constexpr samplers (`research/docs/26` §21.3, C1b). The
+    // reflection names each one's descriptor location and its decoded state;
+    // the contract carries that state on the sampled texture the sampler is
+    // paired with, so a caller cannot declare a filtering the module was not
+    // lowered against. This increment reviews exactly one sampler bound by
+    // exactly one sampled texture, and a runtime `[[sampler(n)]]` has no
+    // contract surface at all.
+    let mut static_samplers = Vec::new();
+    for binding in &reflection.bindings {
+        if binding.kind == ResourceKind::Sampler {
+            return Err(failure(format!(
+                "runtime [[sampler({})]] is not part of the reviewed compute contract",
+                binding.metal_index
+            )));
+        }
+        if binding.kind != ResourceKind::StaticSampler {
+            continue;
+        }
+        let state = binding.static_sampler.ok_or_else(|| {
+            failure(format!(
+                "AIR static sampler at descriptor {:?} carries no decoded state",
+                binding.descriptor.map(|descriptor| descriptor.binding)
+            ))
+        })?;
+        static_samplers.push(
+            crate::static_sampler_policy(&state)
+                .map_err(|error| failure(format!("static sampler state: {error}")))?,
+        );
+    }
+    if static_samplers.len() > 1 {
+        return Err(failure(format!(
+            "a module with {} AIR static samplers is outside the reviewed compute contract (exactly one is reviewed)",
+            static_samplers.len()
+        )));
+    }
     let mut buffer_bindings = Vec::with_capacity(reflection.bindings.len());
     let mut texture_bindings = Vec::new();
     for binding in &reflection.bindings {
@@ -333,7 +374,15 @@ pub(crate) fn pipeline_contract(
         // provider's reflection validation has admitted the binding's kind and
         // access (`research/docs/16` §4.7).
         if binding.kind == ResourceKind::Texture {
-            texture_bindings.push(map_texture_binding(binding)?);
+            texture_bindings.push(map_texture_binding(
+                binding,
+                static_samplers.first().copied(),
+            )?);
+            continue;
+        }
+        // The sampler itself has no separate contract entry: its state is the
+        // declaration the paired texture carries.
+        if binding.kind == ResourceKind::StaticSampler {
             continue;
         }
         if binding.kind != ResourceKind::Buffer {
@@ -352,6 +401,12 @@ pub(crate) fn pipeline_contract(
             access,
             footprint: map_footprint(footprint, binding.metal_index)?,
         });
+    }
+    if !static_samplers.is_empty() && texture_bindings.len() != 1 {
+        return Err(failure(format!(
+            "a module with one AIR static sampler must declare exactly one sampled texture; reflected {}",
+            texture_bindings.len()
+        )));
     }
 
     buffer_bindings.sort_by_key(|binding| binding.metal_binding);
@@ -379,12 +434,17 @@ pub(crate) fn pipeline_contract(
 ///
 /// The mapping is deliberately closed (`research/docs/26` §21.3): this rail
 /// executes D2, single-sample, non-arrayed textures whose AIR component is
-/// `uint`, so anything else is refused here — before a contract exists —
-/// rather than registered as a shape the execution path would refuse later
-/// with a message no class judge can pair against. The sampler state is the
-/// translator's synthesized read sampler, named in the contract so the
-/// execution path creates exactly that state instead of a provider default.
-fn map_texture_binding(binding: &ResourceBinding) -> Result<TextureBindingContract, ExecutorError> {
+/// `uint` (texel reads through the translator's synthesized read sampler, C1)
+/// or `float` (samples through an AIR-embedded constexpr sampler, C1b), so
+/// anything else is refused here — before a contract exists — rather than
+/// registered as a shape the execution path would refuse later with a message
+/// no class judge can pair against. The sampler state is the state the module
+/// itself carries, named in the contract so the execution path creates exactly
+/// that state instead of a provider default.
+fn map_texture_binding(
+    binding: &ResourceBinding,
+    static_sampler: Option<metal_api_core::provider::SamplerPolicy>,
+) -> Result<TextureBindingContract, ExecutorError> {
     use metal2vulkan::meta::{TextureComponent, TextureDimension};
 
     let shape = binding.texture_shape.as_ref().ok_or_else(|| {
@@ -404,16 +464,35 @@ fn map_texture_binding(binding: &ResourceBinding) -> Result<TextureBindingContra
             binding.metal_index
         )));
     }
-    // The component mapping is closed the same way: `uint` is the one AIR
-    // component the first increment executes, and the shared constructor below
-    // names the shape once for both rails.
-    if shape.component != TextureComponent::Uint {
-        return Err(failure(format!(
-            "texture {} samples {:?}, which the first texture increment does not execute",
-            binding.metal_index, shape.component
-        )));
-    }
-    Ok(TextureBindingContract::sampled_r32uint(binding.metal_index))
+    // The component mapping is closed the same way: `uint` is the texel-read
+    // component C1 executes and `float` is the component C1b samples. The
+    // float sample path exists only where the module carries an AIR
+    // constexpr sampler, so a float texture with none stays outside the
+    // reviewed window rather than being registered with a state nobody
+    // stated; the shared constructor names the shape once for both rails.
+    let format = match shape.component {
+        TextureComponent::Uint => metal_api_core::provider::TextureFormat::R32Uint,
+        TextureComponent::Float => {
+            if static_sampler.is_none() {
+                return Err(failure(format!(
+                    "texture {} samples float without an AIR static sampler, which the reviewed compute sampling path does not execute",
+                    binding.metal_index
+                )));
+            }
+            metal_api_core::provider::TextureFormat::R32Float
+        }
+        other => {
+            return Err(failure(format!(
+                "texture {} samples {other:?}, which the compute texture face does not execute",
+                binding.metal_index
+            )))
+        }
+    };
+    Ok(TextureBindingContract::sampled(
+        binding.metal_index,
+        format,
+        static_sampler.unwrap_or_else(metal_api_core::provider::SamplerPolicy::synthesized_read),
+    ))
 }
 
 fn map_access(access: Option<ResourceAccess>, index: u32) -> Result<BufferAccess, ExecutorError> {
