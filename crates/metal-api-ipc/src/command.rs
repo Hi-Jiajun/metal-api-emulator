@@ -1421,8 +1421,8 @@ mod tests {
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DepthFormat,
         DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor, HeapId,
-        HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+        DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, HeapDescriptor,
+        HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
         IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
         IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
         LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
@@ -1435,11 +1435,11 @@ mod tests {
         RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest,
         ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
         StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
-        StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType,
-        TextureView, TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout,
-        VertexFormat, VertexLayout, ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES,
-        MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_RENDER_STAGE_BUFFERS,
-        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
+        TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
+        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
+        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+        MAX_RENDER_STAGE_BUFFERS, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2237,10 +2237,13 @@ mod tests {
         let request = render_submit_with_formats(vec![AttachmentFormat::Rgba8Unorm]);
         let frame = CommandCodec::encode_request(&request).unwrap();
         let mut unknown = frame.clone();
-        unknown[pipeline_entry_kind_offset()] = 0x04;
+        // `0x05` is a kind no version of this walk assigns: compute `0x00`,
+        // render `0x01`/`0x02`/`0x03` and the compute texture face `0x04`
+        // (`research/docs/23` §91).
+        unknown[pipeline_entry_kind_offset()] = 0x05;
         assert!(matches!(
             CommandCodec::decode_request(&unknown).unwrap_err(),
-            CodecError::UnknownPipelineTag(0x04)
+            CodecError::UnknownPipelineTag(0x05)
         ));
     }
 
@@ -4226,16 +4229,18 @@ mod tests {
         );
 
         // A decoder that predates the section refuses a tag this version does
-        // not know rather than reading it as another section's bytes.
+        // not know rather than reading it as another section's bytes. The
+        // tail's presence tags are powers of two, so `0x7f` is a byte no
+        // version of this walk can ever assign.
         let mut patched = frame.clone();
         let tag = frame
             .windows(block.len())
             .position(|window| window == block)
             .expect("the render-sampler tail carries its presence tag");
-        patched[tag] = 0x80;
+        patched[tag] = 0x7f;
         assert!(matches!(
             CommandCodec::decode_response(&patched),
-            Err(CodecError::UnknownCapabilityTail(0x80))
+            Err(CodecError::UnknownCapabilityTail(0x7f))
         ));
     }
 
@@ -4285,16 +4290,18 @@ mod tests {
         );
         assert_eq!(frame.len(), plain.len() + block.len());
         // A decoder that predates the section refuses a tag this version does
-        // not know rather than reading it as another section's bytes.
+        // not know rather than reading it as another section's bytes. The
+        // tail's presence tags are powers of two, so `0x7f` is a byte no
+        // version of this walk can ever assign.
         let mut patched = frame.clone();
         let tag = frame
             .windows(block.len())
             .position(|window| window == block)
             .expect("the stage-buffer tail carries its presence tag");
-        patched[tag] = 0x80;
+        patched[tag] = 0x7f;
         assert!(matches!(
             CommandCodec::decode_response(&patched).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x80)
+            CodecError::UnknownCapabilityTail(0x7f)
         ));
         eprintln!(
             "stage-buffer capability frame: len={} plain={} block={:02x?}",
@@ -6256,5 +6263,523 @@ mod tests {
             error,
             super::CommandError::Codec(CodecError::ChunkInterrupted { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // C1c: the compute texture declaration face on the wire
+    // (`research/docs/23` §91).
+    // -----------------------------------------------------------------
+
+    /// The declaration block a contract with one [`TextureBindingContract`]
+    /// writes: the count, then binding `0`, access sampled, type D2, format
+    /// `R32Uint`, nearest filtering, clamp-to-edge addressing and a whole-view
+    /// footprint (`research/docs/26` §21.3, C1).
+    const R32UINT_DECLARATION_BLOCK: &[u8] = &[
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// A compute registration whose contract declares the one sampled texture
+    /// its kernel reads — the face C1 added to `PipelineContract` and C1c
+    /// carries (`research/docs/26` §21.3).
+    fn textured_pipeline() -> CompiledComputePipeline {
+        let mut compiled = pipeline(&compile_request());
+        compiled.contract.texture_bindings = vec![TextureBindingContract::sampled_r32uint(0)];
+        compiled
+    }
+
+    /// The 4x4 `R32Uint` view [`textured_pipeline`] declares: the shape both
+    /// rails that execute compute sampling read
+    /// ([`TextureBindingContract::sampled_r32uint`]).
+    fn sampled_r32uint_view() -> TextureView {
+        TextureView {
+            view_id: ViewId::new(71),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(41),
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(vec![0x5a; 64]),
+        }
+    }
+
+    /// [`trace`] with the declared view bound at its own index, i.e. the trace
+    /// `ComputePass::validate` admits against [`textured_pipeline`].
+    fn textured_trace(pipeline: &CompiledComputePipeline) -> ComputeTrace {
+        let mut value = trace(pipeline);
+        let Some(TracePass::Compute(pass)) = value.passes.first_mut() else {
+            panic!("the fixture is a compute pass");
+        };
+        pass.textures = vec![sampled_r32uint_view()];
+        value
+    }
+
+    /// The compute texture bits the two rails publish, on top of the fixture
+    /// snapshot (`research/docs/26` §21.3).
+    fn compute_texture_capabilities() -> ProviderCapabilities {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_compute_texture_sampling = true;
+        capabilities.max_compute_textures = 1;
+        capabilities.supported_compute_texture_formats =
+            vec![TextureFormat::R32Uint, TextureFormat::R32Float];
+        capabilities
+    }
+
+    #[test]
+    fn compute_texture_declarations_take_the_tagged_layout_and_round_trip() {
+        let plain = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: trace(&pipeline(&compile_request())),
+            resources: resources(),
+        })
+        .unwrap();
+        assert_eq!(
+            plain, LEGACY_SUBMIT_FRAME,
+            "a compute-only trace that declares no texture keeps the pre-render bytes"
+        );
+
+        let request = CommandRequest::Submit {
+            trace: textured_trace(&textured_pipeline()),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // The pre-render layout has no section for the block, so the frame
+        // takes the compute-texture submit tag and the tagged pipeline kind.
+        assert_eq!(frame[9], 0x11);
+        assert_eq!(frame[pipeline_entry_kind_offset()], 0x04);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the textured frame re-encodes byte for byte"
+        );
+        // The delta against the legacy shape is exactly the two kind bytes the
+        // tagged layout adds and the declaration block: no other byte moves.
+        assert!(
+            frame
+                .windows(R32UINT_DECLARATION_BLOCK.len())
+                .any(|window| window == R32UINT_DECLARATION_BLOCK),
+            "the declaration block travels in the frame"
+        );
+        // The same trace with the declaration list removed is the shape the
+        // pre-C1c layout writes: the tag choice is the declarations' own
+        // consequence, not the bound views'.
+        let mut undeclared = textured_trace(&textured_pipeline());
+        undeclared.pipelines[0].contract.texture_bindings.clear();
+        let undeclared_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: undeclared,
+            resources: resources(),
+        })
+        .unwrap();
+        assert_eq!(undeclared_frame[9], 0x03);
+        assert_eq!(
+            frame.len(),
+            undeclared_frame.len() + 2 + R32UINT_DECLARATION_BLOCK.len()
+        );
+
+        // The decoded contract is the value admission pairs the pass against:
+        // the declaration list survives the frame field for field.
+        let CommandRequest::Submit { trace, .. } = CommandCodec::decode_request(&frame).unwrap()
+        else {
+            panic!("a textured submit decodes as a submit");
+        };
+        assert_eq!(
+            trace.pipelines[0].contract.texture_bindings,
+            vec![TextureBindingContract::sampled_r32uint(0)]
+        );
+        eprintln!(
+            "compute texture submit: len={} undeclared={} plain={} tag={:#04x} kind={:#04x} \
+             block={:02x?}",
+            frame.len(),
+            undeclared_frame.len(),
+            plain.len(),
+            frame[9],
+            frame[pipeline_entry_kind_offset()],
+            R32UINT_DECLARATION_BLOCK
+        );
+    }
+
+    #[test]
+    fn the_compiled_response_carries_declarations_only_when_the_contract_has_them() {
+        let plain = CommandResponse::Compiled {
+            pipeline: pipeline(&compile_request()),
+        };
+        let plain_frame = CommandCodec::encode_response(&plain).unwrap();
+        assert_eq!(plain_frame[9], 0x02);
+        assert_eq!(CommandCodec::decode_response(&plain_frame).unwrap(), plain);
+
+        let textured = CommandResponse::Compiled {
+            pipeline: textured_pipeline(),
+        };
+        let frame = CommandCodec::encode_response(&textured).unwrap();
+        assert_eq!(frame[9], 0x0b);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), textured);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the compiled textured response re-encodes byte for byte"
+        );
+        assert_eq!(
+            frame.len(),
+            plain_frame.len() + R32UINT_DECLARATION_BLOCK.len()
+        );
+        // The owner learns the declaration list here, which is what lets it
+        // build the trace above with the contract the provider reflected.
+        let CommandResponse::Compiled { pipeline } = CommandCodec::decode_response(&frame).unwrap()
+        else {
+            panic!("a compiled response decodes as a compiled response");
+        };
+        assert_eq!(
+            pipeline.contract.texture_bindings,
+            vec![TextureBindingContract::sampled_r32uint(0)]
+        );
+        assert!(pipeline.render.is_none());
+        eprintln!(
+            "compiled textured pipeline: len={} plain={} tag={:#04x}",
+            frame.len(),
+            plain_frame.len(),
+            frame[9]
+        );
+    }
+
+    #[test]
+    fn release_pipeline_carries_the_declarations_for_a_textured_registration() {
+        let plain = CommandRequest::ReleasePipeline {
+            pipeline: pipeline(&compile_request()),
+        };
+        let plain_frame = CommandCodec::encode_request(&plain).unwrap();
+        assert_eq!(plain_frame[9], 0x07);
+        assert_eq!(CommandCodec::decode_request(&plain_frame).unwrap(), plain);
+
+        let textured = CommandRequest::ReleasePipeline {
+            pipeline: textured_pipeline(),
+        };
+        let frame = CommandCodec::encode_request(&textured).unwrap();
+        assert_eq!(frame[9], 0x12);
+        // The native rail compares the released value against the registration
+        // it holds, so the whole contract has to survive the frame.
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), textured);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the textured release re-encodes byte for byte"
+        );
+        assert_eq!(
+            frame.len(),
+            plain_frame.len() + R32UINT_DECLARATION_BLOCK.len()
+        );
+        eprintln!(
+            "release textured pipeline: len={} plain={} tag={:#04x}",
+            frame.len(),
+            plain_frame.len(),
+            frame[9]
+        );
+    }
+
+    #[test]
+    fn compute_texture_capability_bits_extend_the_stage_buffer_frame() {
+        // The legacy frame every provider without a render or compute texture
+        // bit still sends.
+        let defaults = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        };
+        let default_frame = CommandCodec::encode_response(&defaults).unwrap();
+        assert_eq!(default_frame[9], 0x01);
+        assert_eq!(
+            CommandCodec::decode_response(&default_frame).unwrap(),
+            defaults
+        );
+
+        // The frame the two rails already sent: render bits, render sampling
+        // and stage buffers.
+        let mut prior = fake_capabilities();
+        prior.supports_render_passes = true;
+        prior.max_color_attachments = 1;
+        prior.max_attachment_dimension = [2, 2];
+        prior.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        prior.supports_render_texture_sampling = true;
+        prior.max_render_textures = 1;
+        prior.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        prior.supports_render_stage_buffers = true;
+        prior.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        let prior_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: prior.clone(),
+        })
+        .unwrap();
+
+        let mut extended = prior.clone();
+        extended.supports_compute_texture_sampling = true;
+        extended.max_compute_textures = 1;
+        extended.supported_compute_texture_formats =
+            vec![TextureFormat::R32Uint, TextureFormat::R32Float];
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: extended,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // The block is the tail's newest section: one presence tag, one bool,
+        // one `u32` binding cap and the admitted texture formats
+        // (`research/docs/23` §91). Every integer is big-endian, the width
+        // the frame header established.
+        let block = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x01,
+        ];
+        assert!(
+            frame.windows(block.len()).any(|window| window == block),
+            "the compute-texture tail carries its tag, its bool, its cap and its formats"
+        );
+        assert_eq!(frame.len(), prior_frame.len() + block.len());
+        // The length header is the one byte run that has to move; every byte
+        // the pre-C1c frame wrote after it is still where it was, with the
+        // new block appended behind the stage-buffer half.
+        assert_eq!(
+            &frame[9..prior_frame.len()],
+            &prior_frame[9..],
+            "every byte the pre-C1c frame wrote stays where it was"
+        );
+
+        // A snapshot that declares only the three compute texture bits still
+        // writes the heap/ICB half the decoder reads by position before the
+        // tag, so the declaration cannot be dropped on the wire.
+        let only_compute = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: compute_texture_capabilities(),
+        };
+        let only_frame = CommandCodec::encode_response(&only_compute).unwrap();
+        assert_eq!(only_frame[9], 0x0a);
+        assert_eq!(
+            CommandCodec::decode_response(&only_frame).unwrap(),
+            only_compute
+        );
+        eprintln!(
+            "compute texture capabilities: legacy={} render+stage={} extended={} only={} block={:02x?}",
+            default_frame.len(),
+            prior_frame.len(),
+            frame.len(),
+            only_frame.len(),
+            block
+        );
+    }
+
+    #[test]
+    fn a_heap_bearing_trace_carries_its_pipeline_declarations_under_the_heap_tag() {
+        // The tagged layout is chosen by the heap payload here, not by the
+        // declarations, so this is the path where the two reasons have to
+        // agree: the frame keeps the heap tag and its tail while the pipeline
+        // entry takes the compute-texture kind (`research/docs/23` §91).
+        let mut trace = heap_trace();
+        trace.pipelines[0] = textured_pipeline();
+        let Some(TracePass::Compute(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture's pass is a compute pass");
+        };
+        pass.textures = vec![sampled_r32uint_view()];
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x10);
+        assert_eq!(frame[pipeline_entry_kind_offset()], 0x04);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the heap-bearing textured frame re-encodes byte for byte"
+        );
+        let CommandRequest::Submit { trace, .. } = CommandCodec::decode_request(&frame).unwrap()
+        else {
+            panic!("a heap-bearing submit decodes as a submit");
+        };
+        assert!(trace.heap.is_some(), "the heap tail still travels");
+        assert_eq!(
+            trace.pipelines[0].contract.texture_bindings,
+            vec![TextureBindingContract::sampled_r32uint(0)]
+        );
+        eprintln!(
+            "heap-bearing textured submit: len={} tag={:#04x} kind={:#04x}",
+            frame.len(),
+            frame[9],
+            frame[pipeline_entry_kind_offset()]
+        );
+    }
+
+    #[test]
+    fn compute_texture_declarations_refuse_counts_and_unknown_codes_by_name() {
+        // The encode side refuses a list above the shape's own cap before a
+        // single tuple is written.
+        let mut over = textured_pipeline();
+        over.contract
+            .texture_bindings
+            .push(TextureBindingContract::sampled_r32uint(1));
+        let refused = CommandCodec::encode_response(&CommandResponse::Compiled { pipeline: over })
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::ComputeTextureCount {
+                count: 2,
+                maximum: 1
+            }
+        ));
+        eprintln!("refused: {refused}");
+
+        // An entry that carries a render half *and* a declaration list cannot
+        // be framed at all: the render kinds' bytes are fixed, so the encoder
+        // refuses the combination by name instead of writing a frame the
+        // receiver would have to desync on.
+        let mut combined = pipeline(&compile_request());
+        combined.render = Some(render_contract());
+        combined.contract.texture_bindings = vec![TextureBindingContract::sampled_r32uint(0)];
+        let mut combined_trace = mixed_trace();
+        combined_trace.pipelines[0] = combined;
+        let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: combined_trace,
+            resources: resources(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::ComputeTextureDeclarationsWithRenderHalf { declarations: 1 }
+        ));
+        eprintln!("refused: {refused}");
+
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: textured_trace(&textured_pipeline()),
+            resources: resources(),
+        })
+        .unwrap();
+        let block = frame
+            .windows(R32UINT_DECLARATION_BLOCK.len())
+            .position(|window| window == R32UINT_DECLARATION_BLOCK)
+            .expect("the declaration block is on the wire");
+
+        // The decode side reads the count as one byte and refuses it above the
+        // same cap before sizing a `Vec`.
+        let mut patched = frame.clone();
+        patched[block] = 0x02;
+        let refused = CommandCodec::decode_request(&patched).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::ComputeTextureCount {
+                count: 2,
+                maximum: 1
+            }
+        ));
+        eprintln!("refused: {refused}");
+
+        // Every enum in a tuple keeps its named refusal: a guess here would
+        // change which texels a remote read returns.
+        for (offset, field, code) in [
+            (6, "texture type", 0x07),
+            (8, "sampler filter", 0x02),
+            (9, "sampler address", 0x02),
+            (10, "texture footprint", 0x02),
+        ] {
+            let mut patched = frame.clone();
+            patched[block + offset] = code;
+            let refused = CommandCodec::decode_request(&patched).unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    CodecError::UnknownEnumValue {
+                        field: name,
+                        value,
+                    } if name == field && value == code
+                ),
+                "{field} code {code:#04x} is refused by name"
+            );
+            eprintln!("refused: {refused}");
+        }
+
+        // The capability snapshot's format list is bounded the same way.
+        let mut wide = compute_texture_capabilities();
+        wide.supported_compute_texture_formats = vec![TextureFormat::R32Uint; 9];
+        let refused = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: wide,
+        })
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::ComputeTextureFormatCount {
+                count: 9,
+                maximum: 8
+            }
+        ));
+        eprintln!("refused: {refused}");
+
+        let capability_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: compute_texture_capabilities(),
+        })
+        .unwrap();
+        let capability_block = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x01,
+        ];
+        let capability_block = capability_frame
+            .windows(capability_block.len())
+            .position(|window| window == capability_block)
+            .expect("the compute-texture block is on the wire");
+        let mut patched = capability_frame.clone();
+        // The `u64` format count follows the tag, the bool and the `u32` cap,
+        // and the frame writes its integers big-endian.
+        patched[capability_block + 6..capability_block + 14].copy_from_slice(&9u64.to_be_bytes());
+        let refused = CommandCodec::decode_response(&patched).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::ComputeTextureFormatCount {
+                count: 9,
+                maximum: 8
+            }
+        ));
+        eprintln!("refused: {refused}");
+    }
+
+    #[test]
+    fn a_capability_without_the_compute_texture_bits_refuses_the_decoded_trace_by_name() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: textured_trace(&textured_pipeline()),
+            resources: resources(),
+        })
+        .unwrap();
+        let CommandRequest::Submit { trace, resources } =
+            CommandCodec::decode_request(&frame).unwrap()
+        else {
+            panic!("a textured submit decodes as a submit");
+        };
+        // The decode side holds the provider's declaration list, which is what
+        // admission pairs the pass against; a snapshot that never declared the
+        // capability has to refuse the shape by name rather than execute it.
+        let refusal = fake_capabilities().admit(&trace, &resources).unwrap_err();
+        assert_eq!(refusal.slug, "compute_texture_input_unsupported");
+        assert_eq!(refusal.fields.get("pass"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            refusal.fields.get("textures"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        eprintln!(
+            "refused: slug={} class={:?} fields={:?}",
+            refusal.slug, refusal.class, refusal.fields
+        );
+
+        // A snapshot that declares the bit but no binding slot refuses the
+        // count with its own name, one gate later.
+        let mut narrow = fake_capabilities();
+        narrow.supports_compute_texture_sampling = true;
+        let refusal = narrow.admit(&trace, &resources).unwrap_err();
+        assert_eq!(refusal.slug, "compute_texture_limit");
+        eprintln!("refused: slug={} fields={:?}", refusal.slug, refusal.fields);
     }
 }
