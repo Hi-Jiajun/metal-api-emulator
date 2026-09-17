@@ -77,6 +77,66 @@ fn device_lost_refusal(phase: ProviderPhase, token: Option<CompletionToken>) -> 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const DEVICE_REMOVED_ERROR_CODE: i64 = 11;
 
+// The three no-copy refusals are provider logic both lease rails share
+// (`research/docs/23` §72, R3d): the compute rail's pool bindings and the render
+// rail's vertex/index streams map the same owner reservation the same way, so
+// one definition keeps the two arms from drifting apart. They are compiled for
+// the two configurations that resolve a no-copy window, exactly like the rails
+// themselves.
+#[cfg(any(target_os = "macos", test))]
+use metal_api_core::provider::{FieldValue, LeaseId};
+
+/// An owner window whose base address misses the provider's import alignment.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn lease_alignment_refusal(
+    lease_id: LeaseId,
+    pointer: usize,
+    alignment: u64,
+) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_alignment_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("pointer", FieldValue::Unsigned(pointer as u64))
+    .with_field("alignment", FieldValue::Unsigned(alignment))
+}
+
+/// An owner reservation whose length misses the provider's import alignment.
+///
+/// Metal maps whole pages, so a reservation that is not a page multiple cannot
+/// be mapped at all.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn lease_length_refusal(
+    lease_id: LeaseId,
+    length: u64,
+    alignment: u64,
+) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_length_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("length", FieldValue::Unsigned(length))
+    .with_field("alignment", FieldValue::Unsigned(alignment))
+}
+
+/// A view whose offset inside the imported reservation misses the 4-byte rule
+/// a binding uses.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn lease_offset_refusal(lease_id: LeaseId, offset: u64) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_offset_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("offset", FieldValue::Unsigned(offset))
+    .with_field("alignment", FieldValue::Unsigned(4))
+}
+
 /// How a terminal `MTLCommandBufferStatus::Error` must be classified.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
