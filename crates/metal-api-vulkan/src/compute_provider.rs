@@ -1043,8 +1043,8 @@ impl VulkanComputeProvider {
                 };
                 // The declared view serves two purposes: it is the attachment's
                 // landing for the writeback channel, and it is the source of
-                // the previous bytes a `LoadOp::Load` pass uploads before it
-                // opens (`research/docs/23` §3.3). A loading pass therefore
+                // the previous contents a `LoadOp::Load` pass uploads before it
+                // opens (`research/docs/23` §3.3/§74). A loading pass therefore
                 // needs the declaration even when the trace asks for no host
                 // readback.
                 let declared = pool.iter().find(|view| {
@@ -1080,24 +1080,13 @@ impl VulkanComputeProvider {
                 } else {
                     None
                 };
-                let previous = if loading {
-                    match view.map(|view| &view.source) {
-                        Some(BufferSource::OwnedBytes(bytes)) => Some(bytes.as_slice()),
-                        _ => {
-                            return Err(refusal(
-                                ProviderPhase::Resolve,
-                                ProviderErrorClass::Capability,
-                                "attachment_load_op_unsupported",
-                            )
-                            .with_field("load_op", FieldValue::Text("load".to_owned()))
-                            .with_detail(
-                                "the first `LoadOp::Load` increment uploads trace-owned bytes only",
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
+                // A loading attachment's previous contents are resolved by the
+                // rail from this same declaration: the caller hands the view
+                // over and the rail decides its source arm — trace-owned bytes,
+                // the provider's staged copy, or the owner's imported window —
+                // so a lease-backed declaration is never snapshotted here
+                // (`research/docs/23` §74, R5b).
+                let previous = view.filter(|_| loading);
                 let target = self.present_target(present, attachment)?;
                 let executor = self.lock_executor()?;
                 let texels = render::execute_present_render(
@@ -1120,9 +1109,12 @@ impl VulkanComputeProvider {
             }
 
             // The offscreen shape: resolve one landing view and one
-            // previous-byte source per attachment, in location order, then hand
-            // the render rail the whole list and publish one writeback per
-            // attachment that has a landing.
+            // previous-contents declaration per attachment, in location order,
+            // then hand the render rail the whole list and publish one
+            // writeback per attachment that has a landing. The declaration is
+            // what the rail resolves into bytes, so a lease-backed attachment
+            // load is imported (or refused by name) inside the rail rather
+            // than being snapshotted here (`research/docs/23` §74, R5b).
             let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
             let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
             for attachment in &planned.pass.color_attachments {
@@ -1152,25 +1144,7 @@ impl VulkanComputeProvider {
                 } else {
                     None
                 };
-                let source = if loading {
-                    match view.map(|view| &view.source) {
-                        Some(BufferSource::OwnedBytes(bytes)) => Some(bytes.as_slice()),
-                        _ => {
-                            return Err(refusal(
-                                ProviderPhase::Resolve,
-                                ProviderErrorClass::Capability,
-                                "attachment_load_op_unsupported",
-                            )
-                            .with_field("load_op", FieldValue::Text("load".to_owned()))
-                            .with_detail(
-                                "the first `LoadOp::Load` increment uploads trace-owned bytes only",
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-                previous.push(source);
+                previous.push(view.filter(|_| loading));
                 views.push(view);
             }
             // The stored depth attachment's landing view, resolved before the
