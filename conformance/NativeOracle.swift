@@ -1937,6 +1937,30 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     },
                     "\(definition.id): expected a 16-byte read buffer at 0, a write buffer at 1 "
                     + "and a 16-byte read buffer at 2")
+    case "render_declaring_landing_view":
+        // v40's landing-view declaring case: the reviewed `copy_word_with_witness`
+        // kernel reads one word from the caller's own view (16 bytes) and one from
+        // the landing view's owner window (16 bytes, imported `borrowed_no_copy`)
+        // and writes the witness into the 4-byte output view, so the render case's
+        // landing rests on the declaring pass (E-TX13, `research/docs/23` §115 ff.).
+        // The render case itself (`landing_view_quad_2x2`) names the Vulkan rail
+        // alone; this arm validates the shared declaring shape the compute side runs.
+        try require(definition.entry == "copy_word_with_witness"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3,
+                    "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains {
+                        $0.binding == 0 && $0.access == "read" && $0.length == 16
+                    }
+                    && definition.buffers.contains {
+                        $0.binding == 1 && $0.access == "write" && $0.length == 4
+                    }
+                    && definition.buffers.contains {
+                        $0.binding == 2 && $0.access == "read" && $0.length == 16
+                    },
+                    "\(definition.id): expected a 16-byte read buffer at 0, a write buffer at 1 "
+                    + "and a 16-byte read buffer at 2")
     case "render_declaring_stage_buffer_lease":
         // v31's borrowed-lease declaring case: the reviewed `copy_word` kernel
         // reads one word from the fragment stage's tint view (16 bytes) and
