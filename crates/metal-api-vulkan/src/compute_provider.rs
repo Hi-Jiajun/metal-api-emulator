@@ -2735,7 +2735,12 @@ impl ComputeProvider for VulkanComputeProvider {
     }
 
     fn submit(&self, admitted: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
+        // The submission profile's enclosing bar, and the one that counts the
+        // window (`crate::phase_profile`). Off is the default: one relaxed load
+        // here and one per bar below, no clock read, no lock.
+        let _total = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Total);
         let trace = admitted.trace();
+        let _admit = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Admit);
         check_epoch(self.device_epoch(), trace.device_epoch)?;
         // A ValidatedComputeTrace may have been admitted against another
         // capability snapshot. Only the receiving owner can authorize execution.
@@ -2747,6 +2752,11 @@ impl ComputeProvider for VulkanComputeProvider {
         // checked before any compute resource exists. The render rail owns the
         // draw half; `None` here means the compute sequence dispatches directly.
         let indirect_dispatch = self.indirect_dispatch_threadgroups(trace)?;
+        drop(_admit);
+        // What will run and onto what: the render plan, the registered
+        // pipelines, the serial resource pool, the heap placement and the
+        // per-pass dispatch list. Pure CPU, and the part a caller can cache.
+        let _plan = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Plan);
         // Render work is planned before the compute sequence runs, so a trace
         // this provider cannot execute end to end is refused with no execution
         // at all rather than after its compute passes already wrote bytes.
@@ -2836,6 +2846,11 @@ impl ComputeProvider for VulkanComputeProvider {
             device_epoch: self.device_epoch(),
         };
         let alignment = self.no_copy_alignment();
+        drop(_plan);
+        // The submission's own inputs: one device binding per pooled view,
+        // including the owned-byte copies, the staged-lease resolution and the
+        // gathered guest runs, plus the borrow retains that keep them alive.
+        let _pool = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Pool);
         // Owned views of one allocation share a single device buffer, so the
         // backing is created once and the readback is sliced per view
         // (`research/docs/15` §3). Only allocations with more than one owned
@@ -2987,6 +3002,7 @@ impl ComputeProvider for VulkanComputeProvider {
             )
             .with_detail(error.to_string())
         })?;
+        drop(_pool);
         if self.async_execution {
             let executor = self.lock_executor()?.clone();
             let queue_index = executor.context.pick_queue();
@@ -3033,12 +3049,12 @@ impl ComputeProvider for VulkanComputeProvider {
             // (`AttachmentComputeConflict` / `RenderPassOrderUnsupported`)
             // rather than by a shared queue submission. Its bytes are merged
             // with the deferred pool readback at `wait`.
-            let render_writebacks = match self.execute_render_passes(
-                trace,
-                &pool,
-                &render_plan,
-                admitted.resources(),
-            ) {
+            let _render =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTotal);
+            let rendered =
+                self.execute_render_passes(trace, &pool, &render_plan, admitted.resources());
+            drop(_render);
+            let render_writebacks = match rendered {
                 Ok(writebacks) => writebacks,
                 Err(error) => {
                     self.retire(pending);
@@ -3046,6 +3062,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     return Err(attach_token(error, token));
                 }
             };
+            let _settle = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Settle);
             let record = match &self.completion_outbox {
                 Some(outbox) => {
                     let _ = outbox.submitted(token);
@@ -3104,18 +3121,22 @@ impl ComputeProvider for VulkanComputeProvider {
             // both rails could have written is refused by core admission
             // (`AttachmentComputeConflict`), and the render rail runs last, so
             // the map keeps the bytes a repeated attachment write ends with.
+            let mapped = {
+                let _writebacks =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Writebacks);
+                map_writebacks(&pool, &textures, updates, token)?
+            };
+            let rendered = {
+                let _render =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTotal);
+                self.execute_render_passes(trace, &pool, &render_plan, admitted.resources())?
+            };
             let mut merged = BTreeMap::new();
-            for writeback in map_writebacks(&pool, &textures, updates, token)?
-                .into_iter()
-                .chain(self.execute_render_passes(
-                    trace,
-                    &pool,
-                    &render_plan,
-                    admitted.resources(),
-                )?)
-            {
+            for writeback in mapped.into_iter().chain(rendered) {
                 merged.insert((writeback.allocation_id, writeback.view_id), writeback);
             }
+            let _writebacks =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Writebacks);
             let writebacks: Vec<BufferWriteback> = merged.into_values().collect();
             let output = ProviderSubmission {
                 completion: CompletionDisposition::CompletedVisible { token },
@@ -3127,6 +3148,7 @@ impl ComputeProvider for VulkanComputeProvider {
             Ok(output)
         })
         .map_err(|error| attach_token(error, token));
+        let _settle = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Settle);
         let observation = match &result {
             Ok(output) => Some(self.terminal_record(token, output.writebacks.clone())),
             Err(error) if error.completion.token().is_some() => {

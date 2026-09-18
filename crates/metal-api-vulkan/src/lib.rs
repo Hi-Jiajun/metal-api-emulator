@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod compute_provider;
+mod phase_profile;
 mod provider;
 mod render;
 
@@ -2317,6 +2318,10 @@ fn execute_submission_stages(
             CompletionDisposition::SubmittedUnknown { token: None },
         ));
     }
+    // The readback is the second half of the CPU↔GPU round trip and the one
+    // half a reader most easily mistakes for device latency: it is host-mapped
+    // copies, so it is bytes and threads, not the queue.
+    let _read_updates = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadUpdates);
     pending.read_updates()
 }
 
@@ -2406,6 +2411,13 @@ impl PendingExecution {
                 writable_pool_keys: BTreeSet::new(),
             });
         }
+        // The submission profile's three device-side bars. They are disjoint
+        // (`resource_build` ends where `record` starts, and `record` where
+        // `queue_submit` does), so their sum against the enclosing `total` bar
+        // is an identity a reader can check — see `crate::phase_profile`. All
+        // three resolve to `None` after one relaxed load when the profile is
+        // off, and none of them reads a clock in that case.
+        let _build = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ResourceBuild);
         resources
             .create_pipeline_objects(&translated, plans)
             .map_err(|error| {
@@ -2439,9 +2451,14 @@ impl PendingExecution {
                 .create_indirect_dispatch(threadgroups)
                 .map_err(encode_error)?;
         }
+        drop(_build);
+        let _record = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Record);
         resources
             .record(&translated, plans, queue_index)
             .map_err(encode_error)?;
+        drop(_record);
+        let _queue_submit =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::QueueSubmit);
         if let Err(failure) = resources.submit(queue_index) {
             // The provider error is built while `resources` is still owned, so
             // the fault record observed at the driver boundary is attached
@@ -2457,6 +2474,7 @@ impl PendingExecution {
             }
             return Err(error);
         }
+        drop(_queue_submit);
         Ok(Self {
             resources,
             writable_pool_keys: planned.writable_pool_keys,
@@ -2467,6 +2485,10 @@ impl PendingExecution {
     /// work; `Ok(false)` means the timeout elapsed and the caller may retry.
     pub(crate) fn wait(&mut self, timeout_ns: u64) -> Result<bool, ProviderError> {
         if !self.resources.submitted {
+            // No fence behind this submission: the only wait that is exactly
+            // free, and the profile counts it as its own population rather than
+            // letting it dilute the driver-call reading below.
+            crate::phase_profile::note_fence_wait_skipped();
             self.resources.completed = true;
             return Ok(true);
         }
@@ -6363,6 +6385,12 @@ impl ExecutionResources {
     }
 
     fn wait(&mut self, timeout_ns: u64) -> Result<bool, SubmissionFailure> {
+        // The one fence wait this submission performs, classified by how long
+        // the driver call itself took: a wait that returns immediately means the
+        // queue had already retired the work, and those microseconds are driver
+        // overhead rather than device latency.
+        let mut _fence_wait =
+            crate::phase_profile::Bar::enter_fence_wait(crate::phase_profile::Phase::FenceWait);
         let wait = self.context.wait_for_fence(self.fence, timeout_ns);
         match wait {
             Ok(()) => {
@@ -6372,7 +6400,12 @@ impl ExecutionResources {
                 }
                 Ok(true)
             }
-            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(false),
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {
+                if let Some(bar) = _fence_wait.as_mut() {
+                    bar.mark_timed_out();
+                }
+                Ok(false)
+            }
             Err(result) if result == vk::Result::ERROR_DEVICE_LOST => {
                 // The loss is observed while waiting, so the submission
                 // reached the queue and its handles are still unknowns: the
