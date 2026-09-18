@@ -1727,6 +1727,23 @@ pub(crate) fn store_action(store: StoreOp) -> Result<RenderStoreAction, Provider
         // both read, so "kept in the provider's image" cannot pass as "landed
         // through the buffer channel" or the other way round.
         StoreOp::Resident => RenderStoreAction::Store,
+        // The owner-window store (`research/docs/23` §114, E-TX8) lands the
+        // frame in the owner's registered window, and this rail's own window
+        // channel is the render *input* one (`research/docs/23` §72, R3d): it
+        // imports an owner mapping the device reads, and it has no route that
+        // writes one back. The arm is refused rather than executed as a plain
+        // store, because the caller that declared it asked for the guest's own
+        // pages to hold the frame and a writeback nobody lands would leave them
+        // holding the pass's previous bytes.
+        StoreOp::Borrowed => {
+            return Err(capability_refusal("render_attachment_landing_unsupported")
+                .with_field("source", FieldValue::Text("borrowed_no_copy".to_owned()))
+                .with_detail(
+                    "a borrowed store lands the pass's frame in the owner's registered window; \
+                     this rail carries the owner's window as an input and has no landing route \
+                     that writes one",
+                ))
+        }
     })
 }
 
@@ -3575,6 +3592,10 @@ pub(crate) fn plan_with_leases<'a>(
                             Some(StoreOp::Store) => "store",
                             Some(StoreOp::DontCare) => "dontcare",
                             Some(StoreOp::Resident) => "resident",
+                            // The owner-window store is the colour attachment's
+                            // arm (`research/docs/23` §114, E-TX8), refused by
+                            // core admission for the stencil surface.
+                            Some(StoreOp::Borrowed) => "borrowed",
                             None => "unstated",
                         }
                         .to_owned(),

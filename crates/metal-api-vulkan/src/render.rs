@@ -1186,6 +1186,19 @@ pub(crate) struct OffscreenColorAttachment<'a> {
     /// image is borrowed for the pass; the provider keeps owning it, exactly
     /// as the present rail borrows its target (`docs/24` §5.2).
     pub resident: Option<&'a ProviderTargetImage>,
+    /// The owner's registered windows this attachment's stored bytes land in
+    /// (`research/docs/23` §114, E-TX8). `Some` exactly for
+    /// [`StoreOp::Borrowed`], and resolved from the attachment's own view
+    /// declaration before any device object exists: a declaration that names
+    /// no window, or one that is not the attachment's own tightly packed byte
+    /// extent, is refused by name there rather than truncated here.
+    ///
+    /// The write happens once the frame has been read back (the same
+    /// `vkCmdCopyImageToBuffer` every stored attachment performs), so the
+    /// bytes the owner's pages receive are the bytes this rail published —
+    /// one frame, two destinations, which is what makes the two rails' byte
+    /// parity checkable at the window itself.
+    pub landing: Option<AttachmentLanding>,
 }
 
 /// One caller-held vertex stream: the layout the pipeline is built from plus
@@ -3567,7 +3580,13 @@ pub(crate) fn execute_render_pass<'a>(
         context.spirv_feature_policy(),
     )?;
     let retains = RenderInputRetains::retain(leases, &request)?;
-    execute_offscreen_render_with_retains(context, &request, retains)
+    let readback = execute_offscreen_render_with_retains(context, &request, retains)?;
+    // The owner-window landing follows the readback (`research/docs/23` §114,
+    // E-TX8): the pass's own texels are in the provider's buffer by now, and
+    // the guest's pages receive exactly those bytes — the second destination
+    // the borrowed store states.
+    land_owner_windows(&request, &readback, leases)?;
+    Ok(readback)
 }
 
 /// Validate one render pass against the pipeline it names and build the
@@ -4080,6 +4099,44 @@ fn prepare_render_request_with_resident<'a>(
             }
             _ => None,
         };
+        // The borrowed store's landing (`research/docs/23` §114, E-TX8): the
+        // attachment's own view declaration names the owner's window, so the
+        // window is resolved here — with the declaring arm's own checks and the
+        // extent rule — before any device object exists. A borrowed store
+        // beside a resident target would name two homes for one frame, and the
+        // pass cannot state which one the bytes land in, so that pairing is
+        // refused by name instead of being executed with one of them silently
+        // winning.
+        let landing = if attachment.store == StoreOp::Borrowed {
+            if resident.is_some() {
+                return Err(landing_refusal(
+                    index,
+                    "resident_target",
+                    "a borrowed store lands in the owner's registered window, and a resident \
+                     target keeps the frame in the provider's own image: the two are two homes \
+                     for one frame, so the pass states one of them",
+                ));
+            }
+            let view = declared.ok_or_else(|| {
+                landing_refusal(
+                    index,
+                    "no_declaration",
+                    "a borrowed store lands in the owner's registered window, and the window is \
+                     the attachment's own view declaration; this trace declares no view for the \
+                     attachment's (allocation, view) identity",
+                )
+            })?;
+            Some(resolve_attachment_landing(
+                view,
+                leases,
+                index,
+                attachment
+                    .expected_bytes()
+                    .map_err(|error| contract_refusal(&error.to_string()))?,
+            )?)
+        } else {
+            None
+        };
         attachments.push(OffscreenColorAttachment {
             format: attachment.format,
             store: attachment.store,
@@ -4087,6 +4144,7 @@ fn prepare_render_request_with_resident<'a>(
             previous,
             resident,
             seed,
+            landing,
         });
     }
     // A pass with no colour attachment takes its extent from the depth
@@ -5000,6 +5058,222 @@ fn resolve_attachment_load<'a>(
     Ok(source)
 }
 
+/// The owner's registered windows one `StoreOp::Borrowed` attachment's frame
+/// lands in (`research/docs/23` §114, E-TX8).
+///
+/// Resolved before any device object exists, exactly as a loading attachment's
+/// source is: the declaring view's own source arm is what names the window (the
+/// single-window borrow arm, or a guest-run list), and the concatenation of the
+/// windows has to be the attachment's own tightly packed byte extent. The
+/// windows are the owner's live pages, so the write below goes straight into
+/// the guest's memory — the landing `StoreOp::Store` leaves to its caller.
+#[derive(Debug)]
+pub(crate) struct AttachmentLanding {
+    windows: Vec<AttachmentWindow>,
+}
+
+#[derive(Debug)]
+struct AttachmentWindow {
+    lease: LeaseId,
+    window: BorrowedView,
+}
+
+impl AttachmentLanding {
+    /// The bytes the landing covers, which is the attachment's extent by
+    /// construction.
+    fn byte_len(&self) -> usize {
+        self.windows.iter().map(|entry| entry.window.len).sum()
+    }
+
+    /// Write one stored frame into the owner's windows, in declaration order.
+    ///
+    /// Every window is held for the duration of its own copy — the same
+    /// retain/release shape [`gather_guest_runs`] takes on the read side — so
+    /// the owner's ledger cannot release the backing this write names. The
+    /// copy is in memory order: the frame arrives in the attachment's own
+    /// texel order (`AttachmentFormat` is the format, and the readback is
+    /// tightly packed), which is exactly the order the window's view declares.
+    fn land(&self, registry: &BorrowedLeaseRegistry, texels: &[u8]) -> Result<(), ProviderError> {
+        let held: Vec<LeaseId> = self.windows.iter().map(|entry| entry.lease).collect();
+        registry.retain_all(&held)?;
+        let mut outcome = Ok(());
+        let mut offset = 0_usize;
+        for entry in &self.windows {
+            let Some(chunk) = texels.get(offset..offset + entry.window.len) else {
+                outcome = Err(args_refusal("render_attachment_landing_mismatch")
+                    .with_field("resolved_bytes", FieldValue::Unsigned(texels.len() as u64))
+                    .with_detail(
+                        "the frame a borrowed store lands has to be the attachment's own \
+                         tightly packed byte extent",
+                    ));
+                break;
+            };
+            // SAFETY: the registry resolved this window for an imported lease,
+            // and the hold taken above keeps the owner from releasing the
+            // mapping until this loop has written it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    entry.window.pointer as *mut u8,
+                    entry.window.len,
+                );
+            }
+            offset += entry.window.len;
+        }
+        registry.retire_all(&held);
+        outcome
+    }
+}
+
+/// Resolve the owner windows a `StoreOp::Borrowed` attachment's stored bytes
+/// land in (`research/docs/23` §114, E-TX8).
+///
+/// The view is the attachment's own declaration, so the window is the one the
+/// trace already named for the view's bytes — no second naming channel exists
+/// and the two cannot disagree. Two source arms carry live owner pages and are
+/// accepted: the single registered window (`BufferSource::BorrowedNoCopy`) and
+/// the ordered run list whose concatenation is the view's byte range
+/// (`BufferSource::GuestRuns`). The two *copy* arms are refused by name: their
+/// bytes are the trace's own image (or the provider's staged copy of one
+/// reservation), so land in them would be a write into a buffer no owner's
+/// ledger protects, and the writeback channel already carries the frame for
+/// every caller that wants it.
+fn resolve_attachment_landing(
+    view: &BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    attachment: usize,
+    expected_bytes: u64,
+) -> Result<AttachmentLanding, ProviderError> {
+    let leases = leases.ok_or_else(|| {
+        landing_refusal(
+            attachment,
+            "no_lease_channel",
+            "the render submission carries no lease channel, so the owner's window a borrowed \
+             store lands in cannot be resolved",
+        )
+    })?;
+    let windows =
+        match &view.source {
+            BufferSource::BorrowedNoCopy(lease_id) => {
+                let window = leases.borrowed.view_pointer(
+                    *lease_id,
+                    view,
+                    leases.device_epoch,
+                    leases.resources,
+                )?;
+                vec![AttachmentWindow {
+                    lease: *lease_id,
+                    window,
+                }]
+            }
+            BufferSource::GuestRuns(runs) => {
+                let mut windows = Vec::with_capacity(runs.len());
+                for run in runs {
+                    let window =
+                        leases
+                            .borrowed
+                            .run_pointer(*run, leases.device_epoch, leases.resources)?;
+                    windows.push(AttachmentWindow {
+                        lease: run.lease_id,
+                        window,
+                    });
+                }
+                windows
+            }
+            BufferSource::OwnedBytes(_) => return Err(landing_refusal(
+                attachment,
+                "owned_bytes",
+                "a borrowed store lands in the owner's own registered window; trace-owned bytes \
+                 are the writeback channel's source, not a window an owner's ledger holds",
+            )),
+            BufferSource::StagedLease(_) => return Err(landing_refusal(
+                attachment,
+                "staged_lease",
+                "a borrowed store lands in the owner's own registered window; a staged lease is \
+                 the provider's copy of one reservation rather than the owner's live pages",
+            )),
+        };
+    let landing = AttachmentLanding { windows };
+    let resolved = u64::try_from(landing.byte_len()).unwrap_or(u64::MAX);
+    if resolved != expected_bytes {
+        return Err(args_refusal("render_attachment_landing_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+            .with_field("expected_bytes", FieldValue::Unsigned(expected_bytes))
+            .with_field("resolved_bytes", FieldValue::Unsigned(resolved))
+            .with_detail(
+                "the windows a borrowed store lands in have to be the attachment's own tightly \
+                 packed byte extent",
+            ));
+    }
+    Ok(landing)
+}
+
+/// The refusal a `StoreOp::Borrowed` attachment's declaration that names no
+/// owner window is answered with.
+fn landing_refusal(attachment: usize, source: &str, detail: &str) -> ProviderError {
+    capability_refusal("render_attachment_landing_unsupported")
+        .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+        .with_field("source", FieldValue::Text(source.to_owned()))
+        .with_detail(detail)
+}
+
+/// Land every `StoreOp::Borrowed` attachment's frame in the owner's window
+/// (`research/docs/23` §114, E-TX8).
+///
+/// The frame the pass just read back *is* the frame the owner's pages receive:
+/// one `vkCmdCopyImageToBuffer` lands the texels in the provider's own
+/// readback, and this write copies exactly those bytes into the windows the
+/// declaration named, in declaration order. A pass that published no frame for
+/// an attachment the declaration says lands is a rail wiring bug and is named
+/// here rather than silently skipped — the owner's pages would keep the
+/// pre-pass bytes while the trace reports a stored attachment.
+fn land_owner_windows(
+    request: &OffscreenRenderRequest<'_>,
+    readback: &OffscreenReadback,
+    leases: Option<&RenderLeaseContext<'_>>,
+) -> Result<(), ProviderError> {
+    for (index, attachment) in request.attachments.iter().enumerate() {
+        let Some(landing) = attachment.landing.as_ref() else {
+            continue;
+        };
+        let leases = leases.ok_or_else(|| {
+            landing_refusal(
+                index,
+                "no_lease_channel",
+                "the render submission carries no lease channel, so the owner's window a borrowed \
+                 store lands in cannot be written",
+            )
+        })?;
+        let Some(texels) = readback
+            .attachments
+            .get(index)
+            .and_then(|bytes| bytes.as_deref())
+        else {
+            return Err(capability_refusal("render_attachment_landing_undeclared")
+                .with_field("attachment", FieldValue::Unsigned(index as u64))
+                .with_detail(
+                    "a borrowed store lands the frame the pass read back, and this pass published \
+                     none for the attachment",
+                ));
+        };
+        landing.land(leases.borrowed, texels)?;
+    }
+    Ok(())
+}
+
+/// Whether one store arm publishes its bytes through the pass's readback
+/// channel (`research/docs/23` §3.6/§76/§114).
+///
+/// `Store` and its owner-window sibling `Borrowed` do: the borrowed arm adds
+/// the owner's window as a second destination rather than replacing the
+/// channel, which is what keeps every pre-E-TX8 reader of the completion
+/// byte-identical. A resident store keeps the frame in the provider's own
+/// image, and a discarding store leaves none behind.
+fn store_publishes(store: StoreOp) -> bool {
+    matches!(store, StoreOp::Store | StoreOp::Borrowed)
+}
+
 /// The one texel a multisampled `Load` seeds every sample with
 /// (`research/docs/23` §82, v82).
 ///
@@ -5716,7 +5990,12 @@ pub(crate) fn execute_indirect_render_pass<'a>(
     )?;
     request.indirect = Some(replay);
     let retains = RenderInputRetains::retain(leases, &request)?;
-    execute_offscreen_render_with_retains(context, &request, retains)
+    let readback = execute_offscreen_render_with_retains(context, &request, retains)?;
+    // The indirect replay lands its borrowed stores exactly as the direct
+    // shape does (`research/docs/23` §114, E-TX8): the pass the command
+    // replays is the same pass, so its declaration is the same declaration.
+    land_owner_windows(&request, &readback, leases)?;
+    Ok(readback)
 }
 
 /// Narrow one attachment dimension to the `u32` the Vulkan image extent uses.
@@ -6909,7 +7188,7 @@ fn execute_offscreen_render_with_retains(
         // stored attachments alone (`docs/23` §3.6, v19): a discarded
         // attachment is not copied out and must not be refused for a feature
         // its execution never needs.
-        if attachment.store == StoreOp::Store
+        if store_publishes(attachment.store)
             && !format_features(context, *vk_format, tiling)
                 .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
         {
@@ -6999,7 +7278,7 @@ fn execute_offscreen_render_with_retains(
                 height,
                 attachment.load,
                 attachment.seed,
-                attachment.store == StoreOp::Store,
+                store_publishes(attachment.store),
                 samples,
             )?,
         }
@@ -7131,7 +7410,7 @@ fn execute_offscreen_render_with_retains(
     // (`docs/23` §3.6, v19).
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
     for attachment in &request.attachments {
-        if attachment.store == StoreOp::Store {
+        if store_publishes(attachment.store) {
             // Each stored attachment lands `width * height * its own texel
             // width` bytes (`research/docs/23` §78), so a two-location pass
             // whose formats differ in width still reads both back whole.
@@ -7229,7 +7508,7 @@ fn execute_offscreen_render_with_retains(
     let mut results = Vec::with_capacity(request.attachments.len());
     let mut mappings = readback_mappings.into_iter();
     for attachment in &request.attachments {
-        if attachment.store == StoreOp::Store {
+        if store_publishes(attachment.store) {
             let mapping = mappings.next().expect("one readback per stored attachment");
             let bytes = attachment_readback_bytes(request.extent, attachment.format)?;
             let texels = unsafe {
@@ -7675,6 +7954,19 @@ pub(crate) fn execute_present_render<'a>(
     if attachment.store == StoreOp::DontCare {
         return Err(render_all_attachments_discarded_refusal());
     }
+    // A present target is the provider's own image and the present action is
+    // what hands it on, so a borrowed store beside it would name a second
+    // home for the same frame (`research/docs/23` §114, E-TX8). The pairing is
+    // refused by name here rather than executed with one of the two landings
+    // silently winning.
+    if attachment.store == StoreOp::Borrowed {
+        return Err(capability_refusal("render_present_borrowed_store_unsupported")
+            .with_field("view", FieldValue::Unsigned(pass.color_attachments[0].view_id.get()))
+            .with_detail(
+                "the present rail renders into one provider-owned target and hands that target \
+                 on; a borrowed store lands in the owner's registered window instead",
+            ));
+    }
     // A present pass renders into the provider-owned target alone: it opens no
     // depth surface, so a trace that names one — stored or not — asks for a
     // state this shape cannot execute. Refusing here keeps the depth attachment
@@ -7716,6 +8008,11 @@ pub(crate) fn execute_present_render<'a>(
                         // (`research/docs/23` §76, R7): the stencil surface has
                         // no provider-owned identity to keep its bytes under.
                         Some(StoreOp::Resident) => "resident",
+                        // The owner-window store is the colour attachment's arm
+                        // (`research/docs/23` §114, E-TX8), refused by core
+                        // admission for the same reason: the stencil surface
+                        // states no view whose source arm could name a window.
+                        Some(StoreOp::Borrowed) => "borrowed",
                         None => "unstated",
                     }
                     .to_owned(),
@@ -8632,7 +8929,7 @@ impl<'a> OffscreenObjects<'a> {
             // its image, memory or view (`research/docs/23` §76, R7).
             owns_image: false,
             owns_resolve: false,
-            publishes: attachment.store == StoreOp::Store,
+            publishes: store_publishes(attachment.store),
             previous_buffer: vk::Buffer::null(),
             previous_memory: vk::DeviceMemory::null(),
         });
@@ -14793,6 +15090,7 @@ mod tests {
                 stencil: None,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
+                    landing: None,
                     format,
                     store: StoreOp::Store,
                     load: LoadOp::Clear(clear),
@@ -15192,6 +15490,7 @@ mod tests {
             stencil: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
+                landing: None,
                 format: AttachmentFormat::R32Uint,
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -15268,6 +15567,7 @@ mod tests {
                     stencil: None,
                     scissor: None,
                     attachments: vec![OffscreenColorAttachment {
+                        landing: None,
                         format,
                         store: StoreOp::Store,
                         load: LoadOp::Clear(clear),
@@ -15513,6 +15813,7 @@ mod tests {
                 stencil: None,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
+                    landing: None,
                     format: AttachmentFormat::Rgba16Float,
                     store: StoreOp::Store,
                     load: LoadOp::Clear(
@@ -15572,6 +15873,7 @@ mod tests {
             stencil: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
+                landing: None,
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16140,6 +16442,7 @@ mod tests {
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
+                        landing: None,
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16148,6 +16451,7 @@ mod tests {
                         resident: None,
                     },
                     OffscreenColorAttachment {
+                        landing: None,
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16218,6 +16522,7 @@ mod tests {
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
+                        landing: None,
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16226,6 +16531,7 @@ mod tests {
                         resident: None,
                     },
                     OffscreenColorAttachment {
+                        landing: None,
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16300,6 +16606,7 @@ mod tests {
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
+                        landing: None,
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
                         load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16308,6 +16615,7 @@ mod tests {
                         resident: None,
                     },
                     OffscreenColorAttachment {
+                        landing: None,
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
                         load: LoadOp::Load,
@@ -16359,6 +16667,7 @@ mod tests {
             stencil: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
+                landing: None,
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::DontCare,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16460,6 +16769,7 @@ mod tests {
             scissor: None,
             attachments: vec![
                 OffscreenColorAttachment {
+                    landing: None,
                     format: AttachmentFormat::Rgba8Unorm,
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16468,6 +16778,7 @@ mod tests {
                     resident: None,
                 },
                 OffscreenColorAttachment {
+                    landing: None,
                     format: AttachmentFormat::R32Float,
                     store: StoreOp::Store,
                     load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -16705,6 +17016,7 @@ mod tests {
                 // The left column is drawn; the right one keeps the seed.
                 scissor: Some([0, 0, 1, 2]),
                 attachments: vec![OffscreenColorAttachment {
+                    landing: None,
                     format: AttachmentFormat::Rgba8Unorm,
                     store: StoreOp::Store,
                     load: LoadOp::Load,
@@ -16844,6 +17156,7 @@ mod tests {
                 stencil: None,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
+                    landing: None,
                     format: AttachmentFormat::Rgba8Unorm,
                     store: StoreOp::Store,
                     load: LoadOp::DontCare,
@@ -16968,6 +17281,7 @@ mod tests {
             base_vertex: 0,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
+                landing: None,
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
@@ -17063,6 +17377,7 @@ mod tests {
             base_vertex: 0,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
+                landing: None,
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::Store,
                 load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),

@@ -2086,6 +2086,42 @@ pub enum LoadOp {
 pub enum StoreOp {
     /// Store the pass's writes. This is what makes the attachment comparable.
     Store,
+    /// Land the pass's writes in the *owner's registered window*
+    /// (`research/docs/23` §114, E-TX8).
+    ///
+    /// The arm is the store sibling of the load channel R5b/§74 and E-TX6
+    /// opened: a guest-backed surface's bytes live in the guest's own pages,
+    /// and those pages reach the provider as an owner-issued window (a
+    /// [`BufferSource::BorrowedNoCopy`] reservation view, or the runs of a
+    /// [`BufferSource::GuestRuns`] list). The attachment's *own* declared view
+    /// — the `(allocation_id, view_id)` pair every pass already names, resolved
+    /// from the trace's serial view list — is what carries that window, so the
+    /// declaration the pass begins from and the memory it lands in cannot
+    /// disagree: this arm says "the attachment view *is* the owner's window",
+    /// exactly as `StoreOp::Resident` says "the attachment view is the
+    /// provider's own image".
+    ///
+    /// What the rail does with it is the one thing `StoreOp::Store` cannot
+    /// state: after the pass's texels are read back, it copies them into the
+    /// owner's window at the view's own coordinates, so the guest's pages hold
+    /// the frame the pass drew without a second landing on the caller's side.
+    /// The window has to be the attachment's own tightly packed byte extent —
+    /// one window at the view's own start, or a run list whose concatenation is
+    /// exactly that extent — and a declaration that disagrees is refused by
+    /// name rather than truncated.
+    ///
+    /// The writeback channel still carries the same bytes
+    /// ([`RenderAttachment::publishes_bytes`] stays true for this arm): the trace's own
+    /// production ([`TextureSource::TraceView`]) and the caller's parity
+    /// comparison read the completion exactly as they do for
+    /// [`Self::Store`]. The arm therefore states *where the frame lands in the
+    /// owner's memory*, not a second, different set of bytes.
+    ///
+    /// A pass whose frame has no owner window — a pooled offscreen target, an
+    /// offline trace's own bytes — keeps [`Self::Store`]: the arm is only
+    /// legal beside a view declaration that names a window, which is the
+    /// declaration the rail resolves before any device object exists.
+    Borrowed,
     /// Keep the pass's writes in the *provider-resident* target
     /// (`research/docs/23` §76, R7).
     ///
@@ -2833,8 +2869,28 @@ impl RenderAttachment {
     /// writeback channel: [`StoreOp::Store`] alone, because a resident store
     /// keeps them in the provider's image instead
     /// (`research/docs/23` §76, R7).
+    ///
+    /// [`StoreOp::Borrowed`] publishes as well (`research/docs/23` §114,
+    /// E-TX8): the arm adds the owner-window landing on top of the writeback
+    /// channel rather than replacing it, so every reader of the completion —
+    /// the trace's own later passes and the caller's parity comparison — sees
+    /// the same bytes it saw before the arm existed.
     pub fn publishes_bytes(&self) -> bool {
-        self.store == StoreOp::Store
+        matches!(self.store, StoreOp::Store | StoreOp::Borrowed)
+    }
+
+    /// Whether this attachment's stored bytes land in the *owner's registered
+    /// window* rather than only in the writeback channel
+    /// (`research/docs/23` §114, E-TX8).
+    ///
+    /// The window itself is not part of this value: it is the source arm of the
+    /// view the trace declares for the attachment's own
+    /// `(allocation_id, view_id)` pair, exactly as a `LoadOp::Load`
+    /// attachment's previous contents are. The rail resolves it (and refuses a
+    /// declaration that names no window, or one that is not the attachment's
+    /// own tightly packed extent) before any device object exists.
+    pub const fn lands_in_owner_window(&self) -> bool {
+        matches!(self.store, StoreOp::Borrowed)
     }
 
     /// Whether this attachment names the provider's resident target on either
@@ -4268,10 +4324,18 @@ impl RenderPassDescriptor {
         // them. The rule counts it for the same reason it counts a stored
         // depth surface: what it refuses is a pass whose whole output is
         // thrown away, not a pass whose landing is not a guest writeback.
-        let stored_colour = self
-            .color_attachments
-            .iter()
-            .any(|attachment| matches!(attachment.store, StoreOp::Store | StoreOp::Resident));
+        //
+        // The owner-window store is a landing for that same reason
+        // (`research/docs/23` §114, E-TX8): the frame lands in the guest's own
+        // pages under the attachment's own view declaration, and it is exactly
+        // the shape whose only other observable channel — the writeback — the
+        // guest-backed attachment's own caller does not consume.
+        let stored_colour = self.color_attachments.iter().any(|attachment| {
+            matches!(
+                attachment.store,
+                StoreOp::Store | StoreOp::Resident | StoreOp::Borrowed
+            )
+        });
         let stored_depth = self
             .depth
             .as_ref()
@@ -4740,6 +4804,16 @@ impl RenderPassDescriptor {
                 (Some(StoreOp::Resident), _) => {
                     return Err(ContractError::UnsupportedAttachmentStoreOp(
                         StoreOp::Resident,
+                    ));
+                }
+                // The owner-window store is the colour attachment's arm
+                // (`research/docs/23` §114, E-TX8): the window it names is the
+                // *colour* view declaration's own source arm, and the stencil
+                // surface states no view of its own, so the arm is refused here
+                // for the same reason the resident one is.
+                (Some(StoreOp::Borrowed), _) => {
+                    return Err(ContractError::UnsupportedAttachmentStoreOp(
+                        StoreOp::Borrowed,
                     ));
                 }
                 (None, Some(_))
@@ -8881,6 +8955,11 @@ fn validate_writebacks_for_trace(
             {
                 match attachment.store {
                     StoreOp::Store => stored = true,
+                    // The owner-window store publishes the same bytes through
+                    // the writeback channel (`research/docs/23` §114, E-TX8):
+                    // the arm adds the owner's window as a second landing, so
+                    // the view lands exactly the writeback this rule asks for.
+                    StoreOp::Borrowed => stored = true,
                     // A resident store keeps the pass's bytes in the provider's
                     // own image rather than the writeback channel
                     // (`research/docs/23` §76, R7), so the view lands no
