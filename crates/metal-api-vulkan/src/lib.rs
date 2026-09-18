@@ -5,6 +5,7 @@
 //! as the dispatch contract; unsupported resources fail before any Vulkan work
 //! is submitted.
 
+use crate::readback_rect::ReadbackFallback;
 use ash::ext::{device_fault, external_memory_host};
 use ash::khr::shader_float_controls2;
 use ash::{vk, Device as AshDevice, Entry, Instance};
@@ -36,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 mod compute_provider;
 mod phase_profile;
 mod provider;
+mod readback_rect;
 mod render;
 
 pub use compute_provider::{
@@ -419,6 +421,43 @@ pub(crate) fn device_loss_refusal(
 }
 
 /// Native Vulkan implementation of the Phase 1 compute subset.
+/// Cumulative render-readback regions of the written-rect increment
+/// (`docs/WRITTEN-RECT-READBACK.md` §2).
+///
+/// Every stored colour attachment the render half publishes is read back one of
+/// two ways: through the rectangle this pass can have written — in which case
+/// the rest of the frame is the seed the rail already holds host-side — or
+/// whole, exactly as the pre-increment rail did. The counters are cumulative
+/// over the executor's life and always on, so a round can report the split
+/// beside the phase profile and an e2e oracle can tell which arm a shape took
+/// without turning the profile on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReadbackRegionCounts {
+    /// Stored attachments read back through their written rectangle.
+    pub rect_attachments: usize,
+    /// Bytes those readbacks copied out of the device mapping.
+    pub rect_bytes: usize,
+    /// Bytes the same attachments' whole extents occupy: what the
+    /// whole-attachment readback would have copied instead.
+    pub rect_extent_bytes: usize,
+    /// Stored attachments read back whole.
+    pub full_attachments: usize,
+    /// Bytes those whole readbacks copied.
+    pub full_bytes: usize,
+    /// Whole readbacks the `METAL_API_VULKAN_FULL_READBACK` control switch asked
+    /// for.
+    pub switch_attachments: usize,
+    /// Whole readbacks of shapes whose seed this rail does not hold host-side
+    /// (a multisampled raster, a resident load, an undefined load).
+    pub shape_attachments: usize,
+    /// Whole readbacks whose declared viewport or scissor the rail cannot prove
+    /// (empty, or reaching outside the attachment's extent).
+    pub bounds_attachments: usize,
+    /// Whole readbacks whose written rectangle covers the whole attachment, so
+    /// narrowing it saves nothing.
+    pub whole_attachments: usize,
+}
+
 pub struct VulkanExecutor {
     context: Arc<VulkanContext>,
 }
@@ -596,6 +635,20 @@ impl VulkanExecutor {
     #[doc(hidden)]
     pub fn present_counts(&self) -> (usize, usize) {
         self.context.present_counts()
+    }
+
+    /// Cumulative render-readback regions: how many stored attachments were
+    /// read back through their written rectangle, how many bytes that cost, and
+    /// how many took the whole-extent path with the reason
+    /// (`docs/WRITTEN-RECT-READBACK.md` §2).
+    ///
+    /// The counters are always on and cumulative, so a comparison needs the
+    /// difference between two readings — which is what
+    /// `METAL_API_VULKAN_FULL_READBACK` lets one process observe: the same
+    /// shape runs twice, once per arm.
+    #[doc(hidden)]
+    pub fn readback_region_counts(&self) -> ReadbackRegionCounts {
+        self.context.readback_regions()
     }
 
     /// Successful submissions recorded per device queue.
@@ -1146,6 +1199,22 @@ pub(crate) struct VulkanContext {
     /// (`research/docs/15` step 4).
     buffer_upload_bytes: AtomicUsize,
     buffer_readback_bytes: AtomicUsize,
+    /// The render half's readback regions (`docs/WRITTEN-RECT-READBACK.md`
+    /// §2): every stored attachment either copies only its written rectangle
+    /// out of the device or reads back whole, and this is the count of each,
+    /// the bytes each cost, and — for the whole-extent arm — which fact sent it
+    /// there. The counters are process-wide and always on; they are what a
+    /// round reports beside the phase profile, and what the e2e oracle reads to
+    /// tell a trimmed readback from a fallback.
+    readback_rect_attachments: AtomicUsize,
+    readback_rect_bytes: AtomicUsize,
+    readback_rect_extent_bytes: AtomicUsize,
+    readback_full_attachments: AtomicUsize,
+    readback_full_bytes: AtomicUsize,
+    readback_fallback_switch: AtomicUsize,
+    readback_fallback_shape: AtomicUsize,
+    readback_fallback_bounds: AtomicUsize,
+    readback_whole: AtomicUsize,
     /// Presentation completions of the first present increment
     /// (`research/docs/24` §3.3, §5.3): one acquire when the provider takes
     /// ownership of a present target for a pass, one present when the target's
@@ -1379,6 +1448,15 @@ impl VulkanContext {
             buffer_readbacks: AtomicUsize::new(0),
             buffer_upload_bytes: AtomicUsize::new(0),
             buffer_readback_bytes: AtomicUsize::new(0),
+            readback_rect_attachments: AtomicUsize::new(0),
+            readback_rect_bytes: AtomicUsize::new(0),
+            readback_rect_extent_bytes: AtomicUsize::new(0),
+            readback_full_attachments: AtomicUsize::new(0),
+            readback_full_bytes: AtomicUsize::new(0),
+            readback_fallback_switch: AtomicUsize::new(0),
+            readback_fallback_shape: AtomicUsize::new(0),
+            readback_fallback_bounds: AtomicUsize::new(0),
+            readback_whole: AtomicUsize::new(0),
             present_acquires: AtomicUsize::new(0),
             present_presents: AtomicUsize::new(0),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -1636,6 +1714,54 @@ impl VulkanContext {
     pub(crate) fn record_buffer_readback_bytes(&self, bytes: usize) {
         self.buffer_readback_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one stored attachment read back through its written rectangle:
+    /// the bytes that left the device mapping, and the bytes the attachment's
+    /// whole extent occupies (what the whole-attachment readback would have
+    /// copied instead).
+    pub(crate) fn record_readback_rect(&self, bytes: usize, extent_bytes: usize) {
+        self.readback_rect_attachments
+            .fetch_add(1, Ordering::Relaxed);
+        self.readback_rect_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.readback_rect_extent_bytes
+            .fetch_add(extent_bytes, Ordering::Relaxed);
+    }
+
+    /// Record one stored attachment read back whole, whatever sent it there.
+    pub(crate) fn record_readback_full(&self, bytes: usize) {
+        self.readback_full_attachments
+            .fetch_add(1, Ordering::Relaxed);
+        self.readback_full_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record *why* one attachment read back whole: the control switch, a shape
+    /// whose seed this rail does not hold host-side, a declared rect the rail
+    /// cannot prove, or a rectangle that covers the whole attachment anyway.
+    pub(crate) fn record_readback_fallback(&self, bucket: ReadbackFallback) {
+        match bucket {
+            ReadbackFallback::Switch => &self.readback_fallback_switch,
+            ReadbackFallback::Shape => &self.readback_fallback_shape,
+            ReadbackFallback::Bounds => &self.readback_fallback_bounds,
+            ReadbackFallback::Whole => &self.readback_whole,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The render half's cumulative readback regions
+    /// (`docs/WRITTEN-RECT-READBACK.md` §2).
+    pub(crate) fn readback_regions(&self) -> ReadbackRegionCounts {
+        ReadbackRegionCounts {
+            rect_attachments: self.readback_rect_attachments.load(Ordering::Relaxed),
+            rect_bytes: self.readback_rect_bytes.load(Ordering::Relaxed),
+            rect_extent_bytes: self.readback_rect_extent_bytes.load(Ordering::Relaxed),
+            full_attachments: self.readback_full_attachments.load(Ordering::Relaxed),
+            full_bytes: self.readback_full_bytes.load(Ordering::Relaxed),
+            switch_attachments: self.readback_fallback_switch.load(Ordering::Relaxed),
+            shape_attachments: self.readback_fallback_shape.load(Ordering::Relaxed),
+            bounds_attachments: self.readback_fallback_bounds.load(Ordering::Relaxed),
+            whole_attachments: self.readback_whole.load(Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn buffer_copy_counts(&self) -> (usize, usize) {
