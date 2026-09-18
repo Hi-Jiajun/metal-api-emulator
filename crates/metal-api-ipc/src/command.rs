@@ -1421,11 +1421,11 @@ mod tests {
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DepthFormat,
         DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, HeapDescriptor,
-        HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
-        IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-        IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
-        LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
+        DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, GuestRun,
+        HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
+        IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
+        IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId,
+        LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
         MultisampleStencilResolve, OperationId, PipelineCompileRequest, PipelineContract,
         PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
         ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
@@ -2754,14 +2754,16 @@ mod tests {
             .expect("the stage buffer's own bytes travel in the frame");
         let mut patched = frame.clone();
         // The blob's eight-byte length precedes the payload, and the source
-        // tag precedes that length.
-        patched[payload_at - 9] = 0x03;
+        // tag precedes that length. `3` is the guest-runs tag since E-TX6
+        // (`research/docs/23` §74), so the probe states a tag that is still
+        // unassigned: the byte after the arm the frame actually carries.
+        patched[payload_at - 9] = 0x04;
         let refused = CommandCodec::decode_request(&patched).unwrap_err();
         assert!(matches!(
             refused,
             CodecError::UnknownEnumValue {
                 field: "buffer source",
-                value: 3,
+                value: 4,
             }
         ));
         eprintln!("corrupt stage buffer view refused: {refused}");
@@ -3609,6 +3611,92 @@ mod tests {
         };
         pass.textures = vec![sampled_texture_view(0)];
         trace
+    }
+
+    /// The guest-runs source arm (`research/docs/23` §74, E-TX6): the view's
+    /// bytes are an ordered list of owner windows, and the frame carries the
+    /// triples rather than the bytes they describe.
+    ///
+    /// The tag is new, so the three earlier source arms keep their own bytes —
+    /// which is what makes this frame's size the owned arm's minus the byte
+    /// payload plus one triple per run.
+    #[test]
+    fn a_guest_runs_source_round_trips_as_its_run_list() {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        let mut view = sampled_texture_view(0);
+        let runs = vec![
+            GuestRun {
+                lease_id: LeaseId::new(21),
+                offset: 0,
+                length: 8,
+            },
+            GuestRun {
+                lease_id: LeaseId::new(22),
+                offset: 8,
+                length: 8,
+            },
+        ];
+        // The arm is a `BufferSource`, so the pass's own vertex input carries
+        // it: one stream whose bytes are the two runs.
+        let stream = BufferView {
+            view_id: ViewId::new(9),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(3),
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::GuestRuns(runs.clone()),
+        };
+        view.source = TextureSource::OwnedBytes(vec![0; 16]);
+        pass.vertex_buffers = vec![stream.clone()];
+        let mut resources = resources();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(3),
+                owner_epoch: DeviceEpoch::new(7),
+                size: 16,
+            })
+            .unwrap();
+        for (lease_id, offset) in [(21_u64, 0_u64), (22, 8)] {
+            resources
+                .insert_lease(LeaseReservation {
+                    lease: BufferLease {
+                        lease_id: LeaseId::new(lease_id),
+                        allocation_id: AllocationId::new(3),
+                        owner_epoch: DeviceEpoch::new(7),
+                    },
+                    offset,
+                    length: 8,
+                })
+                .unwrap();
+        }
+        let request = CommandRequest::Submit { trace, resources };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(
+            CommandCodec::decode_request(&frame).unwrap(),
+            request,
+            "the run list is what travels"
+        );
+        // The listing itself is in the frame — one `(lease, offset, length)`
+        // triple per run — and no run's bytes are.
+        let mut expected = Vec::new();
+        for run in &runs {
+            // The codec's wide integers travel big-endian, like every other
+            // identifier on this channel.
+            expected.extend_from_slice(&run.lease_id.get().to_be_bytes());
+            expected.extend_from_slice(&run.offset.to_be_bytes());
+            expected.extend_from_slice(&run.length.to_be_bytes());
+        }
+        assert!(
+            frame
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "the frame carries the run list"
+        );
     }
 
     /// The trace-produced source arm (`research/docs/23` §110, E-TX3): the

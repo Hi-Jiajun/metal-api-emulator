@@ -17,7 +17,7 @@ use metal_api_core::provider::{
     CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode,
     DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
     DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
+    GuestRun, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
     IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
     MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
@@ -2512,6 +2512,20 @@ fn put_view(encoder: &mut Encoder, view: &BufferView) {
             encoder.u8(2);
             encoder.u64(lease_id.get());
         }
+        // E-TX6 (`research/docs/23` §74): the guest-runs arm travels as its own
+        // ordered list, each run a `(lease, offset, length)` triple. The tag is
+        // new, so every earlier source keeps its byte-for-byte layout; an older
+        // decoder that meets the tag refuses the frame by name
+        // (`UnknownEnumValue`) rather than reading the list as something else.
+        BufferSource::GuestRuns(runs) => {
+            encoder.u8(3);
+            encoder.u64(runs.len() as u64);
+            for run in runs {
+                encoder.u64(run.lease_id.get());
+                encoder.u64(run.offset);
+                encoder.u64(run.length);
+            }
+        }
     }
 }
 
@@ -2527,6 +2541,22 @@ fn get_view(decoder: &mut Decoder<'_>) -> Result<BufferView, CodecError> {
         0 => BufferSource::OwnedBytes(decoder.blob()?),
         1 => BufferSource::StagedLease(LeaseId::new(decoder.u64()?)),
         2 => BufferSource::BorrowedNoCopy(LeaseId::new(decoder.u64()?)),
+        3 => {
+            let count =
+                usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+                    needed: usize::MAX,
+                    remaining: decoder.remaining(),
+                })?;
+            let mut runs = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                runs.push(GuestRun {
+                    lease_id: LeaseId::new(decoder.u64()?),
+                    offset: decoder.u64()?,
+                    length: decoder.u64()?,
+                });
+            }
+            BufferSource::GuestRuns(runs)
+        }
         value => {
             return Err(CodecError::UnknownEnumValue {
                 field: "buffer source",

@@ -19,6 +19,7 @@
 //! trace's own resource table and the serial pool; executing a render pass
 //! (Vulkan render pass, native `MTLRenderCommandEncoder`) is still open.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -533,12 +534,35 @@ pub enum BufferSource {
     /// Provider may use the owner's backing without copying; the lease remains
     /// valid until every associated GPU reservation is known to be retired.
     BorrowedNoCopy(LeaseId),
+    /// The bytes are the owner's own guest runs (`research/docs/23` §74,
+    /// E-TX6): an ordered list of windows inside imported no-copy leases whose
+    /// concatenation *is* the view's byte range.
+    ///
+    /// The arm exists because the caller's real source is not always one
+    /// window. A guest surface's bytes live in the pages the guest owns, and
+    /// those pages are described as runs — a head, then a stretch of pages,
+    /// then a tail — never as one pointer the owner may hand over. The
+    /// engine's own answer for a render attachment's prior contents
+    /// ([`Self::GuestRuns`]'s shape there) is exactly this list, and its
+    /// alternatives are a host framebuffer materialization or a CPU fallback.
+    ///
+    /// The provider *gathers* the runs — it copies each window's bytes out of
+    /// the owner's live pages at execution — so unlike [`Self::BorrowedNoCopy`]
+    /// this arm states no device import and no alignment requirement: the
+    /// window a run points at is read by the host, and the copy the provider
+    /// uploads is its own. Reading at execution rather than at admission is
+    /// what keeps the arm honest: the bytes the pass begins from are the bytes
+    /// the owner holds when the pass runs.
+    GuestRuns(Vec<GuestRun>),
 }
 
 impl BufferSource {
     pub const fn lease_id(&self) -> Option<LeaseId> {
         match self {
-            Self::OwnedBytes(_) => None,
+            // A guest-runs source names several leases, so no single identity
+            // answers here; the per-run checks are `validate_trace`'s
+            // (`BufferSource::guest_runs`).
+            Self::OwnedBytes(_) | Self::GuestRuns(_) => None,
             Self::StagedLease(lease_id) | Self::BorrowedNoCopy(lease_id) => Some(*lease_id),
         }
     }
@@ -548,7 +572,48 @@ impl BufferSource {
             Self::OwnedBytes(_) => BufferSourceKind::OwnedBytes,
             Self::StagedLease(_) => BufferSourceKind::StagedLease,
             Self::BorrowedNoCopy(_) => BufferSourceKind::BorrowedNoCopy,
+            Self::GuestRuns(_) => BufferSourceKind::GuestRuns,
         }
+    }
+
+    /// The ordered owner windows this source is made of, when it is the
+    /// guest-runs arm.
+    pub fn guest_runs(&self) -> Option<&[GuestRun]> {
+        match self {
+            Self::GuestRuns(runs) => Some(runs),
+            Self::OwnedBytes(_) | Self::StagedLease(_) | Self::BorrowedNoCopy(_) => None,
+        }
+    }
+}
+
+/// One stretch of an owner-imported guest window a [`BufferSource::GuestRuns`]
+/// view's bytes are read from (`research/docs/23` §74, E-TX6).
+///
+/// The triple is the run's own coordinates inside the *allocation* the lease
+/// covers — the same namespace a [`BufferView`]'s `offset`/`length` live in —
+/// so the run's window is resolved by the same checks the single-window arms
+/// use: the lease has to be imported and admitted, the epoch has to agree, and
+/// the range has to fall inside the reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestRun {
+    pub lease_id: LeaseId,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl GuestRun {
+    /// Validate one run's own identity and extent. Refuses a zero lease, a
+    /// zero-length run, and a range that overflows.
+    pub fn validate(&self) -> Result<u64, ContractError> {
+        if self.lease_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("guest run lease id"));
+        }
+        if self.length == 0 {
+            return Err(ContractError::ZeroLength("guest run"));
+        }
+        self.offset
+            .checked_add(self.length)
+            .ok_or(ContractError::ArithmeticOverflow("guest run range"))
     }
 }
 
@@ -557,6 +622,9 @@ pub enum BufferSourceKind {
     OwnedBytes,
     StagedLease,
     BorrowedNoCopy,
+    /// The runs [`BufferSource::GuestRuns`] carries (`research/docs/23` §74,
+    /// E-TX6).
+    GuestRuns,
 }
 
 /// Texture formats admitted by the first texture increment
@@ -1233,6 +1301,28 @@ impl BufferView {
                     view: self.view_id,
                     expected: self.length,
                     actual,
+                });
+            }
+        }
+        // A guest-runs declaration is the other arm whose own bytes *are* its
+        // shape rule (`research/docs/23` §74, E-TX6): the runs concatenate to
+        // the view's byte range and nothing else, so the same
+        // `SourceLengthMismatch` answers a list that is short, long or empty.
+        // Each run's own identity and extent are checked first, so a malformed
+        // list is refused by its own name rather than by the sum.
+        if let BufferSource::GuestRuns(runs) = &self.source {
+            let mut total = 0_u64;
+            for run in runs {
+                run.validate()?;
+                total = total
+                    .checked_add(run.length)
+                    .ok_or(ContractError::ArithmeticOverflow("guest run total"))?;
+            }
+            if total != self.length {
+                return Err(ContractError::SourceLengthMismatch {
+                    view: self.view_id,
+                    expected: self.length,
+                    actual: total,
                 });
             }
         }
@@ -6162,8 +6252,22 @@ impl ResourceTableSnapshot {
 
     pub fn validate_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         trace.validate()?;
-        let mut views =
-            BTreeMap::<ViewId, (AllocationId, u64, u64, BufferSourceKind, Option<LeaseId>)>::new();
+        // One declaration per view, in the order the identity is compared in:
+        // the allocation, the range, the source's *kind*, and then the source's
+        // own coordinates. `LeaseId` carries the single-window arms' lease; the
+        // guest-runs arm names several, so its runs travel beside it
+        // (`research/docs/23` §74, E-TX6) — two declarations of one view that
+        // read different windows are two different declarations, exactly as two
+        // that name different leases are.
+        type Declaration = (
+            AllocationId,
+            u64,
+            u64,
+            BufferSourceKind,
+            Option<LeaseId>,
+            Option<Vec<(u64, u64, u64)>>,
+        );
+        let mut views = BTreeMap::<ViewId, Declaration>::new();
         let mut ranges = Vec::<(usize, AllocationId, ViewId, u64, u64, BufferAccess)>::new();
         for (pass_index, pass) in trace.passes.iter().enumerate() {
             // Attachments are not `BufferView`s; their range admission joins
@@ -6251,16 +6355,69 @@ impl ResourceTableSnapshot {
                         });
                     }
                 }
+                // A guest-runs declaration is the multi-window form of the same
+                // check (`research/docs/23` §74, E-TX6): every run has to name
+                // an admitted reservation of the view's own allocation and
+                // epoch, and its own range has to fall inside it. The view's
+                // byte range is *not* required to sit inside one reservation —
+                // that is the whole point of the arm — so this is the only
+                // place the per-run bound is stated.
+                let runs = view
+                    .source
+                    .guest_runs()
+                    .map(|runs| -> Result<Vec<(u64, u64, u64)>, ContractError> {
+                        let mut identity = Vec::with_capacity(runs.len());
+                        for run in runs {
+                            let run_end = run.validate()?;
+                            let reservation = self
+                                .leases
+                                .get(&run.lease_id)
+                                .ok_or(ContractError::UnknownLease(run.lease_id))?;
+                            if reservation.lease.allocation_id != view.allocation_id {
+                                return Err(ContractError::LeaseMismatch {
+                                    view: view.view_id,
+                                    lease: run.lease_id,
+                                });
+                            }
+                            if reservation.lease.owner_epoch != trace.device_epoch {
+                                return Err(ContractError::LeaseEpochMismatch {
+                                    lease: run.lease_id,
+                                    expected: trace.device_epoch,
+                                    actual: reservation.lease.owner_epoch,
+                                });
+                            }
+                            let lease_end = reservation.end()?;
+                            if run.offset < reservation.offset || run_end > lease_end {
+                                return Err(ContractError::LeaseRangeOutOfBounds {
+                                    lease: run.lease_id,
+                                    end: run_end,
+                                    allocation_size: lease_end,
+                                });
+                            }
+                            identity.push((run.lease_id.get(), run.offset, run.length));
+                        }
+                        Ok(identity)
+                    })
+                    .transpose()?;
                 let declaration = (
                     view.allocation_id,
                     view.offset,
                     view.length,
                     view.source.kind(),
                     view.source.lease_id(),
+                    runs,
                 );
-                if let Some(previous) = views.insert(view.view_id, declaration) {
-                    if previous != declaration {
-                        return Err(ContractError::ViewIdentityMismatch(view.view_id));
+                // The declaration is compared against a previous one, so it is
+                // cloned once per *repeated* view rather than moved: the first
+                // sighting of a view takes the tuple itself.
+                match views.entry(view.view_id) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(declaration);
+                    }
+                    Entry::Occupied(slot) => {
+                        if *slot.get() != declaration {
+                            return Err(ContractError::ViewIdentityMismatch(view.view_id));
+                        }
                     }
                 }
             }
@@ -6981,6 +7138,29 @@ impl BorrowedLeaseRegistry {
         )
     }
 
+    /// Resolve one run of a guest-runs declaration to owner memory
+    /// (`research/docs/23` §74, E-TX6).
+    ///
+    /// The same checks the single-window arms take, on the run's own
+    /// coordinates inside the allocation: the lease has to be imported
+    /// (`lease_not_imported`), admitted by the snapshot, in the device's epoch,
+    /// and its reservation has to cover the run (`lease_range_out_of_bounds`).
+    /// The window this hands back is the run's own pages, so a rail that
+    /// gathers the runs reads the bytes the owner holds at execution.
+    pub fn run_pointer(
+        &self,
+        run: GuestRun,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<BorrowedView, ProviderError> {
+        self.window_pointer(
+            run.lease_id,
+            LeaseWindow::GuestRun(run),
+            device_epoch,
+            resources,
+        )
+    }
+
     /// One window's owner memory, with the checks both entry points share and
     /// in the order the staged registry uses: the import first
     /// (`lease_not_imported`), then the admitted snapshot, the epoch, and the
@@ -7100,6 +7280,9 @@ enum LeaseWindow<'a> {
     View(&'a BufferView),
     /// A texture's whole tightly packed extent at the reservation's start.
     Texture(&'a TextureView),
+    /// One run of a guest-runs declaration, at its own coordinates
+    /// (`research/docs/23` §74, E-TX6).
+    GuestRun(GuestRun),
 }
 
 impl LeaseWindow<'_> {
@@ -7112,6 +7295,7 @@ impl LeaseWindow<'_> {
                 reservation.offset,
                 texture.expected_bytes().map_err(contract_error_refusal)?,
             )),
+            Self::GuestRun(run) => Ok((run.offset, run.length)),
         }
     }
 }
@@ -9421,7 +9605,14 @@ impl ProviderCapabilities {
                 let storage_mode = match &buffer.source {
                     BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
                     BufferSource::StagedLease(_) => StorageMode::StagedLease,
-                    BufferSource::BorrowedNoCopy(_) => StorageMode::BorrowedNoCopy,
+                    // A guest-runs source is read out of the owner's imported
+                    // mappings by the provider (`research/docs/23` §74,
+                    // E-TX6), so it needs the same device capability a no-copy
+                    // window does: a provider that cannot import host memory
+                    // cannot reach the runs either.
+                    BufferSource::BorrowedNoCopy(_) | BufferSource::GuestRuns(_) => {
+                        StorageMode::BorrowedNoCopy
+                    }
                 };
                 if !self.storage_modes.contains(&storage_mode) {
                     return Err(capability_error("storage_mode_unsupported")
@@ -9882,7 +10073,12 @@ impl ProviderCapabilities {
                 let mode = match &stage.view.source {
                     BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
                     BufferSource::StagedLease(_) => StorageMode::StagedLease,
-                    BufferSource::BorrowedNoCopy(_) => StorageMode::BorrowedNoCopy,
+                    // The guest-runs mapping is the compute arm's
+                    // (`research/docs/23` §74, E-TX6): the runs are read out of
+                    // imported mappings, so the capability is the no-copy one.
+                    BufferSource::BorrowedNoCopy(_) | BufferSource::GuestRuns(_) => {
+                        StorageMode::BorrowedNoCopy
+                    }
                 };
                 if !self.storage_modes.contains(&mode) {
                     return Err(capability_error("storage_mode_unsupported")
@@ -16833,6 +17029,183 @@ mod tests {
                 .unwrap_err()
                 .slug,
             "lease_not_imported"
+        );
+    }
+
+    /// A guest-runs declaration is the view's bytes and nothing else
+    /// (`research/docs/23` §74, E-TX6).
+    ///
+    /// The runs concatenate to the view's own length, so a list that is short,
+    /// long or empty is refused with the same length rule the owned-bytes arm
+    /// answers; a run's own identity and extent are checked first, so a
+    /// malformed run is named by itself rather than by the sum.
+    #[test]
+    fn guest_runs_add_up_to_the_view_they_declare() {
+        let runs = |runs: Vec<GuestRun>| BufferView {
+            view_id: ViewId::new(21),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(9),
+            offset: 0,
+            length: 16,
+            // The declaring kernel of the test's trace writes its binding, and
+            // the access a view declares here is what admission compares.
+            access: BufferAccess::Write,
+            attribute_stride: None,
+            source: BufferSource::GuestRuns(runs),
+        };
+        let run = |lease: u64, offset: u64, length: u64| GuestRun {
+            lease_id: LeaseId::new(lease),
+            offset,
+            length,
+        };
+
+        // The head and the tail of one surface: two runs, one declaration.
+        runs(vec![run(11, 0, 8), run(12, 8, 8)])
+            .validate_shape()
+            .expect("the runs cover the view exactly");
+
+        assert_eq!(
+            runs(vec![run(11, 0, 8)]).validate_shape(),
+            Err(ContractError::SourceLengthMismatch {
+                view: ViewId::new(21),
+                expected: 16,
+                actual: 8,
+            })
+        );
+        assert_eq!(
+            runs(Vec::new()).validate_shape(),
+            Err(ContractError::SourceLengthMismatch {
+                view: ViewId::new(21),
+                expected: 16,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            runs(vec![run(11, 0, 0), run(12, 0, 16)]).validate_shape(),
+            Err(ContractError::ZeroLength("guest run"))
+        );
+        assert_eq!(
+            runs(vec![run(0, 0, 16)]).validate_shape(),
+            Err(ContractError::InvalidIdentity("guest run lease id"))
+        );
+    }
+
+    /// Every run is checked against its own reservation (`research/docs/23` §74,
+    /// E-TX6): the arm is a list of leases, so a list is only as good as each of
+    /// its windows.
+    #[test]
+    fn every_guest_run_is_bounded_by_its_own_reservation() {
+        let allocation = AllocationId::new(9);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: DeviceEpoch::new(1),
+                size: 16,
+            })
+            .unwrap();
+        resources
+            .insert_lease(LeaseReservation {
+                lease: BufferLease {
+                    lease_id: LeaseId::new(11),
+                    allocation_id: allocation,
+                    owner_epoch: DeviceEpoch::new(1),
+                },
+                offset: 0,
+                length: 8,
+            })
+            .unwrap();
+        resources
+            .insert_lease(LeaseReservation {
+                lease: BufferLease {
+                    lease_id: LeaseId::new(12),
+                    allocation_id: allocation,
+                    owner_epoch: DeviceEpoch::new(1),
+                },
+                offset: 8,
+                length: 8,
+            })
+            .unwrap();
+
+        let view = |runs: Vec<GuestRun>| BufferView {
+            view_id: ViewId::new(21),
+            metal_binding: 0,
+            allocation_id: allocation,
+            offset: 0,
+            length: 16,
+            // The test trace's declaring kernel writes binding 0, and the
+            // access a view declares is what admission compares it against.
+            access: BufferAccess::Write,
+            attribute_stride: None,
+            source: BufferSource::GuestRuns(runs),
+        };
+        let run = |lease: u64, offset: u64, length: u64| GuestRun {
+            lease_id: LeaseId::new(lease),
+            offset,
+            length,
+        };
+
+        let two_runs = view(vec![run(11, 0, 8), run(12, 8, 8)]);
+        resources
+            .validate_trace(&trace(vec![pass(4, vec![two_runs.clone()])]))
+            .expect("each run sits inside its own reservation");
+
+        // A run that reaches past its reservation's end is refused by name.
+        let overrun = view(vec![run(11, 0, 8), run(12, 4, 8)]);
+        assert_eq!(
+            resources.validate_trace(&trace(vec![pass(4, vec![overrun])])),
+            Err(ContractError::LeaseRangeOutOfBounds {
+                lease: LeaseId::new(12),
+                end: 12,
+                allocation_size: 16,
+            })
+        );
+
+        // A lease that was never admitted is refused rather than guessed.
+        let unknown = view(vec![run(11, 0, 8), run(13, 8, 8)]);
+        assert_eq!(
+            resources.validate_trace(&trace(vec![pass(4, vec![unknown])])),
+            Err(ContractError::UnknownLease(LeaseId::new(13)))
+        );
+
+        // A run whose lease belongs to another allocation cannot be the view's.
+        let mut foreign = resources.clone();
+        foreign
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(10),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 8,
+            })
+            .unwrap();
+        foreign
+            .insert_lease(LeaseReservation {
+                lease: BufferLease {
+                    lease_id: LeaseId::new(14),
+                    allocation_id: AllocationId::new(10),
+                    owner_epoch: DeviceEpoch::new(1),
+                },
+                offset: 0,
+                length: 8,
+            })
+            .unwrap();
+        let mismatched = view(vec![run(11, 0, 8), run(14, 0, 8)]);
+        assert_eq!(
+            foreign.validate_trace(&trace(vec![pass(4, vec![mismatched])])),
+            Err(ContractError::LeaseMismatch {
+                view: ViewId::new(21),
+                lease: LeaseId::new(14),
+            })
+        );
+
+        // Two declarations of one view that read different windows are two
+        // different declarations: the identity check compares the runs.
+        let rebound = trace(vec![
+            pass(4, vec![two_runs]),
+            pass(4, vec![view(vec![run(12, 8, 8), run(11, 0, 8)])]),
+        ]);
+        assert_eq!(
+            resources.validate_trace(&rebound),
+            Err(ContractError::ViewIdentityMismatch(ViewId::new(21)))
         );
     }
 

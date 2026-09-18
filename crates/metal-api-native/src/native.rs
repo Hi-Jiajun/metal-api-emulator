@@ -896,6 +896,21 @@ impl ComputeProvider for NativeMetalProvider {
         let resolve = |view: &BufferView| -> Result<ResolvedBuffer, ProviderError> {
             match &view.source {
                 BufferSource::OwnedBytes(bytes) => Ok(ResolvedBuffer::Owned(bytes.clone())),
+                // The guest-runs arm's reading is the Vulkan rail's gather
+                // (`research/docs/23` §74, E-TX6); this rail states the
+                // boundary by name rather than reading the runs with a
+                // different meaning.
+                BufferSource::GuestRuns(_) => Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "storage_mode_unsupported",
+                )
+                .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+                .with_field("storage_mode", FieldValue::Text("guest_runs".to_owned()))
+                .with_detail(
+                    "the bytes are an ordered list of the owner's guest runs, and this rail \
+                     does not read the guest-runs arm yet (`research/docs/23` §74, E-TX6)",
+                )),
                 BufferSource::StagedLease(lease_id) => self
                     .staging
                     .view_bytes(*lease_id, view, self.epoch, admitted.resources())
