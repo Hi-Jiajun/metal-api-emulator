@@ -51,6 +51,9 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
+use crate::readback_rect::{
+    full_readback_requested, written_rect, ReadbackFallback, RectRefusal, WrittenRect,
+};
 use crate::{SpirvFeaturePolicy, VulkanContext};
 
 /// The four-byte texel the pre-v78 rail computed every readback extent with.
@@ -7135,6 +7138,292 @@ pub(crate) struct StageBufferReadback {
     pub bytes: Vec<u8>,
 }
 
+/// How one stored attachment's frame is read back
+/// (`docs/WRITTEN-RECT-READBACK.md`).
+///
+/// `rect` is the rectangle this pass can have written. `Some` means the device
+/// copy carries only that rectangle and the frame's other texels are the seed
+/// the image began from — bytes this rail already holds host-side, so no device
+/// traffic is needed to reproduce them. `None` is the whole-attachment readback
+/// every pre-increment shape took.
+#[derive(Clone, Copy, Debug)]
+struct AttachmentReadback<'a> {
+    rect: Option<WrittenRect>,
+    /// What the texels outside `rect` hold, which is the seed `record` opens the
+    /// pass's image with. `Some` exactly when `rect` is `Some`: a whole
+    /// readback needs no seed, because the frame *is* what the device copied.
+    base: Option<ReadbackBase<'a>>,
+    /// The attachment's whole tightly packed extent, in bytes: the length of the
+    /// frame the readback publishes, and the copy-out length of a whole
+    /// readback.
+    extent_bytes: u64,
+    /// The number of texels the attachment's extent covers, which a clear's
+    /// repeated payload is widened over.
+    texels: u64,
+}
+
+/// The host-side seed a trimmed readback rebuilds a frame's uncovered texels
+/// from.
+#[derive(Clone, Copy, Debug)]
+enum ReadbackBase<'a> {
+    /// One texel of the payload a `LoadOp::Clear` pass fills the whole render
+    /// area with, repeated over every other texel.
+    Clear(&'a [u8]),
+    /// A `LoadOp::Load` pass's previous contents: the bytes the image was
+    /// uploaded with, which is what every texel the draw did not cover still
+    /// holds.
+    Previous(&'a [u8]),
+}
+
+/// One stored attachment's readback decision, in location order, `None` for a
+/// discarded attachment — the same shape the readback channel itself has.
+type ReadbackRegions<'a> = Vec<Option<AttachmentReadback<'a>>>;
+
+/// Decide how every stored attachment of one pass is read back.
+///
+/// The decision is taken before any device object exists, so a shape this rail
+/// cannot prove falls back to the whole-attachment readback before it costs
+/// anything — and every fallback is counted, because "how much of the guest's
+/// traffic this saves" is only readable beside the shapes that keep the old
+/// cost (`VulkanExecutor::readback_region_counts`).
+fn plan_readback_regions<'a>(
+    context: &VulkanContext,
+    request: &'a OffscreenRenderRequest<'a>,
+) -> Result<ReadbackRegions<'a>, ProviderError> {
+    // The control arm: `METAL_API_VULKAN_FULL_READBACK` asks for the
+    // pre-increment path for this whole process, which is what lets one round
+    // compare the two arms' frames byte for byte.
+    let forced = full_readback_requested();
+    let multisampled = request
+        .multisample
+        .is_some_and(|state| state.sample_count != SampleCount::One);
+    let mut regions = Vec::with_capacity(request.attachments.len());
+    for attachment in &request.attachments {
+        if !store_publishes(attachment.store) {
+            regions.push(None);
+            continue;
+        }
+        let extent_bytes = attachment_readback_bytes(request.extent, attachment.format)?;
+        let texels = u64::from(request.extent[0]) * u64::from(request.extent[1]);
+        // The seed the frame's uncovered texels hold. A `Load` source is the
+        // attachment's own declaration, resolved before any device object
+        // exists; its length is that attachment's tightly packed extent by
+        // construction (`resolve_attachment_load`), so the copy it feeds below
+        // is the frame's own length. A `Clear` carries its payload in the same
+        // memory order the pass clears with.
+        let base = match &attachment.load {
+            LoadOp::Clear(clear) => Some(ReadbackBase::Clear(clear.as_bytes())),
+            LoadOp::Load => attachment
+                .previous
+                .as_ref()
+                .map(|source| ReadbackBase::Previous(source.proof_bytes())),
+            LoadOp::Resident | LoadOp::DontCare => None,
+        };
+        let decision = if forced {
+            Err(RectRefusal::Multisample)
+        } else {
+            written_rect(
+                request.extent,
+                request.viewport,
+                request.scissor,
+                multisampled,
+                attachment.load,
+                attachment
+                    .previous
+                    .as_ref()
+                    .is_some_and(|source| source.len() as u64 == extent_bytes),
+            )
+        };
+        let rect = match decision {
+            Ok(rect) if !rect.is_whole(request.extent) && base.is_some() => Some(rect),
+            Ok(_) => {
+                // A rectangle covering the whole attachment is the
+                // pre-increment readback with extra steps: it is counted as one
+                // rather than copied through the rebuilding path.
+                context.record_readback_fallback(ReadbackFallback::Whole);
+                crate::phase_profile::note_readback(
+                    crate::phase_profile::ReadbackRegion::Fallback(ReadbackFallback::Whole),
+                );
+                None
+            }
+            Err(refusal) => {
+                let bucket = if forced {
+                    ReadbackFallback::Switch
+                } else {
+                    refusal.fallback()
+                };
+                context.record_readback_fallback(bucket);
+                crate::phase_profile::note_readback(
+                    crate::phase_profile::ReadbackRegion::Fallback(bucket),
+                );
+                None
+            }
+        };
+        // A proof of `rect` rests on a seed this rail holds: a shape whose load
+        // operation states bytes it does not have (`Resident`, `DontCare`, or a
+        // `Load` that resolved nothing) was refused above, so the two are
+        // `Some` together. The attachment still lands its whole readback — it is
+        // a stored attachment, not a discarded one.
+        debug_assert!(
+            rect.is_none() || base.is_some(),
+            "a written rectangle is only proven beside the seed the frame is rebuilt from"
+        );
+        regions.push(Some(AttachmentReadback {
+            rect,
+            base,
+            extent_bytes,
+            texels,
+        }));
+    }
+    Ok(regions)
+}
+
+/// The bytes one trimmed readback publishes: the seed, with the rectangle the
+/// copy-out carried patched into it.
+///
+/// This is the whole frame the pre-increment rail read back, rebuilt instead of
+/// read — the texels outside the rectangle are the image's own seed (a `Clear`
+/// payload or the `Load` source's bytes) and the rectangle's texels are the
+/// device's, so the frame is byte for byte the one the whole readback produces.
+fn rebuild_frame(
+    region: &AttachmentReadback<'_>,
+    extent: [u32; 2],
+    rect: WrittenRect,
+    texel_bytes: usize,
+    rect_bytes: &[u8],
+) -> Result<Vec<u8>, ProviderError> {
+    let base = region
+        .base
+        .expect("a trimmed readback states the seed its frame is rebuilt from");
+    let mut frame = match base {
+        ReadbackBase::Clear(clear) => {
+            crate::readback_rect::clear_frame(region.texels, texel_bytes, clear)
+        }
+        ReadbackBase::Previous(bytes) => {
+            if bytes.len() as u64 == region.extent_bytes {
+                Ok(bytes.to_vec())
+            } else {
+                Err(crate::readback_rect::PatchRefusal::Frame)
+            }
+        }
+    }
+    .map_err(|refusal| {
+        args_refusal("render_readback_seed_mismatch")
+            .with_field(
+                "attachment_bytes",
+                FieldValue::Unsigned(region.extent_bytes),
+            )
+            .with_detail(refusal.detail())
+    })?;
+    crate::readback_rect::patch_rect(&mut frame, extent, rect, texel_bytes, rect_bytes).map_err(
+        |refusal| {
+            args_refusal("render_readback_rect_mismatch")
+                .with_field(
+                    "attachment_bytes",
+                    FieldValue::Unsigned(region.extent_bytes),
+                )
+                .with_field(
+                    "copied_bytes",
+                    FieldValue::Unsigned(rect_bytes.len() as u64),
+                )
+                .with_detail(refusal.detail())
+        },
+    )?;
+    Ok(frame)
+}
+
+/// Read one executed pass's observable bytes back to the host: every stored
+/// attachment (through its written rectangle, or whole), the stored depth and
+/// stencil surfaces, and every writable stage buffer.
+///
+/// The mappings the attachments were copied into are read here, which is why
+/// this runs after the completion fence has signalled — and why the caller
+/// retires the pass's input retains only after it returns: a `Load` seed read
+/// out of an owner's window is the owner's memory, and the hold is what keeps it
+/// readable until the pass's own landings run (`docs/WRITTEN-RECT-READBACK.md`
+/// §3).
+fn read_back_offscreen(
+    context: &VulkanContext,
+    request: &OffscreenRenderRequest<'_>,
+    objects: &OffscreenObjects,
+    regions: &[Option<AttachmentReadback<'_>>],
+    mappings: Vec<usize>,
+    depth_byte_length: u64,
+    stencil_byte_length: u64,
+) -> Result<OffscreenReadback, ProviderError> {
+    // One readback record per stored attachment: `copy_out` equals the stored
+    // attachment count, so a caller can observe that a stored location really
+    // left the device and that a discarded one produced no bytes at all. A
+    // stored depth surface adds its own record on top of that count, through
+    // the same copy-out channel (`research/docs/23` §3.3, v43).
+    let _render_readback =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReadback);
+    let mut results = Vec::with_capacity(request.attachments.len());
+    let mut mappings = mappings.into_iter();
+    for (attachment, region) in request.attachments.iter().zip(regions) {
+        let Some(region) = region else {
+            results.push(None);
+            continue;
+        };
+        let mapping = mappings.next().expect("one readback per stored attachment");
+        let texel_bytes = usize::try_from(attachment.format.bytes_per_texel())
+            .map_err(|_| contract_refusal("render attachment texel width overflows usize"))?;
+        let frame = match region.rect {
+            Some(rect) => {
+                // The copy region leaves the rectangle's own tightly packed rows
+                // at the mapping's start (`VkBufferImageCopy` with no row
+                // stride), so this is one contiguous read — and the read this
+                // increment exists to shrink.
+                let copied = rect
+                    .byte_length(texel_bytes as u64)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .ok_or_else(|| contract_refusal("render readback rectangle overflows usize"))?;
+                let rect_bytes =
+                    unsafe { std::slice::from_raw_parts(mapping as *const u8, copied).to_vec() };
+                let frame = rebuild_frame(region, request.extent, rect, texel_bytes, &rect_bytes)?;
+                context.record_buffer_readback();
+                context.record_buffer_readback_bytes(rect_bytes.len());
+                let extent_bytes = usize::try_from(region.extent_bytes).unwrap_or(usize::MAX);
+                context.record_readback_rect(rect_bytes.len(), extent_bytes);
+                crate::phase_profile::note_readback(crate::phase_profile::ReadbackRegion::Rect {
+                    bytes: rect_bytes.len() as u64,
+                    extent_bytes: region.extent_bytes,
+                });
+                frame
+            }
+            None => {
+                let bytes = usize::try_from(region.extent_bytes)
+                    .map_err(|_| contract_refusal("render attachment bytes overflow usize"))?;
+                let texels =
+                    unsafe { std::slice::from_raw_parts(mapping as *const u8, bytes).to_vec() };
+                context.record_buffer_readback();
+                context.record_buffer_readback_bytes(texels.len());
+                context.record_readback_full(texels.len());
+                crate::phase_profile::note_readback(crate::phase_profile::ReadbackRegion::Full {
+                    bytes: texels.len() as u64,
+                });
+                texels
+            }
+        };
+        results.push(Some(frame));
+    }
+    let depth = objects.depth_readback_bytes(depth_byte_length as usize, context)?;
+    // The stored stencil surface follows the depth one through the same
+    // copy-out channel; its byte extent is one per texel, not the colour
+    // attachments' four (`research/docs/23` §3.3, v49).
+    let stencil = objects.stencil_readback_bytes(stencil_byte_length as usize, context)?;
+    // The writable stage buffers come last, after the attachments' own
+    // landings (`research/docs/23` §3.3, v86): their bytes are the pass's other
+    // observable output, read beside the texels that same submission wrote.
+    let stage_buffers = objects.stage_buffer_readback_bytes(context)?;
+    Ok(OffscreenReadback {
+        attachments: results,
+        depth,
+        stencil,
+        stage_buffers,
+    })
+}
+
 fn execute_offscreen_render_with_retains(
     context: &VulkanContext,
     request: &OffscreenRenderRequest<'_>,
@@ -7862,17 +8151,30 @@ fn execute_offscreen_render_with_retains(
     // One readback destination per stored attachment; a discarded attachment
     // creates none, because its bytes leave no observable surface to land in
     // (`docs/23` §3.6, v19).
+    //
+    // Each stored attachment lands `width * height * its own texel width` bytes
+    // (`research/docs/23` §78), so a two-location pass whose formats differ in
+    // width still reads both back whole — unless the pass's own rectangle is
+    // narrower, in which case only that rectangle is staged and the buffer is
+    // sized for it (`docs/WRITTEN-RECT-READBACK.md`).
+    let regions = plan_readback_regions(context, request)?;
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
-    for attachment in &request.attachments {
-        if store_publishes(attachment.store) {
-            // Each stored attachment lands `width * height * its own texel
-            // width` bytes (`research/docs/23` §78), so a two-location pass
-            // whose formats differ in width still reads both back whole.
-            readback_mappings.push(objects.create_readback(attachment_readback_bytes(
-                request.extent,
-                attachment.format,
-            )?)?);
-        }
+    for (attachment, region) in request.attachments.iter().zip(&regions) {
+        let Some(region) = region else {
+            continue;
+        };
+        let staged = match region.rect {
+            Some(rect) => {
+                let texel_bytes = attachment.format.bytes_per_texel();
+                rect.byte_length(texel_bytes)
+                    .ok_or_else(|| contract_refusal("render readback rectangle overflows u64"))?
+            }
+            None => region.extent_bytes,
+        };
+        // A rectangle that covers nothing stages nothing — `record` skips its
+        // copy entirely — but the buffer still has to exist, and a zero-sized
+        // `VkBuffer` is invalid.
+        readback_mappings.push(objects.create_readback(staged.max(1))?);
     }
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
@@ -7914,6 +8216,12 @@ fn execute_offscreen_render_with_retains(
         &request.attachments,
         request.depth.as_ref(),
         request.stencil.as_ref(),
+        // The rectangle each stored attachment can have written, in location
+        // order: the copy-out carries only that rectangle, so a draw that
+        // touches a few thousand texels of a 1920x1080 surface moves a few
+        // thousand texels through the staging buffer
+        // (`docs/WRITTEN-RECT-READBACK.md`).
+        &regions,
         // The resolve filter the subpass was built with; `record` reads the
         // same request field for its clear-value placeholder and copy-out
         // source (`research/docs/23` §3.3, v57).
@@ -7933,9 +8241,6 @@ fn execute_offscreen_render_with_retains(
     // (`research/docs/23` §71, R3c).
     match objects.submit_and_wait(queue_index) {
         Ok(()) => {
-            if let Some(retains) = retains.as_mut() {
-                retains.retire();
-            }
             // The pass completed, so every resident target is now in the
             // layout the next submission starts from — and, for the provider's
             // own bookkeeping, in a state a later `LoadOp::Resident` may read
@@ -7958,44 +8263,27 @@ fn execute_offscreen_render_with_retains(
         }
     }
 
-    // One readback record per stored attachment: `copy_out` equals the stored
-    // attachment count, so a caller can observe that a stored location really
-    // left the device and that a discarded one produced no bytes at all. A
-    // stored depth surface adds its own record on top of that count, through
-    // the same copy-out channel (`research/docs/23` §3.3, v43).
-    let _render_readback =
-        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReadback);
-    let mut results = Vec::with_capacity(request.attachments.len());
-    let mut mappings = readback_mappings.into_iter();
-    for attachment in &request.attachments {
-        if store_publishes(attachment.store) {
-            let mapping = mappings.next().expect("one readback per stored attachment");
-            let bytes = attachment_readback_bytes(request.extent, attachment.format)?;
-            let texels = unsafe {
-                std::slice::from_raw_parts(mapping as *const u8, bytes as usize).to_vec()
-            };
-            context.record_buffer_readback();
-            context.record_buffer_readback_bytes(texels.len());
-            results.push(Some(texels));
-        } else {
-            results.push(None);
+    // The readback comes before the retains retire, and not the other way
+    // around: a trimmed readback rebuilds the frame's uncovered texels from the
+    // attachment's own seed, and a `Load` seed can be the owner's live window —
+    // memory the retain is what keeps readable. The pass's own landings into
+    // those windows run after this function returns, so the bytes read here are
+    // the pre-pass bytes by construction (`docs/WRITTEN-RECT-READBACK.md` §3).
+    let readback = read_back_offscreen(
+        context,
+        request,
+        &objects,
+        &regions,
+        readback_mappings,
+        depth_byte_length,
+        stencil_byte_length,
+    );
+    if readback.is_ok() {
+        if let Some(retains) = retains.as_mut() {
+            retains.retire();
         }
     }
-    let depth = objects.depth_readback_bytes(depth_byte_length as usize, context)?;
-    // The stored stencil surface follows the depth one through the same
-    // copy-out channel; its byte extent is one per texel, not the colour
-    // attachments' four (`research/docs/23` §3.3, v49).
-    let stencil = objects.stencil_readback_bytes(stencil_byte_length as usize, context)?;
-    // The writable stage buffers come last, after the attachments' own
-    // landings (`research/docs/23` §3.3, v86): their bytes are the pass's other
-    // observable output, read beside the texels that same submission wrote.
-    let stage_buffers = objects.stage_buffer_readback_bytes(context)?;
-    Ok(OffscreenReadback {
-        attachments: results,
-        depth,
-        stencil,
-        stage_buffers,
-    })
+    readback
 }
 
 /// One provider-owned target image: the present rail's presentable target
@@ -8649,6 +8937,11 @@ pub(crate) fn execute_present_render<'a>(
         std::slice::from_ref(attachment),
         None,
         None,
+        // The present rail keeps the whole-target readback: its bytes are the
+        // frame the present action hands on, and the action reads the target
+        // image itself (`docs/24` §3.3), so the increment's written-rect arm
+        // starts on the offscreen half (`docs/WRITTEN-RECT-READBACK.md` §5).
+        &[None],
         None,
         None,
         None,
@@ -12836,6 +13129,10 @@ impl<'a> OffscreenObjects<'a> {
         attachments: &[OffscreenColorAttachment<'_>],
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
+        // The readback region of every stored attachment, in location order
+        // (`docs/WRITTEN-RECT-READBACK.md`): `Some` stages only that rectangle,
+        // `None` stages the whole extent.
+        written: &[Option<AttachmentReadback<'_>>],
         depth_resolve: Option<DepthResolveFilter>,
         stencil_resolve: Option<StencilResolveFilter>,
         scissor: Option<[u32; 4]>,
@@ -13398,15 +13695,25 @@ impl<'a> OffscreenObjects<'a> {
         // location and can tell them apart. A discarded attachment has no
         // readback buffer and is left out of the copy entirely (`docs/23`
         // §3.6, v19).
-        for (attachment, readback) in self
+        //
+        // The copy region is the pass's *written rectangle* when this rail
+        // proved one (`docs/WRITTEN-RECT-READBACK.md`): `VkBufferImageCopy` with
+        // no row stride leaves the rectangle's rows tightly packed at the
+        // mapping's start, which is what the host then reads — a narrow region
+        // is a narrow device copy *and* a narrow host read. A rectangle that
+        // covers no texel is not recorded at all: the draw wrote nothing, so
+        // the frame is its own seed (`VkBufferImageCopy::imageExtent` may not be
+        // zero).
+        for ((index, attachment), readback) in self
             .attachments
             .iter()
+            .enumerate()
             // The pair is the trace's own store decision, not the Vulkan
             // action: a resident store also renders with `STORE` (the image
             // keeps its bytes) but lands no readback buffer, so filtering by
             // `store_op` would shift every later attachment's copy by one
             // (`research/docs/23` §76, R7).
-            .filter(|attachment| attachment.publishes)
+            .filter(|(_, attachment)| attachment.publishes)
             .zip(&self.readbacks)
         {
             // A multisampled location's bytes are the resolve target's, not the
@@ -13419,22 +13726,52 @@ impl<'a> OffscreenObjects<'a> {
                 .resolve
                 .as_ref()
                 .map_or(attachment.image, |resolve| resolve.image);
-            let copy = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
+            let region = written.get(index).copied().flatten();
+            let copy = match region.and_then(|region| region.rect) {
+                Some(rect) if !rect.is_empty() => vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D {
+                        x: i32::try_from(rect.x).map_err(|_| {
+                            contract_refusal("render readback origin reaches beyond i32")
+                        })?,
+                        y: i32::try_from(rect.y).map_err(|_| {
+                            contract_refusal("render readback origin reaches beyond i32")
+                        })?,
+                        z: 0,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: rect.width,
+                        height: rect.height,
+                        depth: 1,
+                    }),
+                // An empty rectangle: the pass wrote nothing outside its seed,
+                // and the readback is the seed alone.
+                Some(_) => continue,
+                None => vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    }),
+            };
             unsafe {
                 self.context.device.cmd_copy_image_to_buffer(
                     self.command,

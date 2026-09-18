@@ -29,11 +29,28 @@
 //!   render_submit_us=... render_wait_us=... (with render_wait's own
 //!   idle/blocked/timeout fields) render_readback_us=... writebacks_us=...
 //!   settle_us=... fence_wait_skipped_n=... plan_settle_us=... render_us=...
+//!   readback_rect_n=... readback_rect_bytes=... readback_rect_extent_bytes=...
+//!   readback_full_n=... readback_full_bytes=... readback_switch_n=...
+//!   readback_shape_n=... readback_bounds_n=... readback_whole_n=...
 //!   ```
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
 //! so a reader can add lines together and divide by the summed `n` without
 //! weighting error. µs fields carry three decimals, i.e. nanosecond resolution.
+//!
+//! The `readback_*` fields are the one exception in *unit*, not in window: they
+//! count the stored attachments this window's submissions published — how many
+//! `vkCmdCopyImageToBuffer` stages carried only the pass's written rectangle
+//! (`readback_rect_n`) and how many bytes the host then read
+//! (`readback_rect_bytes`, versus `readback_rect_extent_bytes`, what those
+//! attachments' whole extents occupy), how many carried the whole attachment
+//! (`readback_full_n` / `readback_full_bytes`) and which fact sent them there
+//! (`readback_switch_n` for the `METAL_API_VULKAN_FULL_READBACK` control arm,
+//! `readback_shape_n` for a shape whose seed this rail does not hold,
+//! `readback_bounds_n` for a declared rect it cannot prove,
+//! `readback_whole_n` for a rectangle that covered the whole attachment anyway).
+//! They are window sums like every other field, so the same add-and-divide rule
+//! answers "bytes read back per submission" (`docs/WRITTEN-RECT-READBACK.md`).
 //!
 //! The accumulator is **thread-local**, and a line is emitted by the thread that
 //! filled its own window. That is what makes each line self-consistent: with one
@@ -58,6 +75,8 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+use crate::readback_rect::ReadbackFallback;
 
 /// One bar of the submission profile.
 ///
@@ -177,6 +196,73 @@ const EVERY_DEFAULT: u64 = 256;
 /// (and move it with `METAL_API_VULKAN_PHASE_IDLE_NS`).
 const IDLE_NS_DEFAULT: u64 = 100_000;
 
+/// The readback region one stored attachment was published through
+/// (`docs/WRITTEN-RECT-READBACK.md` §2), as an emitted line counts it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReadbackRegion {
+    /// Only the pass's written rectangle left the device. `bytes` is what the
+    /// host copied out of the mapping and `extent_bytes` what the attachment's
+    /// whole extent occupies — the cost the same attachment had before the
+    /// increment.
+    Rect { bytes: u64, extent_bytes: u64 },
+    /// The whole attachment left the device.
+    Full { bytes: u64 },
+    /// The whole attachment left the device because this rail could not prove a
+    /// narrower rectangle: the control switch, the shape's seed, the declared
+    /// bounds, or a rectangle that covered the whole attachment anyway.
+    Fallback(ReadbackFallback),
+}
+
+/// One window's readback regions, in the same units the counter line prints.
+#[derive(Default)]
+struct ReadbackCounts {
+    rect_n: u64,
+    rect_bytes: u64,
+    rect_extent_bytes: u64,
+    full_n: u64,
+    full_bytes: u64,
+    switch_n: u64,
+    shape_n: u64,
+    bounds_n: u64,
+    whole_n: u64,
+}
+
+impl ReadbackCounts {
+    fn note(&mut self, region: ReadbackRegion) {
+        match region {
+            ReadbackRegion::Rect {
+                bytes,
+                extent_bytes,
+            } => {
+                self.rect_n += 1;
+                self.rect_bytes += bytes;
+                self.rect_extent_bytes += extent_bytes;
+            }
+            ReadbackRegion::Full { bytes } => {
+                self.full_n += 1;
+                self.full_bytes += bytes;
+            }
+            ReadbackRegion::Fallback(fallback) => match fallback {
+                ReadbackFallback::Switch => self.switch_n += 1,
+                ReadbackFallback::Shape => self.shape_n += 1,
+                ReadbackFallback::Bounds => self.bounds_n += 1,
+                ReadbackFallback::Whole => self.whole_n += 1,
+            },
+        }
+    }
+}
+
+/// Count one stored attachment's readback region for the emitting thread's
+/// window. A no-op — one relaxed load — while the profile is off, exactly as a
+/// bar is.
+#[inline]
+pub(crate) fn note_readback(region: ReadbackRegion) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| local.borrow_mut().readback.note(region));
+}
+
 /// One thread's window of the profile.
 #[derive(Default)]
 struct Local {
@@ -192,6 +278,8 @@ struct Local {
     fence_skipped_calls: u64,
     /// `total` bars closed since the last emitted line.
     window: u64,
+    /// The stored attachments this window's submissions read back, by region.
+    readback: ReadbackCounts,
 }
 
 impl Local {
@@ -266,12 +354,25 @@ impl Local {
             fields.push_str(&format!(" {name}_us={:.3}", micros(ns)));
         }
         let skipped = std::mem::take(&mut self.fence_skipped_calls);
+        let readback = std::mem::take(&mut self.readback);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
-             plan_settle_us={plan_settle_us:.3} render_us={render_us:.3}"
+             plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
+             readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
+             readback_full_n={} readback_full_bytes={} readback_switch_n={} \
+             readback_shape_n={} readback_bounds_n={} readback_whole_n={}",
+            readback.rect_n,
+            readback.rect_bytes,
+            readback.rect_extent_bytes,
+            readback.full_n,
+            readback.full_bytes,
+            readback.switch_n,
+            readback.shape_n,
+            readback.bounds_n,
+            readback.whole_n,
         );
     }
 }
