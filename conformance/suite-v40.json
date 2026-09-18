@@ -41,9 +41,9 @@
           "binding": 2,
           "allocation": 940,
           "view": 950,
-          "offset": 4096,
+          "offset": 0,
           "length": 16,
-          "allocation_size": 8192,
+          "allocation_size": 16384,
           "access": "read",
           "initial_hex": "11223344112233441122334411223344",
           "storage_mode": "borrowed_no_copy"
