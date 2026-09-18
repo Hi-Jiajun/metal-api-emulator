@@ -519,8 +519,10 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # sampler's second byte order (`research/docs/23` §3.3, §107), whose
         # plan `test_suite_v33.py` pins. v34 carries the widened stage-buffer
         # ceiling (`research/docs/23` §3.3, §108), whose two render cases
-        # `test_suite_v34.py` pins, so it joins the list too.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 33)
+        # `test_suite_v34.py` pins, so it joins the list too — as does v35,
+        # whose folded stage-buffer pair (`research/docs/23` §3.3, E-TX9)
+        # `test_suite_v35.py` pins.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 34)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -536,7 +538,7 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v28", "compute-buffer-v29",
                                       "compute-buffer-v30", "compute-buffer-v31",
                                       "compute-buffer-v32", "compute-buffer-v33",
-                                      "compute-buffer-v34"):
+                                      "compute-buffer-v34", "compute-buffer-v35"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

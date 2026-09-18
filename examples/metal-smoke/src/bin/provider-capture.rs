@@ -3960,6 +3960,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // descriptor floor rather than a reviewed module's fixed pairs — so
         // this table pins the declaring pass, which every rail executes.
         (1, "compute-buffer-v34") => &["render_declaring_widened_extent"],
+        // The folded stage-buffer pair (`research/docs/23` §3.3, E-TX9): the
+        // declaring pass of the render case whose two translated stages read
+        // the same Metal buffer index. Its render case runs on the Vulkan rails
+        // alone (the two stages are the translator's), so this table pins the
+        // declaring pass, which every rail executes.
+        (1, "compute-buffer-v35") => &["render_declaring_stage_buffer_namespace"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -8627,6 +8633,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         // plain copy kernel over the 2x2 attachment's own sixteen-byte view
         // (`research/docs/23` §3.3, §108).
         "render_declaring_widened_extent" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4)][..],
+        ),
+        // E-TX9: the folded stage-buffer pair's declaring pass is the same
+        // 2x2 attachment's own sixteen-byte view beside the copy landing
+        // (`research/docs/23` §3.3).
+        "render_declaring_stage_buffer_namespace" => (
             "copy_word",
             [1, 1, 1],
             [1, 1, 1],

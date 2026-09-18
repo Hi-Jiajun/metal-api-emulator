@@ -1414,6 +1414,10 @@ mod tests {
         MAX_SUPPORTED_HEAP_STORAGE_MODES, MAX_SUPPORTED_INDIRECT_COMMANDS,
         MAX_SUPPORTED_PRESENT_MODES, MAX_TAGGED_TRACE_PASSES,
     };
+    /// The bytes a command frame spends before its payload: the magic, the
+    /// frame kind and the payload's length. Tests that talk about "the payload"
+    /// slice from here rather than repeating the number.
+    const FRAME_HEADER: usize = 9;
     use metal_api_core::provider::{
         AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment,
         BlendFactor, BlendOperation, BufferAccess, BufferBindingContract, BufferLease,
@@ -4568,6 +4572,125 @@ mod tests {
         );
     }
 
+    /// The folded shape's bit travels in its own extended block
+    /// (`research/docs/23` §3.3, E-TX9).
+    ///
+    /// The block is the capability tail's ninth section, so it cannot use a
+    /// bit-flag tag the eight before it have all taken: it is introduced by the
+    /// `0x00` escape and then the second family's own tag. The readings are the
+    /// increment's three wire obligations — the round trip keeps every field,
+    /// the bytes before the block are the frame the same snapshot writes
+    /// without it (so no earlier block moved), and the frame re-encodes byte
+    /// for byte.
+    #[test]
+    fn the_folded_shape_bit_travels_in_its_own_extended_block() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_texture_sampling = true;
+        capabilities.max_render_textures = 1;
+        capabilities.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        // The frame the same snapshot writes with the bit at its default: the
+        // new block's absence has to leave every byte before it exactly where
+        // the previous increment put them.
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // One escape byte, one tag from the second family and one bool.
+        let block = [0x00, 0x01, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the folded-shape block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        // The frame header states the payload's length, so "the sections
+        // before it keep their bytes" is a statement about the payload: the
+        // longer frame's payload starts with the shorter frame's payload,
+        // byte for byte.
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        eprintln!(
+            "folded-shape capability frame: len={} without={} block={block:02x?}",
+            frame.len(),
+            without.len()
+        );
+    }
+
+    /// A frame that ends before the folded-shape block reads the bit as
+    /// `false`, and a tag the walk does not know is refused rather than read as
+    /// another section's bytes (`research/docs/23` §3.3, E-TX9).
+    #[test]
+    fn a_frame_without_the_folded_shape_block_reads_the_bit_as_false() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+
+        // The pre-increment frame is this frame's payload without its three
+        // trailing bytes, reframed: the walk finds nothing after the
+        // compute-texture block (this snapshot declares none) and keeps the
+        // bit's default.
+        let mut prior_capabilities = capabilities.clone();
+        prior_capabilities.supports_render_stage_buffer_namespace_split = false;
+        let expected = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: prior_capabilities,
+        };
+        let prior = CommandCodec::encode_response(&expected).unwrap();
+        assert_eq!(
+            &prior[FRAME_HEADER..],
+            &frame[FRAME_HEADER..frame.len() - 3],
+            "the pre-increment payload is this payload without the block"
+        );
+        assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
+
+        // The escape byte is the walk's own reserved value, and the second
+        // family's tags are a closed set: an unknown one is a typed refusal,
+        // not a silent read of the block's payload as another section.
+        let mut unknown_escape = frame.clone();
+        let escape_at = unknown_escape.len() - 3;
+        unknown_escape[escape_at] = 0x03;
+        assert!(matches!(
+            CommandCodec::decode_response(&unknown_escape).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x03)
+        ));
+        let mut unknown_tag = frame.clone();
+        let tag_at = unknown_tag.len() - 2;
+        unknown_tag[tag_at] = 0x7f;
+        assert!(matches!(
+            CommandCodec::decode_response(&unknown_tag).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x7f)
+        ));
+    }
+
     #[test]
     fn vertex_input_and_present_travel_as_independent_bits() {
         let mut trace = vertex_input_trace();
@@ -5640,6 +5763,7 @@ mod tests {
                 capabilities: ProviderCapabilities {
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
+                    supports_render_stage_buffer_namespace_split: false,
                     max_passes: 2,
                     supports_threads_exact: true,
                     supports_threadgroups: false,
@@ -6019,6 +6143,7 @@ mod tests {
         ProviderCapabilities {
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            supports_render_stage_buffer_namespace_split: false,
             max_passes: 1,
             supports_threads_exact: true,
             supports_threadgroups: false,

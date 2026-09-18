@@ -232,6 +232,10 @@ impl ComputeProvider for FakeProvider {
             } else {
                 0
             },
+            // The folded shape's bit rides the same ask (`research/docs/23`
+            // §3.3, E-TX9): the object API's stage-buffer fixture declares the
+            // two namespaces when it declares the face at all.
+            supports_render_stage_buffer_namespace_split: self.stage_buffers,
             // The object API's compute texture face (`research/docs/23` §3.3,
             // v98): the fixture provider declares the sampled arm when a test
             // asks for it.

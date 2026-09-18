@@ -2441,8 +2441,16 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // case.
     case "compute-buffer-v34":
         expectedIDs = ["render_declaring_widened_extent"]
+    // The folded stage-buffer pair (`research/docs/23` §3.3, E-TX9): the
+    // declaring pass of the render case whose two translated stages read the
+    // same Metal buffer index. The render case is marked for the Vulkan rails
+    // alone — the two stages are the translator's, and this rail's reviewed
+    // pair reads its own two slots — so this oracle validates the declaring
+    // pass's metadata and executes it as an ordinary compute case.
+    case "compute-buffer-v35":
+        expectedIDs = ["render_declaring_stage_buffer_namespace"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v34 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v35 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

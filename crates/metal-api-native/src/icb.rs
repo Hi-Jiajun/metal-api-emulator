@@ -402,6 +402,7 @@ mod tests {
         ProviderCapabilities {
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            supports_render_stage_buffer_namespace_split: false,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,

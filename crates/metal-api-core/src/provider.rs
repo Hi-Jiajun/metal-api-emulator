@@ -9286,6 +9286,29 @@ pub struct ProviderCapabilities {
     /// default for a snapshot whose bit above is false, so a caller reading
     /// the limit without checking the bit cannot read one as an admission.
     pub max_render_stage_buffers: u32,
+    /// Whether this snapshot executes the *folded* stage-buffer shape: one
+    /// render pass whose two stages each read a `[[buffer(n)]]` argument of
+    /// the same Metal index, with different bytes behind them
+    /// (`research/docs/23` §3.3, E-TX9). Defaults to `false`.
+    ///
+    /// The bit is a *shape* declaration and not a second stage-buffer limit:
+    /// [`Self::supports_render_stage_buffers`] answers "can this rail fill a
+    /// stage-buffer slot at all", while this one answers "can it execute two
+    /// stages' buffer namespaces side by side". Metal's
+    /// `setVertexBuffer(_:offset:index:)` and
+    /// `setFragmentBuffer(_:offset:index:)` name independent index spaces, so a
+    /// pair of translated stages folded into one descriptor slot would execute
+    /// with one stage reading the other's bytes — a snapshot that does not
+    /// declare this bit has to be read as "do not submit the folded shape"
+    /// (the consumer's fail-closed direction), which is why the bit is
+    /// separate from the pair of fields above rather than folded into them.
+    ///
+    /// Declared `true` by the snapshots whose rail arranges the two stages'
+    /// buffers in different descriptor slots: the Vulkan rail's canonical
+    /// namespace layout (`stage_buffer_namespace_layout`) and the native rail,
+    /// whose reviewed pair already binds `setVertexBuffer` at set 1 and
+    /// `setFragmentBuffer` at set 2 (the Apple device readings).
+    pub supports_render_stage_buffer_namespace_split: bool,
     /// Whether this snapshot can execute the present action of
     /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
     /// contract and the refusals, while the Vulkan "readable swapchain
@@ -9423,6 +9446,21 @@ impl ProviderCapabilities {
         self.supports_render_texture_sampling
             || self.max_render_textures != 0
             || !self.supported_render_texture_formats.is_empty()
+    }
+
+    /// Whether this snapshot declares the folded stage-buffer shape
+    /// (`research/docs/23` §3.3, E-TX9).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so the question is asked in the same place a consumer asks
+    /// every other "did this snapshot declare the shape" question, instead of
+    /// one call site reading the field and another comparing the rest of the
+    /// snapshot against its defaults. The capability frame writes the bit as
+    /// its own tagged tail block, so this predicate is also what keeps a
+    /// snapshot that declares *only* this bit from falling back to the legacy
+    /// payload and dropping the declaration on the wire.
+    pub fn declares_render_stage_buffer_namespace_split(&self) -> bool {
+        self.supports_render_stage_buffer_namespace_split
     }
 
     /// Whether any present bit differs from its default.
@@ -15172,6 +15210,7 @@ mod tests {
         ProviderCapabilities {
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            supports_render_stage_buffer_namespace_split: false,
             supports_compute_texture_sampling: false,
             max_compute_textures: 0,
             supported_compute_texture_formats: Vec::new(),
@@ -20258,6 +20297,34 @@ mod tests {
         provider.supports_render_stage_buffers = true;
         provider.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
         provider
+    }
+
+    /// The folded stage-buffer shape's bit is a declaration, not a default
+    /// (`research/docs/23` §3.3, E-TX9).
+    ///
+    /// A snapshot that never spoke about the shape must be read as "do not
+    /// submit a pair whose two stages read one Metal index": the bit defaults
+    /// to `false`, its predicate answers the same thing, and setting it is the
+    /// only way to flip either reading. The bit is deliberately *not* part of
+    /// [`ProviderCapabilities::declares_render_support`] — it travels in the
+    /// capability frame's own tagged tail block, the way the stage-buffer pair
+    /// beside it does — so a snapshot that declares only this bit still keeps
+    /// the legacy render question's answer and the codec's own guard is what
+    /// keeps the declaration on the wire.
+    #[test]
+    fn the_default_snapshot_does_not_declare_the_folded_stage_buffer_shape() {
+        let default = render_capabilities();
+        assert!(!default.supports_render_stage_buffer_namespace_split);
+        assert!(!default.declares_render_stage_buffer_namespace_split());
+
+        let mut declared = default.clone();
+        declared.supports_render_stage_buffer_namespace_split = true;
+        assert!(declared.declares_render_stage_buffer_namespace_split());
+        assert_eq!(
+            default.declares_render_support(),
+            declared.declares_render_support(),
+            "the shape bit is the capability frame's own tail block, not one of the render bits"
+        );
     }
 
     /// The landing allocation plus the sink allocation the writable

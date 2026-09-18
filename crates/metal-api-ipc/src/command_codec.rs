@@ -606,6 +606,29 @@ const CAPABILITY_STAGE_BUFFER_TAIL: u8 = 0x40;
 /// provider admission refuses a texture-bearing compute pass with.
 const CAPABILITY_COMPUTE_TEXTURE_TAIL: u8 = 0x80;
 
+/// The escape byte that introduces the capability tail's *second* tag family
+/// (`research/docs/23` §3.3, E-TX9).
+///
+/// The tail's original tags are the eight powers of two `0x01..=0x80`, and the
+/// eight optional sections before the folded-shape block have taken all of
+/// them. `0x00` is therefore not a section tag: it means "the section's own tag
+/// byte follows", which is the one byte no pre-increment frame can carry —
+/// every version of the walk refused it as [`CodecError::UnknownCapabilityTail`]
+/// — and which leaves the next section room to arrive without a second escape.
+const CAPABILITY_EXTENDED_TAIL: u8 = 0x00;
+
+/// Tag, inside the tail's second family, of the folded-shape block
+/// (`research/docs/23` §3.3, E-TX9).
+///
+/// The section follows the compute-texture block and carries one bool: whether
+/// the snapshot executes a render pass whose two stages each read a
+/// `[[buffer(n)]]` argument of the same Metal index
+/// ([`ProviderCapabilities::supports_render_stage_buffer_namespace_split`]).
+/// It is a separate tagged section for the same reason the eight before it
+/// are: a snapshot that declares the shape without any earlier bit still keeps
+/// the decoder's position rules unambiguous.
+const CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL: u8 = 0x01;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -5371,7 +5394,13 @@ fn get_storage_mode(decoder: &mut Decoder<'_>) -> Result<StorageMode, CodecError
 /// this crate's to keep, so the declaration cannot be dropped on the wire —
 /// the exact failure every other `declares_*` predicate exists to prevent.
 fn declares_render_stage_buffer_support(capabilities: &ProviderCapabilities) -> bool {
-    capabilities.supports_render_stage_buffers || capabilities.max_render_stage_buffers != 0
+    capabilities.supports_render_stage_buffers
+        || capabilities.max_render_stage_buffers != 0
+        // The folded shape's bit belongs to the same face (`research/docs/23`
+        // §3.3, E-TX9): a snapshot that declares only it still has to write the
+        // extended payload, or the declaration would be dropped on the wire —
+        // the failure this predicate exists to prevent for every block.
+        || capabilities.declares_render_stage_buffer_namespace_split()
 }
 
 /// Whether any compute texture capability bit differs from its default
@@ -5621,6 +5650,21 @@ fn put_capabilities(
                 put_texture_format(encoder, *format);
             }
         }
+        // The folded-shape block is the tail's newest section and follows the
+        // compute-texture half (`research/docs/23` §3.3, E-TX9). It carries one
+        // presence tag and one bool. The tail's original tag space is the eight
+        // powers of two `0x01..=0x80`, which the eight blocks before this one
+        // have all taken, so the section is introduced by an *escape* byte
+        // instead of a bit flag: no pre-increment frame can carry it, and a
+        // section added later has room to follow it. A snapshot whose bit stays
+        // at its default writes nothing here, and the decoder reads the missing
+        // section as `false` — the "do not submit the folded shape" default a
+        // consumer keeps its fail-closed direction with.
+        if capabilities.declares_render_stage_buffer_namespace_split() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL);
+            encoder.bool(capabilities.supports_render_stage_buffer_namespace_split);
+        }
     }
     Ok(())
 }
@@ -5672,6 +5716,11 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
     Ok(ProviderCapabilities {
         supports_render_stage_buffers: false,
         max_render_stage_buffers: 0,
+        // A legacy payload cannot have declared the folded shape either
+        // (`research/docs/23` §3.3, E-TX9): the section arrived after the
+        // compute-texture block, so a frame that ends earlier reads the
+        // consumer's fail-closed default.
+        supports_render_stage_buffer_namespace_split: false,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,
@@ -5746,6 +5795,35 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         max_indirect_commands: 0,
         supported_indirect_commands: Vec::new(),
     })
+}
+
+/// Read the capability tail's second tag family, when `tag` is its escape byte
+/// (`research/docs/23` §3.3, E-TX9).
+///
+/// The tail's original tags are the eight powers of two `0x01..=0x80` and the
+/// eight sections before the folded-shape block have taken all of them, so the
+/// ninth section is introduced by the reserved `0x00` escape and then the
+/// family's own tag. The walk asks this question wherever it reads a tag,
+/// because the section is the *last* one the encoder writes: a snapshot that
+/// declares it beside any of the eight earlier blocks writes the escape
+/// directly after whichever block came last, so the escape can appear at every
+/// one of the walk's read points. Every other tag is left to the walk's own
+/// ordered checks, which is why this helper only answers for the escape and
+/// refuses a family tag the walk cannot skip to.
+fn decode_capability_extended_tail(
+    decoder: &mut Decoder<'_>,
+    capabilities: &mut ProviderCapabilities,
+    tag: u8,
+) -> Result<bool, CodecError> {
+    if tag != CAPABILITY_EXTENDED_TAIL {
+        return Ok(false);
+    }
+    let family_tag = decoder.u8()?;
+    if family_tag != CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL {
+        return Err(CodecError::UnknownCapabilityTail(family_tag));
+    }
+    capabilities.supports_render_stage_buffer_namespace_split = decoder.bool()?;
+    Ok(true)
 }
 
 fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, CodecError> {
@@ -5857,6 +5935,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
     // writes it — so the tag is the mutable cursor the optional blocks move
     // forward rather than a chain of shadows.
     let mut tag = decoder.u8()?;
+    if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+        return Ok(capabilities);
+    }
     if tag == CAPABILITY_VERTEX_INPUT_TAIL {
         capabilities.max_vertex_buffers = decoder.u32()?;
         let vertex_format_count = usize::try_from(decoder.u64()?).map_err(|_| {
@@ -5896,6 +5977,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
     }
     if tag != CAPABILITY_INSTANCING_TAIL
         && tag != CAPABILITY_MULTISAMPLE_TAIL
@@ -5914,6 +5998,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
         if tag != CAPABILITY_MULTISAMPLE_TAIL
             && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
@@ -5931,6 +6018,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
         if tag != CAPABILITY_DEPTH_RESOLVE_TAIL
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
@@ -5951,6 +6041,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
         if tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
             && tag != CAPABILITY_STAGE_BUFFER_TAIL
@@ -5970,6 +6063,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
     }
     // The render-sampler block is the tail's sixth optional section
     // (`research/docs/23` §3.3, v70): it follows the stencil-resolve block when
@@ -5999,6 +6095,9 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
     }
     // The stage-buffer block is the tail's seventh optional section
     // (`research/docs/23` §3.3, v83): it follows the render-sampler block when
@@ -6013,12 +6112,15 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+            return Ok(capabilities);
+        }
     }
-    // The compute-texture block is the tail's eighth and newest optional
-    // section (`research/docs/23` §91): it follows the stage-buffer block when
-    // present, and reads the bool, the binding cap and the admitted texture
-    // formats. It is the last section this decoder knows, so a tag that is
-    // not it describes a section the walk cannot skip to.
+    // The compute-texture block is the tail's eighth optional section
+    // (`research/docs/23` §91): it follows the stage-buffer block when present,
+    // and reads the bool, the binding cap and the admitted texture formats. A
+    // tag that is neither it nor the second family's escape describes a
+    // section the walk cannot skip to.
     if tag != CAPABILITY_COMPUTE_TEXTURE_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
@@ -6040,5 +6142,17 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         supported_compute_texture_formats.push(get_texture_format(decoder)?);
     }
     capabilities.supported_compute_texture_formats = supported_compute_texture_formats;
+    // The folded-shape block is the tail's newest optional section
+    // (`research/docs/23` §3.3, E-TX9) and follows the compute-texture half. A
+    // frame written before this increment ends here, so the bit keeps its
+    // `false` default — the "do not submit the folded shape" reading a
+    // consumer's fail-closed direction needs.
+    if decoder.remaining() == 0 {
+        return Ok(capabilities);
+    }
+    let tag = decoder.u8()?;
+    if !decode_capability_extended_tail(decoder, &mut capabilities, tag)? {
+        return Err(CodecError::UnknownCapabilityTail(tag));
+    }
     Ok(capabilities)
 }

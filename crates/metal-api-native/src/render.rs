@@ -958,6 +958,16 @@ pub(crate) const APPLE_2D_TEXTURE_CEILING: u64 = 16_384;
 pub(crate) struct StageBufferCapabilityBits {
     pub(crate) supports_render_stage_buffers: bool,
     pub(crate) max_render_stage_buffers: u32,
+    /// Whether this rail executes a pair whose two stages each read a
+    /// `[[buffer(n)]]` argument of the same Metal index (`research/docs/23`
+    /// §3.3, E-TX9). Declared beside the pair above because it is the same
+    /// face: the reviewed pair already binds its vertex stage's bytes through
+    /// `setVertexBuffer(_:offset:index:)` at set 1 and its fragment stage's
+    /// through `setFragmentBuffer(_:offset:index:)` at set 2, which is exactly
+    /// the arrangement the folded shape needs, and the Apple device readings
+    /// (`--stage-buffer-selftest`, `--stage-buffer-write-selftest`) are the
+    /// readings for the shape those two stages state.
+    pub(crate) supports_render_stage_buffer_namespace_split: bool,
 }
 
 /// The one spelling of the stage-buffer bits, so the macOS snapshot and the
@@ -967,6 +977,11 @@ pub(crate) fn stage_buffer_capability_bits() -> StageBufferCapabilityBits {
     StageBufferCapabilityBits {
         supports_render_stage_buffers: true,
         max_render_stage_buffers: MAX_RENDER_STAGE_BUFFERS,
+        // The reviewed pair binds the two stages at different slots, so the
+        // folded shape is the arrangement this rail already executes. No new
+        // native implementation arrives with the bit: the declaration names
+        // the shape the two device readings above measured.
+        supports_render_stage_buffer_namespace_split: true,
     }
 }
 
@@ -7437,6 +7452,17 @@ mod tests {
             capabilities.max_render_stage_buffers,
             MAX_RENDER_STAGE_BUFFERS
         );
+        // The folded shape's bit is the same face's (`research/docs/23` §3.3,
+        // E-TX9): the reviewed pair already binds its two stages at set 1 and
+        // set 2, so the snapshot declares the arrangement those Apple device
+        // readings measured.
+        assert!(capabilities.supports_render_stage_buffer_namespace_split);
+        assert!(capabilities.declares_render_stage_buffer_namespace_split());
+        assert!(
+            !capabilities_before_the_stage_buffer_flip(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+                .supports_render_stage_buffer_namespace_split,
+            "the pre-flip declaration keeps the shape bit closed"
+        );
     }
 
     /// A stage buffer resolves through the same three-armed source channel a
@@ -10159,6 +10185,11 @@ mod tests {
         let mut capabilities = capabilities(bits);
         capabilities.supports_render_stage_buffers = false;
         capabilities.max_render_stage_buffers = 0;
+        // The folded shape's bit arrived with the same face
+        // (`research/docs/23` §3.3, E-TX9), so the pre-flip declaration keeps
+        // it closed too: a snapshot that cannot fill a stage-buffer slot
+        // cannot execute a pair whose two stages read one Metal index.
+        capabilities.supports_render_stage_buffer_namespace_split = false;
         capabilities
     }
 
@@ -10173,6 +10204,8 @@ mod tests {
         ProviderCapabilities {
             supports_render_stage_buffers: stage_buffers.supports_render_stage_buffers,
             max_render_stage_buffers: stage_buffers.max_render_stage_buffers,
+            supports_render_stage_buffer_namespace_split: stage_buffers
+                .supports_render_stage_buffer_namespace_split,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -11312,6 +11345,10 @@ mod tests {
         let bits = stage_buffer_capability_bits();
         assert!(bits.supports_render_stage_buffers);
         assert_eq!(bits.max_render_stage_buffers, MAX_RENDER_STAGE_BUFFERS);
+        // The folded shape's bit is part of the same spelling (`research/docs/23`
+        // §3.3, E-TX9): the reviewed pair's two stages are bound at set 1 and
+        // set 2, so the shape that needs those two namespaces declared here.
+        assert!(bits.supports_render_stage_buffer_namespace_split);
         assert_eq!(
             bits.max_render_stage_buffers,
             metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS as u32
