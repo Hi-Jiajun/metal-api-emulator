@@ -36,7 +36,7 @@ use metal_api_core::provider::{
     AffineAccess, AffineTerm, AllocationId, AttachmentFormat, BlendFactor, BlendOperation,
     BorrowedLeaseRegistry, BorrowedView, BufferAccess, BufferSource, BufferView, BufferWriteback,
     ClearColor, ColorWriteMask, CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter,
-    DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, FootprintProof, IndexFormat,
+    DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, FootprintProof, GuestRun, IndexFormat,
     IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp, MultisampleDepthResolve,
     MultisampleState, MultisampleStencilResolve, ProviderError, ProviderErrorClass, ProviderPhase,
     RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
@@ -4669,6 +4669,22 @@ pub(crate) enum RenderInputSource<'a> {
     /// is where they came from, which is the trace's own execution rather
     /// than a copy the request carried in.
     ProducedBytes(&'a [u8]),
+    /// The owner's own guest runs (`BufferSource::GuestRuns`,
+    /// `research/docs/23` §74, E-TX6): the rail gathers each run's window out
+    /// of the imported mapping at resolution and uploads the concatenation
+    /// exactly as it uploads [`Self::StagedBytes`]. What differs from
+    /// [`Self::Borrowed`] is that the provider copies — so no device import of
+    /// the runs is asked for, no alignment rule applies, and the bytes the
+    /// pass begins from are the owner's pages as the pass was prepared.
+    ///
+    /// The leases the runs were read from travel beside the bytes: the hold the
+    /// submission takes on them is what keeps the owner's ledger from releasing
+    /// the backing a gathered read names, exactly as the single-window arms
+    /// hold theirs.
+    GatheredBytes {
+        bytes: Vec<u8>,
+        leases: Vec<LeaseId>,
+    },
 }
 
 impl RenderInputSource<'_> {
@@ -4683,6 +4699,7 @@ impl RenderInputSource<'_> {
             Self::StagedBytes(bytes) => bytes.len(),
             Self::Borrowed { window, .. } => window.len,
             Self::ProducedBytes(bytes) => bytes.len(),
+            Self::GatheredBytes { bytes, .. } => bytes.len(),
         }
     }
 
@@ -4699,6 +4716,7 @@ impl RenderInputSource<'_> {
             Self::TraceBytes(bytes) => bytes,
             Self::StagedBytes(bytes) => bytes,
             Self::ProducedBytes(bytes) => bytes,
+            Self::GatheredBytes { bytes, .. } => bytes,
             // SAFETY: the window was resolved by the no-copy registry for an
             // imported lease, whose contract keeps the mapping readable over
             // exactly this window until the import is released.
@@ -4717,6 +4735,7 @@ impl RenderInputSource<'_> {
             Self::TraceBytes(bytes) => Some(bytes),
             Self::StagedBytes(bytes) => Some(bytes),
             Self::ProducedBytes(bytes) => Some(bytes),
+            Self::GatheredBytes { bytes, .. } => Some(bytes),
             Self::Borrowed { .. } => None,
         }
     }
@@ -4724,8 +4743,21 @@ impl RenderInputSource<'_> {
     /// The no-copy lease this source reads, when it is one.
     const fn borrowed_lease(&self) -> Option<LeaseId> {
         match self {
-            Self::TraceBytes(_) | Self::StagedBytes(_) | Self::ProducedBytes(_) => None,
+            Self::TraceBytes(_)
+            | Self::StagedBytes(_)
+            | Self::ProducedBytes(_)
+            | Self::GatheredBytes { .. } => None,
             Self::Borrowed { lease, .. } => Some(*lease),
+        }
+    }
+
+    /// Every no-copy lease this source holds a window of, when the source is
+    /// one that reads the owner's mappings.
+    fn borrowed_leases(&self) -> Vec<LeaseId> {
+        match self {
+            Self::Borrowed { lease, .. } => vec![*lease],
+            Self::GatheredBytes { leases, .. } => leases.clone(),
+            _ => Vec::new(),
         }
     }
 }
@@ -4853,7 +4885,85 @@ fn resolve_render_input<'a>(
                 window,
             })
         }
+        // The multi-window guest source (`research/docs/23` §74, E-TX6): the
+        // view's bytes are an ordered list of runs inside the owner's imported
+        // mappings, and the rail gathers them into its own upload. Each run's
+        // window is resolved by the same registry checks a single-window lease
+        // takes — import, snapshot, epoch, reservation bounds — so a run that
+        // names a lease nobody imported, or one that reaches past its
+        // reservation, is refused by that check's own name instead of being
+        // read out of range.
+        BufferSource::GuestRuns(runs) => {
+            let bytes = gather_guest_runs(leases, runs, role, slot)?;
+            Ok(RenderInputSource::GatheredBytes {
+                bytes,
+                leases: runs.iter().map(|run| run.lease_id).collect(),
+            })
+        }
     }
+}
+
+/// Gather a guest-runs declaration's windows out of the owner's imported
+/// mappings (`research/docs/23` §74, E-TX6).
+///
+/// The bytes are copied here, at resolution, into the upload the rail owns —
+/// which is what makes the arm independent of the device's host-import
+/// extension, of the windows' alignment, and of how many runs the caller
+/// needed: one window or four travelling through the same path. Each read
+/// holds its lease for the duration of the copy, so an owner that releases the
+/// mapping between two runs of one declaration is refused (`lease_in_use`)
+/// rather than read through.
+fn gather_guest_runs(
+    leases: Option<&RenderLeaseContext<'_>>,
+    runs: &[GuestRun],
+    role: RenderInputRole,
+    slot: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    let leases = leases.ok_or_else(|| {
+        render_input_refusal(
+            role,
+            slot,
+            "guest_runs",
+            "the render submission carries no lease channel, so the runs a guest-runs input is \
+             made of cannot be read",
+        )
+    })?;
+    let total = runs.iter().try_fold(0_u64, |total, run| {
+        total
+            .checked_add(run.length)
+            .ok_or_else(|| args_refusal("render_input_bytes_overflow"))
+    })?;
+    let capacity =
+        usize::try_from(total).map_err(|_| args_refusal("render_input_bytes_overflow"))?;
+    // One hold per run for the whole gather, taken before the first read and
+    // dropped after the last: a run list that names one lease twice holds it
+    // twice, which is what the registry's counter is for. A run whose lease
+    // nobody imported keeps the registry's own name (`lease_not_imported`)
+    // and rolls the holds the earlier runs took back off.
+    let held: Vec<LeaseId> = runs.iter().map(|run| run.lease_id).collect();
+    leases.borrowed.retain_all(&held)?;
+    let mut gathered = Vec::with_capacity(capacity);
+    let mut outcome = Ok(());
+    for run in runs {
+        match leases
+            .borrowed
+            .run_pointer(*run, leases.device_epoch, leases.resources)
+        {
+            // SAFETY: the registry resolved this window for an imported lease
+            // and the hold taken above keeps the owner from releasing the
+            // mapping until this loop has finished with it.
+            Ok(window) => gathered.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(window.pointer as *const u8, window.len)
+            }),
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+    }
+    leases.borrowed.retire_all(&held);
+    outcome?;
+    Ok(gathered)
 }
 
 /// Resolve one loading attachment's previous contents into the window the rail
@@ -6121,14 +6231,10 @@ impl RenderInputRetains {
     ) -> Result<Option<Self>, ProviderError> {
         let mut lease_ids = Vec::new();
         for stream in &request.vertex_streams {
-            if let Some(lease) = stream.source.borrowed_lease() {
-                lease_ids.push(lease);
-            }
+            lease_ids.extend(stream.source.borrowed_leases());
         }
         if let Some(index) = &request.index_stream {
-            if let Some(lease) = index.source.borrowed_lease() {
-                lease_ids.push(lease);
-            }
+            lease_ids.extend(index.source.borrowed_leases());
         }
         // A loading attachment whose previous contents come from an owner's
         // mapping is the third input of the same shape (`research/docs/23`
@@ -6136,9 +6242,7 @@ impl RenderInputRetains {
         // the hold covers it exactly like a stream's.
         for attachment in &request.attachments {
             if let Some(source) = &attachment.previous {
-                if let Some(lease) = source.borrowed_lease() {
-                    lease_ids.push(lease);
-                }
+                lease_ids.extend(source.borrowed_leases());
             }
         }
         // A sampled texture whose bytes come from an owner's mapping is the
@@ -6147,17 +6251,13 @@ impl RenderInputRetains {
         // signals, so a pass that binds several textures retains each lease
         // once per window it appears in.
         for texture in &request.textures {
-            if let Some(lease) = texture.source.borrowed_lease() {
-                lease_ids.push(lease);
-            }
+            lease_ids.extend(texture.source.borrowed_leases());
         }
         // A stage buffer whose bytes come from an owner's mapping is the
         // fifth (`research/docs/23` §3.3, v83): it resolves through the same
         // channel, so its imported window is held exactly like a stream's.
         for stage in &request.stage_buffers {
-            if let Some(lease) = stage.source.borrowed_lease() {
-                lease_ids.push(lease);
-            }
+            lease_ids.extend(stage.source.borrowed_leases());
         }
         if lease_ids.is_empty() {
             return Ok(None);
@@ -10062,6 +10162,21 @@ impl<'a> OffscreenObjects<'a> {
                     )?;
                     None
                 }
+                // A gathered guest-runs window is the provider's own copy
+                // (`research/docs/23` §74, E-TX6), so it uploads through the
+                // same host-visible path as the staged arm.
+                RenderInputSource::GatheredBytes { bytes, .. } => {
+                    let texels = texture.gathered.as_deref().unwrap_or(bytes);
+                    self.upload_render_texture(
+                        image,
+                        memory,
+                        &requirements,
+                        width,
+                        height,
+                        texels,
+                    )?;
+                    None
+                }
             };
             let view =
                 crate::create_color_image_view(self.context, image, format, "render texture")
@@ -10528,7 +10643,8 @@ impl<'a> OffscreenObjects<'a> {
                         // reason every other rail-uploaded buffer does.
                         RenderInputSource::TraceBytes(_)
                         | RenderInputSource::StagedBytes(_)
-                        | RenderInputSource::ProducedBytes(_) => {
+                        | RenderInputSource::ProducedBytes(_)
+                        | RenderInputSource::GatheredBytes { .. } => {
                             StageBufferLanding {
                                 stage: stream.stage,
                                 index: stream.index,
@@ -10972,6 +11088,16 @@ impl<'a> OffscreenObjects<'a> {
             // The trace's own production is copied in exactly as the two
             // trace-carried arms are (`research/docs/23` §110, E-TX3).
             RenderInputSource::ProducedBytes(bytes) => self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                usage,
+                bytes,
+                name,
+            ),
+            // A gathered guest-runs window is the provider's own copy
+            // (`research/docs/23` §74, E-TX6): it uploads exactly as the
+            // staged and produced arms do, because the copy is what the rail
+            // holds rather than the owner's mapping.
+            RenderInputSource::GatheredBytes { bytes, .. } => self.create_host_visible_buffer(
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 usage,
                 bytes,
@@ -17580,6 +17706,192 @@ mod tests {
             refused.fields.get("attachment"),
             Some(&FieldValue::Unsigned(0))
         );
+    }
+
+    /// A page-aligned owner window the gather reads directly, so the test can
+    /// rewrite the bytes a run points at.
+    #[repr(align(4096))]
+    struct OwnerPage([u8; 8]);
+
+    /// A guest-runs declaration gathers every run out of the owner's mappings
+    /// (`research/docs/23` §74, E-TX6).
+    ///
+    /// The reading the arm owes is the *list*: one window or several, resolved
+    /// run by run through the no-copy registry's own checks, read into the
+    /// provider's upload in declaration order, and held until the pass's fence.
+    /// The falsification is the rewrite: a rail that pinned the bytes at
+    /// admission would keep the first page's word.
+    #[test]
+    fn a_guest_runs_attachment_load_gathers_each_run_and_holds_each_lease() {
+        let epoch = DeviceEpoch::new(3);
+        let allocation = AllocationId::new(48);
+        let head_lease = LeaseId::new(27);
+        let tail_lease = LeaseId::new(28);
+        let head_reservation = lease_registration(head_lease, allocation, 8, epoch);
+        let tail_reservation = lease_registration(tail_lease, allocation, 8, epoch);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 16,
+            })
+            .expect("the fixture allocation is well formed");
+        for reservation in [head_reservation, tail_reservation] {
+            resources
+                .insert_lease(reservation)
+                .expect("the fixture lease covers its run");
+        }
+        let mut head = OwnerPage([0x11; 8]);
+        let mut tail = OwnerPage([0x22; 8]);
+        let borrowed = BorrowedLeaseRegistry::new();
+        for (reservation, page) in [(head_reservation, &mut head), (tail_reservation, &mut tail)] {
+            // Both pages outlive the registry's holds and the pass, and both
+            // pointers are page-aligned allocations of exactly the run's size.
+            borrowed
+                .import(
+                    BorrowedLease::new(reservation, page.0.as_mut_ptr() as usize)
+                        .expect("an aligned owner page is a valid reservation"),
+                )
+                .expect("the fixture import is accepted");
+        }
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(borrowed);
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = loading_pass();
+        let runs = vec![
+            GuestRun {
+                lease_id: head_lease,
+                offset: 0,
+                length: 8,
+            },
+            GuestRun {
+                lease_id: tail_lease,
+                offset: 0,
+                length: 8,
+            },
+        ];
+        let view = attachment_previous_view(BufferSource::GuestRuns(runs.clone()), allocation);
+        let declared = [Some(&view)];
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &declared,
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the two runs add up to the attachment's own extent");
+        let [attachment] = request.attachments.as_slice() else {
+            panic!("the milestone pass carries one colour attachment");
+        };
+        let Some(RenderInputSource::GatheredBytes {
+            bytes,
+            leases: held,
+        }) = &attachment.previous
+        else {
+            panic!(
+                "a guest-runs declaration resolves into the provider's own copy: {:?}",
+                attachment.previous
+            );
+        };
+        assert_eq!(
+            bytes.as_slice(),
+            [[0x11; 8], [0x22; 8]].concat(),
+            "the runs are gathered in declaration order"
+        );
+        assert_eq!(
+            held,
+            &runs.iter().map(|run| run.lease_id).collect::<Vec<_>>()
+        );
+
+        // The submission holds every run's lease, not just the last one read.
+        let retains = RenderInputRetains::retain(Some(&leases), &request)
+            .expect("the gathered arm's holds are taken")
+            .expect("a gathered read holds the mappings it read");
+        assert_eq!(borrowed.outstanding(head_lease), Some(1));
+        assert_eq!(borrowed.outstanding(tail_lease), Some(1));
+        let mut retains = retains;
+        retains.retire();
+        assert_eq!(borrowed.outstanding(head_lease), Some(0));
+        assert_eq!(borrowed.outstanding(tail_lease), Some(0));
+
+        // The owner rewriting its pages is what the next resolution reads: the
+        // gather is a read of the owner's memory, not a pinned snapshot.
+        head.0.copy_from_slice(&[0x33; 8]);
+        assert_eq!(
+            head.0, [0x33; 8],
+            "the owner's own page holds the rewritten word"
+        );
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &declared,
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the rewritten page is still the run's window");
+        let [attachment] = request.attachments.as_slice() else {
+            panic!("the milestone pass carries one colour attachment");
+        };
+        let Some(RenderInputSource::GatheredBytes { bytes, .. }) = &attachment.previous else {
+            panic!("a guest-runs declaration resolves into the provider's own copy");
+        };
+        assert_eq!(
+            bytes.as_slice(),
+            [[0x33; 8], [0x22; 8]].concat(),
+            "the owner's rewritten page is what the run reads"
+        );
+
+        // A run whose lease nobody imported is refused under the registry's own
+        // name, and a submission with no lease channel under this rail's.
+        let unimported = attachment_previous_view(
+            BufferSource::GuestRuns(vec![GuestRun {
+                lease_id: LeaseId::new(29),
+                offset: 0,
+                length: 16,
+            }]),
+            allocation,
+        );
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&unimported)],
+            Some(&leases),
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a run whose lease was never imported cannot be read"),
+        };
+        eprintln!("unimported guest run refused: {refused:?}");
+        assert_eq!(refused.slug, "lease_not_imported");
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &[Some(&view)],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a guest-runs declaration needs the lease channel"),
+        };
+        eprintln!("guest runs without a lease channel refused: {refused:?}");
+        assert_eq!(refused.slug, "render_attachment_load_source_unsupported");
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("guest_runs".to_owned()))
+        );
+        // Neither refusal left a hold behind.
+        assert_eq!(borrowed.outstanding(head_lease), Some(0));
+        assert_eq!(borrowed.outstanding(tail_lease), Some(0));
     }
 
     /// A declaring view whose window is not the attachment's own extent is

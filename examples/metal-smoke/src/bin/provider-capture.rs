@@ -415,6 +415,15 @@ fn buffer_storage_mode(buffer: &Buffer, case_id: &str) -> Result<BufferSourceKin
         None | Some("owned_bytes") => Ok(BufferSourceKind::OwnedBytes),
         Some("staged_lease") => Ok(BufferSourceKind::StagedLease),
         Some("borrowed_no_copy") => Ok(BufferSourceKind::BorrowedNoCopy),
+        // The guest-runs arm (`research/docs/23` §74, E-TX6) is a provider-side
+        // declaration the suite has no case for yet: the harness's own cases
+        // state one window, and the multi-run arm's reading is the Lavapipe
+        // e2e's (`render_e2e::a_guest_runs_attachment_load...`). A suite that
+        // names it is refused here rather than captured with a meaning the
+        // comparator has no oracle for.
+        Some("guest_runs") => {
+            Err(format!("case {case_id}: the guest-runs arm has no capture case yet").into())
+        }
         Some(other) => Err(format!("case {case_id}: unknown buffer storage mode {other:?}").into()),
     }
 }
@@ -426,6 +435,7 @@ fn storage_mode_name(kind: BufferSourceKind) -> &'static str {
         BufferSourceKind::OwnedBytes => "owned_bytes",
         BufferSourceKind::StagedLease => "staged_lease",
         BufferSourceKind::BorrowedNoCopy => "borrowed_no_copy",
+        BufferSourceKind::GuestRuns => "guest_runs",
     }
 }
 
@@ -616,6 +626,16 @@ fn case_sources(
                 CaseSource::Lease(BufferSource::BorrowedNoCopy(
                     borrowed.reservation.lease.lease_id,
                 ))
+            }
+            // The parser refuses the name before this walk (`buffer_storage_mode`),
+            // so a suite cannot reach the arm; the arm's own capture case is the
+            // e2e's until the suite grows one.
+            BufferSourceKind::GuestRuns => {
+                return Err(format!(
+                    "case {}: the guest-runs arm has no capture case yet",
+                    case.id
+                )
+                .into())
             }
         };
         sources.push(source);
@@ -5941,6 +5961,11 @@ fn stage_buffer_storage_mode(
         None | Some("owned_bytes") => Ok(BufferSourceKind::OwnedBytes),
         Some("staged_lease") => Ok(BufferSourceKind::StagedLease),
         Some("borrowed_no_copy") => Ok(BufferSourceKind::BorrowedNoCopy),
+        // The guest-runs arm's capture case is the e2e's for the reason the
+        // compute parser states (`research/docs/23` §74, E-TX6).
+        Some("guest_runs") => {
+            Err(format!("{where_}: the guest-runs arm has no capture case yet").into())
+        }
         Some(other) => Err(format!(
             "{where_}: stage buffer {}/{} names unknown storage mode {other:?}",
             definition.stage, definition.index
@@ -6199,6 +6224,11 @@ fn resolved_stage_buffers(
                     allocation_size,
                     arm: objects::StageBufferLeaseArm::BorrowedNoCopy,
                 }
+            }
+            // The parser refuses the name before this walk
+            // (`stage_buffer_storage_mode`), exactly as the compute walk does.
+            BufferSourceKind::GuestRuns => {
+                return Err(format!("{where_}: the guest-runs arm has no capture case yet").into())
             }
         };
         slots.push(ResolvedStageBuffer {

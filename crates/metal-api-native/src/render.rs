@@ -2557,6 +2557,23 @@ fn resolve_render_input<'a>(
 ) -> Result<PlannedInputSource<'a>, ProviderError> {
     match &view.source {
         BufferSource::OwnedBytes(bytes) => Ok(PlannedInputSource::Declared(bytes)),
+        // The multi-window guest source (`research/docs/23` §74, E-TX6) is
+        // refused by name on this rail for the reason every unflipped arm is:
+        // the arm's reading is the gather the Vulkan rail performs out of the
+        // owner's imported mappings, and the Apple-side reading its flip would
+        // owe — a host plan that reads several windows of one view, plus the
+        // device evidence behind it — is a later increment. Stating the
+        // boundary keeps a native caller from getting a different meaning for
+        // the same declaration instead of a refusal.
+        BufferSource::GuestRuns(_) => Err(render_input_refusal(
+            role,
+            view.view_id,
+            "guest_runs",
+            "the bytes are an ordered list of the owner's guest runs, and this rail does not \
+             read the guest-runs arm yet: the arm is executed by the Vulkan rail \
+             (`research/docs/23` §74, E-TX6), and the Apple-side reading its flip would owe is \
+             a later increment",
+        )),
         BufferSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
@@ -2771,6 +2788,9 @@ fn storage_mode_name(source: &BufferSource) -> &'static str {
         BufferSource::OwnedBytes(_) => "owned_bytes",
         BufferSource::StagedLease(_) => "staged_lease",
         BufferSource::BorrowedNoCopy(_) => "borrowed_no_copy",
+        // The guest-runs arm this rail refuses by name
+        // (`research/docs/23` §74, E-TX6).
+        BufferSource::GuestRuns(_) => "guest_runs",
     }
 }
 

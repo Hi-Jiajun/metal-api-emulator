@@ -14,8 +14,8 @@ use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, AttachmentFormat, BufferSource, BufferView,
     BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken,
     ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
-    FunctionSource, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind, LeaseId,
-    LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
+    FunctionSource, GuestRun, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind,
+    LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
     PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
@@ -2456,6 +2456,46 @@ impl VulkanComputeProvider {
             .lock()
             .expect("heap observation lock poisoned") = observations;
     }
+
+    /// Gather a guest-runs binding's windows out of the owner's imported
+    /// mappings (`research/docs/23` §74, E-TX6).
+    ///
+    /// The compute rail's half of the arm the render rail resolves for a
+    /// loading attachment: the runs are read in order into one provider-owned
+    /// buffer, each window resolved by the no-copy registry's own checks
+    /// (import, snapshot, epoch, reservation bounds) and each read made under a
+    /// hold, so an owner that releases a mapping mid-list is refused by name
+    /// (`lease_in_use`) rather than read through.
+    fn gather_guest_runs(
+        &self,
+        runs: &[GuestRun],
+        resources: &ResourceTableSnapshot,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let held: Vec<LeaseId> = runs.iter().map(|run| run.lease_id).collect();
+        self.borrowed.retain_all(&held)?;
+        let mut gathered = Vec::new();
+        let mut outcome = Ok(());
+        for run in runs {
+            match self
+                .borrowed
+                .run_pointer(*run, self.device_epoch(), resources)
+            {
+                // SAFETY: the registry resolved this window for an imported
+                // lease, and the holds taken above keep the owner from
+                // releasing the mapping until the loop has finished with it.
+                Ok(window) => gathered.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(window.pointer as *const u8, window.len)
+                }),
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        self.borrowed.retire_all(&held);
+        outcome?;
+        Ok(gathered)
+    }
 }
 
 impl LeaseImporter for VulkanComputeProvider {
@@ -2875,6 +2915,20 @@ impl ComputeProvider for VulkanComputeProvider {
                         len: view.len,
                         capacity: view.capacity,
                     });
+                }
+                // The compute half of the guest-runs arm (`research/docs/23`
+                // §74, E-TX6): a binding whose bytes are an ordered list of
+                // owner windows is gathered into the provider's own upload,
+                // exactly as the render rail gathers an attachment's previous
+                // contents. The holds the reads take are retired as soon as
+                // the copy is complete and the submission-level retain below
+                // keeps the backing alive with the trace.
+                BufferSource::GuestRuns(runs) => {
+                    let bytes = self.gather_guest_runs(runs, admitted.resources())?;
+                    for run in runs {
+                        borrowed_leases.push(run.lease_id);
+                    }
+                    buffers.push(PoolBinding::Owned(BufferBinding { index, bytes }));
                 }
             }
         }
