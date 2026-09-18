@@ -5467,6 +5467,22 @@ fn stage_shader_flags(stage: RenderPipelineStage) -> vk::ShaderStageFlags {
     }
 }
 
+/// How many slots of one descriptor type a planned slot list declares
+/// (`research/docs/23` §3.3, v112).
+///
+/// The list is one entry per descriptor slot, so a slot two textures name
+/// contributes one entry and one pool size — the same reading twice, once for
+/// the layout and once for the pool it is allocated from.
+fn descriptor_type_count(
+    planned: &BTreeMap<u32, (vk::DescriptorType, vk::ShaderStageFlags)>,
+    descriptor_type: vk::DescriptorType,
+) -> u32 {
+    planned
+        .values()
+        .filter(|(candidate, _)| *candidate == descriptor_type)
+        .count() as u32
+}
+
 /// One contract blend factor as the `VkBlendFactor` it names. Closed for the
 /// same reason every other translation here is: a factor that gains no arm is a
 /// compile error rather than a silently different one.
@@ -10244,62 +10260,28 @@ impl<'a> OffscreenObjects<'a> {
         }
         // The descriptor set layout is the sampled pipeline's own: one
         // fragment-stage combined image sampler per binding, in binding order
-        // (`research/docs/23` §3.3, v70).
-        // The descriptor shapes are the *module's* (`research/docs/23` §3.3,
-        // v100): the reviewed pair samples through one combined image sampler
-        // per binding, while the translator emits a translated stage's texture
-        // and its AIR static sampler as two descriptors — an `OpTypeImage` and
-        // an `OpTypeSampler` the module combines itself — so that arm binds a
-        // `SAMPLED_IMAGE` and a `SAMPLER` at the slots the reflection names.
-        // One layout entry per *slot*, not per texture: a runtime
-        // `[[sampler(n)]]` argument is one descriptor however many textures
-        // sample through it (`research/docs/23` §3.3, v102), and two identical
-        // `VkDescriptorSetLayoutBinding`s at one binding would be an invalid
-        // layout. The map keys the entries by binding and keeps the descriptor
-        // type each one is declared with, so a slot that two textures name
-        // still contributes one entry and one pool size.
-        let mut planned_bindings = BTreeMap::<u32, vk::DescriptorType>::new();
-        for texture in &self.textures {
-            match texture.slot {
-                RenderTextureSlot::Combined { binding, .. } => {
-                    planned_bindings.insert(binding, vk::DescriptorType::COMBINED_IMAGE_SAMPLER);
-                }
-                RenderTextureSlot::Split {
-                    image,
-                    sampler_binding,
-                    ..
-                } => {
-                    planned_bindings.insert(image, vk::DescriptorType::SAMPLED_IMAGE);
-                    planned_bindings.insert(sampler_binding, vk::DescriptorType::SAMPLER);
-                }
-                // The sampler-free arm declares the image alone
-                // (`research/docs/23` §3.3, v105): the module's own
-                // `OpImageFetch` reads it, and a `SAMPLER` entry here would be
-                // a descriptor nothing in the module reads.
-                RenderTextureSlot::Fetch { image, .. } => {
-                    planned_bindings.insert(image, vk::DescriptorType::SAMPLED_IMAGE);
-                }
-            }
-        }
-        let mut combined_count = 0_u32;
-        let mut sampled_image_count = 0_u32;
-        let mut sampler_count = 0_u32;
-        let mut bindings = Vec::with_capacity(planned_bindings.len());
-        for (binding, descriptor_type) in &planned_bindings {
-            match *descriptor_type {
-                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => combined_count += 1,
-                vk::DescriptorType::SAMPLED_IMAGE => sampled_image_count += 1,
-                vk::DescriptorType::SAMPLER => sampler_count += 1,
-                _ => {}
-            }
-            bindings.push(
+        // (`research/docs/23` §3.3, v70). The slots are the module's own
+        // ([`Self::render_texture_slots`]), and a pass whose stages also read a
+        // stage buffer in set 0 shares this set with them instead of the two
+        // faces fighting for the slot (`research/docs/23` §3.3, v112).
+        let planned_bindings = self.render_texture_slots();
+        let combined_count = descriptor_type_count(
+            &planned_bindings,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        );
+        let sampled_image_count =
+            descriptor_type_count(&planned_bindings, vk::DescriptorType::SAMPLED_IMAGE);
+        let sampler_count = descriptor_type_count(&planned_bindings, vk::DescriptorType::SAMPLER);
+        let bindings = planned_bindings
+            .iter()
+            .map(|(binding, (descriptor_type, stage_flags))| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(*binding)
                     .descriptor_type(*descriptor_type)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            );
-        }
+                    .stage_flags(*stage_flags)
+            })
+            .collect::<Vec<_>>();
         self.descriptor_set_layout = unsafe {
             self.context.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -10345,6 +10327,85 @@ impl<'a> OffscreenObjects<'a> {
         self.descriptor_set = sets.into_iter().next().ok_or_else(|| {
             execution_refusal("allocate descriptor set", "driver returned no set")
         })?;
+        self.write_render_texture_descriptors(self.descriptor_set);
+        Ok(())
+    }
+
+    /// The descriptor slots this pass's sampled textures declare in set 0
+    /// (`research/docs/23` §3.3, v70/v100/v105).
+    ///
+    /// The descriptor shapes are the *module's* (`research/docs/23` §3.3,
+    /// v100): the reviewed pair samples through one combined image sampler per
+    /// binding, while the translator emits a translated stage's texture and its
+    /// AIR static sampler as two descriptors — an `OpTypeImage` and an
+    /// `OpTypeSampler` the module combines itself — so that arm binds a
+    /// `SAMPLED_IMAGE` and a `SAMPLER` at the slots the reflection names.
+    /// One entry per *slot*, not per texture: a runtime `[[sampler(n)]]`
+    /// argument is one descriptor however many textures sample through it
+    /// (`research/docs/23` §3.3, v102), and two identical
+    /// `VkDescriptorSetLayoutBinding`s at one binding would be an invalid
+    /// layout. The map keys the entries by binding, keeps the descriptor type
+    /// each one is declared with, and carries the stage that reads the slot:
+    /// every texture slot is the fragment stage's, while a stage buffer sharing
+    /// the set keeps its own stage's flag (`research/docs/23` §3.3, v112).
+    fn render_texture_slots(&self) -> BTreeMap<u32, (vk::DescriptorType, vk::ShaderStageFlags)> {
+        let mut planned_bindings = BTreeMap::new();
+        for texture in &self.textures {
+            match texture.slot {
+                RenderTextureSlot::Combined { binding, .. } => {
+                    planned_bindings.insert(
+                        binding,
+                        (
+                            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
+                    );
+                }
+                RenderTextureSlot::Split {
+                    image,
+                    sampler_binding,
+                    ..
+                } => {
+                    planned_bindings.insert(
+                        image,
+                        (
+                            vk::DescriptorType::SAMPLED_IMAGE,
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
+                    );
+                    planned_bindings.insert(
+                        sampler_binding,
+                        (vk::DescriptorType::SAMPLER, vk::ShaderStageFlags::FRAGMENT),
+                    );
+                }
+                // The sampler-free arm declares the image alone
+                // (`research/docs/23` §3.3, v105): the module's own
+                // `OpImageFetch` reads it, and a `SAMPLER` entry here would be
+                // a descriptor nothing in the module reads.
+                RenderTextureSlot::Fetch { image, .. } => {
+                    planned_bindings.insert(
+                        image,
+                        (
+                            vk::DescriptorType::SAMPLED_IMAGE,
+                            vk::ShaderStageFlags::FRAGMENT,
+                        ),
+                    );
+                }
+            }
+        }
+        planned_bindings
+    }
+
+    /// Write this pass's sampled-texture descriptors into `set`
+    /// (`research/docs/23` §3.3, v70/v100/v102/v105).
+    ///
+    /// `set` is the sampled pipeline's own set 0, or — when the pass's stages
+    /// also read a stage buffer in set 0 — the one set the two faces share
+    /// (`research/docs/23` §3.3, v112): the slots are the ones
+    /// [`Self::render_texture_slots`] planned, and only the texture half of
+    /// them is written here, so each family's writes land under its own
+    /// declaration.
+    fn write_render_texture_descriptors(&self, set: vk::DescriptorSet) {
         // The infos have to outlive the writes that borrow them, so they are
         // collected first and the writes attached once every push is done —
         // the same order the compute rail's own descriptor write uses.
@@ -10379,7 +10440,7 @@ impl<'a> OffscreenObjects<'a> {
             };
             let write = |binding: u32, ty: vk::DescriptorType| {
                 vk::WriteDescriptorSet::default()
-                    .dst_set(self.descriptor_set)
+                    .dst_set(set)
                     .dst_binding(binding)
                     .descriptor_type(ty)
                     .descriptor_count(1)
@@ -10462,7 +10523,6 @@ impl<'a> OffscreenObjects<'a> {
         unsafe {
             self.context.device.update_descriptor_sets(&writes, &[]);
         }
-        Ok(())
     }
 
     /// Bind every stage buffer the pass's stages read
@@ -10485,6 +10545,14 @@ impl<'a> OffscreenObjects<'a> {
     /// other's bytes — the shape the translator's default layout produces when
     /// both stages read `[[buffer(n)]]` with the same index — so it is refused
     /// by name rather than executed with one stage reading the other's buffer.
+    ///
+    /// A set index the sampled pipeline also uses is not two sets: when a
+    /// translated module reads a stage buffer from set 0 and the pass samples
+    /// textures, the two faces share the one set, laid out with their slots
+    /// side by side (`research/docs/23` §3.3, v112) — the translator's own
+    /// layout keeps the buffers' and the images' bands apart, so nothing is
+    /// substituted and no slot is dropped. A slot both faces name is refused
+    /// by name ([`Self::create_merged_set_zero`]).
     fn create_stage_buffers(
         &mut self,
         streams: &[StageBufferStream<'_>],
@@ -10549,76 +10617,23 @@ impl<'a> OffscreenObjects<'a> {
             }
         }
         for (set, set_streams) in &by_set {
-            let bindings = set_streams
-                .iter()
-                .map(|stream| {
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(stream.slot.binding())
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(stage_shader_flags(stream.stage))
-                })
-                .collect::<Vec<_>>();
-            let layout = unsafe {
-                self.context.device.create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                    None,
-                )
-            }
-            .map_err(|error| {
-                execution_refusal(
-                    &format!("create set-{set} stage descriptor set layout"),
-                    &error.to_string(),
-                )
-            })?;
-            let pool_sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(bindings.len() as u32)];
-            let pool = unsafe {
-                self.context.device.create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&pool_sizes),
-                    None,
-                )
-            }
-            .map_err(|error| {
-                unsafe {
-                    self.context
-                        .device
-                        .destroy_descriptor_set_layout(layout, None)
-                };
-                execution_refusal(
-                    &format!("create set-{set} stage descriptor pool"),
-                    &error.to_string(),
-                )
-            })?;
-            let layouts = [layout];
-            let sets = unsafe {
-                self.context.device.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )
-            }
-            .map_err(|error| {
-                unsafe {
-                    self.context.device.destroy_descriptor_pool(pool, None);
-                    self.context
-                        .device
-                        .destroy_descriptor_set_layout(layout, None);
-                }
-                execution_refusal(
-                    &format!("allocate set-{set} stage descriptor set"),
-                    &error.to_string(),
-                )
-            })?;
-            let descriptor_set = sets.into_iter().next().ok_or_else(|| {
-                execution_refusal(
-                    &format!("allocate set-{set} stage descriptor set"),
-                    "driver returned no set",
-                )
-            })?;
+            // A translated module reads its stage buffers and its sampled
+            // textures from the one descriptor set the translator's layout
+            // puts every Metal resource in — `DescriptorLayout`'s buffers
+            // `0..32`, sampled textures `32..160` and samplers `160..192` — so
+            // a pass whose stages do both is one layout, one pool and one set
+            // at set 0, carrying the two families' slots side by side
+            // (`research/docs/23` §3.3, v112). Those bands are disjoint by
+            // construction, so the shared layout is buildable; a slot both
+            // faces name is refused by name in the helper below rather than
+            // built with one of the two writes landing under the other's
+            // declaration.
+            let merged = *set == 0 && self.descriptor_set_layout != vk::DescriptorSetLayout::null();
+            let (layout, pool, descriptor_set) = if merged {
+                self.create_merged_set_zero(set_streams)?
+            } else {
+                self.create_stage_descriptor_set(*set, set_streams)?
+            };
             // The view's bytes are bound through the same two arms the streams
             // use; the buffers are kept alive with the pass and destroyed
             // beside it.
@@ -10690,12 +10705,35 @@ impl<'a> OffscreenObjects<'a> {
             unsafe {
                 self.context.device.update_descriptor_sets(&writes, &[]);
             }
-            self.stage_buffer_sets.push(StageBufferDescriptorSet {
-                set: *set,
-                layout,
-                pool,
-                descriptor_set,
-            });
+            if merged {
+                // The sampled textures' descriptors are written into the set
+                // the two faces now share, and the sampled pipeline's own
+                // set-0 objects are retired beside them: the old set was
+                // allocated from the old pool, so destroying the pool frees it
+                // and the layout goes after it, the order the pass's own
+                // teardown destroys the pair in. The merged three take their
+                // place, which is also what `record` binds at set 0 and what
+                // the pipeline layout's positional list carries there.
+                self.write_render_texture_descriptors(descriptor_set);
+                unsafe {
+                    self.context
+                        .device
+                        .destroy_descriptor_pool(self.descriptor_pool, None);
+                    self.context
+                        .device
+                        .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                }
+                self.descriptor_pool = pool;
+                self.descriptor_set_layout = layout;
+                self.descriptor_set = descriptor_set;
+            } else {
+                self.stage_buffer_sets.push(StageBufferDescriptorSet {
+                    set: *set,
+                    layout,
+                    pool,
+                    descriptor_set,
+                });
+            }
         }
         // The pipeline layout's positional list is built last, once every set
         // index the streams land in is known: entry `i` is the layout of set
@@ -10738,6 +10776,248 @@ impl<'a> OffscreenObjects<'a> {
             self.stage_buffer_layout_slots.push(layout);
         }
         Ok(())
+    }
+
+    /// Create one set index's descriptor set layout, its one-set pool and the
+    /// set itself (`research/docs/23` §3.3, v83).
+    ///
+    /// One `STORAGE_BUFFER` binding per stream, created with the stage's own
+    /// `VkShaderStageFlags`, in the order the streams were resolved. This is
+    /// the arm every set index of a pass that samples nothing takes — the
+    /// reviewed pair's sets 1 and 2, and a translated module's own slots —
+    /// and its objects are the ones the pass binds through
+    /// [`StageBufferDescriptorSet`].
+    fn create_stage_descriptor_set(
+        &self,
+        set: u32,
+        streams: &[&StageBufferStream<'_>],
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+        ),
+        ProviderError,
+    > {
+        let bindings = streams
+            .iter()
+            .map(|stream| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(stream.slot.binding())
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(stage_shader_flags(stream.stage))
+            })
+            .collect::<Vec<_>>();
+        let layout = unsafe {
+            self.context.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .map_err(|error| {
+            execution_refusal(
+                &format!("create set-{set} stage descriptor set layout"),
+                &error.to_string(),
+            )
+        })?;
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(bindings.len() as u32)];
+        let pool = unsafe {
+            self.context.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .map_err(|error| {
+            unsafe {
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(layout, None)
+            };
+            execution_refusal(
+                &format!("create set-{set} stage descriptor pool"),
+                &error.to_string(),
+            )
+        })?;
+        let layouts = [layout];
+        let sets = unsafe {
+            self.context.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(|error| {
+            unsafe {
+                self.context.device.destroy_descriptor_pool(pool, None);
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(layout, None);
+            }
+            execution_refusal(
+                &format!("allocate set-{set} stage descriptor set"),
+                &error.to_string(),
+            )
+        })?;
+        let descriptor_set = sets.into_iter().next().ok_or_else(|| {
+            execution_refusal(
+                &format!("allocate set-{set} stage descriptor set"),
+                "driver returned no set",
+            )
+        })?;
+        Ok((layout, pool, descriptor_set))
+    }
+
+    /// Create the one set 0 a pass shares between its sampled textures and the
+    /// stage buffers its stages read there (`research/docs/23` §3.3, v112).
+    ///
+    /// The slots are the sampled textures' own ([`Self::render_texture_slots`])
+    /// plus one `STORAGE_BUFFER` per stream, ascending by binding: the two
+    /// families sit beside each other in one layout, one pool and one set,
+    /// which is what the pipeline layout's set 0 then is and what `record`
+    /// binds there. The texture half is written by the caller beside the stage
+    /// buffers' writes, because the sampled pipeline's own set is retired in
+    /// the same step.
+    ///
+    /// A slot the two faces both name is refused by name: the translator's own
+    /// layout keeps the two bands apart (`research/docs/23` §3.3, v84), so this
+    /// is the arm a module outside that layout lands in, and building it would
+    /// leave one of the two writes landing under the other's declaration.
+    fn create_merged_set_zero(
+        &self,
+        streams: &[&StageBufferStream<'_>],
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+        ),
+        ProviderError,
+    > {
+        let mut planned_bindings = self.render_texture_slots();
+        for stream in streams {
+            let binding = stream.slot.binding();
+            if planned_bindings.contains_key(&binding) {
+                return Err(capability_refusal("render_texture_layout_unsupported")
+                    .with_field("set", FieldValue::Unsigned(0))
+                    .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+                    .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
+                    .with_field("index", FieldValue::Unsigned(u64::from(stream.index)))
+                    .with_detail(
+                        "the module reads a stage buffer from a descriptor slot the sampled \
+                         textures' own set declares, so one of the two writes would land under \
+                         the other's declaration; the two faces have to occupy different slots \
+                         for one set to hold both",
+                    ));
+            }
+            planned_bindings.insert(
+                binding,
+                (
+                    vk::DescriptorType::STORAGE_BUFFER,
+                    stage_shader_flags(stream.stage),
+                ),
+            );
+        }
+        let bindings = planned_bindings
+            .iter()
+            .map(|(binding, (descriptor_type, stage_flags))| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(*binding)
+                    .descriptor_type(*descriptor_type)
+                    .descriptor_count(1)
+                    .stage_flags(*stage_flags)
+            })
+            .collect::<Vec<_>>();
+        let mut pool_sizes = vec![vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(descriptor_type_count(
+                &planned_bindings,
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            ))];
+        let sampled_image_count =
+            descriptor_type_count(&planned_bindings, vk::DescriptorType::SAMPLED_IMAGE);
+        if sampled_image_count > 0 {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(sampled_image_count),
+            );
+        }
+        let sampler_count = descriptor_type_count(&planned_bindings, vk::DescriptorType::SAMPLER);
+        if sampler_count > 0 {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(sampler_count),
+            );
+        }
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(streams.len() as u32),
+        );
+        let layout = unsafe {
+            self.context.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .map_err(|error| {
+            execution_refusal(
+                "create the merged set-0 descriptor set layout",
+                &error.to_string(),
+            )
+        })?;
+        let pool = unsafe {
+            self.context.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .map_err(|error| {
+            unsafe {
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(layout, None)
+            };
+            execution_refusal(
+                "create the merged set-0 descriptor pool",
+                &error.to_string(),
+            )
+        })?;
+        let layouts = [layout];
+        let sets = unsafe {
+            self.context.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(|error| {
+            unsafe {
+                self.context.device.destroy_descriptor_pool(pool, None);
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(layout, None);
+            }
+            execution_refusal(
+                "allocate the merged set-0 descriptor set",
+                &error.to_string(),
+            )
+        })?;
+        let descriptor_set = sets.into_iter().next().ok_or_else(|| {
+            execution_refusal(
+                "allocate the merged set-0 descriptor set",
+                "driver returned no set",
+            )
+        })?;
+        Ok((layout, pool, descriptor_set))
     }
 
     /// The graphics pipeline of the milestone: two stages, no vertex input, no
@@ -10913,22 +11193,29 @@ impl<'a> OffscreenObjects<'a> {
         // that binds no stage buffer keeps exactly the one-set layout every
         // earlier increment built. Nothing can shift an existing pass's
         // numbering because the positional list starts at set 0.
-        // Set 0 carries the sampled textures' combined image samplers whenever
-        // the pass binds any (`research/docs/23` §3.3, v70/v100). A pass whose
-        // stages also read stage buffers laid that list out positionally, so
-        // the textures' layout takes slot 0 when nothing else claimed it — and
-        // a translated module that reads a stage buffer in set 0 conflicts with
-        // the image layout, which is refused by name rather than built with one
-        // of the two dropped.
+        // Set 0 carries the sampled textures' descriptors whenever the pass
+        // binds any (`research/docs/23` §3.3, v70/v100), and a translated
+        // module that reads a stage buffer there is bound through the *same*
+        // set: `create_stage_buffers` merges the two families into the one
+        // layout when both faces meet at set 0 (`research/docs/23` §3.3,
+        // v112), so the slot this list carries there is already the sampled
+        // pipeline's own. A slot that is neither — some other set-0 layout
+        // this rail did not build — is refused by name rather than built with
+        // one of the two dropped.
         let mut descriptor_set_layouts = self.stage_buffer_layout_slots.clone();
         if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
             match descriptor_set_layouts.first().copied() {
+                // The merged set 0 is the sampled pipeline's own layout
+                // (`research/docs/23` §3.3, v112): nothing to install, the
+                // slot already carries both faces' slots.
+                Some(layout) if layout == self.descriptor_set_layout => {}
                 Some(layout) if layout != vk::DescriptorSetLayout::null() => {
                     return Err(capability_refusal("render_texture_layout_unsupported")
+                        .with_field("set", FieldValue::Unsigned(0))
                         .with_detail(
-                            "a stage buffer occupies descriptor set 0, which is where this \
-                             pipeline's combined image samplers live; the two faces need \
-                             different slots for one layout to hold both",
+                            "descriptor set 0 carries a layout this rail did not build for this \
+                             pass's own faces, and this pipeline's sampled textures live there; \
+                             the two faces need different slots for one layout to hold both",
                         ));
                 }
                 Some(_) => descriptor_set_layouts[0] = self.descriptor_set_layout,
