@@ -1073,3 +1073,38 @@ object API's `draw_primitives_with_depth` and `draw_indexed_primitives_with_dept
 are the depth-bearing recording entries, and the pass they record carries the
 same rail-owned surface and state the trace contract names. The fixture's
 marker therefore names all five rails.
+
+## 17. The non-indexed draw arm (v39)
+
+The render narrow class's one draw has two arms (`research/docs/23` §3.3, v39).
+The first is the indexed one every pre-v39 case declares: the reviewed
+`float32x2` position stream at stride eight plus an index buffer. The second is
+the same streams drawn *without* an index buffer, which the contract has always
+carried — `RenderPassDescriptor::indices` is an `Option`, and `None` reads as
+"the draw names its vertices `0..vertices`".
+
+What the arm owes is not a new module but the footprint rule the two rails
+already prove for it: a non-indexed draw reads one record per vertex, so every
+per-vertex stream has to cover the whole `vertices * stride` span (the indexed
+arm only has to cover the span its index values reach, so this is the stricter
+of the two), and a draw of fewer than three vertices rasterizes no triangle at
+all. A case carrying no `vertex_layout` at all is the milestone's `vertex_id`
+triangle and stays pinned to `vertices == 3`; one with a layout may name any
+`vertices >= 3` its streams cover.
+
+`suite-v39.json` states the arm four ways, so the parity and the falsifiers sit
+in one suite: the milestone's `vertex_id` triangle (which the widened coverage
+now admits rather than refuses), the reviewed indexed quad carried unchanged,
+the same six vertices expanded out of the index buffer and drawn without one
+(whose frame has to be the indexed case's frame byte for byte), and a neighbour
+that draws one triangle of the same layout over a single texel (whose frame has
+to move, which is what makes the vertex bytes — not the draw's shape — the thing
+the attachment reads). The neighbour declares the partial coverage it resolves
+and `conformance/narrow-class.json` refuses it by that rule, but it still owes
+all five rails.
+
+The object rails record the arm through `draw_primitives_with_attachments`,
+which binds the encoder's streams and carries no index buffer: the same entry
+the indexed arm's `draw_indexed_primitives_with_attachments` mirrors. The
+milestone's `draw_render_pass` stays the one entry that binds nothing, so a
+stream-carrying case can never be recorded through it by accident.

@@ -186,6 +186,46 @@ class CoveredRuleTests(unittest.TestCase):
                     narrow_class.check_fixture(entry, tampered, suite_path, fixture)
                 self.assertEqual(caught.exception.rule, rule)
 
+    def test_the_non_indexed_arm_is_a_covered_draw_axis(self):
+        # The covered rule's own widening (`research/docs/23` §3.3, v39): both
+        # arms of the class's one draw are covered — the `vertex_id` triangle
+        # that carries no stream, and the non-indexed draw over the reviewed
+        # streams — while the reasons a stream cannot stand for the shape it
+        # claims stay refused by the same rule.
+        entry = self.class_named("render-narrow")
+        suite_path, _, suite = narrow_class.check_class(entry)
+        for case_id in ("offscreen_triangle_clear_2x2", "nonindexed_quad_clear_2x2"):
+            with self.subTest(case=case_id):
+                narrow_class.check_fixture(entry, suite, suite_path, case_id)
+
+        def short_stream(case):
+            case["vertex_buffers"][0]["length"] = 40
+            case["vertex_buffers"][0]["initial_hex"] = "00" * 40
+
+        def too_few_vertices(case):
+            case["vertices"] = 2
+
+        def unstreamed_triangle_with_four_vertices(case):
+            case["vertices"] = 4
+
+        def a_base_vertex(case):
+            case["base_vertex"] = 1
+
+        for case_id, mutation, message in (
+            ("nonindexed_quad_clear_2x2", short_stream, "fewer than"),
+            ("nonindexed_quad_clear_2x2", too_few_vertices, "rasterizes no triangle"),
+            ("offscreen_triangle_clear_2x2", unstreamed_triangle_with_four_vertices,
+             "three-vertex triangle"),
+            ("nonindexed_quad_clear_2x2", a_base_vertex, "base vertex 0"),
+        ):
+            with self.subTest(case=case_id, reason=message):
+                tampered = copy.deepcopy(suite)
+                case = next(case for case in tampered["render_cases"]
+                            if case["id"] == case_id)
+                mutation(case)
+                with self.assertRaisesRegex(narrow_class.ClassParityError, message):
+                    narrow_class.check_fixture(entry, tampered, suite_path, case_id)
+
 
 class RailParityTests(unittest.TestCase):
     def setUp(self):

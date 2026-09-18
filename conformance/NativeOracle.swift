@@ -2481,8 +2481,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // metadata and executes it as an ordinary compute case.
     case "compute-buffer-v38":
         expectedIDs = ["render_declaring_vertex_superset"]
+    // The non-indexed draw arm (`research/docs/23` §3.3, v39): the declaring
+    // pass of the four render cases the render class's widened coverage is
+    // derived from — the milestone's `vertex_id` triangle, the reviewed indexed
+    // quad, the same streams drawn without an index buffer, and the
+    // partial-coverage neighbour one triangle of that stream draws. Every one
+    // of the four is executed by this oracle, so the render-case list is where
+    // the arm's own review lives rather than in this table.
+    case "compute-buffer-v39":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v38 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v39 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -3482,6 +3491,73 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                                            offset: indices.offset,
                                            baseVertex: baseVertex,
                                            bytes: indexBytes)
+    case (let layout?, let bindings?, nil):
+        // The non-indexed arm (`research/docs/23` §3.3, v39): the same reviewed
+        // streams drawn without an index buffer. A non-indexed draw names its
+        // vertices `0..vertices`, so every per-vertex stream has to cover the
+        // whole `vertices * stride` span rather than the span some index values
+        // reach — the stricter of the two footprint rules the rails prove, and
+        // the one `render.rs::plan_vertex_input` states for the same arm. The
+        // index buffer is draw state and not pipeline state, so the reviewed
+        // pair and its layout are the indexed quad's own.
+        guard let reviewedBuffers = reviewed.buffers else {
+            throw OracleError("\(definition.id): a vertex layout selects an unreviewed module")
+        }
+        try require(layout.buffers == reviewedBuffers,
+                    "\(definition.id): the vertex layout is not the reviewed one")
+        // The pair shapes (depth, stencil, cull, blend) are their own reviewed
+        // fixtures and each of them is written against the index arm's
+        // geometry; this arm has no index buffer to prove them against, so a
+        // case that declares one of them is refused by name instead of being
+        // read as this shape.
+        try require(definition.depth == nil && definition.cull == nil
+                    && definition.blend == nil && definition.stencil == nil
+                    && definition.stencil_test == nil,
+                    "\(definition.id): the reviewed non-indexed draw carries no depth, "
+                    + "stencil, culling or blend state")
+        // The base vertex only exists for an indexed draw: both APIs add it to
+        // the index values, and a non-indexed draw has none to add it to
+        // (`research/docs/23` §3.3, v34), which is why the contract refuses
+        // `base_vertex != 0` without an index buffer.
+        try require((definition.base_vertex ?? 0) == 0,
+                    "\(definition.id): a base vertex needs an index buffer")
+        // A draw of fewer than three vertices rasterizes no triangle, so it
+        // could only ever land the frame the pass started from.
+        try require(definition.vertices >= 3,
+                    "\(definition.id): the reviewed non-indexed draw is at least one triangle")
+        try require(bindings.count == reviewedBuffers.count,
+                    "\(definition.id): one binding per reviewed stream")
+        var nonIndexedStreams = [ValidatedVertexStream]()
+        for (binding, buffer) in bindings.enumerated() {
+            try require(buffer.view > 0 && buffer.allocation > 0,
+                        "\(definition.id): zero vertex stream identity")
+            let bytes = try decodeHex(buffer.initial_hex,
+                                      context: "\(definition.id) vertex stream \(binding)")
+            try require(UInt64(bytes.count) == buffer.length,
+                        "\(definition.id): vertex stream \(binding) declares "
+                        + "\(buffer.length) bytes and carries \(bytes.count)")
+            let stream = ValidatedVertexStream(binding: binding,
+                                               stride: reviewedBuffers[binding].stride,
+                                               step: reviewedBuffers[binding].resolvedStep,
+                                               attributes: reviewedBuffers[binding].attributes,
+                                               offset: buffer.offset,
+                                               bytes: bytes)
+            // The footprint proof: the draw reads one record per vertex, so
+            // `vertices` records have to fit in every stream. The division is
+            // the same reading the indexed arm's proof uses, and a stream whose
+            // stride is zero cannot reach it (the reviewed layouts state a
+            // non-zero stride).
+            try require(stream.step == "per_vertex",
+                        "\(definition.id): the reviewed non-indexed draw advances every "
+                        + "stream per vertex")
+            let covered = UInt64(bytes.count) / stream.stride
+            try require(definition.vertices <= covered,
+                        "\(definition.id): the draw reads \(definition.vertices) records of "
+                        + "binding \(binding), which covers \(covered)")
+            nonIndexedStreams.append(stream)
+        }
+        vertexStreams = nonIndexedStreams
+        indexStream = nil
     default:
         throw OracleError("\(definition.id): a vertex layout, its bindings and the index "
                           + "buffer are declared together")

@@ -1494,6 +1494,15 @@ fn register_render_pipeline(
             ),
             _ => return Err("the reviewed MRT shapes are one, two and four attachments".into()),
         },
+        // The non-indexed arm's pair is the indexed quad's own
+        // (`research/docs/23` §3.3, v39): the index buffer is draw state, not
+        // pipeline state, so the reviewed pair and its layout are unchanged.
+        RenderGeometry::NonIndexedQuad => (
+            (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+            (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+            (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
+            reviewed_quad_layout(),
+        ),
         // The instanced fixture owns a module pair of its own
         // (`research/docs/23` §3.3, v31): the vertex stage reads the
         // per-instance tint and shifts each instance's copy with
@@ -4058,6 +4067,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // declaring pass of the translated render case whose vertex stage reads
         // two of the four declared attribute locations.
         (1, "compute-buffer-v38") => &["render_declaring_vertex_superset"],
+        // The non-indexed draw arm (`research/docs/23` §3.3, v39): the
+        // declaring pass of the four render cases the class's widened coverage
+        // is derived from — the `vertex_id` triangle, the reviewed indexed
+        // quad, the same quad drawn without an index buffer, and the
+        // partial-coverage neighbour one triangle of it draws.
+        (1, "compute-buffer-v39") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4228,15 +4243,25 @@ fn validate_suite(suite: &Suite) -> Result<()> {
 /// cannot satisfy it.
 /// The reviewed geometry a render case draws (`research/docs/23` §3.3).
 ///
-/// Two shapes exist and no third: the milestone's `vertex_id` triangle, and the
-/// reviewed indexed quad whose vertex stream is a `float32x2` position at stride
-/// eight plus six `uint16` indices. A case cannot describe a geometry the two
-/// rails have not been reviewed against — that is what keeps the expected texels
-/// falsifiable instead of merely observed.
+/// The reviewed vertex-input shapes: the milestone's `vertex_id` triangle, the
+/// reviewed quad whose vertex stream is a `float32x2` position at stride eight
+/// — either drawn through six `uint16` indices or, since v39, drawn without an
+/// index buffer so the draw names its vertices `0..vertices` and the stream has
+/// to cover the whole `vertices * stride` span — and, beside them, the five
+/// deeper shapes the pair fixtures select (instanced, base vertex, depth, cull,
+/// blend, and the render sampler's own geometry). A case cannot describe a
+/// geometry the rails have not been reviewed against — that is what keeps the
+/// expected texels falsifiable instead of merely observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenderGeometry {
     Milestone,
     IndexedQuad,
+    /// The reviewed non-indexed quad (`research/docs/23` §3.3, v39): the same
+    /// reviewed pair and the same `float32x2` position stream as `IndexedQuad`,
+    /// drawn *without* an index buffer, so the draw names its vertices
+    /// `0..vertices` and the stream has to cover the whole `vertices * stride`
+    /// span.
+    NonIndexedQuad,
     /// The reviewed instanced pair (`research/docs/23` §3.3, v31): the same
     /// indexed quad, a second per-instance tint stream, and two instances.
     InstancedPair,
@@ -6996,6 +7021,38 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     if buffer.allocation == 0 || buffer.view == 0 {
         return Err(format!("{where_}: zero vertex stream identity").into());
     }
+    let bytes = unhex(&buffer.initial_hex)?;
+    if bytes.len() != usize::try_from(buffer.length)? {
+        return Err(format!("{where_}: the vertex stream bytes do not match its length").into());
+    }
+    // The non-indexed arm (`research/docs/23` §3.3, v39): the same reviewed
+    // stream drawn without an index buffer. A non-indexed draw names its
+    // vertices `0..vertices`, so the stream has to cover the whole
+    // `vertices * stride` span — the footprint rule both rails prove, and the
+    // stricter of the two this class carries, since the indexed arm only has to
+    // cover the span its index values reach. A draw of fewer than three
+    // vertices rasterizes no triangle, so it could only ever land the frame the
+    // pass started from.
+    let Some(indices) = &case.indices else {
+        if case.vertices < 3 {
+            return Err(format!(
+                "{where_}: the reviewed non-indexed draw is at least one triangle"
+            )
+            .into());
+        }
+        let required = QUAD_STRIDE
+            .checked_mul(case.vertices)
+            .ok_or("vertex stream footprint overflows")?;
+        if buffer.length < required {
+            return Err(format!(
+                "{where_}: the non-indexed draw reads {required} bytes of the stream, which \
+                 declares {}",
+                buffer.length
+            )
+            .into());
+        }
+        return Ok(RenderGeometry::NonIndexedQuad);
+    };
     let required = QUAD_STRIDE
         .checked_mul(QUAD_VERTICES)
         .ok_or("vertex stream footprint overflows")?;
@@ -7006,13 +7063,6 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
         )
         .into());
     }
-    let bytes = unhex(&buffer.initial_hex)?;
-    if bytes.len() != usize::try_from(buffer.length)? {
-        return Err(format!("{where_}: the vertex stream bytes do not match its length").into());
-    }
-    let Some(indices) = &case.indices else {
-        return Err(format!("{where_}: the reviewed vertex-input shape is indexed").into());
-    };
     if indices.allocation == 0 || indices.view == 0 {
         return Err(format!("{where_}: zero index buffer identity").into());
     }
@@ -7093,7 +7143,11 @@ fn render_inputs(
         });
     }
     let Some(indices) = &case.indices else {
-        return Err(format!("{where_}: the reviewed vertex-input shape is indexed").into());
+        // The non-indexed arm (`research/docs/23` §3.3, v39): the pass binds the
+        // same reviewed streams and names its vertices `0..vertices`, so it
+        // carries no index binding at all. The shape and its footprint were
+        // reviewed by `render_geometry` before this point.
+        return Ok((vertex_buffers, None));
     };
     let format = match indices.format.as_str() {
         "uint16" => IndexFormat::Uint16,
@@ -7176,6 +7230,23 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             if case.vertices != QUAD_INDICES {
                 return Err(format!(
                     "{where_}: the reviewed indexed quad draws {QUAD_INDICES} indices"
+                )
+                .into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a vertex-input case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
+        RenderGeometry::NonIndexedQuad => {
+            // The non-indexed arm's footprint was pinned by `render_geometry`;
+            // what stays here is the count every triangle-list draw shares
+            // (`research/docs/23` §3.3, v39).
+            if case.vertices < 3 {
+                return Err(format!(
+                    "{where_}: the reviewed non-indexed draw is at least one triangle"
                 )
                 .into());
             }
@@ -7449,6 +7520,10 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             STAGE_BUFFER_MSL_VERTEX_ENTRY,
             STAGE_BUFFER_MSL_FRAGMENT_ENTRY,
         ),
+        // The non-indexed arm compiles the reviewed quad's module pair
+        // (`research/docs/23` §3.3, v39): the index buffer is draw state and
+        // not pipeline state, so neither the entries nor the layout change.
+        RenderGeometry::NonIndexedQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -12227,6 +12302,32 @@ fn run_object_render_case(
                 present,
             )?;
         }
+    } else if !object_streams.is_empty() {
+        // The non-indexed arm (`research/docs/23` §3.3, v39): the pass binds
+        // the case's reviewed streams and names its vertices `0..vertices`, so
+        // the object API's own `draw_primitives_with_attachments` is the entry
+        // that carries both. The `vertex_id` milestone below binds nothing and
+        // is the only shape that records through `draw_render_pass`.
+        if case.instance_count != 1 {
+            return Err(format!(
+                "render case {}: the reviewed non-indexed draw runs one instance",
+                case.id
+            )
+            .into());
+        }
+        if !object_entry_admits(&families) {
+            return Err(format!(
+                "render case {}: the object rails have no single entry for the declared state \
+                 {families:?}",
+                case.id
+            )
+            .into());
+        }
+        for (binding, stream) in object_streams.iter().enumerate() {
+            render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
+        }
+        let vertex_count = u32::try_from(case.vertices)?;
+        render.draw_primitives_with_attachments(&recorded, width, height, vertex_count, present)?;
     } else if case.instance_count > 1 {
         // The milestone's `vertex_id` triangle has no instanced entry point on
         // the object API yet: recording it with one instance would draw a
@@ -13830,5 +13931,124 @@ mod tests {
         }
         pipeline.contract.buffer_bindings[0].metal_binding = 0;
         assert!(verify_copy_contract(&pipeline).is_err());
+    }
+
+    /// The non-indexed draw arm (`research/docs/23` §3.3, v39).
+    ///
+    /// The suite is the fixture: `nonindexed_quad_clear_2x2` draws the same six
+    /// vertices the index buffer names without an index buffer, and
+    /// `nonindexed_triangle_clear_2x2` draws one triangle of its own over the
+    /// same reviewed layout. These tests hold the shape rules that admit the
+    /// two — and the footprint proof that keeps a stream the draw cannot cover
+    /// out of the class — without claiming any GPU evidence.
+    mod nonindexed_draw {
+        use super::*;
+
+        fn suite() -> Suite {
+            serde_json::from_str(include_str!("../../../../conformance/suite-v39.json")).unwrap()
+        }
+
+        fn case(id: &str) -> RenderCase {
+            suite()
+                .render_cases
+                .into_iter()
+                .find(|case| case.id == id)
+                .unwrap_or_else(|| panic!("the suite carries no {id} case"))
+        }
+
+        #[test]
+        fn the_non_indexed_quad_binds_its_streams_and_no_index_buffer() {
+            let suite = suite();
+            let code = |id: &str, case: &RenderCase| {
+                render_geometry(case, id).map(|geometry| (case.id.clone(), geometry))
+            };
+            let quad = case("nonindexed_quad_clear_2x2");
+            assert_eq!(
+                code("case", &quad).unwrap(),
+                (
+                    "nonindexed_quad_clear_2x2".to_owned(),
+                    RenderGeometry::NonIndexedQuad
+                )
+            );
+            validate_render_case(&suite, &quad).unwrap();
+            // The pass the object and trace rails record carries the case's own
+            // streams and no index binding at all: that pair is what the
+            // non-indexed arm means.
+            let (streams, indices) = render_inputs(&quad, "case").unwrap();
+            assert_eq!(streams.len(), 1);
+            assert!(indices.is_none());
+            // The indexed case beside it is still executed through its indices.
+            let indexed = case("quad_indexed_clear_2x2");
+            assert_eq!(
+                code("case", &indexed).unwrap().1,
+                RenderGeometry::IndexedQuad
+            );
+            let (streams, indices) = render_inputs(&indexed, "case").unwrap();
+            assert_eq!(streams.len(), 1);
+            assert!(indices.is_some());
+        }
+
+        #[test]
+        fn the_partial_neighbour_is_admitted_and_keeps_its_own_triangle() {
+            let suite = suite();
+            let partial = case("nonindexed_triangle_clear_2x2");
+            validate_render_case(&suite, &partial).unwrap();
+            assert_eq!(
+                render_geometry(&partial, "case").unwrap(),
+                RenderGeometry::NonIndexedQuad
+            );
+            let (streams, indices) = render_inputs(&partial, "case").unwrap();
+            assert_eq!(streams.len(), 1);
+            assert!(indices.is_none());
+            // Its bytes are its own triangle, not the quad's records: that is
+            // what makes the frame move.
+            let quad = case("nonindexed_quad_clear_2x2");
+            assert_ne!(
+                quad.vertex_buffers[0].initial_hex,
+                partial.vertex_buffers[0].initial_hex
+            );
+        }
+
+        #[test]
+        fn a_stream_the_draw_cannot_cover_is_refused_by_name() {
+            let suite = suite();
+            let quad = case("nonindexed_quad_clear_2x2");
+            let mut short = quad.clone();
+            short.vertex_buffers[0].length = 40;
+            short.vertex_buffers[0].initial_hex = "00".repeat(40);
+            let error = render_geometry(&short, "case").unwrap_err();
+            assert!(
+                format!("{error}").contains("the non-indexed draw reads 48 bytes"),
+                "{error}"
+            );
+            assert!(validate_render_case(&suite, &short).is_err());
+            // The indexed case beside it keeps the weaker rule: its stream only
+            // has to cover the span its index values reach.
+            let mut indexed = case("quad_indexed_clear_2x2");
+            indexed.vertex_buffers[0].length = 32;
+            validate_render_case(&suite, &indexed).unwrap();
+        }
+
+        #[test]
+        fn a_draw_of_fewer_than_three_vertices_is_refused_by_name() {
+            let suite = suite();
+            let mut tiny = case("nonindexed_quad_clear_2x2");
+            tiny.vertices = 2;
+            let error = render_geometry(&tiny, "case").unwrap_err();
+            assert!(
+                format!("{error}").contains("at least one triangle"),
+                "{error}"
+            );
+            assert!(validate_render_case(&suite, &tiny).is_err());
+        }
+
+        #[test]
+        fn the_suite_identity_pins_the_declaring_pass() {
+            let suite = suite();
+            validate_suite(&suite).unwrap();
+            let mut drifted = suite;
+            drifted.cases[0].id = "render_declaring_something_else".to_owned();
+            assert!(validate_suite(&drifted).is_err());
+        }
     }
 }
