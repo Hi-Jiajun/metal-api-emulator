@@ -58,10 +58,12 @@ BUFFER_STORAGE_MODES = ("owned_bytes", "staged_lease", "borrowed_no_copy")
 # The stage-buffer face (`research/docs/23` §3.3, v83-v86): a render case may
 # declare slots whose bytes its stages read — and, for a writable one, land —
 # directly. The vocabulary is the contract's own (`StageBufferBinding` /
-# `StageBufferView`), and the bounds restate `metal_api_core`'s constants.
+# `StageBufferView`), and the bounds restate `metal_api_core`'s constants: the
+# count ceiling is the widened one (`research/docs/23` §108), the descriptor
+# floor Vulkan states for one set's storage buffers.
 STAGE_BUFFER_STAGES = ("vertex", "fragment")
 STAGE_BUFFER_ACCESSES = ("read", "write", "read_write")
-MAX_RENDER_STAGE_BUFFERS = 4
+MAX_RENDER_STAGE_BUFFERS = 8
 MAX_RENDER_STAGE_BUFFER_INDEX = 16
 # The invocation axes an affine footprint may stride over
 # (`metal_api_core::provider::RENDER_AFFINE_AXES`): `0` is the vertex index,

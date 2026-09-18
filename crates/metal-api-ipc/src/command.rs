@@ -2214,8 +2214,8 @@ mod tests {
             CodecError::RenderStageBufferCount { count, maximum }
                 if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
         ));
-        // The decoder refuses the same count by name instead of reading five
-        // tuples from four.
+        // The decoder refuses the same count by name instead of reading one
+        // tuple more than the contract's ceiling states.
         let request = CommandRequest::Submit {
             trace: stage_buffer_trace(),
             resources: resources(),
@@ -2226,11 +2226,14 @@ mod tests {
             .position(|window| window == STAGE_BUFFER_DECLARATION_BLOCK)
             .expect("the declaration block is on the wire");
         let mut patched = frame.clone();
-        patched[at] = 0x05;
+        // One above the contract's own ceiling (`research/docs/23` §3.3,
+        // §108): the count byte is refused before a single tuple is read, so
+        // the patched frame needs no matching block behind it.
+        patched[at] = u8::try_from(MAX_RENDER_STAGE_BUFFERS + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched).unwrap_err(),
-            CodecError::RenderStageBufferCount { count: 5, maximum }
-                if maximum == MAX_RENDER_STAGE_BUFFERS
+            CodecError::RenderStageBufferCount { count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
         ));
         eprintln!("pipeline declaration count refused: {refused}");
     }
@@ -2670,11 +2673,13 @@ mod tests {
         .unwrap();
         let position = stage_buffer_head_at(&frame);
         let mut patched = frame.clone();
-        patched[position + 3] = 0x05;
+        // One above the contract's own ceiling (`research/docs/23` §3.3,
+        // §108): the count byte is refused before a single view is read.
+        patched[position + 3] = u8::try_from(MAX_RENDER_STAGE_BUFFERS + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched).unwrap_err(),
-            CodecError::RenderStageBufferCount { count: 5, maximum }
-                if maximum == MAX_RENDER_STAGE_BUFFERS
+            CodecError::RenderStageBufferCount { count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
         ));
         // The encoder refuses the same protocol bound instead of writing a
         // frame the decoder would reject.
@@ -4361,7 +4366,8 @@ mod tests {
         // The stage-buffer block is the extended payload's newest optional
         // section: one presence tag, one bool and one `u32` binding cap
         // (`research/docs/23` §3.3, v83).
-        let block = [0x40, 0x01, 0x00, 0x00, 0x00, 0x04];
+        let mut block = vec![0x40, 0x01];
+        block.extend_from_slice(&(MAX_RENDER_STAGE_BUFFERS as u32).to_be_bytes());
         assert!(
             frame.windows(block.len()).any(|window| window == block),
             "the stage-buffer tail carries its tag, its bool and its cap"
@@ -4411,7 +4417,8 @@ mod tests {
             frame,
             "the only-stage-buffer capability frame re-encodes byte for byte"
         );
-        let block = [0x40, 0x01, 0x00, 0x00, 0x00, 0x04];
+        let mut block = vec![0x40, 0x01];
+        block.extend_from_slice(&(MAX_RENDER_STAGE_BUFFERS as u32).to_be_bytes());
         assert!(
             frame.windows(block.len()).any(|window| window == block),
             "the stage-buffer tail carries its tag, its bool and its cap"

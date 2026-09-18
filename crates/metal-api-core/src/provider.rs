@@ -1987,12 +1987,33 @@ pub const MAX_RENDER_SAMPLERS: usize = 16;
 pub const MAX_COMPUTE_TEXTURES: usize = 1;
 
 /// Stage buffer bindings a render pass may declare, across both stages
-/// (`research/docs/23` §3.3, v83): four, one per binding the reviewed chain
-/// shape reads, and the same first-increment cap the vertex-input face states
-/// for its streams. A provider's `ProviderCapabilities::max_render_stage_buffers`
-/// stays independent of this value: the contract admits the shape, while each
-/// rail declares how many of those bindings it can execute today.
-pub const MAX_RENDER_STAGE_BUFFERS: usize = 4;
+/// (`research/docs/23` §3.3, v83; §108): eight, the descriptor-set floor
+/// Vulkan states for one set's storage buffers.
+///
+/// The first increment stated four — one per binding the reviewed chain shape
+/// reads — and the deep tail that followed census v13 moved it: the R9o
+/// bucket key is the count itself (`stage_buffer_shape_gt4` = 334 with
+/// `duplicate` and `vertex_layout` both zero,
+/// `evidence/gate3-census-v13-2026-09-17/census_v13_faces.txt` §6), so every
+/// one of those class exits is a draw whose pipeline-level list declares more
+/// than four. Eight is also a *device* fact rather than this contract's
+/// invention: every admitted device guarantees
+/// `maxDescriptorSetStorageBuffers >= 8`, and a declaration is one descriptor
+/// in the set its own stage accounts for (set 1 for the vertex stage's
+/// bindings and set 2 for the fragment stage's on the reviewed arrangement,
+/// the module's own set for a translated stage), so a list of at most eight
+/// never asks one set for more descriptors than the platform promises —
+/// whichever way the stages split it. A ninth declaration is refused by name
+/// (`render_stage_buffer_limit`), and a *stage's* own count above this bound
+/// is not a shape this value states: the count cap is the pipeline-level
+/// list's. The index bound ([`MAX_RENDER_STAGE_BUFFER_INDEX`]) is a separate
+/// fact and does not move.
+///
+/// A provider's `ProviderCapabilities::max_render_stage_buffers` stays
+/// independent of this value: the contract admits the shape, while each rail
+/// declares how many of those bindings it can execute today, and a rail whose
+/// window is narrower refuses the rest by name instead of dropping a binding.
+pub const MAX_RENDER_STAGE_BUFFERS: usize = 8;
 
 /// The invocation indices a render pass's affine stage buffer footprint may
 /// name (`research/docs/23` §3.3, v86).

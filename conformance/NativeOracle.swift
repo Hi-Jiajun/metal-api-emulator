@@ -2432,8 +2432,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // it as an ordinary compute case.
     case "compute-buffer-v33":
         expectedIDs = ["render_declaring_quad_extent"]
+    // The widened stage-buffer ceiling (`research/docs/23` §3.3, §108,
+    // E-SB1): the declaring pass of the six-slot render case, whose list is
+    // census v13's `stage_buffer_shape_gt4` family. The render cases are the
+    // Vulkan rails' arrangement — six slots fill one set's descriptor floor
+    // rather than a reviewed module's fixed pairs — so this oracle validates
+    // the declaring pass's metadata and executes it as an ordinary compute
+    // case.
+    case "compute-buffer-v34":
+        expectedIDs = ["render_declaring_widened_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v33 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v34 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
