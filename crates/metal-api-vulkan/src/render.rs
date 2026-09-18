@@ -1025,16 +1025,30 @@ impl StageBufferSlot {
 /// own pages as the copy's transfer source instead (`research/docs/23` §75,
 /// R5c). The render sampler executes one 8-bit four-component UNORM 2D surface
 /// — `rgba8_unorm` or `bgra8_unorm`, whichever the view itself names
-/// (`research/docs/23` §107) — whose extent matches the render area, so every
-/// fragment stands on a texel centre and the nearest sample is an identity copy
-/// rather than a filtered or boundary-dependent read.
+/// (`research/docs/23` §107) — read at the render area's own extent: a view of
+/// another extent is read through the destination grid before it is uploaded
+/// (`research/docs/23` §111, E-TX5), so the surface the fragment stage samples
+/// is always the render area's and every fragment still stands on a texel
+/// centre of the bytes it reads.
 pub(crate) struct OffscreenRenderTexture<'a> {
     /// Where the texture's tightly packed, row-major texel bytes come from.
-    /// The three arms are the three [`TextureSource`] arms, resolved before any
-    /// device object exists.
+    /// The arms are the [`TextureSource`] arms, resolved before any device
+    /// object exists.
     pub source: RenderInputSource<'a>,
-    /// Extent in texels, which the pass requires to equal the render area
-    /// (`prepare_render_request` refuses the pass otherwise).
+    /// The texels the rail uploads when the source's own extent is not the
+    /// render area's (`research/docs/23` §111, E-TX5): the source read through
+    /// the destination grid, one destination pixel at a time, so the image the
+    /// rail binds is always the render area's own. `None` on every shape whose
+    /// two extents already agree — that arm uploads [`Self::source`]'s bytes
+    /// unchanged, byte for byte the pre-E-TX5 path.
+    pub gathered: Option<Vec<u8>>,
+    /// Extent in texels of the image this rail creates, uploads and binds: the
+    /// render area's own when the reviewed pair's window gathered the source
+    /// (`research/docs/23` §111, E-TX5), and the source view's own otherwise —
+    /// which is where every equal-extent shape and every translated module
+    /// lands. The one arm that never reaches this shape with a different extent
+    /// *and* the reviewed pair is the no-copy window, which
+    /// `prepare_render_request` refuses by name.
     pub extent: [u32; 2],
     /// The `VkFormat` the view's own `TextureFormat` names (`research/docs/23`
     /// §3.3, §107): the image this rail uploads the bytes into and the view the
@@ -4099,11 +4113,15 @@ fn prepare_render_request_with_resident<'a>(
     // own bytes, so the rail proves the footprint the draw reads and refuses
     // anything the reviewed shape does not cover.
     // The render sampler (`research/docs/23` §3.3, v70) is the same kind of
-    // question one dimension up: the reviewed fragment stage samples exactly
-    // one 8-bit four-component UNORM surface — `rgba8_unorm` or `bgra8_unorm`,
-    // the view's own name (`research/docs/23` §107) — whose extent matches the
-    // render area, so a fragment standing on a texel centre reads that texel's
-    // own bytes rather than a filtered or boundary-rule-dependent neighbour.
+    // question one dimension up: the fragment stage samples exactly one 8-bit
+    // four-component UNORM surface — `rgba8_unorm` or `bgra8_unorm`, the view's
+    // own name (`research/docs/23` §107). A source of another extent than the
+    // render area is read through the destination grid when the module is the
+    // reviewed pair, whose samples stand on the fragment's own centre, and it is
+    // bound at its own extent when the module is a translated one, which states
+    // its sample coordinates itself (`research/docs/23` §111, E-TX5): the
+    // reviewed arm's bytes stay a function of the two extents, and the
+    // translated arm's stay the module's own arithmetic.
     // The sampled textures' descriptor slots and sampler states come from the
     // stage the pass renders with (`research/docs/23` §3.3, v100), so they are
     // settled before the views are resolved: the reviewed pair reads its own
@@ -4111,7 +4129,14 @@ fn prepare_render_request_with_resident<'a>(
     // fragment stage reads the slots its reflection names with the state its
     // AIR carries.
     let texture_slots = render_texture_slots(stages, pass)?;
-    let textures = resolve_render_textures(pass, extent, leases, &texture_slots, produced)?;
+    let textures = resolve_render_textures(
+        pass,
+        extent,
+        leases,
+        &texture_slots,
+        produced,
+        stages.fragment_translation.is_none(),
+    )?;
     // Stage buffers (`research/docs/23` §3.3, v83) resolve right beside them:
     // the same three-arm channel, one list carrying both stages' index spaces,
     // and every binding the pipeline declared already paired with the pass in
@@ -4329,30 +4354,49 @@ fn prepare_render_request_with_resident<'a>(
 /// index bound (`RenderPassDescriptor::validate`); this is the rail's own
 /// window, restated for a directly-constructed pass and narrowed to what the
 /// reviewed sampling module covers: one 8-bit four-component UNORM 2D surface
-/// (`rgba8_unorm`/`bgra8_unorm`, `research/docs/23` §107), whose extent equals
-/// the render area. The extent rule is what keeps the fixture's
-/// expectation driver-independent — a texture of another size puts some
-/// fragment's `(column + 0.5) / width` sample either on a texel boundary or
-/// inside a neighbour, which is a filtered read the review never covered, so
-/// the pass is refused by name instead of sampled. Every refusal below names
-/// the view's own `metal_binding` rather than the entry's position, because the
-/// list may skip an index (`v104`) and the number the module reads is the
-/// binding.
+/// (`rgba8_unorm`/`bgra8_unorm`, `research/docs/23` §107). A view whose extent
+/// is not the render area's is answered by which module reads it
+/// (`research/docs/23` §111, E-TX5):
+///
+/// * the *reviewed* pair samples at the fragment's own normalized centre, so
+///   the rail resolves that centre's texel itself — the destination grid —
+///   gathers the source into a render-area-sized surface and uploads that, and
+///   the module still samples a surface of its own extent identity-wise. The
+///   byte expectation stays integer arithmetic rather than a driver's filtering
+///   precision, and no fragment stands on a texel boundary. The one arm that
+///   stays outside is the no-copy window: its whole statement is that the
+///   *device* reads the owner's mapping, so gathering it would need a copy the
+///   arm does not carry, and it is refused by name;
+/// * a *translated* module states its own sample coordinates, so the rail binds
+///   the source at its own extent and the module reads it — exactly as the
+///   engine's copy of that module does. The rail must not reinterpret
+///   coordinates the module states itself, and the census's own shapes arrive
+///   through this arm (the fork registers the guest's translated stages).
+///
+/// `reviewed` is the fragment stage's own kind: `true` when it is the rail's
+/// reviewed pair, `false` when it is a translated module. The reviewed arm's
+/// samples are what makes the destination grid the *module's* own semantics
+/// rather than a reinterpretation of it.
+///
+/// Every refusal below names the view's own `metal_binding` rather than the
+/// entry's position, because the list may skip an index (`v104`) and the number
+/// the module reads is the binding.
 ///
 /// The texture's bytes are resolved through the same three-arm channel the
 /// streams and the loading attachments use (`research/docs/23` §75, R5c): the
 /// trace's own bytes, the provider's staged copy of an owner lease, or the
-/// owner's own mapping — plus the trace-produced arm this increment adds
-/// (`research/docs/23` §110, E-TX3), whose bytes `produced` carries. The
-/// resolution runs before the first device object exists, and the window a
-/// lease resolves to has to be the texture's own tightly packed extent — the
-/// shape the trace-owned arm's `validate_shape` already holds.
+/// owner's own mapping — plus the trace-produced arm of E-TX3
+/// (`research/docs/23` §110), whose bytes `produced` carries. The resolution
+/// runs before the first device object exists, and the window a lease resolves
+/// to has to be the texture's own tightly packed extent — the shape the
+/// trace-owned arm's `validate_shape` already holds.
 fn resolve_render_textures<'a>(
     pass: &'a RenderPassDescriptor,
     extent: [u32; 2],
     leases: Option<&RenderLeaseContext<'_>>,
     slots: &[RenderTextureSlot],
     produced: Option<&'a ProducedTraceViews<'a>>,
+    reviewed: bool,
 ) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
     if pass.textures.len() > MAX_RENDER_TEXTURES {
         return Err(capability_refusal("render_texture_limit")
@@ -4395,29 +4439,47 @@ fn resolve_render_textures<'a>(
                 .with_field("array_length", FieldValue::Unsigned(view.array_length))
                 .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
         }
-        let source = resolve_render_texture_source(
-            view,
-            leases,
-            usize::try_from(binding).unwrap_or(usize::MAX),
-            produced,
-        )?;
         let width = narrow_dimension(view.width)?;
         let height = narrow_dimension(view.height)?;
         if width == 0 || height == 0 {
             return Err(contract_refusal("render texture has a zero dimension"));
         }
-        if [width, height] != extent {
+        // The widened window (`research/docs/23` §111, E-TX5). The reviewed
+        // pair leaves its sample coordinate implicit — the fragment's own
+        // centre — so a source of another extent is gathered into the render
+        // area's own grid, and the module keeps reading a surface of its own
+        // extent identity-wise. The gather answers from the source bytes the
+        // rail already holds, which is why the no-copy arm — whose bytes stay
+        // at the owner's mapping, read by the device — is the one source the
+        // rail cannot read this way: it keeps its own name for what it cannot
+        // do. That answer runs before the source resolves, because the shape is
+        // refused for what the arm *is*, not for anything a lease or a device
+        // could answer. A translated module states its coordinates itself, and
+        // the rail binds the source at its own extent for it; the image the
+        // rail creates is then the source's own size.
+        let gathered_extent = reviewed && [width, height] != extent;
+        if gathered_extent && matches!(view.source, TextureSource::BorrowedNoCopy(_)) {
             return Err(capability_refusal("render_texture_extent_unsupported")
                 .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("width", FieldValue::Unsigned(u64::from(width)))
                 .with_field("height", FieldValue::Unsigned(u64::from(height)))
                 .with_field("render_width", FieldValue::Unsigned(u64::from(extent[0])))
                 .with_field("render_height", FieldValue::Unsigned(u64::from(extent[1])))
+                .with_field("source", FieldValue::Text("borrowed_no_copy".to_owned()))
                 .with_detail(
-                    "the reviewed sampling shape samples a texture of the render area's own \
-                     extent, so every fragment stands on a texel centre",
+                    "the reviewed sampling shape reads a texture of another extent through the \
+                     destination grid, and the one source it cannot gather is the owner's \
+                     no-copy window: that arm's whole statement is that the device reads the \
+                     owner's mapping, so a source of another extent would have to be copied on \
+                     the host — a channel this arm does not carry",
                 ));
         }
+        let source = resolve_render_texture_source(
+            view,
+            leases,
+            usize::try_from(binding).unwrap_or(usize::MAX),
+            produced,
+        )?;
         let expected = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
@@ -4428,14 +4490,84 @@ fn resolve_render_textures<'a>(
                 source.len()
             )));
         }
+        let (gathered, upload_extent) = if gathered_extent {
+            let bytes = source
+                .host_bytes()
+                .expect("only the no-copy window has no host bytes, and it was answered above");
+            (
+                Some(gather_render_texture(
+                    bytes,
+                    [width, height],
+                    extent,
+                    view.format.bytes_per_texel(),
+                )),
+                extent,
+            )
+        } else {
+            (None, [width, height])
+        };
         textures.push(OffscreenRenderTexture {
             source,
-            extent: [width, height],
+            gathered,
+            extent: upload_extent,
             format: render_texture_vk_format(view.format)?,
             slot: slots[position],
         });
     }
     Ok(textures)
+}
+
+/// The source texel one destination pixel's centre falls in
+/// (`research/docs/23` §111, E-TX5).
+///
+/// The reviewed vertex module hands every fragment its own normalized centre,
+/// `(column + 0.5) / width`, and the reviewed fragment module samples the
+/// texture there with the pair's one state (nearest, clamp-to-edge). The texel
+/// such a sample names is therefore
+///
+/// ```text
+/// x = floor((2 * column + 1) * source_width  / (2 * destination_width ))
+/// y = floor((2 * row    + 1) * source_height / (2 * destination_height))
+/// ```
+///
+/// — a `floor` at the destination grid's own resolution, not a filter. The rail
+/// computes it in integers so the bytes a gathered surface carries are a
+/// function of the two extents and the source bytes alone: no interpolation
+/// precision, no boundary rounding, no device.
+fn gather_texel_index(destination_index: u32, source: u32, destination: u32) -> u32 {
+    // A destination centre lies strictly inside the source's own span, so the
+    // quotient is below `source` by construction; `u128` is what keeps the
+    // product of two narrowed extents exact.
+    let numerator = (2 * u128::from(destination_index) + 1) * u128::from(source);
+    let texel = numerator / (2 * u128::from(destination));
+    u32::try_from(texel).expect("a destination centre names a texel inside the source")
+}
+
+/// Gather one sampled surface into the render area's own grid
+/// (`research/docs/23` §111, E-TX5).
+///
+/// Both inputs are tightly packed, row-major, `bytes_per_texel`-byte texels;
+/// the output is the destination extent's grid, row by row, each destination
+/// pixel carrying the source texel [`gather_texel_index`] names for it.
+fn gather_render_texture(
+    bytes: &[u8],
+    source: [u32; 2],
+    destination: [u32; 2],
+    bytes_per_texel: u64,
+) -> Vec<u8> {
+    let stride = usize::try_from(bytes_per_texel).expect("one texel's bytes fit a usize");
+    let mut gathered = Vec::new();
+    for row in 0..destination[1] {
+        let source_row = u64::from(gather_texel_index(row, source[1], destination[1]));
+        for column in 0..destination[0] {
+            let source_column = u64::from(gather_texel_index(column, source[0], destination[0]));
+            let texel = source_row * u64::from(source[0]) + source_column;
+            let start =
+                usize::try_from(texel).expect("a source texel's offset fits a usize") * stride;
+            gathered.extend_from_slice(&bytes[start..start + stride]);
+        }
+    }
+    gathered
 }
 
 /// The owner-issued lease material one render submission resolves its render
@@ -4573,6 +4705,19 @@ impl RenderInputSource<'_> {
             Self::Borrowed { window, .. } => unsafe {
                 std::slice::from_raw_parts(window.pointer as *const u8, window.len)
             },
+        }
+    }
+
+    /// The bytes this source holds on the host, when the arm is one the host
+    /// can read: the three byte arms. The no-copy window has no host copy of
+    /// its own — the import binds the owner's mapping and the *device* reads it
+    /// — which is why a gathered source cannot be one.
+    fn host_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::TraceBytes(bytes) => Some(bytes),
+            Self::StagedBytes(bytes) => Some(bytes),
+            Self::ProducedBytes(bytes) => Some(bytes),
+            Self::Borrowed { .. } => None,
         }
     }
 
@@ -9878,11 +10023,27 @@ impl<'a> OffscreenObjects<'a> {
                     }
                 }
                 RenderInputSource::TraceBytes(bytes) => {
-                    self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
+                    let texels = texture.gathered.as_deref().unwrap_or(bytes);
+                    self.upload_render_texture(
+                        image,
+                        memory,
+                        &requirements,
+                        width,
+                        height,
+                        texels,
+                    )?;
                     None
                 }
                 RenderInputSource::StagedBytes(bytes) => {
-                    self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
+                    let texels = texture.gathered.as_deref().unwrap_or(bytes);
+                    self.upload_render_texture(
+                        image,
+                        memory,
+                        &requirements,
+                        width,
+                        height,
+                        texels,
+                    )?;
                     None
                 }
                 // The trace's own production uploads exactly as the two
@@ -9890,7 +10051,15 @@ impl<'a> OffscreenObjects<'a> {
                 // what makes it different is where the bytes came from, not
                 // how the rail gets them into the sampled image.
                 RenderInputSource::ProducedBytes(bytes) => {
-                    self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
+                    let texels = texture.gathered.as_deref().unwrap_or(bytes);
+                    self.upload_render_texture(
+                        image,
+                        memory,
+                        &requirements,
+                        width,
+                        height,
+                        texels,
+                    )?;
                     None
                 }
             };
@@ -9939,8 +10108,14 @@ impl<'a> OffscreenObjects<'a> {
                 .transpose()?;
             if copy_source.is_none() {
                 self.context.record_buffer_upload();
-                self.context
-                    .record_buffer_upload_bytes(texture.source.len());
+                // The gathered surface is what the upload carries, so its own
+                // length is the one this accounting states
+                // (`research/docs/23` §111, E-TX5).
+                let uploaded = texture
+                    .gathered
+                    .as_ref()
+                    .map_or_else(|| texture.source.len(), Vec::len);
+                self.context.record_buffer_upload_bytes(uploaded);
             }
             self.textures.push(SampledTextureObjects {
                 image,
@@ -13107,14 +13282,18 @@ mod tests {
         .expect("the reviewed sampling shape is admitted");
         assert_eq!(request.textures.len(), 1);
         assert_eq!(request.textures[0].extent, [4, 4]);
+        assert!(request.textures[0].gathered.is_none());
         assert_eq!(request.textures[0].source.len(), 64);
 
-        // Another extent puts some fragment's sample on a texel boundary or
-        // inside a neighbour, which is a filtered read the review never
-        // covered.
+        // An extent of another size is read through the destination grid
+        // (`research/docs/23` §111, E-TX5): the 2x2 source's four texels are
+        // gathered into the 4x4 surface the module samples, columns and rows
+        // both landing on `0, 0, 1, 1` — `(2c + 1) * 2 / 8` is `0` for the
+        // first two destination pixels and `1` for the last two — so the
+        // image the rail binds is still the render area's own extent.
         let mut other_extent = sampled_pass(4);
         other_extent.textures = vec![sampled_texture_view(2, 2)];
-        let refused = match prepare_render_request(
+        let request = prepare_render_request(
             &stages,
             &other_extent,
             &previous,
@@ -13122,13 +13301,31 @@ mod tests {
             0,
             0,
             SpirvFeaturePolicy::PHASE1,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("the rail must refuse a texture of another extent"),
-        };
-        eprintln!("refused: {refused:?}");
-        assert_eq!(refused.slug, "render_texture_extent_unsupported");
-        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        )
+        .expect("a source of another extent is gathered, not refused");
+        assert_eq!(request.textures.len(), 1);
+        assert_eq!(request.textures[0].extent, [4, 4]);
+        assert_eq!(request.textures[0].source.len(), 16);
+        let gathered = request.textures[0]
+            .gathered
+            .as_deref()
+            .expect("the widened shape uploads the gathered surface");
+        let row = [
+            0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0x01, 0x00, 0x01, 0xff, 0x01, 0x00,
+            0x01, 0xff,
+        ];
+        let lower = [
+            0x00, 0x01, 0x01, 0xff, 0x00, 0x01, 0x01, 0xff, 0x01, 0x01, 0x02, 0xff, 0x01, 0x01,
+            0x02, 0xff,
+        ];
+        let mut expected = Vec::new();
+        // Two destination rows per source row: the first two rows read source
+        // row 0 (`y` is 0 for both), the last two read source row 1.
+        expected.extend_from_slice(&row);
+        expected.extend_from_slice(&row);
+        expected.extend_from_slice(&lower);
+        expected.extend_from_slice(&lower);
+        assert_eq!(gathered, expected.as_slice());
 
         // The widened window (`research/docs/23` §107): the declaration and the
         // binding agree on `bgra8_unorm` — the census's BGRA8 binds — and this
@@ -13220,6 +13417,169 @@ mod tests {
             .detail
             .as_deref()
             .is_some_and(|detail| detail.contains("declares texture binding 0")));
+    }
+
+    /// The destination grid the census's own shapes read through
+    /// (`research/docs/23` §111, E-TX5).
+    ///
+    /// These are the numbers behind the census v18 `texture_extent` bucket: the
+    /// fork's class gate refuses a draw whose `[[texture(3)]]` is another size
+    /// than the pass, and the two biggest shapes are `64x64 in 80x64` and
+    /// `160x64 in 186x100`. Both are answered by the same floor rule — the
+    /// source texel the destination pixel's own centre falls in — and both keep
+    /// the destination pixel count and never leave the source's span.
+    #[test]
+    fn the_destination_grid_gathers_the_census_shapes() {
+        // `64x64 in 80x64`: `x = floor((2c + 1) * 64 / 160)`.
+        assert_eq!(gather_texel_index(0, 64, 80), 0);
+        assert_eq!(gather_texel_index(1, 64, 80), 1);
+        // An exact boundary (`(2 * 2 + 1) * 64 = 320 = 2 * 160`) lands on the
+        // higher texel, and it is this integer division that decides it.
+        assert_eq!(gather_texel_index(2, 64, 80), 2);
+        assert_eq!(gather_texel_index(3, 64, 80), 2);
+        assert_eq!(gather_texel_index(79, 64, 80), 63);
+        // The other axis of the same pair is an identity: 64 source rows into
+        // 64 destination rows, every centre in its own texel.
+        for row in [0, 1, 31, 62, 63] {
+            assert_eq!(gather_texel_index(row, 64, 64), row);
+        }
+        // `160x64 in 186x100`: neither axis is a power-of-two ratio.
+        assert_eq!(gather_texel_index(0, 160, 186), 0);
+        assert_eq!(gather_texel_index(1, 160, 186), 1);
+        assert_eq!(gather_texel_index(2, 160, 186), 2);
+        assert_eq!(gather_texel_index(185, 160, 186), 159);
+        assert_eq!(gather_texel_index(0, 64, 100), 0);
+        assert_eq!(gather_texel_index(99, 64, 100), 63);
+
+        // The gather itself, on a shape whose two axes disagree: a 3x2 source
+        // into a 2x3 destination reads columns `0, 2` and rows `0, 1, 1`, and
+        // the row in the middle is the exact boundary `(2 * 1 + 1) * 2 = 6`.
+        let source = (0..2u8)
+            .flat_map(|y| (0..3u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect::<Vec<_>>();
+        let gathered = gather_render_texture(&source, [3, 2], [2, 3], 4);
+        assert_eq!(
+            gathered,
+            vec![
+                0x00, 0x00, 0x00, 0xff, 0x02, 0x00, 0x02, 0xff, 0x00, 0x01, 0x01, 0xff, 0x02, 0x01,
+                0x03, 0xff, 0x00, 0x01, 0x01, 0xff, 0x02, 0x01, 0x03, 0xff,
+            ]
+        );
+    }
+
+    /// The one sampled source the widened extent window cannot gather is the
+    /// owner's no-copy window: its whole statement is that the *device* reads
+    /// the owner's mapping, so a source of another extent would need a host
+    /// copy the arm does not carry (`research/docs/23` §111, E-TX5). The
+    /// refusal keeps the name the pre-widening window published for every
+    /// extent, so a capture can still read which shape stood on the boundary.
+    #[test]
+    fn a_no_copy_sampled_texture_of_another_extent_keeps_its_name() {
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        let mut view = sampled_texture_view(2, 2);
+        view.source = TextureSource::BorrowedNoCopy(LeaseId::new(7));
+        pass.textures = vec![view];
+        let previous = vec![None];
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the no-copy window of another extent has no host bytes to gather"),
+        };
+        eprintln!("no-copy extent: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_extent_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(refused.fields.get("width"), Some(&FieldValue::Unsigned(2)));
+        assert_eq!(refused.fields.get("height"), Some(&FieldValue::Unsigned(2)));
+        assert_eq!(
+            refused.fields.get("render_width"),
+            Some(&FieldValue::Unsigned(4))
+        );
+        assert_eq!(
+            refused.fields.get("render_height"),
+            Some(&FieldValue::Unsigned(4))
+        );
+        assert_eq!(
+            refused.fields.get("source"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert!(refused
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no-copy window")));
+    }
+
+    /// A translated module is bound to its source at the source's own extent
+    /// (`research/docs/23` §111, E-TX5): the module states its own sample
+    /// coordinates — this fixture reads two absolute ones — so the rail must
+    /// not reinterpret them by gathering the source into the render area's
+    /// grid. The census's own shapes arrive through this arm, because the fork
+    /// registers the guest's translated stages, so this reading is the shape
+    /// the gate has to stop refusing.
+    #[test]
+    fn a_translated_module_binds_a_source_of_another_extent_at_its_own_extent() {
+        use metal2vulkan::passes::{Stage, TransformOptions};
+
+        let fixture =
+            include_str!("../tests/fixtures/render_sample_texture_2d_nearest_clamp.frag.ll");
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        let (fragment_spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            fixture,
+            Stage::Fragment,
+            scratch.path(),
+            TransformOptions::default(),
+        )
+        .expect("the nearest/clamp sampling fixture translates");
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract::sampled(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                    REVIEWED_SAMPLER_POLICY,
+                )],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        stages
+            .validate_stage_pair()
+            .expect("the translated sampling stage is executable");
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![sampled_texture_view(6, 4)];
+        let request = prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("a translated module may read a source of its own extent");
+        assert_eq!(request.textures.len(), 1);
+        // The image the rail creates is the *source's* size, and the bytes it
+        // uploads are the source's own: nothing was gathered.
+        assert_eq!(request.textures[0].extent, [6, 4]);
+        assert!(request.textures[0].gathered.is_none());
+        assert_eq!(request.textures[0].source.len(), 6 * 4 * 4);
     }
 
     /// The reviewed pair's window in the runtime-sampler increment and the
