@@ -748,11 +748,13 @@ fn translated_stages_land_the_same_bytes_through_a_present_tail() {
     );
 }
 
-/// A translation that reads no vertex stream cannot describe a contract whose
-/// vertex layout declares one — and the refusal is what keeps the pipeline from
-/// being built with a vertex input state the shader never consumes.
+/// A contract that declares an attribute the translation never reads is the
+/// declared-superset interface (`research/docs/23` §3.3, E-TX11): the stream is
+/// bound and ignored, exactly as `MTLVertexDescriptor` lets a function ignore a
+/// declared location, so the registration is accepted and consumes a pipeline
+/// identity like any other.
 #[test]
-fn a_translation_missing_a_declared_vertex_attribute_is_refused() {
+fn a_translation_that_reads_no_declared_attribute_still_registers() {
     let Some((executor, provider)) = provider_with_device() else {
         return;
     };
@@ -767,14 +769,78 @@ fn a_translation_missing_a_declared_vertex_attribute_is_refused() {
             format: VertexFormat::Float32x2,
         }],
     }]);
-    let refused = provider
+    let superset = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
             contract,
             vertex,
             fragment,
             logical_digest: digest(b"translated-missing-attribute"),
         })
-        .expect_err("a contract attribute the shader does not read is a different interface");
+        .expect("a declared attribute the stage does not read is a stream it ignores");
+    eprintln!("superset pipeline id: {}", superset.pipeline_id.get());
+    assert_eq!(
+        superset.pipeline_id.get(),
+        1,
+        "the superset registration is a registration, and takes the first identity"
+    );
+
+    // The next registration keeps the sequence: the shape above is registered
+    // rather than refused, so it does consume the identity a refusal would have
+    // left free.
+    let reviewed = register_reviewed(&provider).expect("the reviewed pair registers");
+    eprintln!("reviewed pipeline id: {}", reviewed.pipeline_id.get());
+    assert_eq!(
+        reviewed.pipeline_id.get(),
+        2,
+        "the registration after it takes the next identity"
+    );
+}
+
+/// The reverse direction keeps its refusal (`research/docs/23` §3.3, E-TX11): a
+/// location the stage reads that no declared attribute covers would leave that
+/// vertex input undefined, so the registration is refused by name with the
+/// location in its fields — and it consumes no pipeline identity.
+#[test]
+fn a_translation_reading_a_location_the_layout_does_not_declare_is_refused() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let policy = provider.spirv_feature_policy();
+    let vertex = translate_stage_with_policy(
+        &executor,
+        RenderStage::Vertex,
+        TWO_STREAM_VERTEX_AIR,
+        TWO_STREAM_VERTEX_ENTRY,
+        policy,
+    )
+    .expect("the two-stream fixture translates");
+    let fragment = translate_stage_with_policy(
+        &executor,
+        RenderStage::Fragment,
+        FRAGMENT_AIR,
+        FRAGMENT_ENTRY,
+        policy,
+    )
+    .expect("the shared fragment fixture translates");
+    // The stage reads locations 0 and 1; the layout declares only 0.
+    let mut contract = two_stream_contract();
+    contract.vertex_layout = VertexLayout::Buffers(vec![VertexBufferLayout {
+        stride: 8,
+        step: VertexStep::PerVertex,
+        attributes: vec![VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Float32x2,
+        }],
+    }]);
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract,
+            vertex,
+            fragment,
+            logical_digest: digest(b"translated-undeclared-location"),
+        })
+        .expect_err("a location the module reads has to be one the layout declares");
     eprintln!("refused: {refused:?}");
     assert_eq!(refused.slug, "render_stage_reflection_mismatch");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
@@ -787,19 +853,14 @@ fn a_translation_missing_a_declared_vertex_attribute_is_refused() {
         Some(&FieldValue::Text("vertex_attributes".to_owned()))
     );
     assert_eq!(
-        refused.fields.get("declared_attributes"),
-        Some(&FieldValue::Unsigned(1))
-    );
-    assert_eq!(
-        refused.fields.get("reflected_attributes"),
-        Some(&FieldValue::Unsigned(0))
+        refused.fields.get("location"),
+        Some(&FieldValue::Unsigned(1)),
+        "the refusal names the location the layout does not declare"
     );
 
     // Nothing was registered: the refusal happens before the provider mints a
-    // pipeline id, so the next registration takes the id this one would have
-    // taken.
+    // pipeline id.
     let reviewed = register_reviewed(&provider).expect("the reviewed pair registers");
-    eprintln!("reviewed pipeline id: {}", reviewed.pipeline_id.get());
     assert_eq!(
         reviewed.pipeline_id.get(),
         1,

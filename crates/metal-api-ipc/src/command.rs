@@ -4746,10 +4746,10 @@ mod tests {
         // not a silent read of the block's payload as another section.
         let mut unknown_escape = frame.clone();
         let escape_at = unknown_escape.len() - 3;
-        unknown_escape[escape_at] = 0x03;
+        unknown_escape[escape_at] = 0x04;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_escape).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x03)
+            CodecError::UnknownCapabilityTail(0x04)
         ));
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
@@ -4965,6 +4965,181 @@ mod tests {
         };
         assert!(decoded.supports_render_stage_buffer_namespace_split);
         assert!(!decoded.supports_render_texture_gathered_extent);
+    }
+
+    /// The superset vertex interface's bit travels in the escape family's
+    /// *third* block (`research/docs/23` §3.3, E-TX11).
+    ///
+    /// The block follows the gathered-extent one and carries the family's next
+    /// tag, so the frame is the pre-increment frame with one more
+    /// `0x00 <tag> <bool>` section appended. The readings are the increment's
+    /// wire obligations: the round trip keeps every field, the bytes before the
+    /// block are the frame the same snapshot writes without it (so neither the
+    /// gathered-extent block nor anything before it moved), and the frame
+    /// re-encodes byte for byte.
+    #[test]
+    fn the_superset_vertex_interface_bit_travels_in_the_family_s_third_block() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        capabilities.supports_render_texture_gathered_extent = true;
+        // The frame the same snapshot writes with the superset shape at its
+        // default: the new block's absence has to leave every byte before it
+        // exactly where the previous increment put them.
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(&without[without.len() - 3..], &[0x00, 0x02, 0x01]);
+
+        capabilities.supports_render_vertex_interface_superset = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // One escape byte, the family's third tag and one bool.
+        let block = [0x00, 0x03, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the superset interface's block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        // The gathered-extent block is still exactly the section before it: a
+        // decoder that stops after the family's second block (the E-TX10 walk)
+        // leaves these three bytes unconsumed rather than reading the new
+        // section as another block's payload.
+        assert_eq!(
+            &frame[frame.len() - 6..frame.len() - 3],
+            &[0x00, 0x02, 0x01],
+            "the gathered-extent block keeps its place in front of the new one"
+        );
+        eprintln!(
+            "superset-interface capability frame: len={} without={} block={block:02x?}",
+            frame.len(),
+            without.len()
+        );
+    }
+
+    /// A snapshot that declares *only* the superset vertex interface still
+    /// writes the extended payload, and the three vertex-input fields keep
+    /// their own readings beside it (`research/docs/23` §3.3, E-TX11).
+    #[test]
+    fn an_only_superset_interface_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        let prior = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(prior[9], 0x01, "the default snapshot keeps the legacy tag");
+
+        capabilities.supports_render_vertex_interface_superset = true;
+        assert!(capabilities.declares_render_vertex_interface_superset_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the only-superset-interface capability frame re-encodes byte for byte"
+        );
+        // The declaration is the frame's last three bytes; the pre-increment
+        // *code* wrote no frame with this shape at all (its tag guard answered
+        // "legacy payload" and the declaration would have been dropped), which
+        // is exactly the failure the bit's own guard exists to prevent. What a
+        // decoder of the previous increment sees is the escape byte followed by
+        // the family tag it does not know: a typed refusal rather than a
+        // snapshot read as "the shape was not declared".
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x03, 0x01]);
+        let mut old_walk = frame.clone();
+        old_walk.truncate(frame.len() - 3);
+        assert_eq!(
+            &old_walk[FRAME_HEADER..],
+            &frame[FRAME_HEADER..frame.len() - 3],
+            "the new block is the frame's only addition after the payload"
+        );
+        // The shape bit is not one of the three vertex-input fields: the block
+        // they travel in stays unwritten, and the decoder reads their defaults
+        // back.
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(decoded.max_vertex_buffers, 0);
+        assert!(decoded.supported_vertex_formats.is_empty());
+        assert!(decoded.supported_index_formats.is_empty());
+        assert!(decoded.supports_render_vertex_interface_superset);
+        eprintln!(
+            "only superset interface: extended len={} prior len={}",
+            frame.len(),
+            prior.len()
+        );
+    }
+
+    /// A frame that ends before the superset block reads the bit as `false`,
+    /// and the family's closed set now names three tags
+    /// (`research/docs/23` §3.3, E-TX11).
+    #[test]
+    fn a_frame_without_the_superset_block_reads_the_bit_as_false() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        capabilities.supports_render_vertex_interface_superset = true;
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+
+        // The pre-increment frame is this frame's payload without its three
+        // trailing bytes, reframed: the walk finds nothing after the
+        // folded-shape block (this snapshot declares no gathered extent) and
+        // keeps the bit's default.
+        let mut prior_capabilities = capabilities.clone();
+        prior_capabilities.supports_render_vertex_interface_superset = false;
+        let expected = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: prior_capabilities,
+        };
+        let prior = CommandCodec::encode_response(&expected).unwrap();
+        assert_eq!(
+            &prior[FRAME_HEADER..],
+            &frame[FRAME_HEADER..frame.len() - 3],
+            "the pre-increment payload is this payload without the block"
+        );
+        assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
+
+        // The family's tags are a closed set and `0x04` is the next tag the
+        // family has not assigned: a byte no version of the walk may read as a
+        // section is a typed refusal.
+        let mut unknown_tag = frame.clone();
+        let tag_at = unknown_tag.len() - 2;
+        unknown_tag[tag_at] = 0x04;
+        assert!(matches!(
+            CommandCodec::decode_response(&unknown_tag).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x04)
+        ));
     }
 
     #[test]
@@ -6065,6 +6240,7 @@ mod tests {
                     max_vertex_buffers: 0,
                     supported_vertex_formats: Vec::new(),
                     supported_index_formats: Vec::new(),
+                    supports_render_vertex_interface_superset: false,
                     supports_render_instancing: false,
                     max_render_instances: 0,
                     supports_render_multisample: false,
@@ -6446,6 +6622,7 @@ mod tests {
             max_vertex_buffers: 0,
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
+            supports_render_vertex_interface_superset: false,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,

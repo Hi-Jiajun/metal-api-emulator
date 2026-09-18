@@ -526,8 +526,11 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # E-TX10), whose translated render case and declaring pass
         # `test_suite_v36.py` pins, so it joins the list as well — and v37 the
         # render sampler's narrow lanes (`research/docs/23` §3.3, §113), whose
-        # one-case plan `test_suite_v37.py` pins.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 36)
+        # one-case plan `test_suite_v37.py` pins — and v38 carries the
+        # declared-superset vertex interface (`research/docs/23` §3.3, E-TX11),
+        # whose translated render case and declaring pass `test_suite_v38.py`
+        # pins, so it joins the list too.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 37)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -544,7 +547,8 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v30", "compute-buffer-v31",
                                       "compute-buffer-v32", "compute-buffer-v33",
                                       "compute-buffer-v34", "compute-buffer-v35",
-                                      "compute-buffer-v36", "compute-buffer-v37"):
+                                      "compute-buffer-v36", "compute-buffer-v37",
+                                      "compute-buffer-v38"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

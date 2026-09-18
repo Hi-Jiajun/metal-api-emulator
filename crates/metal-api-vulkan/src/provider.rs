@@ -152,6 +152,22 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_vertex_buffers: metal_api_core::provider::MAX_VERTEX_BUFFERS as u32,
         supported_vertex_formats: metal_api_core::provider::VertexFormat::ADMITTED.to_vec(),
         supported_index_formats: metal_api_core::provider::IndexFormat::ADMITTED.to_vec(),
+        // The superset vertex interface is executed (`research/docs/23` §3.3,
+        // E-TX11): `render.rs` builds the pipeline's vertex input state from the
+        // *contract's* own layout — one `VkVertexInputAttributeDescription` per
+        // declared attribute across the streams `resolve_vertex_streams`
+        // pairs with the pass's bindings — so a layout that declares more
+        // locations than the module reads binds those extra streams and the
+        // module simply consumes the locations it declares. The registration
+        // gate is what this bit's declaration follows: it holds every reflected
+        // location to a declared attribute with the same component shape, while
+        // extra declared attributes are bound and ignored
+        // (`tests/render_vertex_superset_e2e.rs`, whose four-attribute stream
+        // lands the two-attribute frame byte for byte). The bit names exactly
+        // that direction: a location the module reads with no declared
+        // attribute covering it stays refused by name, because the driver would
+        // leave that input undefined.
+        supports_render_vertex_interface_superset: true,
         // Instancing is executed (`render.rs` builds each binding's input rate
         // from the layout's step and issues `vkCmdDraw*` with the pass's own
         // instance count). Evidence: the reviewed `instanced_pair_4x4` case on
@@ -886,6 +902,25 @@ mod tests {
         );
         assert!(capabilities.supports_render_texture_gathered_extent);
         assert!(capabilities.declares_render_texture_gathered_extent_support());
+        // The superset vertex interface (`research/docs/23` §3.3, E-TX11): the
+        // three vertex-input readings below are unchanged by the new bit, and
+        // the shape bit is declared because this rail's vertex input state is
+        // built from the contract's own layout — the four-attribute stream in
+        // `tests/render_vertex_superset_e2e.rs` lands the two-attribute frame.
+        assert_eq!(
+            capabilities.max_vertex_buffers,
+            metal_api_core::provider::MAX_VERTEX_BUFFERS as u32
+        );
+        assert_eq!(
+            capabilities.supported_vertex_formats,
+            metal_api_core::provider::VertexFormat::ADMITTED.to_vec()
+        );
+        assert_eq!(
+            capabilities.supported_index_formats,
+            metal_api_core::provider::IndexFormat::ADMITTED.to_vec()
+        );
+        assert!(capabilities.supports_render_vertex_interface_superset);
+        assert!(capabilities.declares_render_vertex_interface_superset_support());
     }
 
     #[test]

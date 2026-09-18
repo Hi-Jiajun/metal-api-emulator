@@ -642,6 +642,19 @@ const CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL: u8 = 0x01;
 /// section added later in the same position rule.
 const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL: u8 = 0x02;
 
+/// Tag, inside the tail's second family, of the superset vertex interface's
+/// block (`research/docs/23` §3.3, E-TX11).
+///
+/// The section follows the gathered-extent block and carries one bool: whether
+/// the snapshot executes a pipeline whose contract's vertex layout declares
+/// every location the stage's reflection reads *plus* locations it does not
+/// read ([`ProviderCapabilities::supports_render_vertex_interface_superset`]).
+/// It is the family's third tag rather than a ninth bit flag because the
+/// tail's original tag space is the eight powers of two `0x01..=0x80`, which
+/// the eight blocks before the family have all taken; its own escape byte
+/// keeps a section added later in the same position rule.
+const CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL: u8 = 0x03;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -860,6 +873,13 @@ impl CommandCodec {
                     // declares only it still has to write the extended payload,
                     // or its declaration would be dropped on the wire.
                     || capabilities.declares_render_texture_gathered_extent_support()
+                    // The superset vertex interface's bit is the vertex-input
+                    // face's fourth question (`research/docs/23` §3.3, E-TX11),
+                    // so it joins through that face's own predicate for the
+                    // same reason: a snapshot that declares only it still has
+                    // to write the extended payload, or its declaration would
+                    // be dropped on the wire.
+                    || declares_vertex_input_face(capabilities)
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -5471,6 +5491,29 @@ fn declares_render_texture_face(capabilities: &ProviderCapabilities) -> bool {
         || capabilities.declares_render_texture_gathered_extent_support()
 }
 
+/// Whether the vertex-input face declares anything the extended payload has to
+/// carry (`research/docs/23` §3.3, E-TX11).
+///
+/// The three vertex-input fields are one question — "how many streams may a
+/// pass declare, and with which attribute formats and index widths" — and the
+/// superset interface is the same face's second one ("does it execute a layout
+/// that declares more attributes than the module reads"). Both spell the
+/// encoder's two guards through this predicate so each guard asks one question
+/// about the face instead of one call site reading the three fields and another
+/// reading the shape bit: a snapshot that declares *only* the superset shape
+/// still has to write the heap/ICB half the decoder reads by position before
+/// the tag, or the declaration would be dropped on the wire — the exact failure
+/// every `declares_*` predicate exists to prevent.
+///
+/// The vertex-input block itself stays gated by
+/// [`ProviderCapabilities::declares_vertex_input_support`]: the shape bit is
+/// not one of those three fields, so a snapshot that declares only it writes no
+/// block for them and its frame ends at the shape's own section.
+fn declares_vertex_input_face(capabilities: &ProviderCapabilities) -> bool {
+    capabilities.declares_vertex_input_support()
+        || capabilities.declares_render_vertex_interface_superset_support()
+}
+
 /// Encode a capability snapshot, including its render bits.
 ///
 /// Only [`RENDER_CAPABILITIES_RESPONSE`] frames use this layout. A snapshot
@@ -5531,7 +5574,14 @@ fn put_capabilities(
     // section the remaining bytes carry.
     if capabilities.declares_heap_support()
         || capabilities.declares_icb_support()
-        || capabilities.declares_vertex_input_support()
+        // The vertex-input face's fourth question is the superset interface
+        // (`research/docs/23` §3.3, E-TX11), so the face's own predicate is what
+        // this guard asks: a snapshot that declares only that shape still has
+        // to write the heap/ICB half the decoder reads by position before the
+        // tag, and the face predicate is what keeps the declaration from being
+        // dropped on the wire. The vertex-input block itself keeps its own
+        // three-field gate below.
+        || declares_vertex_input_face(capabilities)
         || capabilities.declares_instancing_support()
         // A snapshot that declares multisampling but none of the blocks before
         // it still has to write the heap/ICB half, because the decoder reads
@@ -5735,6 +5785,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL);
             encoder.bool(capabilities.supports_render_texture_gathered_extent);
         }
+        // The superset vertex interface's block is the tail's newest section
+        // and follows the gathered-extent block (`research/docs/23` §3.3,
+        // E-TX11). It is the third tag of the escape family, so it carries its
+        // own escape byte and the family's next tag; every section keeps the
+        // walk's position rule — the decoder reads them in exactly the order
+        // this encoder writes them. A snapshot whose bit stays at its default
+        // writes nothing here, and the decoder reads the missing section as
+        // `false` — the "do not submit a layout the module does not fill"
+        // default a consumer keeps its fail-closed direction with.
+        if capabilities.declares_render_vertex_interface_superset_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL);
+            encoder.bool(capabilities.supports_render_vertex_interface_superset);
+        }
     }
     Ok(())
 }
@@ -5796,6 +5860,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // even later than the folded shape: a legacy payload cannot carry it
         // and reads the consumer's fail-closed default.
         supports_render_texture_gathered_extent: false,
+        // The superset vertex interface's bit (`research/docs/23` §3.3,
+        // E-TX11) is the family's third block: a legacy payload cannot carry
+        // it either, so it reads the same fail-closed default — a registration
+        // whose layout and reflection disagree would be refused by name rather
+        // than executed against a vertex input state one side did not state.
+        supports_render_vertex_interface_superset: false,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,
@@ -5908,7 +5978,8 @@ fn decode_capability_extended_tail(
         let family_tag = decoder.u8()?;
         match family_tag {
             CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL
-            | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL => {}
+            | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL
+            | CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -5921,8 +5992,10 @@ fn decode_capability_extended_tail(
         previous_family_tag = family_tag;
         if family_tag == CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL {
             capabilities.supports_render_stage_buffer_namespace_split = decoder.bool()?;
-        } else {
+        } else if family_tag == CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL {
             capabilities.supports_render_texture_gathered_extent = decoder.bool()?;
+        } else {
+            capabilities.supports_render_vertex_interface_superset = decoder.bool()?;
         }
         // The run ends with the frame, so a byte after a family section is
         // either the next section's own escape or a frame the encoder cannot

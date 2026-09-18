@@ -1205,6 +1205,14 @@ def _vertex_input_declaration(case, where):
         return None
     _object(layout, ("buffers",), f"{where}.vertex_layout")
     streams = _list(layout["buffers"], f"{where}.vertex_layout.buffers")
+    # The declared-superset arm (`research/docs/23` §3.3, E-TX11): a
+    # *translated* case whose contract declares more attribute locations than
+    # its module reads. It is its own closed shape — one stream, four
+    # `float32x2` attributes at `8 * location` over a 32-byte record — and it is
+    # classified before the reviewed arms, because a translated case pins AIR
+    # modules the reviewed shapes have no MSL module for.
+    if case.get("translated_stages") is not None:
+        return _superset_declaration(case, streams, vertex_buffers, indices, where)
     if len(streams) == 2:
         return _instanced_declaration(case, streams, vertex_buffers, indices, where)
     # The two reviewed pair shapes are mutually exclusive and the culling one
@@ -1292,6 +1300,104 @@ def _unorm_texel(record, where):
                  f"{where}: a reviewed instance tint is zero or one per component")
         texel[index] = 0xFF if component == 1.0 else 0x00
     return bytes(texel)
+
+
+def _superset_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the declared-superset vertex interface (`research/docs/23` §3.3, E-TX11).
+
+    The shape is the census's: a *translated* vertex module reads a subset of
+    the locations its contract's layout declares, and the extra declared
+    attributes are bound and ignored. The geometry is one stream of 32-byte
+    records carrying four `float32x2` attributes — the two the module reads at
+    the record's head (locations 0 and 1, offsets 0 and 8) and the two it never
+    reads at locations 2 and 3 (offsets 16 and 24) — so the fixture can state
+    both halves of the rule: the frame is the read attributes' function, and the
+    ignored bytes do not enter it. Anything else is refused here rather than
+    read as a shape the review did not cover: two streams, another stride,
+    another attribute set or a selected draw are not this arm.
+    """
+    quad_vertices, quad_indices, quad_stride = 4, 6, 8
+    superset_stride = 32
+    _require(len(streams) == 1,
+             f"{where}: the declared-superset shape is one vertex stream")
+    stream = streams[0]
+    _object(stream, ("stride", "step", "attributes"),
+            f"{where}.vertex_layout.buffers[0]")
+    _require((stream["stride"], stream["step"]) == (superset_stride, "per_vertex"),
+             f"{where}: the declared-superset stream is stride {superset_stride} and steps "
+             "per vertex")
+    attributes = _list(stream["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 4,
+             f"{where}: the declared-superset layout declares four attributes")
+    for location, attribute in enumerate(attributes):
+        attribute_where = f"{where}.vertex_layout.buffers[0].attributes[{location}]"
+        _object(attribute, ("location", "offset", "format"), attribute_where)
+        _require((attribute["location"], attribute["offset"], attribute["format"])
+                 == (location, location * 8, "float32x2"),
+                 f"{attribute_where}: the declared attribute is location {location}, offset "
+                 f"{location * 8}, float32x2")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1,
+             f"{where}: the declared-superset shape binds one vertex stream")
+    binding = bindings[0]
+    _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+            f"{where}.vertex_buffers[0]")
+    _require(binding["allocation"] > 0 and binding["view"] > 0,
+             f"{where}: zero vertex stream identity")
+    _require("format" not in binding,
+             f"{where}: a vertex stream carries no index format")
+    _require(binding["length"] == superset_stride * 3,
+             f"{where}: the declared-superset stream carries exactly the three records the "
+             "fixture's triangle draws")
+    _require(len(_hex(binding["initial_hex"],
+                      f"{where}.vertex_buffers[0].initial_hex")) == binding["length"],
+             f"{where}: the vertex stream bytes do not match its length")
+    # The draw is indexed, which is the reviewed vertex-input shape's own
+    # spelling: the object rails record a vertex-buffer draw through their
+    # indexed entry points, and the three indices name the three vertices in
+    # order, so the geometry the module reads is the fixture's own triangle.
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["allocation"] > 0 and indices["view"] > 0,
+             f"{where}: zero index buffer identity")
+    index_width = {"uint16": 2, "uint32": 4}.get(indices["format"])
+    _require(index_width is not None,
+             f"{where}.indices: the declared-superset shape selects through a uint16 or "
+             "uint32 index buffer")
+    _require(indices["length"] == index_width * 3,
+             f"{where}.indices: the declared-superset shape draws the three vertices the "
+             "stream carries")
+    index_bytes = _hex(indices["initial_hex"], f"{where}.indices.initial_hex")
+    _require(len(index_bytes) == indices["length"],
+             f"{where}.indices: the index bytes do not match their length")
+    for position in range(3):
+        chunk = index_bytes[position * index_width:(position + 1) * index_width]
+        _require(int.from_bytes(chunk, "little") == position,
+                 f"{where}.indices: the index at position {position} has to name vertex "
+                 f"{position}")
+    _require(case.get("base_vertex", 0) == 0,
+             f"{where}: a base vertex needs an index buffer")
+    _require(case["vertices"] == 3,
+             f"{where}: the declared-superset shape draws the translated stage's three "
+             "vertices")
+    _require(case.get("instance_count", 1) == 1,
+             f"{where}: the declared-superset shape draws one instance")
+    # The two ignored attributes are what makes the arm falsifiable: their bytes
+    # have to be far outside the clip space the read attributes use, so a rail
+    # that read them as an input would rasterize a different frame.
+    records = [_hex(binding["initial_hex"][index * superset_stride * 2:
+                                           (index + 1) * superset_stride * 2],
+                    f"{where}.vertex_buffers[0].initial_hex")
+               for index in range(3)]
+    ignored = [record[16:32] for record in records]
+    for index, record in enumerate(ignored):
+        for component in struct.unpack("<4f", record):
+            _require(abs(component) >= 2.0,
+                     f"{where}.vertex_buffers[0]: record {index}'s ignored attributes are "
+                     "outside the clip space the read attributes cover, or a rail that read "
+                     "them would land the same frame")
+    return {"indices": 3, "superset": True}
 
 
 def _instanced_declaration(case, streams, vertex_buffers, indices, where):

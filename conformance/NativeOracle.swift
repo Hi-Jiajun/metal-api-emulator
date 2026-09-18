@@ -2470,8 +2470,19 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // metadata and executes it as an ordinary compute case.
     case "compute-buffer-v37":
         expectedIDs = ["render_declaring_quad_extent"]
+    // The declared-superset vertex interface (`research/docs/23` §3.3, E-TX11;
+    // suite v38, renumbered from v37 when both increments' suites met):
+    // the declaring pass of the render case whose translated vertex stage reads
+    // two of the four attribute locations its contract declares. The render
+    // case is marked for the Vulkan rails alone — the two stages are the
+    // translator's, and this rail selects its reviewed MSL module by the
+    // layout's exact shape, so a layout with attributes no reviewed module
+    // reads is refused by name — so this oracle validates the declaring pass's
+    // metadata and executes it as an ordinary compute case.
+    case "compute-buffer-v38":
+        expectedIDs = ["render_declaring_vertex_superset"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v37 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v38 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

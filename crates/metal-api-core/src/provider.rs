@@ -9239,6 +9239,34 @@ pub struct ProviderCapabilities {
     /// Index widths this snapshot admits. Empty means none, and then no
     /// indexed draw is admissible even with a vertex buffer bound.
     pub supported_index_formats: Vec<IndexFormat>,
+    /// Whether this snapshot executes the *superset* vertex interface: one
+    /// pipeline whose contract's vertex layout declares every location the
+    /// stage's reflection reads, plus locations it does not read at all
+    /// (`research/docs/23` §3.3, E-TX11). Defaults to `false`: a registration
+    /// whose layout and reflection disagree in either direction is refused by
+    /// name instead of being executed against a vertex input state one of the
+    /// two sides did not state.
+    ///
+    /// The bit is limited **by direction**, which is the distinction the three
+    /// fields above cannot state on their own. [`Self::max_vertex_buffers`]
+    /// still answers "how many streams may one pass declare",
+    /// [`Self::supported_vertex_formats`] and [`Self::supported_index_formats`]
+    /// still answer "which attribute formats and index widths". This bit
+    /// answers one more question: "does the snapshot execute a layout that
+    /// declares *more* attribute locations than the module reads, with the
+    /// extra declared attributes bound and ignored". It MUST NOT be read as
+    /// "the snapshot tolerates any difference between the two": the reverse
+    /// direction — a location the module reads that no declared attribute
+    /// covers — is a vertex input the driver would leave undefined, and it
+    /// stays refused by name whoever declares this bit.
+    ///
+    /// Declared `true` by the snapshots whose rail already executes that
+    /// half: the Vulkan rail's vertex input state is built from the contract's
+    /// own layout (`tests/render_vertex_superset_e2e.rs`), and left at the
+    /// default by the native rail, whose reviewed-module table selects a
+    /// module by the layout's exact shape and therefore refuses a layout with
+    /// attributes no reviewed module reads.
+    pub supports_render_vertex_interface_superset: bool,
     /// Whether this snapshot can execute the instanced draw of
     /// `research/docs/23` §3.3 (v31). Defaults to `false`: no provider draws
     /// more than one instance today, so a pass that asks for more is refused
@@ -9467,6 +9495,27 @@ impl ProviderCapabilities {
         self.max_vertex_buffers != 0
             || !self.supported_vertex_formats.is_empty()
             || !self.supported_index_formats.is_empty()
+    }
+
+    /// Whether this snapshot declares the superset vertex interface
+    /// (`research/docs/23` §3.3, E-TX11).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so the question is asked in the same place a consumer asks
+    /// every other "did this snapshot declare the shape" question, instead of
+    /// one call site reading the field and another comparing the rest of the
+    /// snapshot against its defaults. The capability frame writes the bit as
+    /// the third block of its own tagged tail family, so this predicate is
+    /// also what keeps a snapshot that declares *only* this bit from falling
+    /// back to the legacy payload and dropping the declaration on the wire.
+    ///
+    /// Like the folded stage-buffer shape's predicate, this one is
+    /// deliberately *not* part of [`Self::declares_vertex_input_support`]: the
+    /// three fields that predicate reads keep their own readings, and a
+    /// snapshot that never spoke about the superset shape keeps the default
+    /// "refuse a layout the module does not fill" answer.
+    pub fn declares_render_vertex_interface_superset_support(&self) -> bool {
+        self.supports_render_vertex_interface_superset
     }
 
     /// Whether any instancing bit differs from its default. Part of the render
@@ -15328,6 +15377,7 @@ mod tests {
             max_vertex_buffers: 0,
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
+            supports_render_vertex_interface_superset: false,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,
@@ -20454,6 +20504,44 @@ mod tests {
             declared.declares_render_texture_support(),
             "the shape bit is the capability frame's own tail block, not one of the three \
              render-sampler fields"
+        );
+    }
+
+    /// The superset vertex interface's bit is a declaration, not a default
+    /// (`research/docs/23` §3.3, E-TX11).
+    ///
+    /// A snapshot that never spoke about the shape must be read as "do not
+    /// submit a layout that declares attributes the module does not read": the
+    /// bit defaults to `false`, the predicate answers the same thing, and
+    /// setting the bit is the only way to flip either reading. The bit is
+    /// deliberately *not* one of the three vertex-input fields — it travels in
+    /// the capability frame's own tagged tail block, beside the folded
+    /// stage-buffer shape and the gathered extent — so flipping it has to leave
+    /// those three readings exactly where they were, which is what a consumer
+    /// reads "how many streams and which formats" from.
+    #[test]
+    fn the_default_snapshot_does_not_declare_the_superset_vertex_interface() {
+        let default = vertex_input_capabilities();
+        assert!(!default.supports_render_vertex_interface_superset);
+        assert!(!default.declares_render_vertex_interface_superset_support());
+
+        let mut declared = default.clone();
+        declared.supports_render_vertex_interface_superset = true;
+        assert!(declared.declares_render_vertex_interface_superset_support());
+        assert_eq!(declared.max_vertex_buffers, default.max_vertex_buffers);
+        assert_eq!(
+            declared.supported_vertex_formats,
+            default.supported_vertex_formats
+        );
+        assert_eq!(
+            declared.supported_index_formats,
+            default.supported_index_formats
+        );
+        assert_eq!(
+            default.declares_vertex_input_support(),
+            declared.declares_vertex_input_support(),
+            "the shape bit is the capability frame's own tail block, not one of the three \
+             vertex-input fields"
         );
     }
 

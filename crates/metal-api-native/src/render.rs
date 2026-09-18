@@ -1216,6 +1216,9 @@ pub(crate) struct VertexInputCapabilityBits {
     pub(crate) max_vertex_buffers: u32,
     pub(crate) supported_vertex_formats: Vec<VertexFormat>,
     pub(crate) supported_index_formats: Vec<IndexFormat>,
+    /// The superset vertex interface's bit (`research/docs/23` §3.3, E-TX11),
+    /// declared beside the three vertex-input fields it narrows.
+    pub(crate) supports_render_vertex_interface_superset: bool,
 }
 
 /// The vertex-input bits this provider declares as of the vertex-input flip.
@@ -1244,6 +1247,15 @@ pub(crate) fn vertex_input_capability_bits() -> VertexInputCapabilityBits {
         max_vertex_buffers: MAX_VERTEX_BUFFERS,
         supported_vertex_formats: DECLARED_VERTEX_FORMATS.to_vec(),
         supported_index_formats: IndexFormat::ADMITTED.to_vec(),
+        // The superset interface stays refused (`research/docs/23` §3.3,
+        // E-TX11): this rail has no reflection to hold a layout against —
+        // `reviewed_module` selects its MSL module by the layout's *exact*
+        // shape (one stream with two attributes, the instanced pair, the
+        // depth pair, …), so a layout that declares attributes no reviewed
+        // module reads matches no arm and the registration is refused by name.
+        // Declaring the bit would promise a shape this rail's module table
+        // refuses, so it keeps the consumer's fail-closed default.
+        supports_render_vertex_interface_superset: false,
     }
 }
 
@@ -10339,6 +10351,8 @@ mod tests {
             max_vertex_buffers: vertex.max_vertex_buffers,
             supported_vertex_formats: vertex.supported_vertex_formats.clone(),
             supported_index_formats: vertex.supported_index_formats.clone(),
+            supports_render_vertex_interface_superset: vertex
+                .supports_render_vertex_interface_superset,
             supports_render_instancing: false,
             max_render_instances: 0,
             // The test snapshot spells the pre-flip shape out for the same
@@ -12162,6 +12176,13 @@ mod tests {
             DECLARED_VERTEX_FORMATS.to_vec()
         );
         assert_eq!(bits.supported_index_formats, IndexFormat::ADMITTED.to_vec());
+        // The superset vertex interface is this rail's own boundary rather than
+        // a missing measurement (`research/docs/23` §3.3, E-TX11):
+        // `reviewed_module` selects its MSL module by the layout's exact shape,
+        // so a layout declaring attributes no reviewed module reads is refused
+        // by name, and the declaration stays at the contract's fail-closed
+        // default beside the three fields above.
+        assert!(!bits.supports_render_vertex_interface_superset);
         // The declared window is a strict subset of the contract's vocabulary:
         // the four normalized storages are mapped (see the sibling test) but
         // not declared, because the Apple-side reading that would declare them
