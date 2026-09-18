@@ -290,6 +290,24 @@ const SAMPLED_QUAD_VERTEX_ENTRY: &str = "vertex_main";
 /// centre reads that texel's own bytes back.
 const SAMPLED_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_sampled.frag.spv");
 
+/// The reviewed sampling pair's *gathered* sibling (`research/docs/23` §111,
+/// E-TX12).
+///
+/// The pair's second fragment module: the same `Location 0` store of a `vec4`,
+/// reading the same `DescriptorSet 0 / Binding 0` image, but as a
+/// `SAMPLED_IMAGE` texel fetch at the index the destination grid names —
+/// `floor((2 * destination_index + 1) * source / (2 * destination))`, computed
+/// on the device from the fragment's own framebuffer coordinate with the two
+/// extents injected as specialization constants. It is the module that states
+/// the one arm the sampling sibling cannot read: the owner's no-copy window of
+/// another extent. There the *device* reads the owner's mapping — the arm's own
+/// statement — so gathering the source on the host would be a copy the arm does
+/// not carry, and letting a sampler pick the texel would leave the choice to
+/// the driver's interpolation and filtering precision. The index arithmetic
+/// instead restates [`gather_texel_index`], which is why the arm's frame stays
+/// the host-bytes gather's frame byte for byte.
+const GATHERED_FETCH_FRAG_SPV: &[u8] = include_bytes!("render_spv/gathered_fetch.frag.spv");
+
 /// The sampled pass's single texture binding: the fragment stage's
 /// `DescriptorSet 0 / Binding 0`.
 const SAMPLED_TEXTURE_BINDING: u32 = 0;
@@ -480,6 +498,14 @@ fn runtime_sampler_refusal(
         )
 }
 
+/// One reviewed fragment module: the SPIR-V the rail owns for it, and the entry
+/// point that module declares.
+///
+/// Both halves travel together because the registration gate and the execution
+/// path compare the *pair* against what a registration declared
+/// (`research/docs/23` §3.3, v70; §111, E-TX12).
+type ReviewedFragmentModule = (&'static [u8], &'static str);
+
 /// The fragment stage this rail owns for the reviewed sampling pair
 /// (`research/docs/23` §3.3, v70).
 ///
@@ -492,22 +518,101 @@ fn sampled_fragment_stage(
     vertex_entry: &str,
     vertex_spirv: &[u8],
     formats: &[AttachmentFormat],
-) -> Result<Option<(&'static [u8], &'static str)>, ProviderError> {
+) -> Result<Option<ReviewedFragmentModule>, ProviderError> {
+    Ok(
+        sampled_fragment_siblings(vertex_entry, vertex_spirv, formats)?
+            .map(|[sampling, _gathered]| sampling),
+    )
+}
+
+/// Every fragment module the reviewed sampling pair admits for one colour
+/// format list (`research/docs/23` §111, E-TX12).
+///
+/// The pair has two siblings, and which one a pass runs is what the
+/// registration *declares*: the sampling module above, and the gathered fetch
+/// module that states the owner's no-copy window of another extent. The window
+/// they share — the reviewed vertex stage and the single 8-bit UNORM attachment
+/// the fixture draws into — is stated once here, so the registration gate and
+/// the execution path cannot admit different module sets.
+///
+/// `None` means the request's vertex stage is not the reviewed sampling module,
+/// so the fragment half stays the format list's solid module.
+fn sampled_fragment_siblings(
+    vertex_entry: &str,
+    vertex_spirv: &[u8],
+    formats: &[AttachmentFormat],
+) -> Result<Option<[ReviewedFragmentModule; 2]>, ProviderError> {
     if vertex_entry != SAMPLED_QUAD_VERTEX_ENTRY || vertex_spirv != SAMPLED_QUAD_VERT_SPV {
         return Ok(None);
     }
     match formats {
-        [AttachmentFormat::Rgba8Unorm] => Ok(Some((SAMPLED_UNORM8_FRAG_SPV, SOLID_FRAGMENT_ENTRY))),
+        [AttachmentFormat::Rgba8Unorm] => Ok(Some([
+            (SAMPLED_UNORM8_FRAG_SPV, SOLID_FRAGMENT_ENTRY),
+            (GATHERED_FETCH_FRAG_SPV, SOLID_FRAGMENT_ENTRY),
+        ])),
         _ => Err(capability_refusal("render_texture_format_unsupported")
             .with_field("attachments", FieldValue::Unsigned(formats.len() as u64))
             .with_detail("the reviewed sampling module draws into one Rgba8Unorm attachment")),
     }
 }
 
+/// Whether one registration declared the reviewed sampling pair's gathered
+/// sibling, and so states the no-copy window's arm itself
+/// (`research/docs/23` §111, E-TX12).
+///
+/// The answer is the *declaration*'s, not the pass's: a registration that
+/// declares the sampling module keeps every other-extent read on the
+/// destination grid's host gather, while one that declares the gathered sibling
+/// asks for the arm a sampler cannot read. A directly-constructed
+/// [`RenderStages`] is re-asked the same question at execution, because the
+/// registration gate cannot be assumed to have run.
+fn declares_gathered_fetch(stages: &RenderStages) -> bool {
+    let Ok(Some(siblings)) = sampled_fragment_siblings(
+        &stages.contract.vertex_entry,
+        &stages.vertex_spirv,
+        &stages.contract.color_formats,
+    ) else {
+        return false;
+    };
+    let [_sampling, gathered] = siblings;
+    stages.contract.fragment_entry == gathered.1 && stages.fragment_spirv.as_slice() == gathered.0
+}
+
 /// Whether a request's vertex stage is the reviewed sampling module, and so
 /// requires the pass to bind the texture the module samples.
 fn vertex_stage_is_sampled(vertex_entry: &str, vertex_spirv: &[u8]) -> bool {
     vertex_entry == SAMPLED_QUAD_VERTEX_ENTRY && vertex_spirv == SAMPLED_QUAD_VERT_SPV
+}
+
+/// The fragment module a *reviewed* registration executes, given its vertex
+/// stage and the pass's colour format list (`research/docs/23` §3.3,
+/// v31/v36/v70/v83).
+///
+/// The reviewed pairs are a closed set and each one is keyed by its vertex
+/// module: the depth pair states a depth attachment, the instanced pair
+/// forwards a per-instance tint, the sampled pair reads the pass's texture, the
+/// stage-buffer pair reads its two stage buffers, and every other vertex module
+/// keeps the format list's solid module. The registration gate asked the same
+/// question of the module it was handed, so the execution path's answer is the
+/// declared module's own.
+fn reviewed_fragment_stage(
+    vertex_entry: &str,
+    vertex_spirv: &[u8],
+    formats: &[AttachmentFormat],
+) -> Result<(&'static [u8], &'static str), ProviderError> {
+    match depth_fragment_stage(vertex_entry, vertex_spirv, formats)? {
+        Some(pair) => Ok(pair),
+        None => match instanced_fragment_stage(vertex_entry, vertex_spirv, formats)? {
+            Some(pair) => Ok(pair),
+            None => match sampled_fragment_stage(vertex_entry, vertex_spirv, formats)? {
+                Some(pair) => Ok(pair),
+                None => match stage_buffer_fragment_stage(vertex_entry, vertex_spirv, formats)? {
+                    Some(pair) => Ok(pair),
+                    None => solid_fragment_stage(formats),
+                },
+            },
+        },
+    }
 }
 
 /// The reviewed vertex stage of the stage-buffer fixture (`research/docs/23`
@@ -1066,13 +1171,21 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// two extents already agree — that arm uploads [`Self::source`]'s bytes
     /// unchanged, byte for byte the pre-E-TX5 path.
     pub gathered: Option<Vec<u8>>,
+    /// Whether the reviewed pair's *gathered* sibling reads this texture
+    /// (`research/docs/23` §111, E-TX12): the source is the owner's no-copy
+    /// window of another extent, so the image keeps the source's own extent and
+    /// the descriptor carries the image alone — no sampler, no host copy. The
+    /// two extents travel to the pipeline as specialization constants
+    /// ([`Self::extent`] and the render area's), and `gathered` stays `None`
+    /// beside it because there are no host bytes to gather.
+    pub gathered_fetch: bool,
     /// Extent in texels of the image this rail creates, uploads and binds: the
     /// render area's own when the reviewed pair's window gathered the source
     /// (`research/docs/23` §111, E-TX5), and the source view's own otherwise —
     /// which is where every equal-extent shape and every translated module
-    /// lands. The one arm that never reaches this shape with a different extent
-    /// *and* the reviewed pair is the no-copy window, which
-    /// `prepare_render_request` refuses by name.
+    /// lands. The no-copy window of another extent is read at this extent too
+    /// when the pair's gathered sibling states it (`research/docs/23` §111,
+    /// E-TX12), and refused by name when the sampling sibling does.
     pub extent: [u32; 2],
     /// The `VkFormat` the view's own `TextureFormat` names (`research/docs/23`
     /// §3.3, §107): the image this rail uploads the bytes into and the view the
@@ -1667,7 +1780,26 @@ fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
         },
         Err(_) => return false,
     };
-    stages.contract.fragment_entry == stage.1 && stages.fragment_spirv.as_slice() == stage.0
+    let accepted = |(module, entry): (&[u8], &str)| {
+        stages.contract.fragment_entry == entry && stages.fragment_spirv.as_slice() == module
+    };
+    if accepted(stage) {
+        return true;
+    }
+    // The reviewed sampling pair's window admits one further fragment module:
+    // the gathered sibling that states the owner's no-copy window of another
+    // extent (`research/docs/23` §111, E-TX12). It reads the same vertex module
+    // and the same format list, so it is a second reviewed choice beside the
+    // module the table above selected — and the module the registration
+    // *declared* is the one execution runs.
+    sampled_fragment_siblings(
+        &stages.contract.vertex_entry,
+        &stages.vertex_spirv,
+        &stages.contract.color_formats,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|siblings| siblings.into_iter().any(accepted))
 }
 
 /// Validate one translated stage against the contract it is registered under.
@@ -2701,12 +2833,33 @@ fn translated_texture_slots(
 fn render_texture_slots(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
+    extent: [u32; 2],
 ) -> Result<Vec<RenderTextureSlot>, ProviderError> {
     let count = pass.textures.len();
     let slots = match &stages.fragment_translation {
         None => {
             if count == 0 {
                 Vec::new()
+            } else if pass
+                .textures
+                .first()
+                .is_some_and(|view| no_copy_other_extent(view, extent))
+            {
+                // The owner's no-copy window of another extent
+                // (`research/docs/23` §111, E-TX12): the one arm a sampler
+                // cannot read must be fetched, so the pair's second sibling
+                // reads a `SAMPLED_IMAGE` slot and no `VkSampler` is created
+                // for it at all. Whether *these* bytes are the arm is a
+                // question the texture walk answers below and the registration
+                // answers for its own module; a pass that binds this source
+                // without declaring the gathered sibling is refused there, by
+                // name, before the slot could be written.
+                (0..REVIEWED_TEXTURE_COUNT)
+                    .map(|_| RenderTextureSlot::Fetch {
+                        set: 0,
+                        image: SAMPLED_TEXTURE_BINDING,
+                    })
+                    .collect()
             } else {
                 // The module's own window: the one slot the reviewed pair
                 // reads. A pass that binds more than
@@ -4233,7 +4386,27 @@ fn prepare_render_request_with_resident<'a>(
     // binding order with the one state the review covers, and a translated
     // fragment stage reads the slots its reflection names with the state its
     // AIR carries.
-    let texture_slots = render_texture_slots(stages, pass)?;
+    // Whether this registration declared the pair's *gathered* sibling
+    // (`research/docs/23` §111, E-TX12) is the registration's own fact, and the
+    // texture walk is what holds the pass's source to it: a registration that
+    // declares the sibling must be handed the owner's no-copy window of another
+    // extent, and one that declares the sampling sibling keeps that arm refused
+    // by name.
+    let gathered_fetch = stages.fragment_translation.is_none() && declares_gathered_fetch(stages);
+    // The gathered sibling's statement is the pass's own texture binding, so a
+    // registration that declares it over a pass that binds none has no window to
+    // read — the same refusal the execution path states for the sampling sibling
+    // (`render_texture_binding_required`), asked here so no request the rail
+    // builds can name a window nobody declared.
+    if gathered_fetch && pass.textures.is_empty() {
+        return Err(
+            capability_refusal("render_texture_binding_required").with_detail(
+                "the reviewed sampling pair's gathered sibling reads the pass's own texture \
+                 binding; this pass binds none",
+            ),
+        );
+    }
+    let texture_slots = render_texture_slots(stages, pass, extent)?;
     let textures = resolve_render_textures(
         pass,
         extent,
@@ -4241,6 +4414,7 @@ fn prepare_render_request_with_resident<'a>(
         &texture_slots,
         produced,
         stages.fragment_translation.is_none(),
+        gathered_fetch,
     )?;
     // Stage buffers (`research/docs/23` §3.3, v83) resolve right beside them:
     // the same three-arm channel, one list carrying both stages' index spaces,
@@ -4451,6 +4625,141 @@ fn prepare_render_request_with_resident<'a>(
     Ok(request)
 }
 
+/// Whether one texture declaration is the arm only the reviewed pair's
+/// *gathered* sibling can read (`research/docs/23` §111, E-TX12): the owner's
+/// no-copy window whose extent is not the render area's.
+///
+/// The predicate states the *arm*, not the module: the registered fragment
+/// stage decides whether the rail executes it (the gathered sibling) or refuses
+/// it by name (the sampling sibling). It is asked twice — once where the pass's
+/// descriptor slots are planned, and once where the source resolves — so both
+/// walks read one rule.
+fn no_copy_other_extent(view: &TextureView, extent: [u32; 2]) -> bool {
+    if !matches!(view.source, TextureSource::BorrowedNoCopy(_)) {
+        return false;
+    }
+    match (u32::try_from(view.width), u32::try_from(view.height)) {
+        (Ok(width), Ok(height)) => [width, height] != extent,
+        // An extent wider than `u32` is refused by the texture walk's own
+        // narrowing (`attachment_dimension_limit`), not by this predicate.
+        _ => true,
+    }
+}
+
+/// The name one sampled texture's source arm publishes in a refusal
+/// (`research/docs/23` §75/§110/§111), so a capture reads the arm the same way
+/// every other render-input refusal spells it.
+fn texture_source_name(source: &TextureSource) -> &'static str {
+    match source {
+        TextureSource::OwnedBytes(_) => "owned_bytes",
+        TextureSource::StagedLease(_) => "staged_lease",
+        TextureSource::BorrowedNoCopy(_) => "borrowed_no_copy",
+        TextureSource::TraceView => "trace_view",
+    }
+}
+
+/// The axis of a gathered-fetch shape whose index arithmetic leaves the module's
+/// 32-bit window, if any (`research/docs/23` §111, E-TX12).
+///
+/// The gathered sibling computes the destination grid's index in `u32`, so
+/// `(2 * destination - 1) * source` — the largest product one axis can form —
+/// has to stay below `2^32`. Every extent a Vulkan device admits is far inside
+/// that window (the widest image dimension any implementation reports today is
+/// `32768`, where `(2 * 32768 - 1) * 32768` is `2^31`), so this is a declared
+/// bound rather than a shape the census meets: a shape outside it is refused by
+/// name instead of executed with a wrapped index.
+fn gather_window_axis(source: [u32; 2], destination: [u32; 2]) -> Option<usize> {
+    (0..2).find(|axis| {
+        let destination = u64::from(destination[*axis]);
+        let source = u64::from(source[*axis]);
+        (2 * destination - 1)
+            .checked_mul(source)
+            .is_none_or(|product| product > u64::from(u32::MAX))
+    })
+}
+
+/// The refusal the *sampling* sibling's registration gives the owner's no-copy
+/// window of another extent (`research/docs/23` §111, E-TX5/E-TX12).
+///
+/// The name, the fields and the sentence are the ones the pre-E-TX12 window
+/// published, because the fact is unchanged: this module reads the destination
+/// grid's texels through a sampler, and the arm it cannot read is the one whose
+/// bytes stay at the owner's mapping.
+fn no_copy_extent_refusal(binding: u32, source: [u32; 2], render: [u32; 2]) -> ProviderError {
+    capability_refusal("render_texture_extent_unsupported")
+        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+        .with_field("width", FieldValue::Unsigned(u64::from(source[0])))
+        .with_field("height", FieldValue::Unsigned(u64::from(source[1])))
+        .with_field("render_width", FieldValue::Unsigned(u64::from(render[0])))
+        .with_field("render_height", FieldValue::Unsigned(u64::from(render[1])))
+        .with_field("source", FieldValue::Text("borrowed_no_copy".to_owned()))
+        .with_detail(
+            "the reviewed sampling shape reads a texture of another extent through the \
+             destination grid, and the one source it cannot gather is the owner's \
+             no-copy window: that arm's whole statement is that the device reads the \
+             owner's mapping, so a source of another extent would have to be copied on \
+             the host — a channel this arm does not carry",
+        )
+}
+
+/// The refusal the reviewed pair's gathered sibling gives any sampled source
+/// that is not the arm it states (`research/docs/23` §111, E-TX12).
+///
+/// The module's index arithmetic is reviewed for the owner's no-copy window of
+/// another extent and for nothing else: a pass that declares it over, say, the
+/// trace's own bytes, an equal extent, or a lease the provider may copy would be
+/// executed with a read the review never covered. The refusal names the arm the
+/// declaration actually carries, exactly as the source-walk refusals do.
+fn gathered_fetch_arm_refusal(
+    binding: u32,
+    view: &TextureView,
+    source: [u32; 2],
+    render: [u32; 2],
+) -> ProviderError {
+    capability_refusal("render_texture_gathered_fetch_arm_unsupported")
+        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+        .with_field(
+            "source",
+            FieldValue::Text(texture_source_name(&view.source).to_owned()),
+        )
+        .with_field("width", FieldValue::Unsigned(u64::from(source[0])))
+        .with_field("height", FieldValue::Unsigned(u64::from(source[1])))
+        .with_field("render_width", FieldValue::Unsigned(u64::from(render[0])))
+        .with_field("render_height", FieldValue::Unsigned(u64::from(render[1])))
+        .with_detail(
+            "the gathered fragment module states one arm — a sampled source whose extent is \
+             not the render area's and whose bytes are the owner's no-copy window — and reads \
+             it by the destination grid's own integer index; this pass's sampled source is \
+             another one, so the read is refused by name rather than executed with an index \
+             the review does not cover",
+        )
+}
+
+/// The refusal a gathered-fetch shape gets when its extents leave the module's
+/// 32-bit index window (`research/docs/23` §111, E-TX12).
+fn gathered_fetch_window_refusal(
+    binding: u32,
+    source: [u32; 2],
+    render: [u32; 2],
+    axis: usize,
+) -> ProviderError {
+    capability_refusal("render_texture_gathered_fetch_window")
+        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+        .with_field("source", FieldValue::Text("borrowed_no_copy".to_owned()))
+        .with_field("width", FieldValue::Unsigned(u64::from(source[0])))
+        .with_field("height", FieldValue::Unsigned(u64::from(source[1])))
+        .with_field("render_width", FieldValue::Unsigned(u64::from(render[0])))
+        .with_field("render_height", FieldValue::Unsigned(u64::from(render[1])))
+        .with_field("axis", FieldValue::Unsigned(axis as u64))
+        .with_field("maximum", FieldValue::Unsigned(u64::from(u32::MAX)))
+        .with_detail(
+            "the gathered fragment module resolves the destination grid's texel in 32-bit \
+             unsigned arithmetic, so `(2 * render_extent - 1) * source_extent` has to stay \
+             below 2^32 on each axis; this shape's extent pair is outside that window, and the \
+             index is not computed with a wrap",
+        )
+}
+
 /// Resolve one pass's sampled textures into the rail's own request shape
 /// (`research/docs/23` §3.3, v70/v104).
 ///
@@ -4468,10 +4777,16 @@ fn prepare_render_request_with_resident<'a>(
 ///   gathers the source into a render-area-sized surface and uploads that, and
 ///   the module still samples a surface of its own extent identity-wise. The
 ///   byte expectation stays integer arithmetic rather than a driver's filtering
-///   precision, and no fragment stands on a texel boundary. The one arm that
-///   stays outside is the no-copy window: its whole statement is that the
-///   *device* reads the owner's mapping, so gathering it would need a copy the
-///   arm does not carry, and it is refused by name;
+///   precision, and no fragment stands on a texel boundary. The one source that
+///   arm cannot gather is the owner's no-copy window — its whole statement is
+///   that the *device* reads the owner's mapping, so a host copy is a channel
+///   the arm does not carry. That source is answered by the pair's *gathered*
+///   sibling when the registration declared it (`research/docs/23` §111,
+///   E-TX12): the image keeps the source's own extent and the module fetches the
+///   destination grid's texel on the device, so the arm stays copy-free and the
+///   index stays integer arithmetic. A registration that declared the sampling
+///   sibling instead keeps the arm refused, by name, with the fields the
+///   pre-E-TX12 window published;
 /// * a *translated* module states its own sample coordinates, so the rail binds
 ///   the source at its own extent and the module reads it — exactly as the
 ///   engine's copy of that module does. The rail must not reinterpret
@@ -4482,6 +4797,11 @@ fn prepare_render_request_with_resident<'a>(
 /// reviewed pair, `false` when it is a translated module. The reviewed arm's
 /// samples are what makes the destination grid the *module's* own semantics
 /// rather than a reinterpretation of it.
+///
+/// `gathered_fetch` is the registration's own kind: `true` when it declared the
+/// reviewed pair's gathered sibling, which states the no-copy window's arm and
+/// nothing else. It is asked of the module the registration declared, so the
+/// shape a pass may execute is the shape its own pipeline states.
 ///
 /// Every refusal below names the view's own `metal_binding` rather than the
 /// entry's position, because the list may skip an index (`v104`) and the number
@@ -4502,6 +4822,7 @@ fn resolve_render_textures<'a>(
     slots: &[RenderTextureSlot],
     produced: Option<&'a ProducedTraceViews<'a>>,
     reviewed: bool,
+    gathered_fetch: bool,
 ) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
     if pass.textures.len() > MAX_RENDER_TEXTURES {
         return Err(capability_refusal("render_texture_limit")
@@ -4565,21 +4886,36 @@ fn resolve_render_textures<'a>(
         // the rail binds the source at its own extent for it; the image the
         // rail creates is then the source's own size.
         let gathered_extent = reviewed && [width, height] != extent;
+        // The owner's no-copy window of another extent (`research/docs/23` §111,
+        // E-TX12). Which fragment module the registration declared decides what
+        // happens here: the pair's *gathered* sibling states this arm and reads
+        // it with the destination grid's own integer index on the device, while
+        // the *sampling* sibling keeps the arm refused by name — its read would
+        // leave the texel choice to the driver's interpolation and filtering
+        // precision, and the arm carries no host bytes to gather.
         if gathered_extent && matches!(view.source, TextureSource::BorrowedNoCopy(_)) {
-            return Err(capability_refusal("render_texture_extent_unsupported")
-                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
-                .with_field("width", FieldValue::Unsigned(u64::from(width)))
-                .with_field("height", FieldValue::Unsigned(u64::from(height)))
-                .with_field("render_width", FieldValue::Unsigned(u64::from(extent[0])))
-                .with_field("render_height", FieldValue::Unsigned(u64::from(extent[1])))
-                .with_field("source", FieldValue::Text("borrowed_no_copy".to_owned()))
-                .with_detail(
-                    "the reviewed sampling shape reads a texture of another extent through the \
-                     destination grid, and the one source it cannot gather is the owner's \
-                     no-copy window: that arm's whole statement is that the device reads the \
-                     owner's mapping, so a source of another extent would have to be copied on \
-                     the host — a channel this arm does not carry",
+            if !gathered_fetch {
+                return Err(no_copy_extent_refusal(binding, [width, height], extent));
+            }
+            if let Some(axis) = gather_window_axis([width, height], extent) {
+                return Err(gathered_fetch_window_refusal(
+                    binding,
+                    [width, height],
+                    extent,
+                    axis,
                 ));
+            }
+        } else if gathered_fetch {
+            // The gathered sibling's whole statement is the arm above: a pass
+            // that declares it for any other sampled source is refused by name
+            // rather than executed with an index arithmetic the review does not
+            // cover.
+            return Err(gathered_fetch_arm_refusal(
+                binding,
+                view,
+                [width, height],
+                extent,
+            ));
         }
         let source = resolve_render_texture_source(
             view,
@@ -4597,10 +4933,20 @@ fn resolve_render_textures<'a>(
                 source.len()
             )));
         }
-        let (gathered, upload_extent) = if gathered_extent {
-            let bytes = source
-                .host_bytes()
-                .expect("only the no-copy window has no host bytes, and it was answered above");
+        // The one other-extent source that is *not* gathered on the host: the
+        // owner's no-copy window read by the pair's gathered sibling
+        // (`research/docs/23` §111, E-TX12). The image keeps the source's own
+        // extent, the device still reads the owner's mapping, and the module
+        // fetches the destination grid's texel itself — so there is no byte to
+        // copy and nothing to upload.
+        let fetched = gathered_extent
+            && gathered_fetch
+            && matches!(view.source, TextureSource::BorrowedNoCopy(_));
+        let (gathered, upload_extent) = if gathered_extent && !fetched {
+            let bytes = source.host_bytes().expect(
+                "the sampled window is the one source without host bytes, and the \
+                         gathered sibling answered it above",
+            );
             (
                 Some(gather_render_texture(
                     bytes,
@@ -4616,6 +4962,7 @@ fn resolve_render_textures<'a>(
         textures.push(OffscreenRenderTexture {
             source,
             gathered,
+            gathered_fetch: fetched,
             extent: upload_extent,
             format: render_texture_vk_format(view.format)?,
             texel_bytes: view.format.bytes_per_texel(),
@@ -6790,32 +7137,20 @@ fn execute_offscreen_render_with_retains(
             (fragment.spirv, fragment.entry.as_str())
         }
         None => {
-            match depth_fragment_stage(&request.vertex.entry, request.vertex.spirv, &formats)? {
-                Some(pair) => pair,
-                None => match instanced_fragment_stage(
-                    &request.vertex.entry,
-                    request.vertex.spirv,
-                    &formats,
-                )? {
-                    Some(pair) => pair,
-                    None => {
-                        match sampled_fragment_stage(
-                            &request.vertex.entry,
-                            request.vertex.spirv,
-                            &formats,
-                        )? {
-                            Some(pair) => pair,
-                            None => match stage_buffer_fragment_stage(
-                                &request.vertex.entry,
-                                request.vertex.spirv,
-                                &formats,
-                            )? {
-                                Some(pair) => pair,
-                                None => solid_fragment_stage(&formats)?,
-                            },
-                        }
-                    }
-                },
+            // The gathered window is the one shape whose fragment module is the
+            // sampled vertex stage's *sibling* rather than the module the format
+            // list selects (`research/docs/23` §111, E-TX12): the registration
+            // declared that sibling, and the texture walk states the window it
+            // reads, so the pipeline below injects the two extents as
+            // specialization constants.
+            if request
+                .textures
+                .iter()
+                .any(|texture| texture.gathered_fetch)
+            {
+                (GATHERED_FETCH_FRAG_SPV, SOLID_FRAGMENT_ENTRY)
+            } else {
+                reviewed_fragment_stage(&request.vertex.entry, request.vertex.spirv, &formats)?
             }
         }
     };
@@ -8364,6 +8699,11 @@ struct OffscreenObjects<'a> {
     present: bool,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
+    /// The render area this pass's framebuffer was created with
+    /// (`research/docs/23` §111, E-TX12): the gathered sibling's index
+    /// arithmetic needs the destination extent, and the framebuffer is where
+    /// this scope already fixed it.
+    extent: [u32; 2],
     /// The rail's own render pass over the seeded multisampled attachments
     /// (`research/docs/23` §82, v82): one `CLEAR`-opened subpass whose
     /// clear values are the seeds `record` states, storing the image so the
@@ -8486,6 +8826,12 @@ struct SampledTextureObjects {
     /// no-copy arm's `vkCmdCopyBufferToImage` covers (`research/docs/23` §75,
     /// R5c).
     extent: [u32; 2],
+    /// Whether the reviewed pair's *gathered* sibling reads this image
+    /// (`research/docs/23` §111, E-TX12): the source is the owner's no-copy
+    /// window of another extent, so the image keeps the source's own extent,
+    /// the descriptor carries the image alone, and the pipeline's
+    /// specialization constants are this extent beside the render area's.
+    gathered_fetch: bool,
     /// The owner-window buffer a no-copy texture is copied out of, or `None`
     /// for the two uploaded arms.
     copy_source: Option<(vk::Buffer, vk::DeviceMemory)>,
@@ -8756,6 +9102,7 @@ impl<'a> OffscreenObjects<'a> {
             present: false,
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
+            extent: [0, 0],
             seed_render_pass: vk::RenderPass::null(),
             seed_framebuffer: vk::Framebuffer::null(),
             pipeline_layout: vk::PipelineLayout::null(),
@@ -10271,6 +10618,11 @@ impl<'a> OffscreenObjects<'a> {
             .layers(1);
         self.framebuffer = unsafe { self.context.device.create_framebuffer(&info, None) }
             .map_err(|error| execution_refusal("create framebuffer", &error.to_string()))?;
+        // The render area the framebuffer was created with (`research/docs/23`
+        // §111, E-TX12): the gathered sibling's arithmetic is built from this
+        // extent beside the source's own, and both are fixed before the
+        // pipeline exists.
+        self.extent = [width, height];
         Ok(())
     }
 
@@ -10601,6 +10953,7 @@ impl<'a> OffscreenObjects<'a> {
                 view,
                 sampler,
                 extent: [width, height],
+                gathered_fetch: texture.gathered_fetch,
                 copy_source,
                 slot: texture.slot,
             });
@@ -11404,7 +11757,53 @@ impl<'a> OffscreenObjects<'a> {
         }
         .map_err(|error| execution_refusal("create fragment shader module", &error.to_string()))?;
 
-        let stages = [
+        // The gathered sibling's four extents (`research/docs/23` §111, E-TX12):
+        // `source_width`, `source_height`, `destination_width` and
+        // `destination_height`, in the `SpecId` order the module declares them.
+        // They are specialization constants rather than a uniform because the
+        // pipeline is built per pass: the index arithmetic the fragment stage
+        // runs is then this pass's own shape, and no host value can leave the
+        // module with the `1x1` extent its defaults state.
+        // The gathered window, when this pass reads one: the texture walk
+        // resolved it (`OffscreenRenderTexture::gathered_fetch`), the image
+        // carries the source's own extent, and the render area's extent is the
+        // framebuffer this pass already created.
+        let gathered_constants = self
+            .textures
+            .iter()
+            .find(|texture| texture.gathered_fetch)
+            .map(|texture| {
+                [
+                    texture.extent[0],
+                    texture.extent[1],
+                    self.extent[0],
+                    self.extent[1],
+                ]
+            });
+        let gathered_entries = gathered_constants.map(|_| {
+            [0u32, 1, 2, 3].map(|constant_id| {
+                vk::SpecializationMapEntry::default()
+                    .constant_id(constant_id)
+                    .offset(constant_id * 4)
+                    .size(4)
+            })
+        });
+        let gathered_bytes = gathered_constants.as_ref().map(|values| {
+            values
+                .iter()
+                .copied()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        });
+        let gathered_info = match (&gathered_entries, &gathered_bytes) {
+            (Some(entries), Some(bytes)) => Some(
+                vk::SpecializationInfo::default()
+                    .map_entries(entries)
+                    .data(bytes),
+            ),
+            _ => None,
+        };
+        let mut stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.vertex_module)
@@ -11414,6 +11813,9 @@ impl<'a> OffscreenObjects<'a> {
                 .module(self.fragment_module)
                 .name(fragment_entry),
         ];
+        if let Some(info) = &gathered_info {
+            stages[1] = stages[1].specialization_info(info);
+        }
         // The vertex input state is derived from the pipeline's own layout, so
         // the state the pipeline is built with and the buffers `record` binds
         // come from one description (`research/docs/23` §3.3). A `vertex_id`
@@ -14283,6 +14685,114 @@ mod tests {
             .detail
             .as_deref()
             .is_some_and(|detail| detail.contains("no-copy window")));
+    }
+
+    /// The reviewed pair's gathered sibling states one arm and only one
+    /// (`research/docs/23` §111, E-TX12): a pass whose sampled source is not the
+    /// owner's no-copy window of another extent is refused by name, before any
+    /// device object exists, with the arm the declaration actually carries.
+    #[test]
+    fn the_gathered_sibling_refuses_every_other_sampled_source() {
+        let mut stages = reviewed_sampled_stages();
+        stages.fragment_spirv = GATHERED_FETCH_FRAG_SPV.to_vec();
+        stages
+            .validate_stage_pair()
+            .expect("the gathered sibling is a reviewed module of the same window");
+        for (view, expected_source) in [
+            // The trace's own bytes of another extent.
+            (sampled_texture_view(2, 2), "owned_bytes"),
+            // A lease the provider may copy: the arm exists but this module does
+            // not state it.
+            (
+                TextureView {
+                    source: TextureSource::StagedLease(LeaseId::new(11)),
+                    ..sampled_texture_view(2, 2)
+                },
+                "staged_lease",
+            ),
+        ] {
+            let mut pass = sampled_pass(4);
+            pass.textures = vec![view];
+            let previous = vec![None];
+            let refused = match prepare_render_request(
+                &stages,
+                &pass,
+                &previous,
+                None,
+                0,
+                0,
+                SpirvFeaturePolicy::PHASE1,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("the gathered sibling states the no-copy window's arm"),
+            };
+            eprintln!("gathered sibling over another source: {refused:?}");
+            assert_eq!(
+                refused.slug,
+                "render_texture_gathered_fetch_arm_unsupported"
+            );
+            assert_eq!(refused.class, ProviderErrorClass::Capability);
+            assert_eq!(
+                refused.fields.get("source"),
+                Some(&FieldValue::Text(expected_source.to_owned()))
+            );
+            assert_eq!(refused.fields.get("width"), Some(&FieldValue::Unsigned(2)));
+            assert_eq!(refused.fields.get("height"), Some(&FieldValue::Unsigned(2)));
+            assert_eq!(
+                refused.fields.get("render_width"),
+                Some(&FieldValue::Unsigned(4))
+            );
+        }
+    }
+
+    /// The gathered sibling's index arithmetic is 32-bit, and the window that
+    /// covers it is declared rather than assumed (`research/docs/23` §111,
+    /// E-TX12): a source whose product with the render area's extent leaves
+    /// `u32` is refused by name instead of executed with a wrapped index.
+    ///
+    /// The refusal runs before the lease channel is asked — the shape is refused
+    /// for what its two extents are, not for anything a device could answer —
+    /// which is why the reading needs no imported window.
+    #[test]
+    fn a_gathered_window_outside_the_index_window_is_refused_by_name() {
+        let mut stages = reviewed_sampled_stages();
+        stages.fragment_spirv = GATHERED_FETCH_FRAG_SPV.to_vec();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![TextureView {
+            width: u64::from(u32::MAX),
+            height: 4,
+            source: TextureSource::BorrowedNoCopy(LeaseId::new(13)),
+            ..sampled_texture_view(2, 2)
+        }];
+        let previous = vec![None];
+        let refused = match prepare_render_request(
+            &stages,
+            &pass,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the index cannot be computed without a wrap"),
+        };
+        eprintln!("gathered window outside its arithmetic: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_gathered_fetch_window");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("axis"),
+            Some(&FieldValue::Unsigned(0)),
+            "the width axis is the one that leaves the window"
+        );
+        assert_eq!(
+            refused.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(u64::from(u32::MAX)))
+        );
+        assert_eq!(
+            refused.fields.get("source"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
     }
 
     /// A translated module is bound to its source at the source's own extent

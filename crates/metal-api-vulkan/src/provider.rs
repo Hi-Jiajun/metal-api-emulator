@@ -249,6 +249,18 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // (`render_texture_extent_unsupported`), and the declaration is not
         // read as "any source of any extent executes".
         supports_render_texture_gathered_extent: true,
+        // The gathered extent's other arm is executed too (`research/docs/23`
+        // §111, E-TX12): the owner's no-copy window of another extent stays at
+        // its own mapping — no host copy exists for it — and the pair's
+        // *gathered* fragment sibling reads the destination grid's texel with
+        // `OpImageFetch` at an index computed on the device, while a translated
+        // fragment stage keeps stating its own coordinates over the source's own
+        // extent. Both arms land the same frame the host-bytes gather lands, per
+        // byte, in `tests/render_texture_extent_nocopy_e2e.rs`; a registration
+        // that declares the *sampling* sibling instead still gets the rail's own
+        // refusal by name, which is why this bit is its own field rather than a
+        // second reading of the bit above.
+        supports_render_texture_gathered_extent_no_copy: true,
         // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
         // `render.rs` uploads each bound view into a host-visible
         // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1
@@ -902,6 +914,14 @@ mod tests {
         );
         assert!(capabilities.supports_render_texture_gathered_extent);
         assert!(capabilities.declares_render_texture_gathered_extent_support());
+        // The gathered extent's no-copy arm (`research/docs/23` §111, E-TX12):
+        // the same three render-sampler readings stay where they were, and this
+        // rail declares the second shape bit because it executes the owner's
+        // window in place — the gathered fetch sibling and the translated
+        // binding in `tests/render_texture_extent_nocopy_e2e.rs` — while the
+        // sampling sibling keeps its refusal by name.
+        assert!(capabilities.supports_render_texture_gathered_extent_no_copy);
+        assert!(capabilities.declares_render_texture_gathered_extent_no_copy_support());
         // The superset vertex interface (`research/docs/23` §3.3, E-TX11): the
         // three vertex-input readings below are unchanged by the new bit, and
         // the shape bit is declared because this rail's vertex input state is

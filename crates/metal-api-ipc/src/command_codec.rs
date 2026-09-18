@@ -655,6 +655,19 @@ const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL: u8 = 0x02;
 /// keeps a section added later in the same position rule.
 const CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL: u8 = 0x03;
 
+/// Tag, inside the tail's second family, of the gathered extent's *no-copy*
+/// block (`research/docs/23` §111, E-TX12).
+///
+/// The section follows the superset vertex interface's block and carries one
+/// bool: whether the snapshot executes a render pass whose sampled source has an
+/// extent other than the render area's and whose bytes are the owner's no-copy
+/// window ([`ProviderCapabilities::supports_render_texture_gathered_extent_no_copy`]).
+/// It is the family's fourth tag rather than a ninth bit flag because the
+/// tail's original tag space is the eight powers of two `0x01..=0x80`, which the
+/// eight blocks before the family have all taken; its own escape byte keeps a
+/// section added later in the same position rule.
+const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL: u8 = 0x04;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -873,6 +886,13 @@ impl CommandCodec {
                     // declares only it still has to write the extended payload,
                     // or its declaration would be dropped on the wire.
                     || capabilities.declares_render_texture_gathered_extent_support()
+                    // The gathered shape's no-copy arm is the same face's
+                    // third question (`research/docs/23` §111, E-TX12): it
+                    // joins through the face's own predicate below, and a
+                    // snapshot that declares only it still has to write the
+                    // extended payload or its declaration would be dropped on
+                    // the wire.
+                    || capabilities.declares_render_texture_gathered_extent_no_copy_support()
                     // The superset vertex interface's bit is the vertex-input
                     // face's fourth question (`research/docs/23` §3.3, E-TX11),
                     // so it joins through that face's own predicate for the
@@ -5474,7 +5494,9 @@ fn declares_compute_texture_support(capabilities: &ProviderCapabilities) -> bool
 ///
 /// The three render-sampler fields are one question — "does this snapshot
 /// sample a render pass's texture, and how" — and the gathered-extent shape is
-/// the same face's second one ("does it execute a source of another extent").
+/// the same face's second one ("does it execute a source of another extent")
+/// with the same shape's no-copy arm as its third ("does it execute that arm
+/// when the source's bytes are the owner's mapping").
 /// Both spell the encoder's outer guard through this predicate so the guard
 /// asks one question about the face instead of one call site reading the three
 /// fields and another reading the shape bit: a snapshot that declares *only*
@@ -5489,6 +5511,7 @@ fn declares_compute_texture_support(capabilities: &ProviderCapabilities) -> bool
 fn declares_render_texture_face(capabilities: &ProviderCapabilities) -> bool {
     capabilities.declares_render_texture_support()
         || capabilities.declares_render_texture_gathered_extent_support()
+        || capabilities.declares_render_texture_gathered_extent_no_copy_support()
 }
 
 /// Whether the vertex-input face declares anything the extended payload has to
@@ -5799,6 +5822,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL);
             encoder.bool(capabilities.supports_render_vertex_interface_superset);
         }
+        // The gathered extent's no-copy block is the tail's newest section and
+        // follows the superset interface's block (`research/docs/23` §111,
+        // E-TX12). It is the family's fourth tag, so it carries its own escape
+        // byte; every section keeps the walk's position rule — the decoder reads
+        // them in exactly the order this encoder writes them. A snapshot whose
+        // bit stays at its default writes nothing here, and the decoder reads
+        // the missing section as `false` — the "keep the owner's no-copy window
+        // refused by name" default a consumer keeps its fail-closed direction
+        // with.
+        if capabilities.declares_render_texture_gathered_extent_no_copy_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL);
+            encoder.bool(capabilities.supports_render_texture_gathered_extent_no_copy);
+        }
     }
     Ok(())
 }
@@ -5860,6 +5897,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // even later than the folded shape: a legacy payload cannot carry it
         // and reads the consumer's fail-closed default.
         supports_render_texture_gathered_extent: false,
+        // The gathered shape's no-copy bit (`research/docs/23` §111, E-TX12) is
+        // the family's fourth block, so it arrived even later than the superset
+        // interface: a legacy payload cannot carry it and reads the same
+        // fail-closed default — the owner's no-copy window of another extent
+        // keeps its own refusal until a snapshot says otherwise.
+        supports_render_texture_gathered_extent_no_copy: false,
         // The superset vertex interface's bit (`research/docs/23` §3.3,
         // E-TX11) is the family's third block: a legacy payload cannot carry
         // it either, so it reads the same fail-closed default — a registration
@@ -5979,7 +6022,8 @@ fn decode_capability_extended_tail(
         match family_tag {
             CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL
-            | CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL => {}
+            | CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL
+            | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -5990,12 +6034,19 @@ fn decode_capability_extended_tail(
             return Err(CodecError::UnknownCapabilityTail(family_tag));
         }
         previous_family_tag = family_tag;
-        if family_tag == CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL {
-            capabilities.supports_render_stage_buffer_namespace_split = decoder.bool()?;
-        } else if family_tag == CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL {
-            capabilities.supports_render_texture_gathered_extent = decoder.bool()?;
-        } else {
-            capabilities.supports_render_vertex_interface_superset = decoder.bool()?;
+        match family_tag {
+            CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL => {
+                capabilities.supports_render_stage_buffer_namespace_split = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL => {
+                capabilities.supports_render_texture_gathered_extent = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL => {
+                capabilities.supports_render_vertex_interface_superset = decoder.bool()?;
+            }
+            _ => {
+                capabilities.supports_render_texture_gathered_extent_no_copy = decoder.bool()?;
+            }
         }
         // The run ends with the frame, so a byte after a family section is
         // either the next section's own escape or a frame the encoder cannot
