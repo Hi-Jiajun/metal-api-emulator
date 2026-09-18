@@ -347,6 +347,7 @@ impl ComputeProvider for FakeProvider {
             // (`research/docs/23` §3.3, E-TX10), and this provider reaches it
             // through neither entry point.
             supports_render_texture_gathered_extent: false,
+            supports_render_texture_gathered_extent_no_copy: false,
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self

@@ -464,6 +464,13 @@ impl NativeMetalProvider {
                 // starts from.
                 supports_render_texture_gathered_extent: render_bits
                     .supports_render_texture_gathered_extent,
+                // The gathered extent's no-copy arm (`research/docs/23` §111,
+                // E-TX12) is refused by the same walk: the owner's window would
+                // have to be read at a destination-grid index this rail has no
+                // Metal expression for, so the snapshot keeps the fail-closed
+                // default beside the bit above.
+                supports_render_texture_gathered_extent_no_copy: render_bits
+                    .supports_render_texture_gathered_extent_no_copy,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled

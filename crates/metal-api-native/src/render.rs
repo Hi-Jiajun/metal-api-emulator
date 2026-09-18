@@ -1022,6 +1022,10 @@ pub(crate) struct RenderCapabilityBits {
     /// The gathered-extent shape's bit (`research/docs/23` §3.3, E-TX10),
     /// declared beside the three render-sampler fields it narrows.
     pub(crate) supports_render_texture_gathered_extent: bool,
+    /// The gathered extent's *no-copy* arm (`research/docs/23` §111, E-TX12),
+    /// declared beside the bit above for the same reason: it is the other half
+    /// of the same face, and a rail may execute one without the other.
+    pub(crate) supports_render_texture_gathered_extent_no_copy: bool,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -1097,6 +1101,8 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         supported_render_texture_formats: render_texture.supported_render_texture_formats,
         supports_render_texture_gathered_extent: render_texture
             .supports_render_texture_gathered_extent,
+        supports_render_texture_gathered_extent_no_copy: render_texture
+            .supports_render_texture_gathered_extent_no_copy,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -1134,6 +1140,13 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
         // own. Declaring the bit would promise a shape this rail's plan refuses
         // by name, so it keeps the consumer's fail-closed default.
         supports_render_texture_gathered_extent: false,
+        // The gathered extent's no-copy arm (`research/docs/23` §111, E-TX12):
+        // this rail has no reading of the shape at all — every sampled source of
+        // another extent is refused by name, and the reviewed module declares no
+        // coordinate of its own, so there is neither an Apple oracle for the
+        // destination grid's index nor a Metal primitive that expresses it. The
+        // bit keeps the consumer's fail-closed default.
+        supports_render_texture_gathered_extent_no_copy: false,
     }
 }
 
@@ -1149,6 +1162,13 @@ pub(crate) struct RenderTextureCapabilityBits {
     /// declaration, not a missing measurement: the rail's texture walk refuses
     /// the shape by name.
     pub(crate) supports_render_texture_gathered_extent: bool,
+    /// Whether this rail executes the gathered extent's *no-copy* arm — a
+    /// sampled source whose extent is not the render area's and whose bytes are
+    /// the owner's no-copy window (`research/docs/23` §111, E-TX12). `false`
+    /// here is the declaration, not a missing measurement: the rail refuses
+    /// every source of another extent by name, and Apple has no oracle for the
+    /// destination grid's index.
+    pub(crate) supports_render_texture_gathered_extent_no_copy: bool,
 }
 
 /// The first render-sampler increment's binding cap, spelled once so the
@@ -8561,6 +8581,36 @@ mod tests {
         eprintln!("extent refused: {error:?}");
         assert_eq!(error.slug, "render_texture_extent_unsupported");
 
+        // The owner's no-copy window is refused by this rail's *source* walk
+        // (`research/docs/23` §111, E-TX12): the Vulkan rail's gathered sibling
+        // has no Metal expression — this rail's reviewed module declares no
+        // coordinate of its own — and this rail has no channel that could read a
+        // lease-backed texture at all, so the arm stops one question earlier
+        // than the extent walk. The snapshot keeps the same answer as a
+        // declaration beside it (`supports_render_texture_gathered_extent_no_copy`
+        // stays `false`), which is what a consumer reads before submitting.
+        let no_copy_extent = {
+            let mut pass = sampled_pass(4);
+            let mut view = sampled_texture_view(2);
+            view.source = TextureSource::BorrowedNoCopy(LeaseId::new(41));
+            pass.textures = vec![view];
+            pass
+        };
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &no_copy_extent,
+            pipeline: &sampled,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        eprintln!("no-copy extent refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_source_unsupported");
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+
         // The reviewed fragment stage reads one `rgba8_unorm` 2D surface, and
         // the first increment uploads trace-owned bytes only.
         let other_format = {
@@ -8833,6 +8883,11 @@ mod tests {
         // stays at the contract's fail-closed default beside the three fields
         // above.
         assert!(!bits.supports_render_texture_gathered_extent);
+        // The gathered extent's no-copy arm (`research/docs/23` §111, E-TX12):
+        // the same walk refuses the owner's window of another extent, and this
+        // rail has no Metal expression for the destination grid's index, so the
+        // declaration stays at the default beside the bit above.
+        assert!(!bits.supports_render_texture_gathered_extent_no_copy);
         let declared = capability_bits(APPLE_2D_TEXTURE_CEILING);
         assert_eq!(
             declared.supports_render_texture_sampling,
@@ -8847,6 +8902,11 @@ mod tests {
         assert_eq!(
             declared.supports_render_texture_gathered_extent,
             bits.supports_render_texture_gathered_extent
+        );
+        assert!(!declared.supports_render_texture_gathered_extent_no_copy);
+        assert_eq!(
+            declared.supports_render_texture_gathered_extent_no_copy,
+            bits.supports_render_texture_gathered_extent_no_copy
         );
     }
 
@@ -10374,6 +10434,7 @@ mod tests {
             max_render_textures: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
+            supports_render_texture_gathered_extent_no_copy: false,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),

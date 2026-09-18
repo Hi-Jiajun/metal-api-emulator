@@ -9370,6 +9370,35 @@ pub struct ProviderCapabilities {
     /// native rail, which refuses every source of another extent by name and
     /// has no Apple oracle for the shape.
     pub supports_render_texture_gathered_extent: bool,
+    /// Whether this snapshot executes the *no-copy* half of the gathered
+    /// render-sampler shape: one render pass whose sampled texture is the
+    /// owner's no-copy window and whose extent is not the render area's
+    /// (`research/docs/23` §111, E-TX12). Defaults to `false`: a pass that binds
+    /// such a source is refused by name instead of being executed against a
+    /// texture of the wrong extent.
+    ///
+    /// The bit is [`Self::supports_render_texture_gathered_extent`]'s other
+    /// arm, and the two are deliberately separate rather than one bit with two
+    /// readings: the host-bytes half and the no-copy half are answered by
+    /// different code, and a snapshot may execute either without the other.
+    /// This bit's own statement is "does it execute a source whose extent is not
+    /// the render area's, when the source's bytes are the owner's mapping" —
+    /// which is *not* a copy channel: the arm's whole statement is that the
+    /// device reads the owner's mapping, so a snapshot that declares this bit
+    /// reads the window where it lies instead of copying it to the host. It MUST
+    /// NOT be read as "the snapshot copies any source to the host", and it MUST
+    /// NOT be read as a statement about the host-bytes half, which keeps its own
+    /// bit beside this one.
+    ///
+    /// Declared `true` by the snapshots whose rail executes that half: the
+    /// Vulkan rail reads the owner's window with the reviewed pair's *gathered*
+    /// fragment sibling — the destination grid's integer index computed on the
+    /// device, no host copy and no sampler — and with a translated module's own
+    /// coordinates over the source's own extent
+    /// (`tests/render_texture_extent_nocopy_e2e.rs`). The native rail keeps the
+    /// default, because it refuses every source of another extent by name and
+    /// Apple has no oracle for the shape.
+    pub supports_render_texture_gathered_extent_no_copy: bool,
     /// Whether this snapshot can execute a render pass whose stage binds a
     /// buffer directly (`research/docs/23` §3.3, v83). Defaults to `false`: a
     /// snapshot whose rail cannot fill a stage buffer slot refuses the pass
@@ -9587,6 +9616,22 @@ impl ProviderCapabilities {
     /// "refuse the shape by name" answer.
     pub fn declares_render_texture_gathered_extent_support(&self) -> bool {
         self.supports_render_texture_gathered_extent
+    }
+
+    /// Whether this snapshot declares the gathered shape's *no-copy* arm
+    /// (`research/docs/23` §111, E-TX12).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself, and
+    /// it exists for the same reasons its sibling's does: one place answers "did
+    /// this snapshot declare the shape", and the capability frame's payload
+    /// guard asks it, so a snapshot that declares *only* this bit still writes
+    /// the extended payload instead of dropping the declaration on the wire.
+    ///
+    /// The two gathered bits are asked separately on purpose: a consumer decides
+    /// per arm, and a snapshot that executes one half may keep refusing the
+    /// other by name.
+    pub fn declares_render_texture_gathered_extent_no_copy_support(&self) -> bool {
+        self.supports_render_texture_gathered_extent_no_copy
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -15390,6 +15435,7 @@ mod tests {
             max_render_textures: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
+            supports_render_texture_gathered_extent_no_copy: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -20498,6 +20544,42 @@ mod tests {
         assert_eq!(
             declared.supported_render_texture_formats,
             default.supported_render_texture_formats
+        );
+        assert_eq!(
+            default.declares_render_texture_support(),
+            declared.declares_render_texture_support(),
+            "the shape bit is the capability frame's own tail block, not one of the three \
+             render-sampler fields"
+        );
+    }
+
+    /// The gathered extent's no-copy arm is a declaration, not a default
+    /// (`research/docs/23` §111, E-TX12).
+    ///
+    /// A snapshot that never spoke about the arm must be read as "keep the
+    /// owner's no-copy window of another extent refused": the bit defaults to
+    /// `false`, the predicate answers the same thing, and setting the bit is the
+    /// only way to flip either reading. The two gathered bits are asked
+    /// separately — a snapshot that executes the host-bytes half may keep
+    /// refusing this one, and the other way round — so flipping this bit has to
+    /// leave its sibling's reading exactly where it was.
+    #[test]
+    fn the_default_snapshot_does_not_declare_the_no_copy_gathered_extent() {
+        let default = render_texture_capabilities();
+        assert!(!default.supports_render_texture_gathered_extent_no_copy);
+        assert!(!default.declares_render_texture_gathered_extent_no_copy_support());
+
+        let mut declared = default.clone();
+        declared.supports_render_texture_gathered_extent_no_copy = true;
+        assert!(declared.declares_render_texture_gathered_extent_no_copy_support());
+        assert_eq!(
+            declared.supports_render_texture_gathered_extent,
+            default.supports_render_texture_gathered_extent,
+            "the two arms of the shape keep their own readings"
+        );
+        assert_eq!(
+            declared.supports_render_texture_sampling,
+            default.supports_render_texture_sampling
         );
         assert_eq!(
             default.declares_render_texture_support(),

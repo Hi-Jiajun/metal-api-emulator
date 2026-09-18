@@ -1,0 +1,83 @@
+; 零拷贝窗口的另一 extent fixture 的片元着色器（research/docs/23 §111，E-TX12）。
+; 与 solid_unorm8_sampled.frag.spvasm 的差别只有一处：颜色不是对 DescriptorSet 0 /
+; Binding 0 的采样结果，而是该图像在"目的地网格"下那一枚 texel 的取值
+; （VkDescriptorType::SAMPLED_IMAGE + OpImageFetch，不经采样器）。索引按下式在设备侧
+; 用整数算出：
+;   texel_x = floor((2 * column + 1) * source_width  / (2 * destination_width ))
+;   texel_y = floor((2 * row    + 1) * source_height / (2 * destination_height))
+; column/row 来自 gl_FragCoord 的整数部分（OriginUpperLeft 下 gl_FragCoord 的分量是
+; 片段中心的半整数，截断即得列/行），四个 extent 由 specialization constant 在
+; pipeline 创建时注入。索引与 extent 全部用无符号整数：Vulkan 要求
+; `OpImageFetch` 的坐标符号与图像格式分量的符号一致，而本 fixture 的四个格式
+; （rgba8_unorm / bgra8_unorm / r8_unorm / rg8_unorm）都是 unsigned normalized。
+; 这条路径与 rail 的 host gather（render.rs 的
+; gather_texel_index）逐 texel 同一定义，因此 owner 的零拷贝窗口走的是"设备读 owner
+; 映射 + 整数索引取 texel"，既不需要 host 拷贝，也不依赖驱动的过滤精度或 texel 边界
+; 舍入。本文件是 gathered_fetch.frag.spv 的可读源，由渲染轨道 include_bytes! 内嵌。
+; 复现命令：
+;   spirv-as --target-env vulkan1.0 gathered_fetch.frag.spvasm -o gathered_fetch.frag.spv
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "fragment_main" %out %fragcoord
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "fragment_main"
+               OpName %out "out"
+               OpName %tex "tex"
+               OpName %fragcoord "gl_FragCoord"
+               OpName %source_width "source_width"
+               OpName %source_height "source_height"
+               OpName %destination_width "destination_width"
+               OpName %destination_height "destination_height"
+               OpDecorate %out Location 0
+               OpDecorate %tex DescriptorSet 0
+               OpDecorate %tex Binding 0
+               OpDecorate %fragcoord BuiltIn FragCoord
+               OpDecorate %source_width SpecId 0
+               OpDecorate %source_height SpecId 1
+               OpDecorate %destination_width SpecId 2
+               OpDecorate %destination_height SpecId 3
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+     %v2uint = OpTypeVector %uint 2
+        %img = OpTypeImage %float 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_img = OpTypePointer UniformConstant %img
+%_ptr_Input_v4float = OpTypePointer Input %v4float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+       %uint_0 = OpConstant %uint 0
+       %uint_1 = OpConstant %uint 1
+       %uint_2 = OpConstant %uint 2
+        %out = OpVariable %_ptr_Output_v4float Output
+        %tex = OpVariable %_ptr_UniformConstant_img UniformConstant
+  %fragcoord = OpVariable %_ptr_Input_v4float Input
+%source_width = OpSpecConstant %uint 1
+%source_height = OpSpecConstant %uint 1
+%destination_width = OpSpecConstant %uint 1
+%destination_height = OpSpecConstant %uint 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %fc = OpLoad %v4float %fragcoord
+    %fragment_x = OpCompositeExtract %float %fc 0
+    %fragment_y = OpCompositeExtract %float %fc 1
+     %column = OpConvertFToU %uint %fragment_x
+        %row = OpConvertFToU %uint %fragment_y
+      %twice_x = OpIMul %uint %column %uint_2
+       %odd_x = OpIAdd %uint %twice_x %uint_1
+    %numerator_x = OpIMul %uint %odd_x %source_width
+  %denominator_x = OpIMul %uint %destination_width %uint_2
+     %source_x = OpUDiv %uint %numerator_x %denominator_x
+      %twice_y = OpIMul %uint %row %uint_2
+       %odd_y = OpIAdd %uint %twice_y %uint_1
+    %numerator_y = OpIMul %uint %odd_y %source_height
+  %denominator_y = OpIMul %uint %destination_height %uint_2
+     %source_y = OpUDiv %uint %numerator_y %denominator_y
+       %texel = OpCompositeConstruct %v2uint %source_x %source_y
+      %image = OpLoad %img %tex
+      %color = OpImageFetch %v4float %image %texel Lod %uint_0
+               OpStore %out %color
+               OpReturn
+               OpFunctionEnd

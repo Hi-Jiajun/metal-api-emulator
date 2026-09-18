@@ -5096,6 +5096,131 @@ mod tests {
         );
     }
 
+    /// The gathered extent's no-copy bit travels in the escape family's
+    /// *fourth* block (`research/docs/23` §111, E-TX12).
+    ///
+    /// The block follows the superset interface's one and carries the family's
+    /// next tag, so the frame is the pre-increment frame with one more
+    /// `0x00 <tag> <bool>` section appended. The readings are the increment's
+    /// wire obligations: the round trip keeps every field, the bytes before the
+    /// block are the frame the same snapshot writes without it (so neither the
+    /// superset interface's block nor anything before it moved), and the frame
+    /// re-encodes byte for byte.
+    #[test]
+    fn the_no_copy_gathered_extent_bit_travels_in_the_family_s_fourth_block() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        capabilities.supports_render_texture_gathered_extent = true;
+        capabilities.supports_render_vertex_interface_superset = true;
+        // The frame the same snapshot writes with the no-copy arm at its
+        // default: the new block's absence has to leave every byte before it
+        // exactly where the previous increment put them.
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(&without[without.len() - 3..], &[0x00, 0x03, 0x01]);
+
+        capabilities.supports_render_texture_gathered_extent_no_copy = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // One escape byte, the family's fourth tag and one bool.
+        let block = [0x00, 0x04, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the no-copy gathered block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        // The superset interface's block is still exactly the section before
+        // it: a decoder that stops after the family's third block (the E-TX11
+        // walk) leaves these three bytes unconsumed rather than reading the new
+        // section as another block's payload.
+        assert_eq!(
+            &frame[frame.len() - 6..frame.len() - 3],
+            &[0x00, 0x03, 0x01],
+            "the superset interface's block keeps its place in front of the new one"
+        );
+        eprintln!(
+            "no-copy gathered capability frame: len={} without={} block={block:02x?}",
+            frame.len(),
+            without.len()
+        );
+    }
+
+    /// A snapshot that declares *only* the gathered extent's no-copy arm still
+    /// writes the extended payload (`research/docs/23` §111, E-TX12).
+    ///
+    /// The three render-sampler fields and the other two shape bits keep their
+    /// own readings beside it: the declaration travels in the frame's own
+    /// tagged tail, so it must not be read as a statement about the sampling
+    /// window or about the host-bytes arm.
+    #[test]
+    fn an_only_no_copy_gathered_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        let prior = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(prior[9], 0x01, "the default snapshot keeps the legacy tag");
+
+        capabilities.supports_render_texture_gathered_extent_no_copy = true;
+        assert!(capabilities.declares_render_texture_gathered_extent_no_copy_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the only-no-copy capability frame re-encodes byte for byte"
+        );
+        // The declaration is the frame's last three bytes; the pre-increment
+        // *code* wrote no frame with this shape at all (its tag guard answered
+        // "legacy payload" and the declaration would have been dropped), which
+        // is exactly the failure the bit's own guard exists to prevent. What a
+        // decoder of the previous increment sees is the escape byte followed by
+        // the family tag it does not know: a typed refusal rather than a
+        // snapshot read as "the arm was not declared".
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x04, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_texture_sampling);
+        assert_eq!(decoded.max_render_textures, 0);
+        assert!(decoded.supported_render_texture_formats.is_empty());
+        assert!(!decoded.supports_render_texture_gathered_extent);
+        assert!(decoded.supports_render_texture_gathered_extent_no_copy);
+        eprintln!(
+            "only no-copy gathered: extended len={} prior len={}",
+            frame.len(),
+            prior.len()
+        );
+    }
+
     /// A frame that ends before the superset block reads the bit as `false`,
     /// and the family's closed set now names three tags
     /// (`research/docs/23` §3.3, E-TX11).
@@ -5130,15 +5255,17 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x04` is the next tag the
+        // The family's tags are a closed set and `0x05` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
-        // section is a typed refusal.
+        // section is a typed refusal. (`0x04` was this probe's value until
+        // E-TX12 assigned it to the gathered extent's no-copy block, which is
+        // exactly the drift the closed set exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x04;
+        unknown_tag[tag_at] = 0x05;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x04)
+            CodecError::UnknownCapabilityTail(0x05)
         ));
     }
 
@@ -6253,6 +6380,7 @@ mod tests {
                     max_render_textures: 0,
                     supported_render_texture_formats: Vec::new(),
                     supports_render_texture_gathered_extent: false,
+                    supports_render_texture_gathered_extent_no_copy: false,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -6635,6 +6763,7 @@ mod tests {
             max_render_textures: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
+            supports_render_texture_gathered_extent_no_copy: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
