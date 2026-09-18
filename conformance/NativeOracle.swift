@@ -2449,8 +2449,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // pass's metadata and executes it as an ordinary compute case.
     case "compute-buffer-v35":
         expectedIDs = ["render_declaring_stage_buffer_namespace"]
+    // The gathered-extent arm (`research/docs/23` §3.3, §111, E-TX10): the
+    // declaring pass of the render case whose translated fragment stage samples
+    // a texture whose extent is not the render area's. The render case is
+    // marked for the Vulkan rails alone — the two stages are the translator's,
+    // and this rail answers every source of another extent with its own refusal
+    // by name — so this oracle validates the declaring pass's metadata and
+    // executes it as an ordinary compute case.
+    case "compute-buffer-v36":
+        expectedIDs = ["render_declaring_gathered_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v35 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v36 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

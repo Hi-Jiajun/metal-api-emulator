@@ -449,6 +449,13 @@ impl NativeMetalProvider {
                 supported_render_texture_formats: render_bits
                     .supported_render_texture_formats
                     .clone(),
+                // The gathered-extent shape's bit (`research/docs/23` §3.3,
+                // E-TX10): this rail refuses every sampled source of another
+                // extent by name and has no Apple reading of the shape, so the
+                // snapshot declares the same fail-closed default the contract
+                // starts from.
+                supports_render_texture_gathered_extent: render_bits
+                    .supports_render_texture_gathered_extent,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled

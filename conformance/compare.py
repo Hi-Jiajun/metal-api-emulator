@@ -2416,10 +2416,22 @@ def _render_plan(plan, suite):
             _require(attachment_format in SAMPLED_TEXTURE_FORMATS,
                      f"{where}.attachment: the sampled shape's colour attachment is one "
                      "8-bit four-component unorm surface, in either byte order")
-            _require(texture.get("width") == attachment.get("width")
-                     and texture.get("height") == attachment.get("height"),
-                     f"{texture_where}: the sampled texture has to share the "
-                     "attachment's extent")
+            if translated is None:
+                _require(texture.get("width") == attachment.get("width")
+                         and texture.get("height") == attachment.get("height"),
+                         f"{texture_where}: the sampled texture has to share the "
+                         "attachment's extent")
+            else:
+                # The gathered-extent arm (`research/docs/23` §3.3, §111,
+                # E-TX10): a *translated* fragment module states its own
+                # absolute sample coordinates, so the rail binds the source at
+                # its own extent and the case's whole point is that the two
+                # extents differ. A case whose source shared the render area's
+                # extent would be the window the reviewed pair already measures.
+                _require(texture.get("width") != attachment.get("width")
+                         or texture.get("height") != attachment.get("height"),
+                         f"{texture_where}: the gathered arm's source has to differ from the "
+                         "render area in at least one axis")
             _require(attachment.get("load") == "clear"
                      and attachment.get("store", "store") == "store",
                      f"{texture_where}: the reviewed sampling shape clears and stores "
@@ -2469,11 +2481,6 @@ def _render_plan(plan, suite):
                          f"{where}: readback windows travel with the texture's own texel rule")
                 texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
                 expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
-                _require(expected == _sampled_expectation(texture_format, attachment_format,
-                                                          texels),
-                         f"{where}: the expectation has to be the uploaded texels in the "
-                         "attachment's own byte order: the sampling stage's sample at a "
-                         "texel centre is an identity copy")
                 chunks = [texels[offset:offset + 4] for offset in range(0, len(texels), 4)]
                 _require(len(chunks) == texture_width * texture_height,
                          f"{texture_where}: the uploaded texels do not match the extent")
@@ -2483,6 +2490,31 @@ def _render_plan(plan, suite):
                 _require(clear not in chunks,
                          f"{texture_where}: an uploaded texel equals the clear colour, so a "
                          "rail that ignored the texture could pass")
+                if translated is None:
+                    _require(expected == _sampled_expectation(texture_format, attachment_format,
+                                                              texels),
+                             f"{where}: the expectation has to be the uploaded texels in the "
+                             "attachment's own byte order: the sampling stage's sample at a "
+                             "texel centre is an identity copy")
+                else:
+                    # The gathered arm's expectation is the module's own reading
+                    # of the source bytes, and only the module knows its sample
+                    # coordinates, so the fixture states those bytes and the
+                    # comparator holds them to the render area's own byte count
+                    # — the same shape the translated stage-buffer case's frame
+                    # has (`research/docs/23` §3.3, E-TX10).
+                    destination_width = _integer(attachment.get("width"),
+                                                 f"{where}.attachment.width", 1)
+                    destination_height = _integer(attachment.get("height"),
+                                                  f"{where}.attachment.height", 1)
+                    _require(len(expected) == destination_width * destination_height * 4,
+                             f"{where}.expected_hex: the gathered arm's expectation is the "
+                             "render area's own bytes")
+                    _require(_hex(case.get("expected_hex"),
+                                  f"{where}.expected_hex") != clear * (destination_width
+                                                                       * destination_height),
+                             f"{where}.expected_hex: an all-clear frame is what a rail that "
+                             "ignored the draw would land")
 
         vertex_input = _vertex_input_declaration(case, where)
         # The single attachment form spells its expectation at the case level —

@@ -350,6 +350,12 @@ fn fixture() -> Option<Fixture> {
 
 /// The sampled texture one case declares: its own extent, its own bytes.
 fn texture_view(case: &Case) -> TextureView {
+    texture_view_with_bytes(case, texels(case))
+}
+
+/// The same declaration over one explicit byte grid, so a reading can replace
+/// the source's texels without touching the pass, the pipeline or the binding.
+fn texture_view_with_bytes(case: &Case, bytes: Vec<u8>) -> TextureView {
     TextureView {
         view_id: TEXTURE_VIEW,
         metal_binding: 0,
@@ -362,7 +368,7 @@ fn texture_view(case: &Case) -> TextureView {
         array_length: 1,
         sample_count: 1,
         access: TextureAccess::Sampled,
-        source: TextureSource::OwnedBytes(texels(case)),
+        source: TextureSource::OwnedBytes(bytes),
     }
 }
 
@@ -478,7 +484,14 @@ fn trace_for(
 
 /// The trace rail's frame for one case.
 fn trace_frame(fixture: &Fixture, case: &Case) -> Vec<u8> {
-    let (trace, resources) = trace_for(fixture, case, vec![texture_view(case)]);
+    trace_frame_with_source(fixture, case, texels(case))
+}
+
+/// The same reading over one explicit source byte grid: everything the pass
+/// states stays where it is, so a frame that moves is the source's own function
+/// (`research/docs/23` §111, E-TX10's falsifiable shape).
+fn trace_frame_with_source(fixture: &Fixture, case: &Case, source: Vec<u8>) -> Vec<u8> {
+    let (trace, resources) = trace_for(fixture, case, vec![texture_view_with_bytes(case, source)]);
     let admitted = fixture
         .provider
         .capabilities()
@@ -507,6 +520,12 @@ fn trace_frame(fixture: &Fixture, case: &Case) -> Vec<u8> {
 /// own extent, one attachment of the render area's, and the same sampling
 /// pipeline wrapped for the object API.
 fn object_frame(fixture: &Fixture, case: &Case) -> Vec<u8> {
+    object_frame_with_source(fixture, case, texels(case))
+}
+
+/// The object rail's frame over one explicit source byte grid, so the two rails
+/// can be compared byte for byte on a reading whose bytes moved.
+fn object_frame_with_source(fixture: &Fixture, case: &Case, source: Vec<u8>) -> Vec<u8> {
     use metal_api_core::provider::{PipelineCompileRequest, ShaderSource};
     use metal_api_core::provider_api::RenderAttachmentLoad;
     use metal_api_core::Size;
@@ -531,7 +550,7 @@ fn object_frame(fixture: &Fixture, case: &Case) -> Vec<u8> {
             TextureFormat::Rgba8Unorm,
             u64::from(case.source[0]),
             u64::from(case.source[1]),
-            texels(case),
+            source,
         )
         .expect("the sampled texture is declared at its own extent");
     let command = device.new_command_queue().command_buffer();
@@ -632,6 +651,125 @@ fn a_sampled_texture_of_another_extent_enters_the_provider() {
             case.name
         );
     }
+}
+
+/// The translated module's own reading for one source byte grid
+/// (`research/docs/23` §111, E-TX5/E-TX10).
+///
+/// Its fragment stage states two *absolute* sample coordinates, so the
+/// fragment's red channel is the source texel at column five of row zero and
+/// its green channel the texel at column one of the same row; blue and alpha
+/// are the module's own constants. The derivation is the module's declaration
+/// rather than the rail's arithmetic — a rail that gathered the source into the
+/// destination grid would answer the second sample with column two's byte —
+/// which is what makes a moved source byte a falsifiable reading.
+fn translated_frame_from(source: &[u8]) -> [u8; 4] {
+    let texel = |column: usize| source[column * 4];
+    [texel(5), texel(1), 0x00, 0xff]
+}
+
+/// The gathered frame is the source bytes' own function: replacing a texel the
+/// translated module reads has to move exactly the channel that texel decides,
+/// and replacing a texel its two samples never reach has to leave the frame
+/// where it was (`research/docs/23` §111, E-TX10).
+///
+/// This is the increment's falsifiability claim in its strongest form: the
+/// frame is pinned to the fixture's own definition *and* the reading moves when
+/// the bytes move, so a rail that answered with a constant, a stale upload or
+/// the destination grid's own byte could not pass both halves.
+#[test]
+fn a_gathered_frame_is_the_source_bytes_function() {
+    let Some(fixture) = fixture() else {
+        return;
+    };
+    // The census arm: the translated pair over a 6×4 source into a 4×4 render
+    // area.
+    let case = &CASES[3];
+    let texel = |x: usize, y: usize| (y * case.source[0] as usize + x) * 4;
+    let baseline_source = texels(case);
+    let baseline = trace_frame_with_source(&fixture, case, baseline_source.clone());
+    assert_eq!(
+        translated_frame_from(&baseline_source),
+        TRANSLATED_FRAME,
+        "the byte-driven oracle has to be the module's pinned reading"
+    );
+    let mut expected = Vec::with_capacity(baseline.len());
+    for _ in 0..case.destination[0] * case.destination[1] {
+        expected.extend_from_slice(&translated_frame_from(&baseline_source));
+    }
+    assert_eq!(
+        baseline, expected,
+        "the gathered frame has to be the module's own reading of the source bytes"
+    );
+    assert_eq!(
+        baseline,
+        expected_frame(case),
+        "the byte-driven oracle and the fixture's pinned expectation agree"
+    );
+
+    // The first sample's texel: column five's red byte decides the fragment's
+    // red channel, and nothing else about the frame moves.
+    let mut shifted = baseline_source.clone();
+    for row in 0..case.source[1] as usize {
+        let at = texel(5, row);
+        shifted[at] = 0x33;
+    }
+    let oracle = translated_frame_from(&shifted);
+    assert_eq!(oracle, [0x33, 0x10, 0x00, 0xff]);
+    let moved = trace_frame_with_source(&fixture, case, shifted.clone());
+    assert_ne!(
+        moved, baseline,
+        "the source byte the module reads has to move"
+    );
+    assert!(
+        moved.chunks_exact(4).all(|pixel| pixel == oracle),
+        "every fragment reads the replaced texel's channel: {}",
+        hex(&moved)
+    );
+    assert!(
+        baseline
+            .chunks_exact(4)
+            .zip(moved.chunks_exact(4))
+            .all(|(before, after)| before[0] != after[0]
+                && before[1] == after[1]
+                && before[2] == after[2]
+                && before[3] == after[3]),
+        "the change stays on the channel that source texel decides"
+    );
+    // The object rail lands the moved frame, byte for byte.
+    assert_eq!(
+        object_frame_with_source(&fixture, case, shifted),
+        moved,
+        "the object rail lands the trace rail's moved frame, byte for byte"
+    );
+
+    // The second sample's texel: column one's red byte decides the green
+    // channel instead, so the two samples own different halves of the frame.
+    let mut shifted = baseline_source.clone();
+    for row in 0..case.source[1] as usize {
+        let at = texel(1, row);
+        shifted[at] = 0x22;
+    }
+    let oracle = translated_frame_from(&shifted);
+    assert_eq!(oracle, [0x50, 0x22, 0x00, 0xff]);
+    let moved = trace_frame_with_source(&fixture, case, shifted);
+    assert!(
+        moved.chunks_exact(4).all(|pixel| pixel == oracle),
+        "the second sample's texel owns the other channel: {}",
+        hex(&moved)
+    );
+
+    // A texel neither sample reaches: the frame must stay where it was.
+    let mut untouched = baseline_source;
+    for row in 0..case.source[1] as usize {
+        let at = texel(0, row);
+        untouched[at] = 0xee;
+    }
+    assert_eq!(
+        trace_frame_with_source(&fixture, case, untouched),
+        baseline,
+        "a source byte neither absolute sample reaches cannot move the frame"
+    );
 }
 
 /// The one source the widened window cannot gather keeps its name: the owner's

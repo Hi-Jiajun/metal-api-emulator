@@ -217,6 +217,22 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         supports_render_texture_sampling: true,
         max_render_textures: MAX_RENDER_TEXTURES as u32,
         supported_render_texture_formats: TextureFormat::RENDER_SAMPLED.to_vec(),
+        // The gathered extent is executed for the arm whose source has host
+        // bytes (`research/docs/23` §3.3, §111, E-TX5/E-TX10): a reviewed
+        // module's sample coordinate is the fragment's own centre, so
+        // `render.rs` gathers the source into the render area's integer grid
+        // (`gather_render_texture`), while a *translated* fragment stage states
+        // its own absolute coordinates and the rail binds the source at its own
+        // extent. Both were measured before this bit existed: the three
+        // reviewed shapes (`6x4→4x4`, `2x8→4x4`, `32x32→40x32`) and the
+        // translated pair in `tests/render_texture_extent_e2e.rs`, whose frame
+        // is the fixture's own definition (`50 10 00 ff` per fragment) on
+        // Lavapipe and on the RTX 5060. The bit names exactly that arm: the
+        // owner's zero-copy window has no host bytes to gather, so a source of
+        // another extent in it keeps the rail's own refusal
+        // (`render_texture_extent_unsupported`), and the declaration is not
+        // read as "any source of any extent executes".
+        supports_render_texture_gathered_extent: true,
         // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
         // `render.rs` uploads each bound view into a host-visible
         // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1
@@ -857,6 +873,19 @@ mod tests {
         );
         assert!(capabilities.supports_render_stage_buffer_namespace_split);
         assert!(capabilities.declares_render_stage_buffer_namespace_split());
+        // The gathered extent (`research/docs/23` §3.3, E-TX10): the three
+        // render-sampler readings above/below are unchanged by the new bit, and
+        // the shape bit is declared because this rail already executes the
+        // host-bytes arm — the translated binding and the reviewed gather in
+        // `tests/render_texture_extent_e2e.rs`.
+        assert!(capabilities.supports_render_texture_sampling);
+        assert_eq!(capabilities.max_render_textures, MAX_RENDER_TEXTURES as u32);
+        assert_eq!(
+            capabilities.supported_render_texture_formats,
+            TextureFormat::RENDER_SAMPLED.to_vec()
+        );
+        assert!(capabilities.supports_render_texture_gathered_extent);
+        assert!(capabilities.declares_render_texture_gathered_extent_support());
     }
 
     #[test]

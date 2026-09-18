@@ -4691,6 +4691,213 @@ mod tests {
         ));
     }
 
+    /// The gathered-extent shape's bit travels in the escape family's *second*
+    /// block (`research/docs/23` §3.3, E-TX10).
+    ///
+    /// The block follows the folded-shape one and carries the family's next
+    /// tag, so the frame is the pre-increment frame with one more `0x00 <tag>
+    /// <bool>` section appended. The readings are the increment's wire
+    /// obligations: the round trip keeps every field, the bytes before the
+    /// block are the frame the same snapshot writes without it (so neither the
+    /// folded-shape block nor anything before it moved), and the frame
+    /// re-encodes byte for byte.
+    #[test]
+    fn the_gathered_extent_bit_travels_in_the_family_s_second_block() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_texture_sampling = true;
+        capabilities.max_render_textures = 1;
+        capabilities.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        // The frame the same snapshot writes with the gathered shape at its
+        // default: the new block's absence has to leave every byte before it
+        // exactly where the previous increment put them.
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+
+        capabilities.supports_render_texture_gathered_extent = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // One escape byte, the family's next tag and one bool.
+        let block = [0x00, 0x02, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the gathered-extent block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        // The folded-shape block is still exactly the section before it: a
+        // decoder that stops after the family's first block (the E-TX9 walk)
+        // leaves these three bytes unconsumed rather than reading the new
+        // section as another block's payload.
+        assert_eq!(
+            &frame[frame.len() - 6..frame.len() - 3],
+            &[0x00, 0x01, 0x01],
+            "the folded-shape block keeps its place in front of the new one"
+        );
+        eprintln!(
+            "gathered-extent capability frame: len={} without={} block={block:02x?}",
+            frame.len(),
+            without.len()
+        );
+    }
+
+    /// A snapshot that declares *only* the gathered shape still writes the
+    /// extended payload, and the three render-sampler fields keep their own
+    /// readings beside it (`research/docs/23` §3.3, E-TX10).
+    #[test]
+    fn an_only_gathered_extent_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        let prior = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(prior[9], 0x01, "the default snapshot keeps the legacy tag");
+
+        capabilities.supports_render_texture_gathered_extent = true;
+        assert!(capabilities.declares_render_texture_gathered_extent_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the only-gathered-shape capability frame re-encodes byte for byte"
+        );
+        // The declaration is the frame's last three bytes; the pre-increment
+        // *code* wrote no frame with this shape at all (its tag guard answered
+        // "legacy payload" and the declaration would have been dropped), which
+        // is exactly the failure the bit's own guard exists to prevent. What a
+        // decoder of the previous increment sees is the escape byte followed by
+        // the family tag it does not know: a typed refusal rather than a
+        // snapshot read as "the shape was not declared".
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x02, 0x01]);
+        let mut old_walk = frame.clone();
+        old_walk.truncate(frame.len() - 3);
+        assert_eq!(
+            &old_walk[FRAME_HEADER..],
+            &frame[FRAME_HEADER..frame.len() - 3],
+            "the new block is the frame's only addition after the payload"
+        );
+        // The shape bit is not one of the three render-sampler fields: the
+        // block they travel in stays unwritten, and the decoder reads their
+        // defaults back.
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_texture_sampling);
+        assert_eq!(decoded.max_render_textures, 0);
+        assert!(decoded.supported_render_texture_formats.is_empty());
+        assert!(decoded.supports_render_texture_gathered_extent);
+        eprintln!(
+            "only gathered extent: extended len={} prior len={}",
+            frame.len(),
+            prior.len()
+        );
+    }
+
+    /// The frames the walk must refuse around the escape family
+    /// (`research/docs/23` §3.3, E-TX10): a tag outside the family's closed
+    /// set, a section the encoder cannot have written twice or out of order,
+    /// and a byte that follows a family section without being the next
+    /// section's escape.
+    #[test]
+    fn the_escape_family_refuses_tags_and_bytes_it_cannot_have_written() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities.supports_render_stage_buffer_namespace_split = true;
+        capabilities.supports_render_texture_gathered_extent = true;
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x02, 0x01]);
+
+        // A family tag the closed set does not name (`0x7f` is a byte no
+        // version of the family assigns) is a typed refusal, not a payload
+        // read as another section.
+        let mut unknown_tag = frame.clone();
+        let tag_at = unknown_tag.len() - 2;
+        unknown_tag[tag_at] = 0x7f;
+        assert!(matches!(
+            CommandCodec::decode_response(&unknown_tag).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x7f)
+        ));
+
+        // The family's sections are read in the one order the encoder writes
+        // them: repeating the first tag is a section the encoder cannot have
+        // placed there.
+        let mut repeated = frame.clone();
+        repeated[tag_at] = 0x01;
+        assert!(matches!(
+            CommandCodec::decode_response(&repeated).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x01)
+        ));
+
+        // A byte after a family section that is not the next section's escape
+        // would make the caller read a section that was never there, so the
+        // walk refuses the byte instead of leaving its cursor on it.
+        let mut stray_section = frame.clone();
+        let escape_at = stray_section.len() - 3;
+        stray_section[escape_at] = 0x40;
+        assert!(matches!(
+            CommandCodec::decode_response(&stray_section).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x40)
+        ));
+
+        // The pre-increment frame is the payload without the new block: the
+        // bit reads `false` and nothing else moved, which is the direction a
+        // consumer of the previous increment sees.
+        capabilities.supports_render_texture_gathered_extent = false;
+        let prior = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        })
+        .unwrap();
+        assert_eq!(
+            &prior[FRAME_HEADER..],
+            &frame[FRAME_HEADER..frame.len() - 3],
+            "the pre-increment payload is this payload without the block"
+        );
+        let decoded = match CommandCodec::decode_response(&prior) {
+            Ok(CommandResponse::Capabilities { capabilities, .. }) => capabilities,
+            other => panic!("the pre-increment frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_stage_buffer_namespace_split);
+        assert!(!decoded.supports_render_texture_gathered_extent);
+    }
+
     #[test]
     fn vertex_input_and_present_travel_as_independent_bits() {
         let mut trace = vertex_input_trace();
@@ -5800,6 +6007,7 @@ mod tests {
                     supports_render_texture_sampling: false,
                     max_render_textures: 0,
                     supported_render_texture_formats: Vec::new(),
+                    supports_render_texture_gathered_extent: false,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -6180,6 +6388,7 @@ mod tests {
             supports_render_texture_sampling: false,
             max_render_textures: 0,
             supported_render_texture_formats: Vec::new(),
+            supports_render_texture_gathered_extent: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
