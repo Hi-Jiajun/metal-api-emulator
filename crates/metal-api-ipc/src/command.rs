@@ -1419,28 +1419,28 @@ mod tests {
     /// slice from here rather than repeating the number.
     const FRAME_HEADER: usize = 9;
     use metal_api_core::provider::{
-        AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment,
-        BlendFactor, BlendOperation, BufferAccess, BufferBindingContract, BufferLease,
-        BufferSource, BufferView, BufferWriteback, ClearColor, ColorWriteMask, CompareFunction,
-        CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
-        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DepthFormat,
-        DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, GuestRun,
-        HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
-        IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
-        IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId,
-        LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
-        MultisampleStencilResolve, OperationId, PipelineCompileRequest, PipelineContract,
-        PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
-        ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-        ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
-        RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-        RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
-        RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount,
-        SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
-        StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
-        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp,
-        SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
+        AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, AttachmentLandingView,
+        BlendAttachment, BlendFactor, BlendOperation, BufferAccess, BufferBindingContract,
+        BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor, ColorWriteMask,
+        CompareFunction, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+        CompletionReadback, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode,
+        DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch,
+        Dispatch, DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity,
+        GuestRun, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
+        IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+        IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
+        IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
+        MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
+        PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
+        PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
+        ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+        RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+        RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding,
+        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, Retryability,
+        SampleCount, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest,
+        ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
+        StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
+        StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
         TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
@@ -5221,6 +5221,85 @@ mod tests {
         );
     }
 
+    /// The landing-view arm's capability block is the tail family's fifth tag
+    /// (`research/docs/23` §115 之后的增量，E-TX13).
+    ///
+    /// It follows the gathered extent's no-copy block, so the four sections
+    /// before it keep their bytes; a decoder of the previous increment reads the
+    /// escape byte followed by a family tag it does not know — a typed refusal
+    /// rather than a snapshot silently read as "the arm was not declared".
+    #[test]
+    fn the_landing_view_block_is_the_tail_familys_fifth_tag() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_texture_gathered_extent_no_copy = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(&without[without.len() - 3..], &[0x00, 0x04, 0x01]);
+
+        capabilities.supports_render_attachment_landing_view = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the landing-view capability frame re-encodes byte for byte"
+        );
+        // One escape byte, the family's fifth tag and one bool.
+        let block = [0x00, 0x05, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the landing-view block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        assert_eq!(
+            &frame[frame.len() - 6..frame.len() - 3],
+            &[0x00, 0x04, 0x01],
+            "the no-copy gathered block keeps its place in front of the new one"
+        );
+    }
+
+    /// A snapshot that declares *only* the landing-view arm still writes the
+    /// extended payload (`research/docs/23` §115 之后的增量，E-TX13).
+    ///
+    /// The gathered-extent bits and the render-sampler fields keep their own
+    /// readings beside it: the declaration travels in the frame's own tagged
+    /// tail, so it must not be read as a statement about sampling.
+    #[test]
+    fn an_only_landing_view_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_attachment_landing_view = true;
+        assert!(capabilities.declares_render_attachment_landing_view_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x05, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_attachment_landing_view);
+        assert!(!decoded.supports_render_texture_gathered_extent);
+        assert!(!decoded.supports_render_texture_gathered_extent_no_copy);
+        assert!(!decoded.supports_render_texture_sampling);
+    }
+
     /// A frame that ends before the superset block reads the bit as `false`,
     /// and the family's closed set now names three tags
     /// (`research/docs/23` §3.3, E-TX11).
@@ -5255,17 +5334,18 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x05` is the next tag the
+        // The family's tags are a closed set and `0x06` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
-        // E-TX12 assigned it to the gathered extent's no-copy block, which is
+        // E-TX12 assigned it to the gathered extent's no-copy block and `0x05`
+        // until E-TX13 assigned it to the attachment landing view, which is
         // exactly the drift the closed set exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x05;
+        unknown_tag[tag_at] = 0x06;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x05)
+            CodecError::UnknownCapabilityTail(0x06)
         ));
     }
 
@@ -5617,9 +5697,11 @@ mod tests {
         assert_eq!(pass.color_attachments[0].store, StoreOp::Borrowed);
 
         // A tag no arm owns is a decoder error, so an older bridge refuses the
-        // frame it does not know instead of reading it as a plain store.
+        // frame it does not know instead of reading it as a plain store. Tag
+        // `0x04` is the landing-view arm's (`research/docs/23` §115 之后的增量，
+        // E-TX13), so the next free tag is `0x05`.
         let mut unknown = borrowed.clone();
-        unknown[store_tag] = 0x04;
+        unknown[store_tag] = 0x05;
         let error = CommandCodec::decode_request(&unknown)
             .expect_err("an unknown store tag is refused by name");
         assert!(
@@ -5627,10 +5709,79 @@ mod tests {
                 error,
                 CodecError::UnknownEnumValue {
                     field: "attachment store op",
-                    value: 0x04,
+                    value: 0x05,
                 }
             ),
             "the refusal names the field and the tag: {error:?}"
+        );
+    }
+
+    /// The landing-view store arm is one tag plus the second view's identity,
+    /// and it is the only thing a pre-E-TX13 frame does not have
+    /// (`research/docs/23` §115 之后的增量，E-TX13).
+    #[test]
+    fn a_landing_view_store_is_a_tag_plus_the_views_identity() {
+        let sentinel = [0xfe_u8; 4];
+        let clear_tape = LEGACY_RENDER_SUBMIT_FRAME
+            .windows(sentinel.len())
+            .position(|window| window == sentinel)
+            .expect("the frozen frame carries the fixture's clear payload");
+        let landing = AttachmentLandingView {
+            allocation_id: AllocationId::new(77),
+            view_id: ViewId::new(78),
+        };
+        let frame_for = |store: StoreOp| {
+            let mut trace = render_only_trace();
+            let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+                panic!("the fixture ends in a render pass");
+            };
+            pass.color_attachments[0].store = store;
+            let request = CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            };
+            CommandCodec::encode_request(&request).unwrap()
+        };
+        let stored = frame_for(StoreOp::Store);
+        let landing_frame = frame_for(StoreOp::BorrowedLanding(landing));
+        let store_tag = clear_tape + sentinel.len();
+        assert_eq!(stored[store_tag], 0x00, "the `Store` tag");
+        assert_eq!(
+            landing_frame[store_tag], 0x04,
+            "the landing-view store's tag"
+        );
+        assert_eq!(
+            landing_frame.len(),
+            stored.len() + 16,
+            "the arm adds the second view's two ids and nothing else"
+        );
+        // The payload is the landing view's identity, in the same order the
+        // attachment's own fields are written: view id first, then allocation.
+        let payload = &landing_frame[store_tag + 1..store_tag + 17];
+        assert_eq!(&payload[..8], &landing.view_id.get().to_be_bytes());
+        assert_eq!(&payload[8..], &landing.allocation_id.get().to_be_bytes());
+        // Everything before the arm and everything after it keeps its bytes:
+        // the frame grows by the identity the arm carries and by nothing else.
+        assert_eq!(
+            &landing_frame[FRAME_HEADER..store_tag],
+            &stored[FRAME_HEADER..store_tag],
+            "the bytes in front of the store arm are the pre-E-TX13 ones"
+        );
+        assert_eq!(
+            &landing_frame[store_tag + 17..],
+            &stored[store_tag + 1..],
+            "the bytes behind the store arm are the pre-E-TX13 ones"
+        );
+        let decoded = CommandCodec::decode_request(&landing_frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        let pass = trace.passes[0]
+            .as_render()
+            .expect("the fixture is a render pass");
+        assert_eq!(
+            pass.color_attachments[0].store,
+            StoreOp::BorrowedLanding(landing)
         );
     }
 
@@ -6381,6 +6532,7 @@ mod tests {
                     supported_render_texture_formats: Vec::new(),
                     supports_render_texture_gathered_extent: false,
                     supports_render_texture_gathered_extent_no_copy: false,
+                    supports_render_attachment_landing_view: false,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -6764,6 +6916,7 @@ mod tests {
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
+            supports_render_attachment_landing_view: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

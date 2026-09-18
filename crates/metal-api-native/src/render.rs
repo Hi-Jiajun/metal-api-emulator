@@ -1026,6 +1026,10 @@ pub(crate) struct RenderCapabilityBits {
     /// declared beside the bit above for the same reason: it is the other half
     /// of the same face, and a rail may execute one without the other.
     pub(crate) supports_render_texture_gathered_extent_no_copy: bool,
+    /// The landing-view arm (`research/docs/23` §115 之后的增量，E-TX13). Kept
+    /// beside the two gathered-extent bits so the snapshot has one place that
+    /// answers "does this rail execute the arm" — this one always says no.
+    pub(crate) supports_render_attachment_landing_view: bool,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -1103,6 +1107,11 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
             .supports_render_texture_gathered_extent,
         supports_render_texture_gathered_extent_no_copy: render_texture
             .supports_render_texture_gathered_extent_no_copy,
+        // The landing-view arm (`research/docs/23` §115 之后的增量，E-TX13) is
+        // refused by this rail's own store walk: its owner-window channel is an
+        // input channel with no route that writes one, so the snapshot keeps the
+        // fail-closed default beside the two bits above.
+        supports_render_attachment_landing_view: false,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -1147,6 +1156,7 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
         // destination grid's index nor a Metal primitive that expresses it. The
         // bit keeps the consumer's fail-closed default.
         supports_render_texture_gathered_extent_no_copy: false,
+        supports_render_attachment_landing_view: false,
     }
 }
 
@@ -1169,6 +1179,9 @@ pub(crate) struct RenderTextureCapabilityBits {
     /// every source of another extent by name, and Apple has no oracle for the
     /// destination grid's index.
     pub(crate) supports_render_texture_gathered_extent_no_copy: bool,
+    /// Whether this rail's snapshot declares the landing-view arm. It never
+    /// does: `store_action` refuses the arm by name.
+    pub(crate) supports_render_attachment_landing_view: bool,
 }
 
 /// The first render-sampler increment's binding cap, spelled once so the
@@ -1807,6 +1820,27 @@ pub(crate) fn store_action(store: StoreOp) -> Result<RenderStoreAction, Provider
                     "a borrowed store lands the pass's frame in the owner's registered window; \
                      this rail carries the owner's window as an input and has no landing route \
                      that writes one",
+                ))
+        }
+        // The landing-view arm (`research/docs/23` §115 之后的增量，E-TX13) names
+        // the window through a *second* view declaration, and this rail's window
+        // channel is an input channel: it imports an owner mapping the device
+        // reads and has no route that writes one back. Refused by name for the
+        // same reason the borrowed arm beside it is — and the field says which
+        // of the two declarations the caller meant, so a reader of the refusal
+        // does not have to guess.
+        StoreOp::BorrowedLanding(view) => {
+            return Err(capability_refusal("render_attachment_landing_unsupported")
+                .with_field("source", FieldValue::Text("landing_view".to_owned()))
+                .with_field("landing_view", FieldValue::Unsigned(view.view_id.get()))
+                .with_field(
+                    "landing_allocation",
+                    FieldValue::Unsigned(view.allocation_id.get()),
+                )
+                .with_detail(
+                    "a landing-view store lands the pass's frame in the owner's registered \
+                     window a second view declaration names; this rail carries the owner's \
+                     window as an input and has no landing route that writes one",
                 ))
         }
     })
@@ -3657,10 +3691,12 @@ pub(crate) fn plan_with_leases<'a>(
                             Some(StoreOp::Store) => "store",
                             Some(StoreOp::DontCare) => "dontcare",
                             Some(StoreOp::Resident) => "resident",
-                            // The owner-window store is the colour attachment's
-                            // arm (`research/docs/23` §114, E-TX8), refused by
-                            // core admission for the stencil surface.
+                            // Both owner-window stores are the colour
+                            // attachment's arms (`research/docs/23` §115 及其后的
+                            // 增量，E-TX8/E-TX13), refused by core admission for
+                            // the stencil surface.
                             Some(StoreOp::Borrowed) => "borrowed",
+                            Some(StoreOp::BorrowedLanding(_)) => "borrowed_landing",
                             None => "unstated",
                         }
                         .to_owned(),
@@ -9194,6 +9230,32 @@ mod tests {
             error.fields.get("source"),
             Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
         );
+
+        // The landing-view arm (`research/docs/23` §115 之后的增量，E-TX13) is
+        // refused for the same reason with its own `source`: the rail has no
+        // route that writes an owner's window, and the refusal names *which*
+        // declaration the caller meant so a reader does not have to guess
+        // whether the window came from the attachment's own view or from a
+        // second one.
+        let landing = metal_api_core::provider::AttachmentLandingView {
+            allocation_id: AllocationId::new(77),
+            view_id: ViewId::new(78),
+        };
+        let error = store_action(StoreOp::BorrowedLanding(landing)).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("source"),
+            Some(&FieldValue::Text("landing_view".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("landing_view"),
+            Some(&FieldValue::Unsigned(landing.view_id.get()))
+        );
+        assert_eq!(
+            error.fields.get("landing_allocation"),
+            Some(&FieldValue::Unsigned(landing.allocation_id.get()))
+        );
     }
 
     #[test]
@@ -10435,6 +10497,7 @@ mod tests {
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
+            supports_render_attachment_landing_view: false,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),

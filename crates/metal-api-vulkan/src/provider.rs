@@ -261,6 +261,17 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // refusal by name, which is why this bit is its own field rather than a
         // second reading of the bit above.
         supports_render_texture_gathered_extent_no_copy: true,
+        // The colour attachment's landing-view arm (`research/docs/23` §115
+        // 之后的增量，E-TX13) is executed: `compute_provider.rs` resolves the
+        // second declaration the store arm carries, `render.rs` writes the
+        // pass's frame into the owner window it names — the same retain/retire
+        // landing E-TX8's borrowed store uses — and the frame still travels the
+        // writeback channel, so every pre-E-TX13 reader is byte-identical.
+        // Evidence: `tests/render_attachment_landing_view_e2e.rs`. The bit is
+        // its own field rather than a second reading of either gathered-extent
+        // bit: those describe a *sampled source's* extent, this one describes
+        // where an attachment's stored frame lands.
+        supports_render_attachment_landing_view: true,
         // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
         // `render.rs` uploads each bound view into a host-visible
         // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1

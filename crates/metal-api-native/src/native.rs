@@ -471,6 +471,12 @@ impl NativeMetalProvider {
                 // default beside the bit above.
                 supports_render_texture_gathered_extent_no_copy: render_bits
                     .supports_render_texture_gathered_extent_no_copy,
+                // The landing-view arm (`research/docs/23` §115 之后的增量，
+                // E-TX13): this rail's owner-window channel is an input channel
+                // and it has no landing route that writes one, so the store arm
+                // is refused by name and the snapshot keeps the default.
+                supports_render_attachment_landing_view: render_bits
+                    .supports_render_attachment_landing_view,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled
@@ -1776,7 +1782,10 @@ fn discarded_only_attachments(trace: &ComputeTrace) -> BTreeSet<(AllocationId, V
             // refused by the same plan for the same reason, so it is on this
             // side of the split too: the frame lands in the owner's window
             // rather than in a writeback this collect could read.
-            StoreOp::Resident | StoreOp::Borrowed | StoreOp::DontCare => {
+            StoreOp::Resident
+            | StoreOp::Borrowed
+            | StoreOp::BorrowedLanding(_)
+            | StoreOp::DontCare => {
                 discarded.insert(identity);
             }
         }

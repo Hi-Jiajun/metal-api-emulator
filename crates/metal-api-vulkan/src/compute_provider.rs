@@ -1309,6 +1309,12 @@ impl VulkanComputeProvider {
             // than being snapshotted here (`research/docs/23` §74, R5b).
             let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
             let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
+            // The landing views the second owner-window arm carries
+            // (`research/docs/23` §115 之后的增量，E-TX13), one entry per
+            // attachment: the identity the store names, resolved against the
+            // same serial view list the attachment's own declaration comes
+            // from. `None` is the shape whose store is not that arm.
+            let mut landings = Vec::with_capacity(planned.pass.color_attachments.len());
             // The provider-resident targets this pass declares, in location
             // order (`research/docs/23` §76, R7). The identity is the
             // attachment's own pair, so the registry and the contract cannot
@@ -1369,6 +1375,12 @@ impl VulkanComputeProvider {
                 // publishes no readback still has to name the guest's pages the
                 // frame lands in.
                 let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
+                // Only the *borrowed* arm takes its window from this
+                // declaration; the landing-view arm beside it takes its own
+                // from the second declaration resolved below, so an attachment
+                // that loads from the caller's bytes with no readback needs no
+                // own-view declaration for the landing (`research/docs/23` §115
+                // 之后的增量，E-TX13).
                 let borrowing = attachment.store == metal_api_core::provider::StoreOp::Borrowed;
                 let landing_needed = borrowing
                     || (host_readback
@@ -1396,9 +1408,27 @@ impl VulkanComputeProvider {
                 };
                 // The rail reads this slice as the attachment's own
                 // declaration: the previous contents for a `Load`, and the
-                // window a borrowed store lands in. One declaration serves both
-                // because the contract names the attachment by one identity.
+                // window a *borrowed* store lands in. One declaration serves
+                // both because the contract names the attachment by one
+                // identity.
+                //
+                // The landing-view arm (`research/docs/23` §115 之后的增量，
+                // E-TX13) is the exception this slice cannot answer: its window
+                // is the *second* declaration the store carries, so the view is
+                // resolved here by that identity and travels beside the
+                // attachment's own slice. A store that names a landing view this
+                // trace never declares is refused by the rail by name.
+                let landing_view = match attachment.store {
+                    metal_api_core::provider::StoreOp::BorrowedLanding(named) => {
+                        pool.iter().find(|view| {
+                            view.view_id == named.view_id
+                                && view.allocation_id == named.allocation_id
+                        })
+                    }
+                    _ => None,
+                };
                 previous.push(view.filter(|_| loading || borrowing));
+                landings.push(landing_view);
                 views.push(view);
             }
             // The stored depth attachment's landing view, resolved before the
@@ -1512,6 +1542,7 @@ impl VulkanComputeProvider {
                         &planned.pass,
                         &payload.command,
                         &previous,
+                        &landings,
                         &resident_refs,
                         Some(&leases),
                         Some(&produced),
@@ -1534,6 +1565,7 @@ impl VulkanComputeProvider {
                     &planned.stages,
                     &planned.pass,
                     &previous,
+                    &landings,
                     &resident_refs,
                     Some(&leases),
                     Some(&produced),

@@ -11,9 +11,9 @@ use crate::codec::CodecError;
 use crate::command::{CommandRequest, CommandResponse};
 use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
-    AttachmentFormat, BlendAttachment, BlendFactor, BlendOperation, BufferAccess,
-    BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
-    ColorWriteMask, CompareFunction, CompiledComputePipeline, CompletionDisposition,
+    AttachmentFormat, AttachmentLandingView, BlendAttachment, BlendFactor, BlendOperation,
+    BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback,
+    ClearColor, ColorWriteMask, CompareFunction, CompiledComputePipeline, CompletionDisposition,
     CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode,
     DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
     DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
@@ -668,6 +668,19 @@ const CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL: u8 = 0x03;
 /// section added later in the same position rule.
 const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL: u8 = 0x04;
 
+/// Tag, inside the tail's second family, of the colour attachment's
+/// landing-view block (`research/docs/23` §115 之后的增量，E-TX13).
+///
+/// The section follows the gathered extent's no-copy block and carries one
+/// bool: whether the snapshot executes a colour attachment whose frame lands in
+/// the owner's registered window a *second* view declaration names
+/// ([`ProviderCapabilities::supports_render_attachment_landing_view`]). It is
+/// the family's fifth tag rather than a ninth bit flag because the tail's
+/// original tag space is the eight powers of two `0x01..=0x80`, which the
+/// eight blocks before the family have all taken; its own escape byte keeps a
+/// section added later in the same position rule.
+const CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL: u8 = 0x05;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -900,6 +913,13 @@ impl CommandCodec {
                     // to write the extended payload, or its declaration would
                     // be dropped on the wire.
                     || declares_vertex_input_face(capabilities)
+                    // The attachment landing-view arm is the colour
+                    // attachment face's own question (`research/docs/23` §115
+                    // 之后的增量，E-TX13), and it joins here for the same
+                    // reason: a snapshot that declares only it still has to
+                    // write the extended payload, or its declaration would be
+                    // dropped on the wire.
+                    || capabilities.declares_render_attachment_landing_view_support()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -3602,6 +3622,18 @@ fn put_load_op(
     Ok(())
 }
 
+/// Encode one attachment's store arm (`research/docs/23` §3.6/§115)。
+///
+/// Four arms are one tag each. The landing-view arm (`research/docs/23` §115
+/// 之后的增量，E-TX13) is the first arm that carries a payload: the identity of
+/// the *second* view declaration the frame lands in. It travels as tag `4` +
+/// `view_id` + `allocation_id` — the same field order the attachment itself
+/// uses — rather than as an optional section after the attachment, because a
+/// trailing section would be read by a pre-E-TX13 decoder as the next
+/// attachment's own fields. A tag that decoder has never seen is refused by
+/// name instead (`UnknownEnumValue{field:"attachment store op"}`), which is the
+/// fail-closed direction the additive policy asks for, and no pre-E-TX13 tag
+/// changes value.
 fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
     encoder.u8(match store {
         StoreOp::Store => 0,
@@ -3615,7 +3647,14 @@ fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
         // channel beside it, which is why no byte of the frame is added here
         // and every pre-E-TX8 tag keeps its own value.
         StoreOp::Borrowed => 3,
+        // E-TX13: the landing-view store names a second declaration, so the
+        // tag is followed by that view's identity.
+        StoreOp::BorrowedLanding(_) => 4,
     });
+    if let StoreOp::BorrowedLanding(view) = store {
+        encoder.u64(view.view_id.get());
+        encoder.u64(view.allocation_id.get());
+    }
 }
 
 /// Encode the heap/ICB tail that follows the completion policy of a
@@ -5020,6 +5059,13 @@ fn get_store_op(decoder: &mut Decoder<'_>) -> Result<StoreOp, CodecError> {
         1 => Ok(StoreOp::DontCare),
         2 => Ok(StoreOp::Resident),
         3 => Ok(StoreOp::Borrowed),
+        // The landing-view arm's payload follows its tag (`research/docs/23`
+        // §115 之后的增量，E-TX13): the second view declaration's identity, in
+        // the same order the attachment's own fields are written.
+        4 => Ok(StoreOp::BorrowedLanding(AttachmentLandingView {
+            view_id: ViewId::new(decoder.u64()?),
+            allocation_id: AllocationId::new(decoder.u64()?),
+        })),
         value => Err(CodecError::UnknownEnumValue {
             field: "attachment store op",
             value,
@@ -5646,6 +5692,12 @@ fn put_capabilities(
         // decoder reads by position before the tag, so the declaration cannot
         // be dropped on the wire.
         || declares_compute_texture_support(capabilities)
+        // The attachment landing-view arm is the colour attachment face's own
+        // question (`research/docs/23` §115 之后的增量，E-TX13), and it joins the
+        // same guard for the same reason: a snapshot that declares only it still
+        // has to write the heap/ICB half the decoder reads by position before
+        // the family's escape, or its declaration would be dropped on the wire.
+        || capabilities.declares_render_attachment_landing_view_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -5836,6 +5888,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL);
             encoder.bool(capabilities.supports_render_texture_gathered_extent_no_copy);
         }
+        // The attachment landing-view block is the tail's newest section and
+        // follows the gathered extent's no-copy block (`research/docs/23` §115
+        // 之后的增量，E-TX13). It is the family's fifth tag, so it carries its
+        // own escape byte; every section keeps the walk's position rule — the
+        // decoder reads them in exactly the order this encoder writes them. A
+        // snapshot whose bit stays at its default writes nothing here, and the
+        // decoder reads the missing section as `false` — the "keep the landing
+        // view refused by name" default a consumer keeps its fail-closed
+        // direction with.
+        if capabilities.declares_render_attachment_landing_view_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL);
+            encoder.bool(capabilities.supports_render_attachment_landing_view);
+        }
     }
     Ok(())
 }
@@ -5903,6 +5969,7 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // fail-closed default — the owner's no-copy window of another extent
         // keeps its own refusal until a snapshot says otherwise.
         supports_render_texture_gathered_extent_no_copy: false,
+        supports_render_attachment_landing_view: false,
         // The superset vertex interface's bit (`research/docs/23` §3.3,
         // E-TX11) is the family's third block: a legacy payload cannot carry
         // it either, so it reads the same fail-closed default — a registration
@@ -6023,7 +6090,8 @@ fn decode_capability_extended_tail(
             CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL
             | CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL
-            | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL => {}
+            | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL
+            | CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6044,8 +6112,11 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL => {
                 capabilities.supports_render_vertex_interface_superset = decoder.bool()?;
             }
-            _ => {
+            CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL => {
                 capabilities.supports_render_texture_gathered_extent_no_copy = decoder.bool()?;
+            }
+            _ => {
+                capabilities.supports_render_attachment_landing_view = decoder.bool()?;
             }
         }
         // The run ends with the frame, so a byte after a family section is

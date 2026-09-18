@@ -3754,11 +3754,18 @@ fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) ->
 /// `resident` is either empty — the shape every pre-R7 caller hands over, which
 /// means "this pass declares no resident target" — or one entry per colour
 /// attachment, exactly as `previous` is (`research/docs/23` §76, R7).
+// The parameter list is the pass's own declaration surface — the stages, the
+// pass, the previous-contents and landing-view lists, the resident targets, the
+// lease context and the trace's own production — exactly as the request builder
+// below states its own (R7 + E-TX13). Splitting it into a struct would move the
+// same seven fields behind one more name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_render_pass<'a>(
     context: &VulkanContext,
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
     previous: &'a [Option<&'a BufferView>],
+    landings: &[Option<&'a BufferView>],
     resident: &[Option<&'a ProviderTargetImage>],
     leases: Option<&RenderLeaseContext<'_>>,
     produced: Option<&'a ProducedTraceViews<'a>>,
@@ -3768,6 +3775,7 @@ pub(crate) fn execute_render_pass<'a>(
         stages,
         pass,
         previous,
+        landings,
         if resident.is_empty() {
             None
         } else {
@@ -3811,10 +3819,15 @@ fn prepare_render_request<'a>(
     // provider-resident target, so the general form below is handed no
     // resident list at all and refuses a pass that declares one
     // (`research/docs/23` §76, R7).
+    // The pre-E-TX13 shape's own landing list: one `None` per colour
+    // attachment, which is what a pass whose store arms carry no landing view
+    // states (`research/docs/23` §115 之后的增量，E-TX13).
+    let landings = vec![None; pass.color_attachments.len()];
     prepare_render_request_with_resident(
         stages,
         pass,
         previous,
+        &landings,
         None,
         leases,
         None,
@@ -3845,6 +3858,7 @@ fn prepare_render_request_with_resident<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
     previous: &'a [Option<&'a BufferView>],
+    landings: &[Option<&'a BufferView>],
     resident: Option<&[Option<&'a ProviderTargetImage>]>,
     leases: Option<&RenderLeaseContext<'_>>,
     produced: Option<&'a ProducedTraceViews<'a>>,
@@ -3882,6 +3896,15 @@ fn prepare_render_request_with_resident<'a>(
     if previous.len() != pass.color_attachments.len() {
         return Err(contract_refusal(
             "the previous-contents list must carry one entry per colour attachment",
+        ));
+    }
+    // The landing list is the previous-contents list's sibling for the second
+    // owner-window arm (`research/docs/23` §115 之后的增量，E-TX13): one entry
+    // per colour attachment, `Some` exactly where the store arm carries a
+    // landing view.
+    if landings.len() != pass.color_attachments.len() {
+        return Err(contract_refusal(
+            "the landing-view list must carry one entry per colour attachment",
         ));
     }
     // The resident list is the previous-contents list's sibling
@@ -4299,33 +4322,59 @@ fn prepare_render_request_with_resident<'a>(
             }
             _ => None,
         };
-        // The borrowed store's landing (`research/docs/23` §114, E-TX8): the
-        // attachment's own view declaration names the owner's window, so the
-        // window is resolved here — with the declaring arm's own checks and the
-        // extent rule — before any device object exists. A borrowed store
-        // beside a resident target would name two homes for one frame, and the
-        // pass cannot state which one the bytes land in, so that pairing is
-        // refused by name instead of being executed with one of them silently
-        // winning.
-        let landing = if attachment.store == StoreOp::Borrowed {
+        // The owner-window landings (`research/docs/23` §115 及其后的增量，
+        // E-TX8/E-TX13): which declaration names the window is the store arm's
+        // own answer — the attachment's own view for `Borrowed`, or the second
+        // view the landing arm carries. The window is resolved here — with the
+        // declaring arm's own checks and the extent rule — before any device
+        // object exists. An owner-window store beside a resident target would
+        // name two homes for one frame, and the pass cannot state which one the
+        // bytes land in, so that pairing is refused by name instead of being
+        // executed with one of them silently winning.
+        let landing = if attachment.store.lands_in_owner_window() {
             if resident.is_some() {
                 return Err(landing_refusal(
                     index,
                     "resident_target",
-                    "a borrowed store lands in the owner's registered window, and a resident \
-                     target keeps the frame in the provider's own image: the two are two homes \
-                     for one frame, so the pass states one of them",
+                    "an owner-window store lands in the owner's registered window, and a \
+                     resident target keeps the frame in the provider's own image: the two are \
+                     two homes for one frame, so the pass states one of them",
                 ));
             }
-            let view = declared.ok_or_else(|| {
-                landing_refusal(
-                    index,
-                    "no_declaration",
-                    "a borrowed store lands in the owner's registered window, and the window is \
-                     the attachment's own view declaration; this trace declares no view for the \
-                     attachment's (allocation, view) identity",
-                )
-            })?;
+            let view = match attachment.store {
+                // The landing view's own declaration (`research/docs/23` §115
+                // 之后的增量，E-TX13): the store arm names the identity, so the
+                // rail looks that identity up in the same serial view list the
+                // attachment's own declaration comes from. A trace that carries
+                // no declaration for it is refused by name — falling back to the
+                // attachment's own declaration would land the frame in a window
+                // the caller never named.
+                StoreOp::BorrowedLanding(view) => {
+                    landings.get(index).copied().flatten().ok_or_else(|| {
+                        landing_refusal(
+                            index,
+                            "landing_view_undeclared",
+                            "a landing-view store lands in the owner's registered window the \
+                             view this arm carries names; this trace declares no view for that \
+                             (allocation, view) identity",
+                        )
+                        .with_field("landing_view", FieldValue::Unsigned(view.view_id.get()))
+                        .with_field(
+                            "landing_allocation",
+                            FieldValue::Unsigned(view.allocation_id.get()),
+                        )
+                    })?
+                }
+                _ => declared.ok_or_else(|| {
+                    landing_refusal(
+                        index,
+                        "no_declaration",
+                        "a borrowed store lands in the owner's registered window, and the \
+                         window is the attachment's own view declaration; this trace declares \
+                         no view for the attachment's (allocation, view) identity",
+                    )
+                })?,
+            };
             Some(resolve_attachment_landing(
                 view,
                 leases,
@@ -5580,14 +5629,14 @@ fn resolve_attachment_landing(
             BufferSource::OwnedBytes(_) => return Err(landing_refusal(
                 attachment,
                 "owned_bytes",
-                "a borrowed store lands in the owner's own registered window; trace-owned bytes \
-                 are the writeback channel's source, not a window an owner's ledger holds",
+                "an owner-window store lands in the owner's own registered window; trace-owned bytes are \
+                 the writeback channel's source, not a window an owner's ledger holds",
             )),
             BufferSource::StagedLease(_) => return Err(landing_refusal(
                 attachment,
                 "staged_lease",
-                "a borrowed store lands in the owner's own registered window; a staged lease is \
-                 the provider's copy of one reservation rather than the owner's live pages",
+                "an owner-window store lands in the owner's own registered window; a staged lease is the \
+                 provider's copy of one reservation rather than the owner's live pages",
             )),
         };
     let landing = AttachmentLanding { windows };
@@ -5599,8 +5648,8 @@ fn resolve_attachment_landing(
             .with_field("expected_bytes", FieldValue::Unsigned(expected_bytes))
             .with_field("resolved_bytes", FieldValue::Unsigned(resolved))
             .with_detail(
-                "the windows a borrowed store lands in have to be the attachment's own tightly \
-                 packed byte extent",
+                "the windows an owner-window store lands in have to be the attachment's own tightly packed \
+                 byte extent",
             ));
     }
     Ok(landing)
@@ -5650,8 +5699,8 @@ fn land_owner_windows(
             return Err(capability_refusal("render_attachment_landing_undeclared")
                 .with_field("attachment", FieldValue::Unsigned(index as u64))
                 .with_detail(
-                    "a borrowed store lands the frame the pass read back, and this pass published \
-                     none for the attachment",
+                    "an owner-window store lands the frame the pass read back, and this pass \
+                     published none for the attachment",
                 ));
         };
         landing.land(leases.borrowed, texels)?;
@@ -5662,13 +5711,17 @@ fn land_owner_windows(
 /// Whether one store arm publishes its bytes through the pass's readback
 /// channel (`research/docs/23` §3.6/§76/§114).
 ///
-/// `Store` and its owner-window sibling `Borrowed` do: the borrowed arm adds
+/// `Store` and its owner-window siblings (`Borrowed` and the landing-view arm,
+/// `research/docs/23` §115 之后的增量，E-TX13) do: each owner-window arm adds
 /// the owner's window as a second destination rather than replacing the
 /// channel, which is what keeps every pre-E-TX8 reader of the completion
 /// byte-identical. A resident store keeps the frame in the provider's own
 /// image, and a discarding store leaves none behind.
 fn store_publishes(store: StoreOp) -> bool {
-    matches!(store, StoreOp::Store | StoreOp::Borrowed)
+    matches!(
+        store,
+        StoreOp::Store | StoreOp::Borrowed | StoreOp::BorrowedLanding(_)
+    )
 }
 
 /// The one texel a multisampled `Load` seeds every sample with
@@ -6322,6 +6375,7 @@ pub(crate) fn execute_indirect_render_pass<'a>(
     pass: &'a RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
     previous: &'a [Option<&'a BufferView>],
+    landings: &'a [Option<&'a BufferView>],
     resident: &[Option<&'a ProviderTargetImage>],
     leases: Option<&RenderLeaseContext<'_>>,
     produced: Option<&'a ProducedTraceViews<'a>>,
@@ -6374,6 +6428,7 @@ pub(crate) fn execute_indirect_render_pass<'a>(
         stages,
         pass,
         previous,
+        landings,
         if resident.is_empty() {
             None
         } else {
@@ -8318,6 +8373,10 @@ pub(crate) fn execute_present_render<'a>(
         stages,
         pass,
         &previous,
+        // The present rail renders into one provider-owned target and refuses
+        // both owner-window store arms by name below, so it states no landing
+        // view (`research/docs/23` §115 及其后的增量，E-TX8/E-TX13).
+        &[None],
         None,
         leases,
         produced,
@@ -8348,16 +8407,16 @@ pub(crate) fn execute_present_render<'a>(
         return Err(render_all_attachments_discarded_refusal());
     }
     // A present target is the provider's own image and the present action is
-    // what hands it on, so a borrowed store beside it would name a second
-    // home for the same frame (`research/docs/23` §114, E-TX8). The pairing is
-    // refused by name here rather than executed with one of the two landings
-    // silently winning.
-    if attachment.store == StoreOp::Borrowed {
+    // what hands it on, so either owner-window store beside it would name a
+    // second home for the same frame (`research/docs/23` §115 及其后的增量，
+    // E-TX8/E-TX13). The pairing is refused by name here rather than executed
+    // with one of the two landings silently winning.
+    if attachment.store.lands_in_owner_window() {
         return Err(capability_refusal("render_present_borrowed_store_unsupported")
             .with_field("view", FieldValue::Unsigned(pass.color_attachments[0].view_id.get()))
             .with_detail(
                 "the present rail renders into one provider-owned target and hands that target \
-                 on; a borrowed store lands in the owner's registered window instead",
+                 on; an owner-window store lands in the owner's registered window instead",
             ));
     }
     // A present pass renders into the provider-owned target alone: it opens no
@@ -8401,11 +8460,13 @@ pub(crate) fn execute_present_render<'a>(
                         // (`research/docs/23` §76, R7): the stencil surface has
                         // no provider-owned identity to keep its bytes under.
                         Some(StoreOp::Resident) => "resident",
-                        // The owner-window store is the colour attachment's arm
-                        // (`research/docs/23` §114, E-TX8), refused by core
-                        // admission for the same reason: the stencil surface
-                        // states no view whose source arm could name a window.
+                        // Both owner-window stores are the colour attachment's
+                        // arms (`research/docs/23` §115 及其后的增量，
+                        // E-TX8/E-TX13), refused by core admission for the same
+                        // reason: the stencil surface states no view whose source
+                        // arm could name a window.
                         Some(StoreOp::Borrowed) => "borrowed",
+                        Some(StoreOp::BorrowedLanding(_)) => "borrowed_landing",
                         None => "unstated",
                     }
                     .to_owned(),
@@ -17515,8 +17576,9 @@ mod tests {
         stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
         let pass = milestone_pass(AttachmentFormat::R32Float);
         pass.validate().expect("the fixture pass is a legal shape");
-        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None, None)
-            .expect_err("the mismatched pairing is refused before any Vulkan object exists");
+        let refused =
+            execute_render_pass(&context, &stages, &pass, &[None], &[None], &[], None, None)
+                .expect_err("the mismatched pairing is refused before any Vulkan object exists");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
@@ -17536,8 +17598,9 @@ mod tests {
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
-        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None, None)
-            .expect_err("`Load` needs an upload rail this increment does not have");
+        let refused =
+            execute_render_pass(&context, &stages, &pass, &[None], &[None], &[], None, None)
+                .expect_err("`Load` needs an upload rail this increment does not have");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
@@ -18013,8 +18076,9 @@ mod tests {
         let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
-        let error = execute_render_pass(&context, &stages, &pass, &[None], &[], None, None)
-            .expect_err("the substituted driver answer refuses the render submission");
+        let error =
+            execute_render_pass(&context, &stages, &pass, &[None], &[None], &[], None, None)
+                .expect_err("the substituted driver answer refuses the render submission");
         eprintln!("render device loss: {error:?}");
         assert_eq!(error.class, ProviderErrorClass::DeviceLost);
         assert_eq!(error.slug, "render_submission_failed");

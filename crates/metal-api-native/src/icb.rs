@@ -442,6 +442,7 @@ mod tests {
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
+            supports_render_attachment_landing_view: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
