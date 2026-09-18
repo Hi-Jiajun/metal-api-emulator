@@ -8991,6 +8991,26 @@ mod tests {
     }
 
     #[test]
+    fn a_borrowed_store_is_refused_by_name() {
+        // The owner-window store (`research/docs/23` §114, E-TX8) lands the
+        // pass's frame in the owner's *registered window*. This rail carries
+        // the owner's window as a render **input** (`research/docs/23` §72,
+        // R3d) and has no landing route that writes one, so the arm stays
+        // refused by name rather than executing as a plain store: a plain
+        // store is not what the caller declared, and the guest's pages would
+        // be left holding the pass's previous bytes. E-TX9b pins the refusal
+        // so the boundary is a measured reading of the native rail rather than
+        // an incidental code path.
+        let error = store_action(StoreOp::Borrowed).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("source"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+    }
+
+    #[test]
     fn plan_refuses_an_attachment_beyond_the_declared_extent() {
         // The rail's reviewed ceiling is `REVIEWED_ATTACHMENT_CEILING` (R1b,
         // `research/docs/23` §70); one texel beyond it is refused rather than

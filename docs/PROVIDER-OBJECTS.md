@@ -204,3 +204,52 @@ cases per path; an independent canonical comparison found every case's
 completion, writebacks and allocation bytes equal across all five paths. Raw
 JSON ordering and backend/device metadata may differ. No new Metal shader
 support is claimed.
+
+## Owner-window attachments (E-TX9b)
+
+The trace rail's `StoreOp::Borrowed` arm lands a colour attachment's frame in
+the *owner's registered window*: the attachment's own view declaration names
+the guest's pages, the pass loads them, and the frame the pass read back is
+copied back into the same window. The window is resolved from the trace's
+serial view list, so an object-rail recording states the same thing in two
+halves:
+
+1. the command's declaring pass names the window —
+   `ComputeCommandEncoder::set_buffer_lease(index, lease)` binds an imported
+   lease at a compute slot, the sibling of the render rail's
+   `set_stage_buffer_lease`. The lease's own identity is the view's id, and a
+   reservation outside the owner allocation the caller states, or a slot the
+   pipeline declares writable, is refused by name
+   (`ContractError::LeaseRangeOutOfBounds`,
+   `Error::WritableComputeLeaseUnsupported` — a writable slot's landing is the
+   bytes' own host image, which an imported lease does not have);
+2. the drawing pass lands the frame there —
+   `RenderCommandEncoder::draw_primitives_with_declared_attachments` /
+   `draw_indexed_primitives_with_declared_attachments` take a positional list
+   of `RenderAttachmentDeclaration`s: `View(RenderColorAttachment)`, which is
+   exactly the shape the pre-E-TX9b entries take, or
+   `Window(RenderWindowAttachment)`, whose store is `StoreOp::Borrowed`.
+
+`RenderWindowAttachment` states one no-copy window (`BorrowedNoCopy`) whose
+length is the attachment's own tightly packed extent. Three shapes are refused
+at the recorder, before any device object exists, rather than truncated or
+deferred to a rail: a window of any other length
+(`Error::WindowAttachmentExtentMismatch`, which is also the padded /
+non-tightly-packed shape this arm does not carry), a copy arm
+(`Error::WindowAttachmentNamesACopyArm` — a staged lease is the provider's copy
+of one reservation, not the owner's live pages), and a window no pass of the
+same command declares (`Error::WindowAttachmentUndeclared`, answered at commit
+against the trace's own serial view list).
+
+A writeback whose identity is one of the command's own lease declarations has
+no host image in this rail: the bytes live in the provider's staged copy or in
+the owner's own pages, and the rail's landing has already written the frame
+into the window, so the writeback copies nothing and loses nothing.
+
+Readings (branch `feat-owner-window-entry`, Lavapipe,
+`render_object_owner_window_e2e`):
+the object rail's guest window after the pass holds exactly the frame the
+trace rail lands from the same bytes through its own
+`BufferSource::BorrowedNoCopy` declaration
+(`4080c0ff112233444080c0ff55667788`: the left column drawn, column 1 the words
+the load read), and the four refusals above are asserted by name.

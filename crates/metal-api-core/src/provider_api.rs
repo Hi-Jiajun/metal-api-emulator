@@ -21,13 +21,14 @@ use crate::provider::{
     Dispatch, DispatchKind, DispatchType, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
     HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
     IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineId,
-    PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities,
-    ProviderError, ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineStage, ResourceTableSnapshot, SamplerPolicy, StageBufferView, StorageMode,
-    StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX,
-    MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
+    PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderHealth, ProviderSubmission, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineStage, ResourceTableSnapshot, SamplerPolicy,
+    StageBufferView, StorageMode, StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
+    MAX_RENDER_STAGE_BUFFER_INDEX, MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -135,6 +136,49 @@ pub enum Error {
     WritableStageBufferLeaseUnsupported {
         stage: RenderPipelineStage,
         index: u32,
+    },
+    /// A lease-bound compute slot the pipeline declares writable has no
+    /// landing the object API could publish (`research/docs/23` §90, E-TX9b).
+    /// The refusal is the stage-buffer one's own reason: the writeback channel
+    /// lands in the bytes' own host image, and an imported lease has none —
+    /// its bytes live in the provider's staged copy or in the owner's own
+    /// mapping. A writable slot is the caller-held arm's shape.
+    WritableComputeLeaseUnsupported {
+        index: u32,
+    },
+    /// One owner-window attachment names a window *no pass of the same command
+    /// declares* (`research/docs/23` §114, E-TX9b).
+    ///
+    /// The window is resolved from the trace's *serial view list* — the
+    /// declaration the attachment's own `(allocation, view)` identity already
+    /// names — so a command whose declaring pass binds a different reservation
+    /// (or none at all) states a landing the rail cannot resolve. The object
+    /// rail refuses it here, where both halves are still visible, rather than
+    /// one rail deeper where it would read as a generic missing declaration.
+    WindowAttachmentUndeclared {
+        lease: LeaseId,
+        view: ViewId,
+    },
+    /// One owner-window attachment's window is not the attachment's own
+    /// tightly packed byte extent (`research/docs/23` §114, E-TX8/E-TX9b).
+    ///
+    /// The frame the pass read back is exactly `width * height * bytes_per_texel`,
+    /// and the window is where all of it lands; a window of any other length
+    /// would have to be truncated or padded, which this arm refuses by name
+    /// instead of doing silently.
+    WindowAttachmentExtentMismatch {
+        lease: LeaseId,
+        expected: u64,
+        declared: u64,
+    },
+    /// One owner-window attachment named a *copy* arm
+    /// (`StageBufferLeaseArm::StagedLease`, `research/docs/23` §114/§90,
+    /// E-TX9b). The store's window has to be the owner's own pages: a staged
+    /// lease is the provider's copy of one reservation, and landing the frame
+    /// there would write into a buffer no owner's ledger protects — exactly
+    /// the shape the render rail refuses as `staged_lease`.
+    WindowAttachmentNamesACopyArm {
+        lease: LeaseId,
     },
     /// A vertex-buffer draw has no stream bound. The `vertex_id`-only shape is
     /// [`RenderCommandEncoder::draw_render_pass`], which binds no input at all.
@@ -272,6 +316,34 @@ impl fmt::Display for Error {
                  no host landing the object API could publish",
                 stage.name(),
                 index
+            ),
+            Self::WritableComputeLeaseUnsupported { index } => write!(
+                f,
+                "the pipeline declares compute binding {index} writable, and an imported lease \
+                 has no host landing the object API could publish"
+            ),
+            Self::WindowAttachmentUndeclared { lease, view } => write!(
+                f,
+                "the owner-window attachment lands in lease {} (view {}), and no pass of \
+                 this command declares that window",
+                lease.get(),
+                view.get()
+            ),
+            Self::WindowAttachmentExtentMismatch {
+                lease,
+                expected,
+                declared,
+            } => write!(
+                f,
+                "the owner-window attachment's window (lease {}) carries {declared} bytes, \
+                 and the attachment's own tightly packed extent is {expected}",
+                lease.get()
+            ),
+            Self::WindowAttachmentNamesACopyArm { lease } => write!(
+                f,
+                "the owner-window attachment names lease {} through a copy arm; a stored \
+                 frame lands in the owner's own registered window",
+                lease.get()
             ),
             Self::MissingVertexBuffer => f.write_str(
                 "a vertex-buffer draw needs a bound vertex stream; the vertex_id-only shape is \
@@ -876,10 +948,92 @@ pub struct RenderColorAttachment<'a> {
 /// stays valid after the caller's views are dropped.
 #[derive(Clone)]
 struct RenderTargetAttachment {
-    view: BufferView,
+    source: RenderAttachmentSource,
     format: AttachmentFormat,
     load: RenderAttachmentLoad,
     store: StoreOp,
+}
+
+/// Where one recorded colour attachment's bytes live
+/// (`research/docs/23` §114, E-TX8/E-TX9b).
+///
+/// The two arms the object rail can record: the caller's own host image — the
+/// shape every pre-E-TX9b recording states — and the owner's registered
+/// window, whose frame lands in the guest's own pages instead of only in the
+/// writeback channel. The window arm's identity is the lease's own, exactly as
+/// a lease-bound stage buffer's view is, so the `(allocation, view)` pair the
+/// pass's descriptor carries and the serial view list's declaration are one
+/// fact.
+#[derive(Clone)]
+enum RenderAttachmentSource {
+    /// A caller-held buffer view.
+    View(BufferView),
+    /// The owner's registered window.
+    Window(StageBufferLease),
+}
+
+impl RenderAttachmentSource {
+    fn view_id(&self) -> ViewId {
+        match self {
+            Self::View(view) => view.view_id(),
+            Self::Window(lease) => ViewId::new(lease.reservation.lease.lease_id.get()),
+        }
+    }
+
+    fn allocation_id(&self) -> AllocationId {
+        match self {
+            Self::View(view) => view.allocation_id(),
+            Self::Window(lease) => lease.reservation.lease.allocation_id,
+        }
+    }
+}
+
+/// One colour attachment a multi-attachment draw records
+/// (`research/docs/23` §114/§115, E-TX9b).
+///
+/// The list stays positional — entry `i` is location `i` — and each entry
+/// states where its bytes come from: the caller's own buffer view or the
+/// owner's registered window. The window arm is the only one that spells
+/// [`StoreOp::Borrowed`]; the view arm keeps the store decision the caller
+/// states, exactly as [`RenderColorAttachment`] already carries it.
+#[derive(Clone, Copy)]
+pub enum RenderAttachmentDeclaration<'a> {
+    /// The attachment's bytes and landing are the caller's own buffer view.
+    View(RenderColorAttachment<'a>),
+    /// The attachment's bytes and landing are the owner's registered window.
+    Window(RenderWindowAttachment),
+}
+
+/// One colour attachment whose stored bytes land in the *owner's registered
+/// window* (`research/docs/23` §114/§115, E-TX8/E-TX9b).
+///
+/// The arm is the store sibling of the load channel R5b/§74 and E-TX6 opened:
+/// a guest-backed surface's bytes live in the guest's own pages, and those
+/// pages reach the provider as an owner-issued window. A recorded pass states
+/// it by declaring *this* window on a pass of the same command and naming its
+/// identity as the attachment — the serial view list is where the rail
+/// resolves the landing, so the declaration the pass begins from and the
+/// memory it lands in cannot disagree.
+///
+/// The window has to be the attachment's own tightly packed byte extent, and
+/// its arm has to be the no-copy one: the frame lands in the owner's live
+/// pages, not in a copy the provider staged. A shape this entry cannot state
+/// is refused by name at the recorder rather than silently truncated, and the
+/// count of colour attachments, their formats and the pass-wide viewport are
+/// the multi-attachment entry's own rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderWindowAttachment {
+    /// The owner's window the frame lands in
+    /// ([`StageBufferLeaseArm::BorrowedNoCopy`]: the provider holds the
+    /// owner's own mapping, so the bytes it writes are the guest's).
+    pub lease: StageBufferLease,
+    /// The attachment's colour format, which has to equal the recorded
+    /// pipeline's compiled format at the same location.
+    pub format: AttachmentFormat,
+    /// How the pass establishes this attachment's contents: `Clear`, `Load`
+    /// (which uploads the window's own current bytes, exactly as E-TX6's load
+    /// half states) or `DontCare`.
+    pub load: RenderAttachmentLoad,
 }
 
 /// The colour attachments one recorded render pass stores into, plus the
@@ -1197,8 +1351,8 @@ impl RenderTarget {
             .attachments
             .iter()
             .map(|attachment| RenderAttachment {
-                view_id: attachment.view.view_id,
-                allocation_id: attachment.view.allocation_id(),
+                view_id: attachment.source.view_id(),
+                allocation_id: attachment.source.allocation_id(),
                 format: attachment.format,
                 width: self.width,
                 height: self.height,
@@ -1219,8 +1373,8 @@ impl RenderTarget {
         let present = match (self.present, self.attachments.first()) {
             (Some(initial), Some(first)) => Some(PresentDescriptor {
                 target: PresentTarget {
-                    allocation_id: first.view.allocation_id(),
-                    view_id: first.view.view_id,
+                    allocation_id: first.source.allocation_id(),
+                    view_id: first.source.view_id(),
                     format: first.format,
                     width: self.width,
                     height: self.height,
@@ -1230,7 +1384,7 @@ impl RenderTarget {
                         PresentInitial::Sentinel(bytes) => InitialState::Sentinel(bytes.to_vec()),
                     },
                 },
-                source: first.view.view_id,
+                source: first.source.view_id(),
                 mode: PresentMode::Fifo,
                 acquire: AcquirePolicy::Blocking,
             }),
@@ -1830,14 +1984,14 @@ fn recorded_view_ids(passes: &[RecordedPass]) -> BTreeSet<ViewId> {
     for pass in passes {
         match pass {
             RecordedPass::Compute { buffers, .. } => {
-                ids.extend(buffers.values().map(|view| view.view_id));
+                ids.extend(buffers.values().map(ComputeBindingSource::view_id));
             }
             RecordedPass::Render { target, .. } => {
                 ids.extend(
                     target
                         .attachments
                         .iter()
-                        .map(|attachment| attachment.view.view_id),
+                        .map(|attachment| attachment.source.view_id()),
                 );
             }
         }
@@ -1864,6 +2018,14 @@ fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Er
             } => {
                 let metadata = pipeline.metadata();
                 for (binding, view) in buffers {
+                    // A lease-bound slot owns no host image of the object API's:
+                    // its bytes live in the provider's staged copy or in the
+                    // owner's own mapping, exactly as a lease-bound render
+                    // stage buffer's do (`research/docs/23` §90, R9i/E-TX9b),
+                    // so there is no range here for a CPU reader to wait on.
+                    let ComputeBindingSource::View(view) = view else {
+                        continue;
+                    };
                     let write = metadata
                         .contract
                         .buffer_bindings
@@ -1881,7 +2043,14 @@ fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Er
             }
             RecordedPass::Render { target, .. } => {
                 for attachment in &target.attachments {
-                    let view = &attachment.view;
+                    // A window-bound attachment owns no host image of the
+                    // object API's: its bytes are the owner's own pages, which
+                    // this rail never holds a guard for — the same reason a
+                    // lease-bound stage buffer reserves no range
+                    // (`research/docs/23` §90, R9i/E-TX9b).
+                    let RenderAttachmentSource::View(view) = &attachment.source else {
+                        continue;
+                    };
                     let write = !matches!(attachment.load, RenderAttachmentLoad::Load);
                     by_allocation
                         .entry(view.allocation_id())
@@ -1977,10 +2146,38 @@ struct CommandReservations {
 /// in the texture's bytes (`research/docs/26` §21.4, C2). Both are the same
 /// identity-keyed channel; the identity decides the target, and an identity no
 /// reservation holds is refused by name rather than dropped.
+/// The identities a command's own lease declarations carry
+/// (`research/docs/23` §90, R9i; §114, E-TX8/E-TX9b).
+///
+/// The writeback channel publishes the bytes a lease-bound view's landing
+/// holds — a `StoreOp::Borrowed` attachment's frame in particular — and this
+/// rail holds no host image for those bytes: they live in the provider's
+/// staged copy or in the owner's own pages, and the rail's landing has already
+/// written the frame into the window. A writeback for one of these identities
+/// therefore copies nothing into the object API's own resources; the bytes it
+/// carries are the ones the owner's memory holds.
+fn lease_bound_identities(trace: &ComputeTrace) -> BTreeSet<(AllocationId, ViewId)> {
+    trace
+        .serial_resources()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|view| {
+            matches!(
+                view.source,
+                BufferSource::StagedLease(_)
+                    | BufferSource::BorrowedNoCopy(_)
+                    | BufferSource::GuestRuns(_)
+            )
+        })
+        .map(|view| (view.allocation_id, view.view_id))
+        .collect()
+}
+
 fn apply_writebacks(
     reservations: &[BufferReservation],
     textures: &[TextureReservation],
     writebacks: &[BufferWriteback],
+    lease_bound: &BTreeSet<(AllocationId, ViewId)>,
 ) -> Result<(), Error> {
     if writebacks.is_empty() {
         return Ok(());
@@ -1994,6 +2191,15 @@ fn apply_writebacks(
     let mut texture_writes = Vec::new();
     for writeback in writebacks {
         let Some(position) = positions.get(&writeback.allocation_id) else {
+            // A writeback a *lease-bound declaration of this same command*
+            // carries has no host image here (`research/docs/23` §90, R9i;
+            // §114, E-TX8/E-TX9b): the bytes live in the provider's staged
+            // copy or in the owner's own pages, and the rail's landing has
+            // already written the frame into the owner's window. The channel
+            // carries the same bytes, so copying nothing loses nothing.
+            if lease_bound.contains(&(writeback.allocation_id, writeback.view_id)) {
+                continue;
+            }
             // A texture identity keys the second target: core admission has
             // already refused an unknown identity, a read-only texture, a short
             // landing and an offset landing against the trace, so this arm
@@ -2259,7 +2465,7 @@ impl CommandQueue {
 enum RecordedPass {
     Compute {
         pipeline: Pipeline,
-        buffers: BTreeMap<u32, BufferView>,
+        buffers: BTreeMap<u32, ComputeBindingSource>,
         textures: BTreeMap<u32, Texture>,
         dispatch: Dispatch,
     },
@@ -2589,6 +2795,32 @@ impl CommandBuffer {
                 }
             }
         }
+        // A lease-bound compute binding's allocation is the owner's own
+        // registration, exactly as a lease-bound stage buffer's is: the
+        // trace's own table has to carry it before the reservation can be
+        // admitted (`research/docs/23` §90, R9i/E-TX9b). The owner's
+        // registered length is the caller's own statement.
+        for pass in passes {
+            let RecordedPass::Compute { buffers, .. } = pass else {
+                continue;
+            };
+            for source in buffers.values() {
+                let ComputeBindingSource::Lease(lease) = source else {
+                    continue;
+                };
+                let allocation = lease.reservation.lease.allocation_id;
+                if resources.allocation(allocation).is_none() {
+                    resources.insert_allocation(AllocationRecord {
+                        allocation_id: allocation,
+                        owner_epoch: owner.epoch,
+                        size: lease.allocation_size,
+                    })?;
+                }
+                if resources.lease(lease.reservation.lease.lease_id).is_none() {
+                    resources.insert_lease(lease.reservation)?;
+                }
+            }
+        }
         // The host bytes must stay stable only while the trace snapshots them:
         // every view copies its bytes into the trace, so the provider never
         // reads the host buffer again. Conflicting CPU access is excluded for
@@ -2619,26 +2851,55 @@ impl CommandBuffer {
                         }
                     }
                     let mut views = Vec::with_capacity(buffers.len());
-                    for (binding, view) in buffers {
+                    for (binding, source) in buffers {
                         let reflected = metadata
                             .contract
                             .buffer_bindings
                             .iter()
                             .find(|value| value.metal_binding == *binding)
                             .ok_or(ContractError::UnknownBinding(*binding))?;
-                        let bytes = &guards[positions[&view.allocation_id()]];
-                        views.push(contract::BufferView {
-                            view_id: view.view_id,
-                            metal_binding: *binding,
-                            allocation_id: view.allocation_id(),
-                            offset: view.offset as u64,
-                            length: view.length as u64,
-                            access: reflected.access,
-                            attribute_stride: None,
-                            source: BufferSource::OwnedBytes(
-                                bytes[view.offset..view.offset + view.length].to_vec(),
-                            ),
-                        });
+                        let view = match source {
+                            ComputeBindingSource::View(view) => {
+                                let bytes = &guards[positions[&view.allocation_id()]];
+                                contract::BufferView {
+                                    view_id: view.view_id,
+                                    metal_binding: *binding,
+                                    allocation_id: view.allocation_id(),
+                                    offset: view.offset as u64,
+                                    length: view.length as u64,
+                                    access: reflected.access,
+                                    attribute_stride: None,
+                                    source: BufferSource::OwnedBytes(
+                                        bytes[view.offset..view.offset + view.length].to_vec(),
+                                    ),
+                                }
+                            }
+                            ComputeBindingSource::Lease(lease) => contract::BufferView {
+                                // The lease's own identity is the view's id,
+                                // the rule the render stage-buffer arm states:
+                                // the reservation names the bytes, so the view
+                                // cannot name a different set (`research/docs/23`
+                                // §90, R9i; §114, E-TX9b).
+                                view_id: ViewId::new(lease.reservation.lease.lease_id.get()),
+                                metal_binding: *binding,
+                                allocation_id: lease.reservation.lease.allocation_id,
+                                offset: lease.reservation.offset,
+                                length: lease.reservation.length,
+                                access: reflected.access,
+                                attribute_stride: None,
+                                source: match lease.arm {
+                                    StageBufferLeaseArm::StagedLease => {
+                                        BufferSource::StagedLease(lease.reservation.lease.lease_id)
+                                    }
+                                    StageBufferLeaseArm::BorrowedNoCopy => {
+                                        BufferSource::BorrowedNoCopy(
+                                            lease.reservation.lease.lease_id,
+                                        )
+                                    }
+                                },
+                            },
+                        };
+                        views.push(view);
                     }
                     trace_passes.push(contract::TracePass::Compute(contract::ComputePass {
                         pipeline: metadata.pipeline_id,
@@ -2676,6 +2937,42 @@ impl CommandBuffer {
         }
         // Snapshot complete: no later step of this command reads the host bytes.
         drop(guards);
+        // The owner-window store resolves its landing from the trace's own
+        // serial view list (`research/docs/23` §114, E-TX8), so the object rail
+        // states here that the command's own declarations carry the window its
+        // frame lands in. A landing no pass declares is refused by name — the
+        // same `(allocation, view)` identity the rail looks up, answered while
+        // both halves are still one trace — instead of being deferred to the
+        // rail, where it would read as a missing declaration
+        // (`research/docs/23` §115, E-TX9b).
+        let declared_windows = trace_passes
+            .iter()
+            .filter_map(contract::TracePass::as_compute)
+            .flat_map(|pass| pass.buffers.iter())
+            .filter(|view| {
+                matches!(
+                    view.source,
+                    BufferSource::BorrowedNoCopy(_) | BufferSource::GuestRuns(_)
+                )
+            })
+            .map(|view| (view.view_id, view.allocation_id))
+            .collect::<BTreeSet<_>>();
+        for pass in trace_passes
+            .iter()
+            .filter_map(contract::TracePass::as_render)
+        {
+            for attachment in &pass.color_attachments {
+                if attachment.store != StoreOp::Borrowed {
+                    continue;
+                }
+                if !declared_windows.contains(&(attachment.view_id, attachment.allocation_id)) {
+                    return Err(Error::WindowAttachmentUndeclared {
+                        lease: LeaseId::new(attachment.view_id.get()),
+                        view: attachment.view_id,
+                    });
+                }
+            }
+        }
         let heap_payload = heap.and_then(|heap| heap.payload()).map(Box::new);
         let indirect_payload = indirect.map(|icb| Box::new(icb.payload().clone()));
         let trace = contract::ComputeTrace {
@@ -2715,6 +3012,7 @@ impl CommandBuffer {
                     &reservations.buffers,
                     &reservations.textures,
                     &submission.writebacks,
+                    &lease_bound_identities(&trace),
                 )?;
                 Ok(ExecutionOutcome::Completed(submission))
             }
@@ -2815,6 +3113,7 @@ impl CommandBuffer {
             &pending.reservations.buffers,
             &pending.reservations.textures,
             &readback.writebacks,
+            &lease_bound_identities(&pending.trace),
         )?;
         Ok(ProviderSubmission {
             completion: readback.completion,
@@ -2833,12 +3132,59 @@ impl CommandBuffer {
     }
 }
 
+/// Where one recorded compute slot's bytes come from (`research/docs/23` §90,
+/// R9i; §114, E-TX9b).
+///
+/// The two arms a dispatch can name: the caller's own host image, snapshotted
+/// at commit under the command's reservations, or a lease the provider
+/// registry already holds. The lease arm is the same one a render stage buffer
+/// has ([`RenderStageSource`]), and it exists on the compute rail for the
+/// owner-window store's own reason: the window a `StoreOp::Borrowed`
+/// attachment's frame lands in is resolved from the trace's *serial view
+/// list*, so a command that lands a frame in the owner's pages declares that
+/// window with a pass — and the pass that declares an input the render pass
+/// also names is the compute one.
+///
+/// The lease's own identity is the view's id, exactly as it is on the render
+/// stage-buffer arm: the reservation names the bytes, so the view cannot name
+/// a different set.
+#[derive(Clone)]
+enum ComputeBindingSource {
+    /// A caller-held buffer view, snapshotted at commit.
+    View(BufferView),
+    /// An imported lease the provider registry already holds.
+    Lease(StageBufferLease),
+}
+
+impl ComputeBindingSource {
+    fn view_id(&self) -> ViewId {
+        match self {
+            Self::View(view) => view.view_id(),
+            Self::Lease(lease) => ViewId::new(lease.reservation.lease.lease_id.get()),
+        }
+    }
+
+    /// Byte interval of this binding inside its allocation, for range hazards.
+    /// A lease-bound slot's interval is its reservation, since that is the
+    /// window the provider reads.
+    fn range(&self) -> BufferRange {
+        match self {
+            Self::View(view) => view.range(),
+            Self::Lease(lease) => BufferRange::new(
+                lease.reservation.lease.allocation_id,
+                lease.reservation.offset,
+                lease.reservation.length,
+            ),
+        }
+    }
+}
+
 /// Encoder state persists across dispatches. Call `clear_buffers` when changing
 /// to a pipeline with a different layout; extra bindings are refused.
 pub struct ComputeCommandEncoder {
     shared: Arc<CommandShared>,
     pipeline: Option<Pipeline>,
-    buffers: BTreeMap<u32, BufferView>,
+    buffers: BTreeMap<u32, ComputeBindingSource>,
     textures: BTreeMap<u32, Texture>,
     dispatch_count: usize,
     indirect: bool,
@@ -2858,10 +3204,63 @@ impl ComputeCommandEncoder {
         if !Arc::ptr_eq(&self.shared.owner, &view.buffer.inner.owner) {
             return Err(Error::ForeignBuffer);
         }
+        self.bind_buffer_source(index, ComputeBindingSource::View(view.clone()))
+    }
+
+    /// Bind one imported lease to `index` (`research/docs/23` §90, R9i; §114,
+    /// E-TX9b).
+    ///
+    /// The lease is the caller's own import: it goes through the same channel a
+    /// compute case's `storage_mode` uses, and the reservation the caller hands
+    /// here is the one the provider's registry resolved. The object API does
+    /// not import anything itself, and the owner's window stays the caller's to
+    /// keep alive until the submission has been waited for.
+    ///
+    /// The lease's own identity is the view's id — the rule the render
+    /// stage-buffer arm states — so a pass that names the owner's window here
+    /// declares exactly the `(allocation, view)` pair a
+    /// [`RenderWindowAttachment`] of the same command lands its frame in. The
+    /// window a `StoreOp::Borrowed` attachment resolves is read from the
+    /// trace's *serial view list*, and this is the object rail's channel into
+    /// that list.
+    ///
+    /// A reservation whose range is not inside the owner allocation the caller
+    /// states is refused by name ([`ContractError::LeaseRangeOutOfBounds`]),
+    /// exactly as the trace's own resource table refuses it. A slot the
+    /// pipeline declares *writable* is
+    /// [`Error::WritableComputeLeaseUnsupported`], refused when the pass is
+    /// recorded because only the pipeline's own contract states the slot's
+    /// access.
+    pub fn set_buffer_lease(&mut self, index: u32, lease: StageBufferLease) -> Result<(), Error> {
+        self.ensure_open()?;
+        if lease.allocation_size == 0 {
+            return Err(ContractError::ZeroLength("lease allocation").into());
+        }
+        let lease_id = lease.reservation.lease.lease_id;
+        let end = lease.reservation.end()?;
+        if end > lease.allocation_size {
+            return Err(ContractError::LeaseRangeOutOfBounds {
+                lease: lease_id,
+                end,
+                allocation_size: lease.allocation_size,
+            }
+            .into());
+        }
+        self.bind_buffer_source(index, ComputeBindingSource::Lease(lease))
+    }
+
+    /// The two refusals every compute binding shares: one index holds one
+    /// source, and two bindings of one allocation may not alias.
+    fn bind_buffer_source(
+        &mut self,
+        index: u32,
+        source: ComputeBindingSource,
+    ) -> Result<(), Error> {
+        let range = source.range();
         if let Some((first, _)) = self
             .buffers
             .iter()
-            .find(|(other, bound)| **other != index && bound.range().overlaps(&view.range()))
+            .find(|(other, bound)| **other != index && bound.range().overlaps(&range))
         {
             return Err(ApiError::AliasedBufferBindings {
                 first: *first,
@@ -2869,7 +3268,34 @@ impl ComputeCommandEncoder {
             }
             .into());
         }
-        self.buffers.insert(index, view.clone());
+        self.buffers.insert(index, source);
+        Ok(())
+    }
+
+    /// Refuse a lease-bound slot the pipeline's own contract declares writable
+    /// (`research/docs/23` §90, R9i/E-TX9b).
+    ///
+    /// The access of a slot is the recorded pipeline's declaration — the pair
+    /// rule [`ComputeCommandEncoder::dispatch_threads`] already enforces
+    /// between the bindings and the contract — so this is where the answer is
+    /// known. A writable slot's landing is the bytes' own host image, and a
+    /// lease has none.
+    fn refuse_writable_lease_slots(&self, pipeline: &Pipeline) -> Result<(), Error> {
+        for (index, source) in &self.buffers {
+            if !matches!(source, ComputeBindingSource::Lease(_)) {
+                continue;
+            }
+            let writable = pipeline
+                .metadata()
+                .contract
+                .buffer_bindings
+                .iter()
+                .find(|slot| slot.metal_binding == *index)
+                .is_some_and(|slot| slot.access != BufferAccess::Read);
+            if writable {
+                return Err(Error::WritableComputeLeaseUnsupported { index: *index });
+            }
+        }
         Ok(())
     }
     pub fn clear_buffers(&mut self) -> Result<(), Error> {
@@ -2951,6 +3377,7 @@ impl ComputeCommandEncoder {
                 return Err(ContractError::UndeclaredTextureBinding { binding: *binding }.into());
             }
         }
+        self.refuse_writable_lease_slots(pipeline)?;
         let mut inner = lock(&self.shared.inner, "provider command")?;
         let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
             .unwrap_or(usize::MAX)
@@ -2962,7 +3389,7 @@ impl ComputeCommandEncoder {
             });
         }
         let mut unique = recorded_view_ids(&inner.passes);
-        unique.extend(self.buffers.values().map(|view| view.view_id));
+        unique.extend(self.buffers.values().map(ComputeBindingSource::view_id));
         if unique.len() > MAX_SERIAL_RESOURCES {
             return Err(ContractError::SerialResourceLimit {
                 requested: unique.len(),
@@ -3046,6 +3473,7 @@ impl ComputeCommandEncoder {
                 return Err(ContractError::UndeclaredTextureBinding { binding: *binding }.into());
             }
         }
+        self.refuse_writable_lease_slots(pipeline)?;
         let mut inner = lock(&self.shared.inner, "provider command")?;
         if inner.indirect.is_some() {
             return Err(Error::IndirectAlreadyRecorded);
@@ -3060,7 +3488,7 @@ impl ComputeCommandEncoder {
             });
         }
         let mut unique = recorded_view_ids(&inner.passes);
-        unique.extend(self.buffers.values().map(|view| view.view_id));
+        unique.extend(self.buffers.values().map(ComputeBindingSource::view_id));
         if unique.len() > MAX_SERIAL_RESOURCES {
             return Err(ContractError::SerialResourceLimit {
                 requested: unique.len(),
@@ -3706,6 +4134,113 @@ impl RenderCommandEncoder {
             stencil_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass over the bound vertex streams
+    /// whose entries state their own source (`research/docs/23` §115, E-TX9b).
+    ///
+    /// The declaration sibling of [`Self::draw_primitives_with_attachments`]:
+    /// the list is positional the same way — entry `i` is location `i` — and
+    /// each entry is either a caller-held view
+    /// ([`RenderAttachmentDeclaration::View`], which is exactly the shape the
+    /// view-only entry takes) or the owner's registered window
+    /// ([`RenderAttachmentDeclaration::Window`]), whose frame lands in the
+    /// guest's own pages under the store arm [`StoreOp::Borrowed`]. Every rule
+    /// the view-only entry states — the attachment count, the extent each
+    /// entry fills, the format agreement with the recorded pipeline, the
+    /// all-`DontCare` refusal — holds here unchanged, because the entries are
+    /// the same shape.
+    ///
+    /// A window entry is a *declaration*: the serial view list is where the
+    /// rail resolves the window, so the same command has to declare it on a
+    /// pass of its own (the object rail's declaring pass, exactly as a
+    /// compute binding's bytes are declared). A command whose declarations do
+    /// not name the window is refused by name when it commits
+    /// ([`Error::WindowAttachmentUndeclared`]) instead of landing nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_with_declared_attachments(
+        &mut self,
+        attachments: &[RenderAttachmentDeclaration<'_>],
+        width: u64,
+        height: u64,
+        vertex_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.vertex_buffers.is_empty() {
+            return Err(Error::MissingVertexBuffer);
+        }
+        Self::admit_draw_counts(vertex_count, 1)?;
+        let draw = RenderDraw {
+            vertices: vertex_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: None,
+            instance_count: 1,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: None,
+            depth_test: None,
+            stencil: None,
+            stencil_test: None,
+            multisample: None,
+            depth_resolve: None,
+            stencil_resolve: None,
+        };
+        self.record_declared_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer
+    /// whose entries state their own source (`research/docs/23` §115, E-TX9b).
+    ///
+    /// [`Self::draw_primitives_with_declared_attachments`]'s indexed sibling:
+    /// the draw selects through the bound index buffer, exactly as
+    /// [`Self::draw_indexed_primitives_with_attachments`] does, and the
+    /// attachment list is the declaration list above. This is the census's
+    /// shape — a stream-fed vertex stage, an index buffer and one colour
+    /// attachment backed by the guest's own pages — with the attachment's
+    /// source stated instead of fixed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_declared_attachments(
+        &mut self,
+        attachments: &[RenderAttachmentDeclaration<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, 1)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count: 1,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: None,
+            depth_test: None,
+            stencil: None,
+            stencil_test: None,
+            multisample: None,
+            depth_resolve: None,
+            stencil_resolve: None,
+        };
+        self.record_declared_render_pass(attachments, width, height, present, draw, None)
     }
 
     /// Record a multi-attachment render pass through the bound index buffer
@@ -4890,6 +5425,38 @@ impl RenderCommandEncoder {
         draw: RenderDraw,
         indirect: Option<&IndirectCommandBuffer>,
     ) -> Result<(), Error> {
+        // Every pre-E-TX9b entry states caller-held views, so this wrapper is
+        // the whole of their share: the declared-list form below is the one
+        // recording path (`research/docs/23` §114/§115, E-TX9b).
+        let declarations = attachments
+            .iter()
+            .copied()
+            .map(RenderAttachmentDeclaration::View)
+            .collect::<Vec<_>>();
+        self.record_declared_render_pass(&declarations, width, height, present, draw, indirect)
+    }
+
+    /// Record one pass over a positional list of attachment *declarations*
+    /// (`research/docs/23` §114/§115, E-TX9b).
+    ///
+    /// The list is [`Self::record_render_pass`]'s own, with each entry's
+    /// source arm stated by the caller instead of fixed to a caller-held view:
+    /// an entry that names the owner's registered window lands its frame in
+    /// the guest's own pages ([`RenderWindowAttachment`]), and its store is the
+    /// window arm [`StoreOp::Borrowed`]. Every other rule — the attachment
+    /// count, the extent each entry's own bytes have to fill, the format
+    /// agreement with the recorded pipeline, the all-`DontCare` refusal — is
+    /// the view-only path's, because those shapes are the same shape.
+    #[allow(clippy::too_many_arguments)]
+    fn record_declared_render_pass(
+        &mut self,
+        attachments: &[RenderAttachmentDeclaration<'_>],
+        width: u64,
+        height: u64,
+        present: Option<PresentInitial>,
+        draw: RenderDraw,
+        indirect: Option<&IndirectCommandBuffer>,
+    ) -> Result<(), Error> {
         let pipeline = self.pipeline.clone().ok_or(ApiError::MissingPipeline)?;
         // A zero-colour-attachment recording is the depth-only pass
         // (`research/docs/23` §3.3, v46): the rasterizer still tests and writes
@@ -4910,37 +5477,44 @@ impl RenderCommandEncoder {
             });
         }
         let mut seen = BTreeSet::new();
+        let mut declared = Vec::with_capacity(attachments.len());
         for attachment in attachments {
-            if !Arc::ptr_eq(&self.shared.owner, &attachment.view.buffer.inner.owner) {
-                return Err(Error::ForeignBuffer);
-            }
-            if !seen.insert((attachment.view.allocation_id(), attachment.view.view_id())) {
-                return Err(Error::DuplicateRenderAttachment);
-            }
-            let expected_bytes = width
-                .checked_mul(height)
-                .and_then(|texels| texels.checked_mul(attachment.format.bytes_per_texel()))
-                .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
-            if u64::try_from(attachment.view.length).unwrap_or(u64::MAX) != expected_bytes {
-                return Err(ContractError::AttachmentExtentMismatch {
-                    pass_index: 0,
-                    view: attachment.view.view_id,
-                    expected: expected_bytes,
-                    declared: u64::try_from(attachment.view.length).unwrap_or(u64::MAX),
+            match attachment {
+                RenderAttachmentDeclaration::View(attachment) => {
+                    if !Arc::ptr_eq(&self.shared.owner, &attachment.view.buffer.inner.owner) {
+                        return Err(Error::ForeignBuffer);
+                    }
+                    if !seen.insert((attachment.view.allocation_id(), attachment.view.view_id())) {
+                        return Err(Error::DuplicateRenderAttachment);
+                    }
+                    let expected_bytes = width
+                        .checked_mul(height)
+                        .and_then(|texels| texels.checked_mul(attachment.format.bytes_per_texel()))
+                        .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
+                    if u64::try_from(attachment.view.length).unwrap_or(u64::MAX) != expected_bytes {
+                        return Err(ContractError::AttachmentExtentMismatch {
+                            pass_index: 0,
+                            view: attachment.view.view_id,
+                            expected: expected_bytes,
+                            declared: u64::try_from(attachment.view.length).unwrap_or(u64::MAX),
+                        }
+                        .into());
+                    }
+                    declared.push(RenderTargetAttachment {
+                        source: RenderAttachmentSource::View(attachment.view.clone()),
+                        format: attachment.format,
+                        load: attachment.load,
+                        store: attachment.store,
+                    });
                 }
-                .into());
+                RenderAttachmentDeclaration::Window(window) => {
+                    declared
+                        .push(self.validate_window_attachment(*window, width, height, &mut seen)?);
+                }
             }
         }
         let target = RenderTarget {
-            attachments: attachments
-                .iter()
-                .map(|attachment| RenderTargetAttachment {
-                    view: attachment.view.clone(),
-                    format: attachment.format,
-                    load: attachment.load,
-                    store: attachment.store,
-                })
-                .collect(),
+            attachments: declared,
             width,
             height,
             scissor: self.scissor,
@@ -5007,7 +5581,7 @@ impl RenderCommandEncoder {
         }
         let mut unique = recorded_view_ids(&inner.passes);
         for attachment in &target.attachments {
-            unique.insert(attachment.view.view_id);
+            unique.insert(attachment.source.view_id());
         }
         if unique.len() > MAX_SERIAL_RESOURCES {
             return Err(ContractError::SerialResourceLimit {
@@ -5028,6 +5602,88 @@ impl RenderCommandEncoder {
         }
         self.draw_count += 1;
         Ok(())
+    }
+
+    /// The attachment extent one colour entry has to fill
+    /// (`research/docs/23` §114, E-TX9b).
+    fn attachment_extent(width: u64, height: u64, format: AttachmentFormat) -> Result<u64, Error> {
+        width
+            .checked_mul(height)
+            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("attachment extent").into())
+    }
+
+    /// Validate one owner-window attachment and record it as the target entry
+    /// its own statement describes (`research/docs/23` §114/§115, E-TX9b).
+    ///
+    /// Four rules, each answered here rather than one rail deeper:
+    ///
+    /// * the arm has to be the owner's own pages
+    ///   ([`StageBufferLeaseArm::BorrowedNoCopy`]); a staged lease is the
+    ///   provider's copy of one reservation, so a frame landed there would
+    ///   write into a buffer no owner's ledger protects
+    ///   ([`Error::WindowAttachmentNamesACopyArm`]);
+    /// * the reservation has to lie inside the owner allocation the caller
+    ///   states ([`ContractError::LeaseRangeOutOfBounds`]);
+    /// * the window has to be the attachment's own tightly packed extent
+    ///   ([`Error::WindowAttachmentExtentMismatch`]) — the frame is all of
+    ///   `width * height * bytes_per_texel`, so any other length would have to
+    ///   be truncated or padded, which this arm refuses by name rather than
+    ///   doing silently;
+    /// * one identity may hold one entry
+    ///   ([`Error::DuplicateRenderAttachment`]).
+    ///
+    /// The declared view's identity is the lease's own — `(allocation,
+    /// ViewId(lease))` — exactly as a lease-bound stage buffer's is, so the
+    /// `(allocation, view)` pair the pass's descriptor carries is the pair the
+    /// serial view list has to declare. The store is the window arm
+    /// [`StoreOp::Borrowed`]: the frame lands in the owner's registered pages,
+    /// and a source that says so cannot carry any other store.
+    fn validate_window_attachment(
+        &self,
+        window: RenderWindowAttachment,
+        width: u64,
+        height: u64,
+        seen: &mut BTreeSet<(AllocationId, ViewId)>,
+    ) -> Result<RenderTargetAttachment, Error> {
+        let lease_id = window.lease.reservation.lease.lease_id;
+        if window.lease.arm != StageBufferLeaseArm::BorrowedNoCopy {
+            return Err(Error::WindowAttachmentNamesACopyArm { lease: lease_id });
+        }
+        if window.lease.allocation_size == 0 {
+            return Err(ContractError::ZeroLength("lease allocation").into());
+        }
+        let end = window.lease.reservation.end()?;
+        if end > window.lease.allocation_size {
+            return Err(ContractError::LeaseRangeOutOfBounds {
+                lease: lease_id,
+                end,
+                allocation_size: window.lease.allocation_size,
+            }
+            .into());
+        }
+        let expected_bytes = Self::attachment_extent(width, height, window.format)?;
+        let window_bytes = window.lease.reservation.length;
+        if window_bytes != expected_bytes {
+            return Err(Error::WindowAttachmentExtentMismatch {
+                lease: lease_id,
+                expected: expected_bytes,
+                declared: window_bytes,
+            });
+        }
+        let identity = (
+            window.lease.reservation.lease.allocation_id,
+            ViewId::new(lease_id.get()),
+        );
+        if !seen.insert(identity) {
+            return Err(Error::DuplicateRenderAttachment);
+        }
+        Ok(RenderTargetAttachment {
+            source: RenderAttachmentSource::Window(window.lease),
+            format: window.format,
+            load: window.load,
+            store: StoreOp::Borrowed,
+        })
     }
 
     /// Record the milestone's single render pass replayed from one encoded
