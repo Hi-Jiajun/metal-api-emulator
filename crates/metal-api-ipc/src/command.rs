@@ -3608,6 +3608,37 @@ mod tests {
         trace
     }
 
+    /// The trace-produced source arm (`research/docs/23` §110, E-TX3): the
+    /// declaration names the trace's own production and carries no texel
+    /// bytes, so the frame is the owned-bytes frame one source payload
+    /// narrower.
+    #[test]
+    fn a_trace_view_source_round_trips_without_texel_bytes() {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        let mut view = sampled_texture_view(0);
+        let texels = match view.source.clone() {
+            TextureSource::OwnedBytes(bytes) => bytes,
+            other => panic!("the fixture starts from owned bytes, got {other:?}"),
+        };
+        view.source = TextureSource::TraceView;
+        pass.textures = vec![view.clone()];
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The arm's own name travels; the sixteen texels do not, because the
+        // bytes do not exist before the trace runs.
+        assert!(
+            !frame.windows(texels.len()).any(|window| window == texels),
+            "a trace-view declaration carries no texel bytes"
+        );
+    }
+
     #[test]
     fn a_sampled_render_pass_takes_its_own_tag_and_round_trips() {
         let request = CommandRequest::Submit {

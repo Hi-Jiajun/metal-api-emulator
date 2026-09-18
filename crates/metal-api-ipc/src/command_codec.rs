@@ -2472,6 +2472,14 @@ fn put_texture_source(encoder: &mut Encoder, source: &TextureSource) {
             encoder.u8(2);
             encoder.u64(lease_id.get());
         }
+        // The trace's own production (`research/docs/23` §110, E-TX3) carries
+        // no bytes and no lease: the view's own identity is the production's
+        // identity, so the tag alone is the whole payload. The tag is appended
+        // after the three existing arms, so every older frame keeps its exact
+        // bytes.
+        TextureSource::TraceView => {
+            encoder.u8(3);
+        }
     }
 }
 
@@ -2480,6 +2488,7 @@ fn get_texture_source(decoder: &mut Decoder<'_>) -> Result<TextureSource, CodecE
         0 => Ok(TextureSource::OwnedBytes(decoder.blob()?)),
         1 => Ok(TextureSource::StagedLease(LeaseId::new(decoder.u64()?))),
         2 => Ok(TextureSource::BorrowedNoCopy(LeaseId::new(decoder.u64()?))),
+        3 => Ok(TextureSource::TraceView),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture source",
             value,

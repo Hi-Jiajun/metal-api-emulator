@@ -1179,6 +1179,15 @@ impl VulkanComputeProvider {
         };
         let host_readback = trace.completion_policy == CompletionPolicy::HostReadback;
         let mut writebacks = Vec::with_capacity(plan.len());
+        // The bytes this trace's own earlier render passes have landed
+        // (`research/docs/23` §110, E-TX3): the writeback channel is keyed by
+        // `(allocation_id, view_id)`, exactly the identity a
+        // `TextureSource::TraceView` declaration states, so one map carries
+        // what a later pass may sample. Entries hold positions into
+        // `writebacks` rather than clones, and only the passes that have
+        // already run publish into it, so a pass can only read what the
+        // trace's own order produced before it.
+        let mut produced_latest = BTreeMap::<(AllocationId, ViewId), usize>::new();
         for planned in plan {
             if let Some(present) = &planned.pass.present {
                 // The present rail renders exactly one attachment into the
@@ -1264,6 +1273,11 @@ impl VulkanComputeProvider {
                 let previous = view.filter(|_| loading);
                 let target = self.present_target(present, attachment)?;
                 let executor = self.lock_executor()?;
+                // The presenting pass may sample the trace's own earlier
+                // production exactly as an offscreen one may
+                // (`research/docs/23` §110, E-TX3), so it resolves through the
+                // same view of what has landed so far.
+                let produced = render::ProducedTraceViews::new(&writebacks, &produced_latest);
                 let texels = render::execute_present_render(
                     &executor.context,
                     &planned.stages,
@@ -1271,14 +1285,17 @@ impl VulkanComputeProvider {
                     &target,
                     previous,
                     Some(&leases),
+                    Some(&produced),
                 )?;
                 if let Some(view) = view {
+                    let position = writebacks.len();
                     writebacks.push(BufferWriteback {
                         view_id: view.view_id,
                         allocation_id: view.allocation_id,
                         offset: view.offset,
                         bytes: texels,
                     });
+                    produced_latest.insert((view.allocation_id, view.view_id), position);
                 }
                 continue;
             }
@@ -1469,6 +1486,11 @@ impl VulkanComputeProvider {
             // order: `Some` exactly for the attachments whose declaration
             // named the provider's image (`research/docs/23` §76, R7).
             let resident_refs: Vec<_> = resident.iter().map(|image| image.as_deref()).collect();
+            // What this pass may sample from the trace's own production
+            // (`research/docs/23` §110, E-TX3), beside the resident slice the
+            // R7 arm borrows: the same two contexts the offscreen rail
+            // resolves every render input against.
+            let produced = render::ProducedTraceViews::new(&writebacks, &produced_latest);
             let outcome = match trace.indirect.as_deref() {
                 Some(payload) => {
                     let outcome = render::execute_indirect_render_pass(
@@ -1479,6 +1501,7 @@ impl VulkanComputeProvider {
                         &previous,
                         &resident_refs,
                         Some(&leases),
+                        Some(&produced),
                     );
                     if outcome.is_ok() {
                         // Publish what was actually replayed: the command kind,
@@ -1500,6 +1523,7 @@ impl VulkanComputeProvider {
                     &previous,
                     &resident_refs,
                     Some(&leases),
+                    Some(&produced),
                 ),
             };
             let readback = match outcome {
@@ -1526,12 +1550,20 @@ impl VulkanComputeProvider {
                 // §3.6, v19).
                 let Some(bytes) = texels else { continue };
                 if let Some(view) = view {
+                    // The landing is also this trace's own production of the
+                    // view's identity, which is what a later
+                    // `TextureSource::TraceView` declaration samples
+                    // (`research/docs/23` §110, E-TX3). A later store of the
+                    // same identity replaces the index, exactly as the
+                    // trace's own order makes the latest write visible.
+                    let position = writebacks.len();
                     writebacks.push(BufferWriteback {
                         view_id: view.view_id,
                         allocation_id: view.allocation_id,
                         offset: view.offset,
                         bytes,
                     });
+                    produced_latest.insert((view.allocation_id, view.view_id), position);
                 }
             }
             // A writable stage buffer is a landing like a stored attachment

@@ -677,12 +677,42 @@ pub enum TextureSource {
     StagedLease(LeaseId),
     /// Provider may use the owner's backing without copying.
     BorrowedNoCopy(LeaseId),
+    /// The texels are the trace's own GPU output (`research/docs/23` §110,
+    /// E-TX3): an *earlier* pass of the same trace stored this view's
+    /// tightly packed bytes, and a later pass samples exactly those bytes
+    /// instead of a copy the request carries.
+    ///
+    /// The arm carries no bytes and no lease because the texels do not exist
+    /// before the trace runs: the view's own identity — its `(allocation_id,
+    /// view_id)` pair — *is* the production's identity, so the declaration
+    /// and its producer agree by construction rather than by a second name a
+    /// trace could get wrong.
+    ///
+    /// [`ComputeTrace::validate_serial_buffer_reuse`] states the whole rule
+    /// and refuses every shape it cannot express:
+    ///
+    /// - the identity has to be a colour attachment of an *earlier* render
+    ///   pass of the same trace, stored with [`StoreOp::Store`] — the arm
+    ///   whose bytes land in the trace's own writeback channel. An identity
+    ///   no pass stores is `RenderTextureSourceUnwritten`, one whose only
+    ///   stores follow the reading pass is
+    ///   `RenderTextureSourceOrderUnsupported`, and one whose most recent
+    ///   store is `Resident` (the provider's own image, the next increment's
+    ///   arm) or `DontCare` is `RenderTextureSourceUnlanded`;
+    /// - the sampled declaration has to restate the stored surface's format
+    ///   and extent, or the rail would sample texels the production never
+    ///   wrote (`RenderTextureSourceShapeMismatch`).
+    ///
+    /// A pass that both samples this identity and writes it as an attachment
+    /// stays refused by [`ContractError::RenderTextureAttachmentConflict`],
+    /// exactly as it is for every other source arm.
+    TraceView,
 }
 
 impl TextureSource {
     pub const fn lease_id(&self) -> Option<LeaseId> {
         match self {
-            Self::OwnedBytes(_) => None,
+            Self::OwnedBytes(_) | Self::TraceView => None,
             Self::StagedLease(lease_id) | Self::BorrowedNoCopy(lease_id) => Some(*lease_id),
         }
     }
@@ -8056,6 +8086,105 @@ impl ComputeTrace {
                 }
             }
         }
+        // Trace-produced sampled textures (`research/docs/23` §110, E-TX3):
+        // a `TextureSource::TraceView` declaration samples the bytes the
+        // trace's own earlier GPU work produced for that view. The walk is
+        // the same order/alias family the rules above state — the trace's own
+        // pass order decides what a read observes — with the two facts this
+        // arm adds:
+        //
+        // - the producer is a *colour attachment* of an earlier render pass
+        //   (the render target the census's shape names), and the most recent
+        //   store before the read is the one that defines the bytes, whatever
+        //   arm it states: a `Resident` store keeps them in the provider's own
+        //   image and a `DontCare` store discards them, so either is refused
+        //   by name instead of letting the rail serve the bytes of an older
+        //   store this trace has already overwritten;
+        // - only a `StoreOp::Store` lands the bytes in the trace's own
+        //   host channel, which is where the rail resolves them from, so the
+        //   landed arm is the one this increment executes.
+        //
+        // The declarations are compared by identity — the `(allocation_id,
+        // view_id)` pair, the same key the writeback channel uses — and a
+        // declaration that restates another extent or texel order is refused
+        // rather than aliased onto the stored surface.
+        let mut first_store = BTreeMap::<(AllocationId, ViewId), usize>::new();
+        for (pass_index, pass) in self.passes.iter().enumerate() {
+            let Some(render) = pass.as_render() else {
+                continue;
+            };
+            for attachment in &render.color_attachments {
+                first_store
+                    .entry((attachment.allocation_id, attachment.view_id))
+                    .or_insert(pass_index);
+            }
+        }
+        // The most recent store of every identity that came before the pass
+        // being walked: `(store_pass, store, format, width, height)`.
+        let mut stored =
+            BTreeMap::<(AllocationId, ViewId), (usize, StoreOp, AttachmentFormat, u64, u64)>::new();
+        for (pass_index, pass) in self.passes.iter().enumerate() {
+            let Some(render) = pass.as_render() else {
+                continue;
+            };
+            // Reads answer against the stores that came *before* them. This
+            // pass's own stores join the map below, after the reads; a pass
+            // that both samples a view and writes it as an attachment is
+            // already refused by `RenderPassDescriptor::validate`, so the
+            // split cannot hide a same-pass read-after-write.
+            for texture in &render.textures {
+                if !matches!(texture.source, TextureSource::TraceView) {
+                    continue;
+                }
+                let identity = (texture.allocation_id, texture.view_id);
+                let Some((store_pass, store, format, width, height)) = stored.get(&identity) else {
+                    let Some(first_store_pass) = first_store.get(&identity) else {
+                        return Err(ContractError::RenderTextureSourceUnwritten {
+                            pass_index,
+                            view: texture.view_id,
+                            allocation: texture.allocation_id,
+                        });
+                    };
+                    return Err(ContractError::RenderTextureSourceOrderUnsupported {
+                        pass_index,
+                        view: texture.view_id,
+                        store_pass: *first_store_pass,
+                    });
+                };
+                if *store != StoreOp::Store {
+                    return Err(ContractError::RenderTextureSourceUnlanded {
+                        pass_index,
+                        view: texture.view_id,
+                        store_pass: *store_pass,
+                        store: *store,
+                    });
+                }
+                if format.as_texture_format() != texture.format
+                    || [*width, *height] != [texture.width, texture.height]
+                {
+                    return Err(ContractError::RenderTextureSourceShapeMismatch {
+                        pass_index,
+                        view: texture.view_id,
+                        stored_format: *format,
+                        texture_format: texture.format,
+                        stored_extent: [*width, *height],
+                        texture_extent: [texture.width, texture.height],
+                    });
+                }
+            }
+            for attachment in &render.color_attachments {
+                stored.insert(
+                    (attachment.allocation_id, attachment.view_id),
+                    (
+                        pass_index,
+                        attachment.store,
+                        attachment.format,
+                        attachment.width,
+                        attachment.height,
+                    ),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -10220,6 +10349,30 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "render_texture_footprint_unsupported",
         ),
+        // Trace-produced sampled textures (`research/docs/23` §110, E-TX3).
+        // Each refusal names its own disagreement: an identity no pass
+        // declares is the writeback channel's own "there is no such landing"
+        // shape (the stage-buffer landing's sibling), an order this
+        // increment's execution cannot honour is the render-pass order
+        // name's sibling, a store arm that lands no host bytes is the family
+        // this increment does not execute, and a shape disagreement is a
+        // caller-fixable pair of numbers.
+        E::RenderTextureSourceUnwritten { .. } => (
+            ProviderErrorClass::Resource,
+            "render_texture_source_unwritten",
+        ),
+        E::RenderTextureSourceOrderUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "render_texture_source_order_unsupported",
+        ),
+        E::RenderTextureSourceUnlanded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_texture_source_unlanded",
+        ),
+        E::RenderTextureSourceShapeMismatch { .. } => (
+            ProviderErrorClass::Args,
+            "render_texture_source_shape_mismatch",
+        ),
         // Runtime sampler contract (`research/docs/23` §3.3, v102). The cap and
         // the index bound are the texture list's own narrowings one face over;
         // the two pairing rules name the runtime `[[sampler(n)]]` argument that
@@ -12214,6 +12367,62 @@ pub enum ContractError {
     RenderTextureAttachmentConflict {
         view: ViewId,
     },
+    // Trace-produced sampled textures (`research/docs/23` §110, E-TX3). The
+    // four refusals below are the whole rule the `TextureSource::TraceView`
+    // arm states: which pass produces the bytes, when, whether they landed,
+    // and what shape the producer wrote. Each names its own disagreement
+    // rather than folding into one "unsupported source" refusal, because the
+    // fix differs: declare the store, reorder the trace, land the store, or
+    // restate the sampled view's shape.
+    /// A trace-produced sampled texture names a view no pass of this trace
+    /// stores (`research/docs/23` §110, E-TX3).
+    RenderTextureSourceUnwritten {
+        pass_index: usize,
+        view: ViewId,
+        allocation: AllocationId,
+    },
+    /// A trace-produced sampled texture names a view whose stores all follow
+    /// the sampling pass (`research/docs/23` §110, E-TX3).
+    ///
+    /// The arm is defined by the trace's own order — an earlier pass writes,
+    /// a later one reads — so a store that comes after the read is a hazard
+    /// this increment states by name instead of executing against bytes the
+    /// trace has not produced yet.
+    RenderTextureSourceOrderUnsupported {
+        pass_index: usize,
+        view: ViewId,
+        store_pass: usize,
+    },
+    /// The most recent store of a trace-produced sampled texture's view does
+    /// not land bytes the trace's own host channel carries
+    /// (`research/docs/23` §110, E-TX3).
+    ///
+    /// `StoreOp::Resident` keeps the texels in the provider's own image (the
+    /// device-resident arm is a later increment) and `StoreOp::DontCare`
+    /// discards them; either way the sampling pass has no bytes to read, so
+    /// the trace is refused by name rather than served the bytes of an older
+    /// store its own order has already overwritten.
+    RenderTextureSourceUnlanded {
+        pass_index: usize,
+        view: ViewId,
+        store_pass: usize,
+        store: StoreOp,
+    },
+    /// A trace-produced sampled texture restates a shape its producer never
+    /// wrote (`research/docs/23` §110, E-TX3).
+    ///
+    /// The producer's own store is the only surface the arm means, so the
+    /// declaration has to agree with it field by field: a view of another
+    /// extent or texel order would sample bytes the trace never produced
+    /// there, which is the aliasing shape this increment refuses by name.
+    RenderTextureSourceShapeMismatch {
+        pass_index: usize,
+        view: ViewId,
+        stored_format: AttachmentFormat,
+        texture_format: TextureFormat,
+        stored_extent: [u64; 2],
+        texture_extent: [u64; 2],
+    },
     /// A render texture declaration reaches an unbounded region of its view
     /// (`research/docs/23` §3.3, v100).
     ///
@@ -13105,6 +13314,43 @@ impl fmt::Display for ContractError {
             Self::RenderTextureAttachmentConflict { view } => write!(
                 formatter,
                 "render pass samples view {view:?} through a texture binding while writing it as an attachment"
+            ),
+            Self::RenderTextureSourceUnwritten {
+                pass_index,
+                view,
+                allocation,
+            } => write!(
+                formatter,
+                "pass {pass_index} samples view {view:?} through the trace's own production, but no pass of this trace stores that view in allocation {allocation:?}"
+            ),
+            Self::RenderTextureSourceOrderUnsupported {
+                pass_index,
+                view,
+                store_pass,
+            } => write!(
+                formatter,
+                "pass {pass_index} samples view {view:?} through the trace's own production, but that view's stores all follow the read (first store: pass {store_pass})"
+            ),
+            Self::RenderTextureSourceUnlanded {
+                pass_index,
+                view,
+                store_pass,
+                store,
+            } => write!(
+                formatter,
+                "pass {pass_index} samples view {view:?} through the trace's own production, but the view's most recent store (pass {store_pass}) is {store:?}, which lands no bytes the trace's host channel carries"
+            ),
+            Self::RenderTextureSourceShapeMismatch {
+                pass_index,
+                view,
+                stored_format,
+                texture_format,
+                stored_extent,
+                texture_extent,
+            } => write!(
+                formatter,
+                "pass {pass_index} samples view {view:?} through the trace's own production, but the sampling declaration restates {texture_format:?} {}x{} where the stored surface is {stored_format:?} {}x{}",
+                texture_extent[0], texture_extent[1], stored_extent[0], stored_extent[1]
             ),
             Self::RenderTextureFootprintProofUnsupported { index, proof } => write!(
                 formatter,
@@ -22375,6 +22621,168 @@ mod tests {
             contract_error_refusal(expected).slug,
             "attachment_allocation_unknown"
         );
+    }
+
+    /// The E-TX3 fixture (`research/docs/23` §110): one compute pass declares
+    /// both attachment views, then the producer render pass stores the first
+    /// and the consumer render pass samples exactly that view through
+    /// `TextureSource::TraceView` while landing in the second.
+    fn trace_view_trace() -> ComputeTrace {
+        let mut consumer_declaration = landing_view(8, 10);
+        consumer_declaration.metal_binding = 1;
+        let mut value = trace(vec![pass(
+            4,
+            vec![landing_view(7, 9), consumer_declaration],
+        )]);
+        value.pipelines[0].contract.buffer_bindings = vec![
+            BufferBindingContract {
+                metal_binding: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 16 },
+            },
+            BufferBindingContract {
+                metal_binding: 1,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 16 },
+            },
+        ];
+        declare_render_contract(&mut value);
+        let TracePass::Render(mut consumer) = render_pass_into(attachment_into(8, 10)) else {
+            panic!("the helper builds a render pass");
+        };
+        consumer.textures = vec![TextureView {
+            view_id: ViewId::new(7),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(9),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::TraceView,
+        }];
+        value.passes.push(render_pass_into(attachment_into(7, 9)));
+        value.passes.push(TracePass::Render(consumer));
+        value
+    }
+
+    /// One render texture of the trace-view fixture, for the tests that mutate
+    /// it.
+    fn trace_view_texture(value: &mut ComputeTrace) -> &mut TextureView {
+        value
+            .passes
+            .iter_mut()
+            .filter_map(|pass| match pass {
+                TracePass::Render(render) => Some(render.textures.as_mut_slice()),
+                TracePass::Compute(_) => None,
+            })
+            .find(|textures| !textures.is_empty())
+            .and_then(|textures| textures.first_mut())
+            .expect("the fixture carries the sampled declaration")
+    }
+
+    /// Trace-produced sampled textures (`research/docs/23` §110, E-TX3): the
+    /// arm is defined by the trace's own order, so one earlier landed store is
+    /// the whole admission; every other shape answers with its own name.
+    #[test]
+    fn a_trace_view_texture_samples_the_production_of_an_earlier_pass() {
+        trace_view_trace()
+            .validate_serial_buffer_reuse()
+            .expect("an earlier landed store is the arm's whole rule");
+
+        // (a) No pass of the trace stores the identity: the arm has nothing
+        // to sample.
+        let mut unwritten = trace_view_trace();
+        unwritten.passes.remove(1);
+        let expected = ContractError::RenderTextureSourceUnwritten {
+            pass_index: 1,
+            view: ViewId::new(7),
+            allocation: AllocationId::new(9),
+        };
+        assert_eq!(
+            unwritten.validate_serial_buffer_reuse(),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected.clone());
+        eprintln!("trace-view unwritten: {expected}");
+        assert_eq!(refusal.class, ProviderErrorClass::Resource);
+        assert_eq!(refusal.slug, "render_texture_source_unwritten");
+        assert_eq!(refusal.detail, Some(expected.to_string()));
+
+        // (b) The store exists but follows the read: the trace's own order
+        // does not produce the bytes the sampling pass reads.
+        let mut reordered = trace_view_trace();
+        reordered.passes.swap(1, 2);
+        let expected = ContractError::RenderTextureSourceOrderUnsupported {
+            pass_index: 1,
+            view: ViewId::new(7),
+            store_pass: 2,
+        };
+        assert_eq!(
+            reordered.validate_serial_buffer_reuse(),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected.clone());
+        eprintln!("trace-view order: {expected}");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "render_texture_source_order_unsupported");
+        assert_eq!(refusal.detail, Some(expected.to_string()));
+
+        // (c) The most recent store keeps the bytes on the device: the
+        // resident arm is the next increment's, so this one refuses it by name
+        // instead of sampling the bytes of a store the trace has overwritten.
+        let mut resident = trace_view_trace();
+        let Some(producer) = resident.passes[1]
+            .as_render()
+            .map(|pass| pass.color_attachments[0])
+        else {
+            panic!("the fixture's second entry is the producer pass");
+        };
+        let Some(TracePass::Render(producer_pass)) = resident.passes.get_mut(1) else {
+            panic!("the fixture's second entry is the producer pass");
+        };
+        producer_pass.color_attachments[0].store = StoreOp::Resident;
+        assert_eq!(producer.store, StoreOp::Store);
+        let expected = ContractError::RenderTextureSourceUnlanded {
+            pass_index: 2,
+            view: ViewId::new(7),
+            store_pass: 1,
+            store: StoreOp::Resident,
+        };
+        assert_eq!(
+            resident.validate_serial_buffer_reuse(),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected.clone());
+        eprintln!("trace-view unlanded: {expected}");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "render_texture_source_unlanded");
+        assert_eq!(refusal.detail, Some(expected.to_string()));
+
+        // (d) The declaration restates a shape the stored surface never had:
+        // the texel order and the extent are both the producer's facts.
+        let mut restated = trace_view_trace();
+        trace_view_texture(&mut restated).format = TextureFormat::Bgra8Unorm;
+        let expected = ContractError::RenderTextureSourceShapeMismatch {
+            pass_index: 2,
+            view: ViewId::new(7),
+            stored_format: AttachmentFormat::Rgba8Unorm,
+            texture_format: TextureFormat::Bgra8Unorm,
+            stored_extent: [2, 2],
+            texture_extent: [2, 2],
+        };
+        assert_eq!(
+            restated.validate_serial_buffer_reuse(),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected.clone());
+        eprintln!("trace-view shape: {expected}");
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "render_texture_source_shape_mismatch");
+        assert_eq!(refusal.detail, Some(expected.to_string()));
     }
 
     #[test]
