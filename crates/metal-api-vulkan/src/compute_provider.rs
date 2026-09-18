@@ -3017,7 +3017,8 @@ impl ComputeProvider for VulkanComputeProvider {
             // (`AttachmentComputeConflict` / `RenderPassOrderUnsupported`)
             // rather than by a shared queue submission. Its bytes are merged
             // with the deferred pool readback at `wait`.
-            let _render = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Render);
+            let _render =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTotal);
             let rendered =
                 self.execute_render_passes(trace, &pool, &render_plan, admitted.resources());
             drop(_render);
@@ -3094,7 +3095,8 @@ impl ComputeProvider for VulkanComputeProvider {
                 map_writebacks(&pool, &textures, updates, token)?
             };
             let rendered = {
-                let _render = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Render);
+                let _render =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTotal);
                 self.execute_render_passes(trace, &pool, &render_plan, admitted.resources())?
             };
             let mut merged = BTreeMap::new();

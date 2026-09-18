@@ -24,9 +24,11 @@
 //!   PHASE submit n=256 total_us=... admit_us=... plan_us=... pool_us=...
 //!   resource_build_us=... record_us=... queue_submit_us=... fence_wait_us=...
 //!   fence_wait_idle_n=... fence_wait_idle_us=... fence_wait_blocked_n=...
-//!   fence_wait_blocked_us=... read_updates_us=... render_us=...
-//!   writebacks_us=... settle_us=... fence_wait_skipped_n=...
-//!   fence_wait_timeout_n=... plan_settle_us=...
+//!   fence_wait_blocked_us=... fence_wait_timeout_n=... read_updates_us=...
+//!   render_total_us=... render_setup_us=... render_record_us=...
+//!   render_submit_us=... render_wait_us=... (with render_wait's own
+//!   idle/blocked/timeout fields) render_readback_us=... writebacks_us=...
+//!   settle_us=... fence_wait_skipped_n=... plan_settle_us=... render_us=...
 //!   ```
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
@@ -41,10 +43,12 @@
 //!
 //! The bars are deliberately disjoint: `enter`-style nesting would charge the
 //! child's time to the parent as well, and then "how much of the total is the
-//! readback" would have no answer. `total` is the one enclosing bar; every other
-//! field is a region inside it, so `sum(fields) <= total` is an identity a reader
-//! can check, and the difference is the seam between the bars (function calls,
-//! `Arc` clones, the queue lock) — the residual, not a missing bar.
+//! readback" would have no answer. `total` encloses the call and `render_total`
+//! encloses the render half; every other field is a region inside one of them,
+//! so `sum(fields) <= total` and `sum(render children) <= render_total` are
+//! identities a reader can check, and the difference is the seam between the
+//! bars (function calls, `Arc` clones, the queue lock) — the residual, not a
+//! missing bar.
 //!
 //! A phase may be charged at more than one disjoint region: `settle` covers the
 //! completion bookkeeping of both the synchronous and the deferred arm, and
@@ -86,9 +90,26 @@ pub(crate) enum Phase {
     FenceWait,
     /// The host-mapped readback of every writable view's bytes.
     ReadUpdates,
-    /// The render half executed inside the same `submit` (render/present passes
-    /// and their own submissions).
-    Render,
+    /// The enclosing bar for the render half executed inside the same `submit`
+    /// (render/present passes and their own submissions). Like [`Phase::Total`]
+    /// it encloses children, so it is an aggregate a reader checks the others
+    /// against rather than a bar to add to them.
+    RenderTotal,
+    /// Everything an offscreen render pass does before it records: the
+    /// attachment/pipeline resolution, the device objects, and the readback
+    /// destination buffers the pass will copy out into.
+    RenderSetup,
+    /// Command-buffer recording for one render pass, including the
+    /// `vkCmdCopyImageToBuffer` that stages the pass's stored attachments.
+    RenderRecord,
+    /// The render half's completion fence and `vkQueueSubmit`.
+    RenderSubmit,
+    /// The render half's `vkWaitForFences`. This is where the pass's own
+    /// copy-out executes, so it is device time as much as it is latency.
+    RenderWait,
+    /// The render half's host-visible readback: the mapped copy of every stored
+    /// attachment, the depth/stencil surfaces and the writable stage buffers.
+    RenderReadback,
     /// Writeback mapping and the contract validation of the merged result.
     Writebacks,
     /// Completion bookkeeping: the terminal observation, its record insert and
@@ -109,7 +130,12 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "queue_submit",
     "fence_wait",
     "read_updates",
-    "render",
+    "render_total",
+    "render_setup",
+    "render_record",
+    "render_submit",
+    "render_wait",
+    "render_readback",
     "writebacks",
     "settle",
 ];
@@ -122,6 +148,20 @@ const PLAN_SETTLE_SLOTS: [usize; 3] = [
     Phase::Pool as usize,
     Phase::Settle as usize,
 ];
+
+/// The slots the printed `render_us` field aggregates: the disjoint regions of
+/// the render half. `render_total` is their enclosing bar and is printed beside
+/// them rather than added to them.
+const RENDER_SLOTS: [usize; 5] = [
+    Phase::RenderSetup as usize,
+    Phase::RenderRecord as usize,
+    Phase::RenderSubmit as usize,
+    Phase::RenderWait as usize,
+    Phase::RenderReadback as usize,
+];
+
+/// The bars that are a fence wait, and therefore carry the idle/blocked split.
+const WAIT_SLOTS: [usize; 2] = [Phase::FenceWait as usize, Phase::RenderWait as usize];
 
 /// Submissions per emitted line, and therefore the `n=` field.
 const EVERY_DEFAULT: u64 = 256;
@@ -142,15 +182,14 @@ const IDLE_NS_DEFAULT: u64 = 100_000;
 struct Local {
     ns: [u64; PHASE_COUNT],
     calls: [u64; PHASE_COUNT],
-    fence_idle_ns: u64,
-    fence_idle_calls: u64,
-    fence_blocked_ns: u64,
-    fence_blocked_calls: u64,
+    wait_idle_ns: [u64; PHASE_COUNT],
+    wait_idle_calls: [u64; PHASE_COUNT],
+    wait_blocked_ns: [u64; PHASE_COUNT],
+    wait_blocked_calls: [u64; PHASE_COUNT],
+    wait_timeout_calls: [u64; PHASE_COUNT],
     /// Waits with no fence to wait for (`PendingExecution::wait`'s `!submitted`
     /// early return): the only waits that are exactly free.
     fence_skipped_calls: u64,
-    /// Waits the driver answered `TIMEOUT`/`NOT_READY` (the caller may retry).
-    fence_timeout_calls: u64,
     /// `total` bars closed since the last emitted line.
     window: u64,
 }
@@ -170,17 +209,18 @@ impl Local {
     /// the queue had already retired the work, and the microseconds that remain
     /// here buy no GPU time.
     #[inline]
-    fn note_fence_wait(&mut self, ns: u64, timed_out: bool) {
-        self.charge(Phase::FenceWait, ns);
+    fn note_fence_wait(&mut self, phase: Phase, ns: u64, timed_out: bool) {
+        self.charge(phase, ns);
+        let slot = phase as usize;
         if ns < idle_ns() {
-            self.fence_idle_ns += ns;
-            self.fence_idle_calls += 1;
+            self.wait_idle_ns[slot] += ns;
+            self.wait_idle_calls[slot] += 1;
         } else {
-            self.fence_blocked_ns += ns;
-            self.fence_blocked_calls += 1;
+            self.wait_blocked_ns[slot] += ns;
+            self.wait_blocked_calls[slot] += 1;
         }
         if timed_out {
-            self.fence_timeout_calls += 1;
+            self.wait_timeout_calls[slot] += 1;
         }
     }
 
@@ -199,20 +239,26 @@ impl Local {
         let n = self.window;
         let mut fields = String::with_capacity(600);
         let mut plan_settle_ns = 0u64;
+        let mut render_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
             self.calls[slot] = 0;
             if PLAN_SETTLE_SLOTS.contains(&slot) {
                 plan_settle_ns += ns;
             }
-            if slot == Phase::FenceWait as usize {
-                let idle_calls = std::mem::take(&mut self.fence_idle_calls);
-                let idle_us = micros(std::mem::take(&mut self.fence_idle_ns));
-                let blocked_calls = std::mem::take(&mut self.fence_blocked_calls);
-                let blocked_us = micros(std::mem::take(&mut self.fence_blocked_ns));
+            if RENDER_SLOTS.contains(&slot) {
+                render_ns += ns;
+            }
+            if WAIT_SLOTS.contains(&slot) {
+                let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
+                let idle_us = micros(std::mem::take(&mut self.wait_idle_ns[slot]));
+                let blocked_calls = std::mem::take(&mut self.wait_blocked_calls[slot]);
+                let blocked_us = micros(std::mem::take(&mut self.wait_blocked_ns[slot]));
+                let timed_out = std::mem::take(&mut self.wait_timeout_calls[slot]);
                 fields.push_str(&format!(
                     " {name}_us={:.3} {name}_idle_n={idle_calls} {name}_idle_us={idle_us:.3} \
-                     {name}_blocked_n={blocked_calls} {name}_blocked_us={blocked_us:.3}",
+                     {name}_blocked_n={blocked_calls} {name}_blocked_us={blocked_us:.3} \
+                     {name}_timeout_n={timed_out}",
                     micros(ns)
                 ));
                 continue;
@@ -220,12 +266,12 @@ impl Local {
             fields.push_str(&format!(" {name}_us={:.3}", micros(ns)));
         }
         let skipped = std::mem::take(&mut self.fence_skipped_calls);
-        let timed_out = std::mem::take(&mut self.fence_timeout_calls);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
+        let render_us = micros(render_ns);
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
-             fence_wait_timeout_n={timed_out} plan_settle_us={plan_settle_us:.3}"
+             plan_settle_us={plan_settle_us:.3} render_us={render_us:.3}"
         );
     }
 }
@@ -305,11 +351,12 @@ impl Bar {
     }
 
     #[inline]
-    pub(crate) fn enter_fence_wait() -> Option<FenceWaitBar> {
+    pub(crate) fn enter_fence_wait(phase: Phase) -> Option<FenceWaitBar> {
         if !enabled() {
             return None;
         }
         Some(FenceWaitBar {
+            phase,
             started: Instant::now(),
             timed_out: false,
         })
@@ -335,6 +382,7 @@ impl Drop for Bar {
 /// The `vkWaitForFences` bar: same shape as [`Bar`], but it reports the idle /
 /// blocked split instead of a plain charge.
 pub(crate) struct FenceWaitBar {
+    phase: Phase,
     started: Instant,
     timed_out: bool,
 }
@@ -343,8 +391,9 @@ impl Drop for FenceWaitBar {
     #[inline]
     fn drop(&mut self) {
         let ns = elapsed_ns(self.started.elapsed());
+        let phase = self.phase;
         let timed_out = self.timed_out;
-        LOCAL.with(|local| local.borrow_mut().note_fence_wait(ns, timed_out));
+        LOCAL.with(|local| local.borrow_mut().note_fence_wait(phase, ns, timed_out));
     }
 }
 
@@ -427,16 +476,27 @@ mod tests {
     #[test]
     fn the_fence_wait_buckets_partition_the_wait() {
         let mut local = Local::default();
-        local.note_fence_wait(1_000, false);
-        local.note_fence_wait(IDLE_NS_DEFAULT, false);
-        local.note_fence_wait(5_000_000, true);
+        local.note_fence_wait(Phase::FenceWait, 1_000, false);
+        local.note_fence_wait(Phase::FenceWait, IDLE_NS_DEFAULT, false);
+        local.note_fence_wait(Phase::FenceWait, 5_000_000, true);
+        local.note_fence_wait(Phase::RenderWait, 7, false);
+        let slot = Phase::FenceWait as usize;
         let total = local.ns[Phase::FenceWait as usize];
-        assert_eq!(total, local.fence_idle_ns + local.fence_blocked_ns);
+        assert_eq!(
+            total,
+            local.wait_idle_ns[slot] + local.wait_blocked_ns[slot]
+        );
         assert_eq!(total, 1_000 + IDLE_NS_DEFAULT + 5_000_000);
-        assert_eq!(local.fence_idle_calls, 1);
-        assert_eq!(local.fence_blocked_calls, 2);
-        assert_eq!(local.fence_timeout_calls, 1);
-        assert_eq!(local.calls[Phase::FenceWait as usize], 3);
+        assert_eq!(local.wait_idle_calls[slot], 1);
+        assert_eq!(local.wait_blocked_calls[slot], 2);
+        assert_eq!(local.wait_timeout_calls[slot], 1);
+        assert_eq!(local.calls[slot], 3);
+        // Each wait bar keeps its own buckets: a render wait must not land in
+        // the submission-level wait's idle reading.
+        let render = Phase::RenderWait as usize;
+        assert_eq!(local.ns[render], 7);
+        assert_eq!(local.wait_idle_calls[render], 1);
+        assert_eq!(local.calls[render], 1);
     }
 
     /// A window drains on the `total` bar that fills it, and a drained window

@@ -30,7 +30,7 @@ With the profile on, each thread that submits prints one line to **stderr** ever
 never one line per draw:
 
 ```text
-PHASE submit n=256 total_us=... admit_us=... plan_us=... pool_us=... resource_build_us=... record_us=... queue_submit_us=... fence_wait_us=... fence_wait_idle_n=... fence_wait_idle_us=... fence_wait_blocked_n=... fence_wait_blocked_us=... read_updates_us=... render_us=... writebacks_us=... settle_us=... fence_wait_skipped_n=... fence_wait_timeout_n=... plan_settle_us=...
+PHASE submit n=256 total_us=... admit_us=... plan_us=... pool_us=... resource_build_us=... record_us=... queue_submit_us=... fence_wait_us=... fence_wait_idle_n=... fence_wait_idle_us=... fence_wait_blocked_n=... fence_wait_blocked_us=... fence_wait_timeout_n=... read_updates_us=... render_total_us=... render_setup_us=... render_record_us=... render_submit_us=... render_wait_us=... render_wait_idle_n=... render_wait_idle_us=... render_wait_blocked_n=... render_wait_blocked_us=... render_wait_timeout_n=... render_readback_us=... writebacks_us=... settle_us=... fence_wait_skipped_n=... plan_settle_us=... render_us=...
 ```
 
 Every µs field is a **sum over that line's own window**, not a mean, with three
@@ -40,13 +40,18 @@ identity checkable:
 
 ```text
 admit + plan + pool + resource_build + record + queue_submit + fence_wait
-      + read_updates + render + writebacks + settle  <=  total
+      + read_updates + render_setup + render_record + render_submit
+      + render_wait + render_readback + writebacks + settle  <=  total
 ```
 
 The difference is the seam between the bars — plain function calls, `Arc`
 clones, the queue lock — and is reported as the residual rather than hidden in
-one of the fields. `total` is the only enclosing bar: the others are disjoint
-regions, so no field can contain another.
+one of the fields. `total` and `render_total` are the enclosing bars; the others
+are disjoint regions, so no field to be summed can contain another. The render
+half has its own identity, `render_setup + render_record + render_submit +
+render_wait + render_readback <= render_total`, whose difference is the work of
+a render path this split does not name (the present and indirect-replay paths
+have their own setup and readback).
 
 | field | region |
 |---|---|
@@ -59,33 +64,48 @@ regions, so no field can contain another.
 | `queue_submit` | completion fence creation and `vkQueueSubmit` |
 | `fence_wait` | `vkWaitForFences`, split idle/blocked (below) |
 | `read_updates` | host-mapped readback of every writable view's bytes |
-| `render` | the render/present half executed inside the same `submit` |
+| `render_total` | the enclosing bar for the render/present half executed inside the same `submit` |
+| `render_setup` | an offscreen pass's resolution, device objects and readback destinations, before recording |
+| `render_record` | the render pass's command recording, `vkCmdCopyImageToBuffer` included |
+| `render_submit` | the render half's queue lock, completion fence and `vkQueueSubmit` |
+| `render_wait` | the render half's `vkWaitForFences` — where the pass's copy-out runs (idle/blocked split) |
+| `render_readback` | the render half's host-visible readback: stored attachments, depth/stencil, writable stage buffers |
 | `writebacks` | writeback mapping and the contract validation of the merged result |
 | `settle` | terminal observation, completion-record insert, health synchronisation |
 | `plan_settle` | the aggregate `plan + pool + settle` |
+| `render` | the aggregate `render_setup + render_record + render_submit + render_wait + render_readback` |
 
 `plan_settle` is printed as one field because it is the answer to a question
 about the *rail* rather than about the device: of the CPU time a submission
 costs, how much is deciding and bookkeeping (cacheable, incremental) as opposed
 to touching the device (not). It is the sum of three disjoint fields above, not
-a fourth region, so it must not be added to them.
+a fourth region, so it must not be added to them. `render` is the same kind of
+reading for the other half; `render_total` is its enclosing bar, and the
+difference between the two is what a render path this split does not name cost.
 
 ## Waiting that is not waiting
 
 `fence_wait_us` alone cannot answer "how much of this is the device". Three
-populations are therefore counted apart:
+populations are therefore counted apart — and `render_wait` carries the same
+three fields of its own (`render_wait_idle_n`, `render_wait_blocked_n`,
+`render_wait_timeout_n`), because a render pass's copy-out runs inside its wait:
 
 | field | meaning |
 |---|---|
 | `fence_wait_idle_n` / `_us` | waits the driver answered inside `METAL_API_VULKAN_PHASE_IDLE_NS` (default 100 000 ns): the queue had already retired the work, so the microseconds are driver-call overhead |
 | `fence_wait_blocked_n` / `_us` | waits that actually blocked on the device |
 | `fence_wait_skipped_n` | waits with no fence behind them (`PendingExecution::wait`'s `!submitted` early return): exactly free |
-| `fence_wait_timeout_n` | waits the driver answered `TIMEOUT`/`NOT_READY`, i.e. the caller may retry |
+| `fence_wait_timeout_n` / `render_wait_timeout_n` | waits the driver answered `TIMEOUT`/`NOT_READY`, i.e. the caller may retry |
 
-The two time buckets partition `fence_wait_us` by construction
-(`idle_us + blocked_us == fence_wait_us`), and the idle/blocked cut is a
-displayed number rather than a hidden one: move it with
+The two time buckets partition their own wait field by construction
+(`idle_us + blocked_us == fence_wait_us`, and the same for `render_wait`), and
+the idle/blocked cut is a displayed number rather than a hidden one: move it with
 `METAL_API_VULKAN_PHASE_IDLE_NS` if a round's own distribution disagrees with it.
+The cut is worth reading as a measured distribution rather than as a law: in the
+first real round the `immediate` population still averaged ~85 µs per call
+against ~406 µs for the blocked ones — a driver call is not free on this box,
+which is why the default sits at 100 µs rather than at 1 µs, and why the raw
+bucket sums are printed beside the counts.
 
 The accumulator is thread-local because a line has to describe one population.
 A process-wide table would put two submitting threads' bars in the same window,

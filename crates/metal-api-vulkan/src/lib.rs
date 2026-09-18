@@ -6389,7 +6389,8 @@ impl ExecutionResources {
         // the driver call itself took: a wait that returns immediately means the
         // queue had already retired the work, and those microseconds are driver
         // overhead rather than device latency.
-        let mut _fence_wait = crate::phase_profile::Bar::enter_fence_wait();
+        let mut _fence_wait =
+            crate::phase_profile::Bar::enter_fence_wait(crate::phase_profile::Phase::FenceWait);
         let wait = self.context.wait_for_fence(self.fence, timeout_ns);
         match wait {
             Ok(()) => {

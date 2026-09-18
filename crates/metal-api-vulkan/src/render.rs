@@ -7085,6 +7085,12 @@ fn execute_offscreen_render_with_retains(
     request: &OffscreenRenderRequest<'_>,
     mut retains: Option<RenderInputRetains>,
 ) -> Result<OffscreenReadback, ProviderError> {
+    // The render half's own split (`crate::phase_profile`), disjoint region by
+    // disjoint region: everything before the recording is setup, the recording
+    // and the submission/wait are charged where they happen, and the mapped
+    // copies come last. All `None` — one relaxed load each, no clock read —
+    // when `METAL_API_VULKAN_PHASE_PROFILE` is off, which is the default.
+    let _render_setup = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderSetup);
     // The attachment count is the rail's own gate, re-run on the request so a
     // hand-built request cannot skip `prepare_render_request`'s admission.
     if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
@@ -7846,6 +7852,9 @@ fn execute_offscreen_render_with_retains(
         None => {}
     }
     objects.create_command_pool(queue_index)?;
+    drop(_render_setup);
+    let _render_record =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRecord);
     objects.record(
         &request.attachments,
         request.depth.as_ref(),
@@ -7863,6 +7872,7 @@ fn execute_offscreen_render_with_retains(
         width,
         height,
     )?;
+    drop(_render_record);
     // The retained no-copy leases outlive the submission: the fence below is
     // what proves the GPU can no longer read the owner's mapping
     // (`research/docs/23` §71, R3c).
@@ -7898,6 +7908,8 @@ fn execute_offscreen_render_with_retains(
     // left the device and that a discarded one produced no bytes at all. A
     // stored depth surface adds its own record on top of that count, through
     // the same copy-out channel (`research/docs/23` §3.3, v43).
+    let _render_readback =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReadback);
     let mut results = Vec::with_capacity(request.attachments.len());
     let mut mappings = readback_mappings.into_iter();
     for attachment in &request.attachments {
@@ -13467,6 +13479,13 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     fn submit_and_wait(&mut self, queue_index: usize) -> Result<(), ProviderError> {
+        // The render half's submission, split the way the compute sequence's is
+        // (`crate::phase_profile`): the queue lock, the fence and `vkQueueSubmit`
+        // are one region, the wait for it is another, and the wait carries the
+        // same idle/blocked split — a pass's copy-out runs inside it, so a wait
+        // that returns immediately is a device that was already done.
+        let _render_submit =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderSubmit);
         let _execution = self
             .context
             .lock_queue(queue_index)
@@ -13493,10 +13512,16 @@ impl<'a> OffscreenObjects<'a> {
         }
         self.submitted = true;
         self.context.record_queue_submission(queue_index);
+        drop(_render_submit);
+        let mut _render_wait =
+            crate::phase_profile::Bar::enter_fence_wait(crate::phase_profile::Phase::RenderWait);
         if let Err(result) = self
             .context
             .wait_for_fence(self.fence, crate::FENCE_TIMEOUT_NS)
         {
+            if let Some(bar) = _render_wait.as_mut() {
+                bar.mark_timed_out();
+            }
             return Err(driver_refusal(
                 self.context,
                 ProviderPhase::Wait,
