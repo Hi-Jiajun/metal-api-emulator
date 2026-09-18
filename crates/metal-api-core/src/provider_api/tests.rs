@@ -336,6 +336,11 @@ impl ComputeProvider for FakeProvider {
                 .then_some(TextureFormat::Rgba8Unorm)
                 .into_iter()
                 .collect(),
+            // The fixture provider executes the reviewed same-extent window
+            // only: the gathered-extent shape is the rail's own declaration
+            // (`research/docs/23` §3.3, E-TX10), and this provider reaches it
+            // through neither entry point.
+            supports_render_texture_gathered_extent: false,
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self

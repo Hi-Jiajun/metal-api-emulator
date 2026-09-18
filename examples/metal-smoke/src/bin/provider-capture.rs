@@ -171,6 +171,17 @@ const STAGE_BUFFER_VERTICES: u64 = 3;
 /// descriptor set.
 const STAGE_BUFFER_VERTEX_SET: u32 = 1;
 const STAGE_BUFFER_FRAGMENT_SET: u32 = 2;
+/// Vertices a gathered-extent case draws (`research/docs/23` §3.3, §111,
+/// E-TX10): the translated vertex module generates the full-screen triangle
+/// from `vertex_id`, so the draw is the milestone's three vertices and no
+/// stream or index buffer takes part.
+const GATHERED_EXTENT_VERTICES: u64 = 3;
+/// The descriptor set both translated stages of a gathered-extent case land in
+/// (`research/docs/23` §3.3, E-TX10): the pair reads no `[[buffer(N)]]`
+/// argument, so the translator's default layout — every Metal resource in set
+/// 0 — is the arrangement the rail's own `render_texture_extent_e2e` reading
+/// measured, and the two stages' buffer namespaces cannot collide without one.
+const GATHERED_EXTENT_SET: u32 = 0;
 
 /// The reviewed vertex-input fixture (`research/docs/23` §3.3): a caller-held
 /// `float32x2` position stream and six `uint16` indices over it. The Vulkan rail
@@ -1416,6 +1427,16 @@ fn register_render_pipeline(
         "suite-sha256-entry-v1",
         format!("{identity}:offscreen_render_pipeline:{attachment_count}").into_bytes(),
     )?;
+    // A gathered-extent case's stages are translated AIR, so it never reaches
+    // this reviewed-pair registrar: `register_render_case_pipeline` hands it to
+    // the translator's own path instead.
+    if geometry == RenderGeometry::GatheredExtent {
+        return Err(format!(
+            "render case {}: the gathered-extent arm registers its translated stages",
+            case.id
+        )
+        .into());
+    }
     // The pipeline-level half of a stage-buffer case's declaration
     // (`research/docs/23` §3.3, v83-v86). Every other geometry declares no
     // slots, so its contract's list stays empty and its bytes are unchanged.
@@ -1554,6 +1575,9 @@ fn register_render_pipeline(
             (STAGE_BUFFER_POSITIONS_SPV, STAGE_BUFFER_TINT_SPV),
             VertexLayout::None,
         ),
+        // Unreachable: the early return above refuses the gathered-extent arm,
+        // whose stages the translator registers.
+        RenderGeometry::GatheredExtent => unreachable!(),
     };
     // The sampled case's declaration (`research/docs/23` §3.3, v100): the
     // fragment stage reads the pass's one texture at binding 0, and the state
@@ -1609,14 +1633,16 @@ fn register_render_pipeline(
 }
 
 /// Register one render case's pipeline, whichever arm its stages belong to
-/// (`research/docs/23` §3.3, v83-v86).
+/// (`research/docs/23` §3.3, v83-v86/E-TX10).
 ///
 /// A reviewed case hands its geometry to [`register_render_pipeline`], which
 /// mints the rail's own reviewed pair. A case that carries `translated_stages`
 /// has no reviewed pair: the Vulkan rail translates its two AIR modules itself
 /// and registers the result, so the descriptor slots come from each module's
 /// own reflection and the contract's declarations are what the rail pairs that
-/// reflection with.
+/// reflection with. Two arms register that way — the stage-buffer pair (whose
+/// slots the contract declares) and the gathered-extent pair (whose fragment
+/// stage samples the pass's own texture of another extent).
 fn register_render_case_pipeline(
     registrar: &RenderRegistrar,
     counters: &CopyCounters,
@@ -1632,7 +1658,7 @@ fn register_render_case_pipeline(
     match (registrar, counters) {
         (RenderRegistrar::Vulkan(vulkan), CopyCounters::Vulkan { executor, .. }) => {
             register_translated_stage_buffer_pipeline(
-                vulkan, executor, identity, case, directory, formats,
+                vulkan, executor, identity, case, directory, geometry, formats,
             )
         }
         // Only the Vulkan trace rail translates AIR, and `validate_render_case`
@@ -1649,7 +1675,7 @@ fn register_render_case_pipeline(
 }
 
 /// Translate and register the two AIR stages of a stage-buffer case on the
-/// Vulkan trace rail (`research/docs/23` §3.3, v84/v86).
+/// Vulkan trace rail (`research/docs/23` §3.3, v84/v86/E-TX10).
 ///
 /// Each stage translates into its own descriptor set — the vertex stage's
 /// `[[buffer(N)]]` arguments in set 1, the fragment stage's in set 2 — the
@@ -1668,6 +1694,7 @@ fn register_translated_stage_buffer_pipeline(
     identity: &str,
     case: &RenderCase,
     directory: &Path,
+    geometry: RenderGeometry,
     formats: &[AttachmentFormat],
 ) -> Result<CompiledComputePipeline> {
     let where_ = format!("render case {}", case.id);
@@ -1679,19 +1706,31 @@ fn register_translated_stage_buffer_pipeline(
         Arc::clone(executor) as Arc<dyn metal_api_core::ComputeExecutor>
     );
     let policy = executor.spirv_feature_policy();
+    // The two arms lay their stages out differently: the stage-buffer pair
+    // keeps the two stages' Metal buffer namespaces apart in set 1 and set 2
+    // (`research/docs/23` §3.3, E-TX9), while a gathered-extent pair reads no
+    // `[[buffer(N)]]` argument at all and takes the translator's default layout
+    // — every Metal resource in set 0 — which is the arrangement the rail's own
+    // `render_texture_extent_e2e` reading measured.
+    let gathered = geometry == RenderGeometry::GatheredExtent;
+    let (vertex_set, fragment_set) = if gathered {
+        (GATHERED_EXTENT_SET, GATHERED_EXTENT_SET)
+    } else {
+        (STAGE_BUFFER_VERTEX_SET, STAGE_BUFFER_FRAGMENT_SET)
+    };
     let mut stages = Vec::with_capacity(2);
     for (stage, source, entry, set) in [
         (
             RenderStage::Vertex,
             &translated.vertex,
             case.vertex_entry.as_str(),
-            STAGE_BUFFER_VERTEX_SET,
+            vertex_set,
         ),
         (
             RenderStage::Fragment,
             &translated.fragment,
             case.fragment_entry.as_str(),
-            STAGE_BUFFER_FRAGMENT_SET,
+            fragment_set,
         ),
     ] {
         let air = String::from_utf8(verified_source(directory, source)?)?;
@@ -1716,13 +1755,28 @@ fn register_translated_stage_buffer_pipeline(
     let [vertex, fragment]: [TranslatedRenderStage; 2] = stages
         .try_into()
         .map_err(|_| format!("{where_}: two translated stages"))?;
+    // The gathered-extent arm's declaration (`research/docs/23` §3.3, §111):
+    // its translated fragment stage samples the pass's own texture at Metal
+    // binding zero through the reviewed nearest/clamp state, and the source's
+    // extent is the view's own — the register gate pairs this declaration with
+    // the module's reflection field by field, so a module that reads another
+    // binding is refused rather than executed against the wrong bytes.
+    let textures = if gathered {
+        vec![TextureBindingContract::sampled(
+            0,
+            sampled_case_texture_format(case)?,
+            SamplerPolicy::reviewed_render_sampler(),
+        )]
+    } else {
+        Vec::new()
+    };
     let contract = RenderPipelineContract {
         vertex_entry: case.vertex_entry.clone(),
         fragment_entry: case.fragment_entry.clone(),
         color_formats: formats.to_vec(),
         vertex_layout: VertexLayout::None,
         stage_buffers: stage_buffer_declarations(case)?,
-        textures: Vec::new(),
+        textures,
     };
     let logical_digest = SemanticDigest::new(
         "suite-sha256-entry-v1",
@@ -3966,6 +4020,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // alone (the two stages are the translator's), so this table pins the
         // declaring pass, which every rail executes.
         (1, "compute-buffer-v35") => &["render_declaring_stage_buffer_namespace"],
+        // The gathered-extent arm (`research/docs/23` §3.3, §111, E-TX10): the
+        // declaring pass of the render case whose translated fragment stage
+        // samples a texture whose extent is not the render area's. Its render
+        // case runs on the Vulkan rails alone (the stages are the translator's),
+        // so this table pins the declaring pass, which every rail executes.
+        (1, "compute-buffer-v36") => &["render_declaring_gathered_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4178,6 +4238,14 @@ enum RenderGeometry {
     /// executes the writable and affine faces the reviewed modules cannot
     /// state (R9f).
     StageBuffers,
+    /// The gathered-extent arm (`research/docs/23` §3.3, §111, E-TX10): the
+    /// census's own shape — two translated AIR stages beside one sampled
+    /// texture whose extent is *not* the render area's. The module states its
+    /// own absolute sample coordinates, so the rail binds the source at its own
+    /// extent and the frame is a function of that source's bytes; the arm is
+    /// the translating rail's, so its marker stays inside the two Vulkan rails
+    /// and no MSL sibling exists to pin.
+    GatheredExtent,
 }
 
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
@@ -5658,6 +5726,192 @@ fn reviewed_sampled_geometry(
     Ok(RenderGeometry::SampledTexture)
 }
 
+/// Classify the gathered-extent arm and pin the shape's own claims
+/// (`research/docs/23` §3.3, §111, E-TX10).
+///
+/// The arm is the census's: two translated AIR stages whose fragment module
+/// states absolute sample coordinates, beside one sampled texture whose extent
+/// is *not* the render area's. The rail binds the source at its own extent for
+/// that arm, so the attachment's bytes are a function of the source's bytes —
+/// which is exactly what makes the case falsifiable, and what the reviewed
+/// same-extent window cannot measure: a rail that gathered the source into the
+/// destination grid would land a different frame, and one that ignored the
+/// binding would land the clear colour.
+///
+/// The case pins its own expectation (`expected_hex`) instead of a derivable
+/// one: only the module knows its sample coordinates, so the fixture states the
+/// reading the two absolute samples produce and the comparator checks the
+/// bytes. This validator pins everything the *fixture* can be held to — the
+/// source differs from the render area in at least one axis, its texels are
+/// pairwise distinct and none of them is the clear colour, the attachment is
+/// the stored 8-bit four-component surface both rails read back, and the marker
+/// stays inside the translating rail's two faces.
+fn reviewed_gathered_extent_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    let textures = case
+        .fragment_textures
+        .as_deref()
+        .ok_or_else(|| format!("{where_}: the gathered-extent arm samples one texture"))?;
+    if textures.len() != 1 {
+        return Err(format!("{where_}: the gathered-extent arm binds exactly one texture").into());
+    }
+    let translated = case.translated_stages.as_ref().ok_or_else(|| {
+        format!("{where_}: the gathered-extent arm registers two translated AIR stages")
+    })?;
+    if !case.stage_buffers.is_empty() {
+        return Err(format!(
+            "{where_}: the gathered-extent arm carries no stage-buffer declaration"
+        )
+        .into());
+    }
+    if case.vertex_layout.is_some() || !case.vertex_buffers.is_empty() || case.indices.is_some() {
+        return Err(format!(
+            "{where_}: the gathered-extent arm is the vertex_id triangle and binds no vertex \
+             stream, layout or index buffer"
+        )
+        .into());
+    }
+    if case.attachments.is_some() {
+        return Err(format!("{where_}: the gathered-extent arm stores one attachment").into());
+    }
+    // The remaining reviewed state families describe other shapes: any of them
+    // beside the gathered source would be a second claim inside one case.
+    if case.depth.is_some()
+        || case.stencil.is_some()
+        || case.cull.is_some()
+        || case.blend.is_some()
+        || case.multisample.is_some()
+        || case.depth_resolve.is_some()
+        || case.stencil_resolve.is_some()
+        || case.present.is_some()
+        || case.icb.is_some()
+        || case.expected_rule.is_some()
+        || case.readback_windows.is_some()
+        || case.scissor.is_some()
+        || case.coverage.is_some()
+    {
+        return Err(format!(
+            "{where_}: a gathered-extent case carries no depth, stencil, cull, blend, \
+             multisample, resolve, present, indirect, rule, scissor or coverage section"
+        )
+        .into());
+    }
+    if case.vertices != GATHERED_EXTENT_VERTICES {
+        return Err(format!(
+            "{where_}: the gathered-extent arm draws the translated stage's \
+             {GATHERED_EXTENT_VERTICES}-vertex triangle"
+        )
+        .into());
+    }
+    if case.instance_count != 1 || case.base_vertex != 0 {
+        return Err(format!(
+            "{where_}: the gathered-extent arm draws one instance with no vertex offset"
+        )
+        .into());
+    }
+    if case.metal.is_some() {
+        return Err(format!(
+            "{where_}: a translated case has no MSL sibling to pin, so it carries no metal source"
+        )
+        .into());
+    }
+    if translated.vertex.path == translated.fragment.path {
+        return Err(
+            format!("{where_}: the two translated stages name their own AIR modules").into(),
+        );
+    }
+    // The translating rail owns the arm: the two Vulkan faces translate AIR,
+    // and no reviewed MSL sibling exists for either stage.
+    let allowed = ["vulkan", "vulkan-objects"];
+    if case.capture_rails.is_empty()
+        || case
+            .capture_rails
+            .iter()
+            .any(|rail| !allowed.contains(&rail.as_str()))
+    {
+        return Err(format!(
+            "{where_}: a gathered-extent case runs on the rails that translate its stages ({}), \
+             so its capture_rails has to stay inside that list",
+            allowed.join(", ")
+        )
+        .into());
+    }
+    let attachment = case
+        .attachment
+        .as_ref()
+        .ok_or_else(|| format!("{where_}: the gathered-extent arm needs its stored attachment"))?;
+    let attachment_layout = attachment_format(&attachment.format)?;
+    if !matches!(
+        attachment_layout,
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+    ) || attachment.store != "store"
+    {
+        return Err(format!(
+            "{where_}: the gathered-extent arm stores one 8-bit four-component unorm attachment, \
+             in either byte order"
+        )
+        .into());
+    }
+    let clear = unhex(attachment.clear_hex.as_deref().unwrap_or_default())?;
+    if attachment.load != "clear" || clear.len() != 4 {
+        return Err(format!(
+            "{where_}.attachment: the gathered-extent arm clears its attachment, so a rail that \
+             ignores the sampled source is observable"
+        )
+        .into());
+    }
+    let texture = &textures[0];
+    // `format()` admits the two 8-bit four-component byte orders the render
+    // sampler table names (`research/docs/23` §107).
+    texture.format()?;
+    if texture.width == 0 || texture.height == 0 {
+        return Err(format!("{where_}.fragment_textures[0]: a zero extent").into());
+    }
+    if texture.width == attachment.width && texture.height == attachment.height {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: the gathered-extent arm's source has to differ from \
+             the render area in at least one axis, or the case measures the same-extent window"
+        )
+        .into());
+    }
+    let texels = texture.texels()?;
+    let unique = texels
+        .chunks_exact(4)
+        .map(|texel| texel.to_vec())
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != texels.len() / 4 {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: the uploaded texels have to be pairwise distinct, or \
+             a repeated read could pass"
+        )
+        .into());
+    }
+    if unique.contains(&clear) {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: an uploaded texel equals the clear colour, so \
+             ignoring the source could pass"
+        )
+        .into());
+    }
+    // The expectation is the module's own reading, so the fixture can only be
+    // held to its shape here: the destination's own byte count. The bytes
+    // themselves are the comparator's reading.
+    let expected = unhex(case.expected_hex.as_deref().ok_or_else(|| {
+        format!("{where_}: the gathered-extent arm states the frame its samples land")
+    })?)?;
+    let destination_bytes = attachment
+        .width
+        .checked_mul(attachment.height)
+        .and_then(|texels| texels.checked_mul(4))
+        .ok_or_else(|| format!("{where_}: the attachment's extent overflows"))?;
+    if expected.len() as u64 != destination_bytes {
+        return Err(format!(
+            "{where_}: the expectation is the render area's own bytes ({destination_bytes})"
+        )
+        .into());
+    }
+    Ok(RenderGeometry::GatheredExtent)
+}
+
 /// Classify a stage-buffer case and pin the declarations the reviewed arms
 /// admit (`research/docs/23` §3.3, v83-v86).
 ///
@@ -6291,6 +6545,15 @@ fn stage_buffer_view(slot: &ResolvedStageBuffer) -> StageBufferView {
 /// draw the fixture claims, with every index naming one of the four reviewed
 /// vertices. Anything else is a case the reviewers have not seen.
 fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    // The gathered-extent arm is the translated arm's sampled source
+    // (`research/docs/23` §3.3, §111, E-TX10): a case that pins two translated
+    // AIR stages *and* a fragment texture is that shape, and nothing else may
+    // join it. It is classified before the stage-buffer shape, because a
+    // translated case that carries no stage buffer would otherwise be read as
+    // one.
+    if case.translated_stages.is_some() && case.fragment_textures.is_some() {
+        return reviewed_gathered_extent_geometry(case, where_);
+    }
     // The stage-buffer shape is classified first (`research/docs/23` §3.3,
     // v83-v86): its stages read their bytes from `[[buffer(N)]]` arguments
     // rather than from a vertex layout or the vertex index, so a case that
@@ -6436,7 +6699,10 @@ fn render_inputs(
     // (`research/docs/23` §3.3, v83).
     if matches!(
         render_geometry(case, where_)?,
-        RenderGeometry::Milestone | RenderGeometry::SampledTexture | RenderGeometry::StageBuffers
+        RenderGeometry::Milestone
+            | RenderGeometry::SampledTexture
+            | RenderGeometry::StageBuffers
+            | RenderGeometry::GatheredExtent
     ) {
         return Ok((Vec::new(), None));
     }
@@ -6637,6 +6903,15 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::GatheredExtent => {
+            // The arm's own claims were pinned by
+            // `reviewed_gathered_extent_geometry` above — the translated pair,
+            // the source's differing extent, the distinct texels and the
+            // Vulkan-only marker — so what is left here is the pass's own half.
+            // The source is a read-only sampled view the trace carries, exactly
+            // as the reviewed sampler's is, so the arm names no landing and the
+            // case states no present or indirect action.
+        }
         RenderGeometry::StageBuffers => {
             // The stage-buffer geometry and its declarations were pinned by
             // `reviewed_stage_buffer_geometry` above; what is left here is the
@@ -6769,6 +7044,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // The render sampler's MSL module carries its own entry pair
         // (`research/docs/23` §3.3, v70).
         RenderGeometry::SampledTexture => (SAMPLED_MSL_VERTEX_ENTRY, SAMPLED_MSL_FRAGMENT_ENTRY),
+        // A gathered-extent case names its own two AIR entries rather than a
+        // reviewed MSL pair (`research/docs/23` §3.3, E-TX10): the arm is the
+        // translator's, exactly as the translated stage-buffer case beside it
+        // is, and the shape module above pinned that it carries no MSL pin.
+        RenderGeometry::GatheredExtent => {
+            (case.vertex_entry.as_str(), case.fragment_entry.as_str())
+        }
         // A translated stage-buffer case names its own two AIR entries rather
         // than a reviewed MSL pair — the stage module above pinned that the
         // case carries `translated_stages` and no MSL pin — while the reviewed
@@ -8646,6 +8928,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 16), (1, "write", 4)][..],
+        ),
+        // E-TX10: the gathered-extent arm's declaring pass is the same kernel
+        // over the render area's own sixty-four-byte view (4x4 texels) beside
+        // the copy landing (`research/docs/23` §3.3, §111).
+        "render_declaring_gathered_extent" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 64), (1, "write", 4)][..],
         ),
         // v49: the same read pair with the *stencil* surface's own one-byte
         // extent (4x4 texels = 16 bytes) as the third read binding, so one

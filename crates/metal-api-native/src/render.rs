@@ -1019,6 +1019,9 @@ pub(crate) struct RenderCapabilityBits {
     pub(crate) supports_render_texture_sampling: bool,
     pub(crate) max_render_textures: u32,
     pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
+    /// The gathered-extent shape's bit (`research/docs/23` §3.3, E-TX10),
+    /// declared beside the three render-sampler fields it narrows.
+    pub(crate) supports_render_texture_gathered_extent: bool,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -1092,6 +1095,8 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         supports_render_texture_sampling: render_texture.supports_render_texture_sampling,
         max_render_textures: render_texture.max_render_textures,
         supported_render_texture_formats: render_texture.supported_render_texture_formats,
+        supports_render_texture_gathered_extent: render_texture
+            .supports_render_texture_gathered_extent,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -1121,6 +1126,14 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
         // promise a shape this rail's plan refuses by name.
         max_render_textures: REVIEWED_SAMPLED_TEXTURE_COUNT as u32,
         supported_render_texture_formats: SUPPORTED_RENDER_TEXTURE_FORMATS.to_vec(),
+        // The gathered extent stays refused (`research/docs/23` §3.3, E-TX10):
+        // this rail answers *every* sampled source of another extent with
+        // `render_texture_extent_unsupported` (the rail's own texture walk),
+        // and Apple has no oracle for the shape — the reviewed module samples
+        // the render area's own texel centres and declares no coordinate of its
+        // own. Declaring the bit would promise a shape this rail's plan refuses
+        // by name, so it keeps the consumer's fail-closed default.
+        supports_render_texture_gathered_extent: false,
     }
 }
 
@@ -1131,6 +1144,11 @@ pub(crate) struct RenderTextureCapabilityBits {
     pub(crate) supports_render_texture_sampling: bool,
     pub(crate) max_render_textures: u32,
     pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
+    /// Whether this rail executes a sampled source whose extent is not the
+    /// render area's (`research/docs/23` §3.3, E-TX10). `false` here is the
+    /// declaration, not a missing measurement: the rail's texture walk refuses
+    /// the shape by name.
+    pub(crate) supports_render_texture_gathered_extent: bool,
 }
 
 /// The first render-sampler increment's binding cap, spelled once so the
@@ -8738,6 +8756,12 @@ mod tests {
             bits.supported_render_texture_formats,
             vec![TextureFormat::Rgba8Unorm]
         );
+        // The gathered extent is this rail's own boundary rather than a
+        // missing measurement (`research/docs/23` §3.3, E-TX10): every sampled
+        // source of another extent is refused by name, so the declaration
+        // stays at the contract's fail-closed default beside the three fields
+        // above.
+        assert!(!bits.supports_render_texture_gathered_extent);
         let declared = capability_bits(APPLE_2D_TEXTURE_CEILING);
         assert_eq!(
             declared.supports_render_texture_sampling,
@@ -8747,6 +8771,11 @@ mod tests {
         assert_eq!(
             declared.supported_render_texture_formats,
             bits.supported_render_texture_formats
+        );
+        assert!(!declared.supports_render_texture_gathered_extent);
+        assert_eq!(
+            declared.supports_render_texture_gathered_extent,
+            bits.supports_render_texture_gathered_extent
         );
     }
 
@@ -10271,6 +10300,7 @@ mod tests {
             supports_render_texture_sampling: false,
             max_render_textures: 0,
             supported_render_texture_formats: Vec::new(),
+            supports_render_texture_gathered_extent: false,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),

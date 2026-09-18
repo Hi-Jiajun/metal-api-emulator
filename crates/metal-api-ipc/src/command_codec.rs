@@ -629,6 +629,19 @@ const CAPABILITY_EXTENDED_TAIL: u8 = 0x00;
 /// the decoder's position rules unambiguous.
 const CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL: u8 = 0x01;
 
+/// Tag, inside the tail's second family, of the gathered-extent block
+/// (`research/docs/23` §3.3, E-TX10).
+///
+/// The section follows the folded-shape block and carries one bool: whether
+/// the snapshot executes a render pass whose sampled source has an extent other
+/// than the render area's, with the source's bytes readable on the host
+/// ([`ProviderCapabilities::supports_render_texture_gathered_extent`]). It is
+/// the family's second tag rather than a ninth bit flag because the tail's
+/// original tag space is the eight powers of two `0x01..=0x80`, which the
+/// eight blocks before the family have all taken; its own escape byte keeps a
+/// section added later in the same position rule.
+const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL: u8 = 0x02;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -838,6 +851,12 @@ impl CommandCodec {
                     // sending the legacy payload and its declaration would be
                     // lost on the wire.
                     || declares_compute_texture_support(capabilities)
+                    // The gathered extent's bit is the render-sampler face's
+                    // second question (`research/docs/23` §3.3, E-TX10), and it
+                    // reaches the tag through the same rule: a snapshot that
+                    // declares only it still has to write the extended payload,
+                    // or its declaration would be dropped on the wire.
+                    || capabilities.declares_render_texture_gathered_extent_support()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -5418,6 +5437,28 @@ fn declares_compute_texture_support(capabilities: &ProviderCapabilities) -> bool
         || !capabilities.supported_compute_texture_formats.is_empty()
 }
 
+/// Whether the render-sampler face declares anything the extended payload has
+/// to carry (`research/docs/23` §3.3, v70/E-TX10).
+///
+/// The three render-sampler fields are one question — "does this snapshot
+/// sample a render pass's texture, and how" — and the gathered-extent shape is
+/// the same face's second one ("does it execute a source of another extent").
+/// Both spell the encoder's outer guard through this predicate so the guard
+/// asks one question about the face instead of one call site reading the three
+/// fields and another reading the shape bit: a snapshot that declares *only*
+/// the gathered shape still has to write the heap/ICB half the decoder reads by
+/// position before the tag, or the declaration would be dropped on the wire —
+/// the exact failure every `declares_*` predicate exists to prevent.
+///
+/// The render-sampler block itself stays gated by
+/// [`ProviderCapabilities::declares_render_texture_support`]: the shape bit is
+/// not one of those three fields, so a snapshot that declares only it writes no
+/// block for them and its frame ends at the shape's own section.
+fn declares_render_texture_face(capabilities: &ProviderCapabilities) -> bool {
+    capabilities.declares_render_texture_support()
+        || capabilities.declares_render_texture_gathered_extent_support()
+}
+
 /// Encode a capability snapshot, including its render bits.
 ///
 /// Only [`RENDER_CAPABILITIES_RESPONSE`] frames use this layout. A snapshot
@@ -5504,7 +5545,10 @@ fn put_capabilities(
         // to write the heap/ICB half the decoder reads by position before the
         // tag, and this guard is what keeps the declaration from being
         // silently dropped (`research/docs/23` §3.3, v70).
-        || capabilities.declares_render_texture_support()
+        // The gathered-extent shape's bit is the same face's second question
+        // (`research/docs/23` §3.3, E-TX10), so it joins the guard through the
+        // face's own predicate.
+        || declares_render_texture_face(capabilities)
         // The stage-buffer block follows the same rule once more
         // (`research/docs/23` §3.3, v83): a snapshot that declares only the
         // two stage buffer bits still writes the heap/ICB half the decoder
@@ -5665,6 +5709,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL);
             encoder.bool(capabilities.supports_render_stage_buffer_namespace_split);
         }
+        // The gathered-extent block is the tail's newest section and follows
+        // the folded-shape block (`research/docs/23` §3.3, E-TX10). It is the
+        // second tag of the escape family, so it carries its own escape byte
+        // and the family's next tag; both sections keep the walk's position
+        // rule — the decoder reads them in exactly the order this encoder
+        // writes them. A snapshot whose bit stays at its default writes nothing
+        // here, and the decoder reads the missing section as `false` — the "do
+        // not submit a source of another extent" default a consumer keeps its
+        // fail-closed direction with.
+        if capabilities.declares_render_texture_gathered_extent_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL);
+            encoder.bool(capabilities.supports_render_texture_gathered_extent);
+        }
     }
     Ok(())
 }
@@ -5721,6 +5779,11 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // compute-texture block, so a frame that ends earlier reads the
         // consumer's fail-closed default.
         supports_render_stage_buffer_namespace_split: false,
+        // The gathered-extent shape's bit (`research/docs/23` §3.3, E-TX10) is
+        // the second block of the frame's tagged tail family, so it arrived
+        // even later than the folded shape: a legacy payload cannot carry it
+        // and reads the consumer's fail-closed default.
+        supports_render_texture_gathered_extent: false,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,
@@ -5798,18 +5861,28 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
 }
 
 /// Read the capability tail's second tag family, when `tag` is its escape byte
-/// (`research/docs/23` §3.3, E-TX9).
+/// (`research/docs/23` §3.3, E-TX9/E-TX10).
 ///
 /// The tail's original tags are the eight powers of two `0x01..=0x80` and the
-/// eight sections before the folded-shape block have taken all of them, so the
-/// ninth section is introduced by the reserved `0x00` escape and then the
+/// eight sections before the family have taken all of them, so a section of
+/// this family is introduced by the reserved `0x00` escape and then the
 /// family's own tag. The walk asks this question wherever it reads a tag,
-/// because the section is the *last* one the encoder writes: a snapshot that
-/// declares it beside any of the eight earlier blocks writes the escape
-/// directly after whichever block came last, so the escape can appear at every
-/// one of the walk's read points. Every other tag is left to the walk's own
-/// ordered checks, which is why this helper only answers for the escape and
-/// refuses a family tag the walk cannot skip to.
+/// because the family's sections are the *last* ones the encoder writes: a
+/// snapshot that declares them beside any of the eight earlier blocks writes
+/// the escape directly after whichever block came last, so the escape can
+/// appear at every one of the walk's read points. Every other tag is left to
+/// the walk's own ordered checks, which is why this helper only answers for the
+/// escape and refuses a family tag the walk cannot skip to.
+///
+/// One escape introduces a **run** of family sections, not one section: the
+/// encoder writes every declared family block in one place, in the family's own
+/// order, so the helper consumes the run to its end. Each later section carries
+/// its own escape (the grammar is `0x00 <family tag> <payload>` per section,
+/// never a count), and the run's end is the end of the frame. That leaves three
+/// refusals, all of them frames this encoder cannot write: a family tag outside
+/// the closed set, a tag that does not come after the one before it (which
+/// covers both a duplicate and a section read out of order), and a byte that
+/// follows a section without being the next section's escape.
 fn decode_capability_extended_tail(
     decoder: &mut Decoder<'_>,
     capabilities: &mut ProviderCapabilities,
@@ -5818,12 +5891,39 @@ fn decode_capability_extended_tail(
     if tag != CAPABILITY_EXTENDED_TAIL {
         return Ok(false);
     }
-    let family_tag = decoder.u8()?;
-    if family_tag != CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL {
-        return Err(CodecError::UnknownCapabilityTail(family_tag));
+    let mut previous_family_tag = 0u8;
+    loop {
+        let family_tag = decoder.u8()?;
+        match family_tag {
+            CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL
+            | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL => {}
+            other => return Err(CodecError::UnknownCapabilityTail(other)),
+        }
+        // The family's tags are read in the one order the encoder writes them,
+        // so a tag that does not advance past its predecessor is a section the
+        // encoder repeated or moved — both frames the walk must refuse rather
+        // than execute.
+        if family_tag <= previous_family_tag {
+            return Err(CodecError::UnknownCapabilityTail(family_tag));
+        }
+        previous_family_tag = family_tag;
+        if family_tag == CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL {
+            capabilities.supports_render_stage_buffer_namespace_split = decoder.bool()?;
+        } else {
+            capabilities.supports_render_texture_gathered_extent = decoder.bool()?;
+        }
+        // The run ends with the frame, so a byte after a family section is
+        // either the next section's own escape or a frame the encoder cannot
+        // have written. Leaving the walk's cursor on that byte would let the
+        // caller read a section that was never there.
+        if decoder.remaining() == 0 {
+            return Ok(true);
+        }
+        let escape = decoder.u8()?;
+        if escape != CAPABILITY_EXTENDED_TAIL {
+            return Err(CodecError::UnknownCapabilityTail(escape));
+        }
     }
-    capabilities.supports_render_stage_buffer_namespace_split = decoder.bool()?;
-    Ok(true)
 }
 
 fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, CodecError> {

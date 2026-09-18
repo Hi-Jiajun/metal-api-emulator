@@ -9271,6 +9271,35 @@ pub struct ProviderCapabilities {
     /// code so the contract's own enum is the single vocabulary, exactly as
     /// [`Self::supported_color_formats`] is.
     pub supported_render_texture_formats: Vec<TextureFormat>,
+    /// Whether this snapshot executes the *gathered* render-sampler shape: one
+    /// render pass whose sampled texture has an extent other than the render
+    /// area's, with that source's bytes readable on the host
+    /// (`research/docs/23` §3.3, E-TX10). Defaults to `false`: a pass that
+    /// binds such a source is refused by name instead of being executed
+    /// against a texture of the wrong extent.
+    ///
+    /// The bit is limited **by arm**, which is the distinction the three fields
+    /// above cannot state on their own. [`Self::supports_render_texture_sampling`]
+    /// still answers "does this snapshot sample a render pass's texture at
+    /// all" — in practice the same-extent window — [`Self::max_render_textures`]
+    /// still answers "how many bindings", and
+    /// [`Self::supported_render_texture_formats`] still answers "which
+    /// formats". This bit answers one more question: "does it execute a source
+    /// whose extent is not the render area's, when the source's bytes are
+    /// readable on the host". It MUST NOT be read as "the snapshot copies an
+    /// arbitrary source to the host", and it MUST NOT be read as "the snapshot
+    /// executes the owner's no-copy window": that arm's whole statement is that
+    /// the device reads the owner's mapping, so a source of another extent
+    /// there would need a host copy the arm does not carry, and it keeps its
+    /// own refusal (`render_texture_extent_unsupported`) whoever declares this
+    /// bit.
+    ///
+    /// Declared `true` by the snapshots whose rail already executes that half:
+    /// the Vulkan rail's translated binding and its integer-grid gather
+    /// (`tests/render_texture_extent_e2e.rs`), and left at the default by the
+    /// native rail, which refuses every source of another extent by name and
+    /// has no Apple oracle for the shape.
+    pub supports_render_texture_gathered_extent: bool,
     /// Whether this snapshot can execute a render pass whose stage binds a
     /// buffer directly (`research/docs/23` §3.3, v83). Defaults to `false`: a
     /// snapshot whose rail cannot fill a stage buffer slot refuses the pass
@@ -9446,6 +9475,27 @@ impl ProviderCapabilities {
         self.supports_render_texture_sampling
             || self.max_render_textures != 0
             || !self.supported_render_texture_formats.is_empty()
+    }
+
+    /// Whether this snapshot declares the gathered-extent render-sampler shape
+    /// (`research/docs/23` §3.3, E-TX10).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so the question is asked in the same place a consumer asks
+    /// every other "did this snapshot declare the shape" question, instead of
+    /// one call site reading the field and another comparing the rest of the
+    /// snapshot against its defaults. The capability frame writes the bit as
+    /// the second block of its own tagged tail family, so this predicate is
+    /// also what keeps a snapshot that declares *only* this bit from falling
+    /// back to the legacy payload and dropping the declaration on the wire.
+    ///
+    /// Like the folded stage-buffer shape's predicate beside it, this one is
+    /// deliberately *not* part of [`Self::declares_render_texture_support`]:
+    /// the three fields that predicate reads keep their own readings, and a
+    /// snapshot that never spoke about the gathered shape keeps the default
+    /// "refuse the shape by name" answer.
+    pub fn declares_render_texture_gathered_extent_support(&self) -> bool {
+        self.supports_render_texture_gathered_extent
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -15247,6 +15297,7 @@ mod tests {
             supports_render_texture_sampling: false,
             max_render_textures: 0,
             supported_render_texture_formats: Vec::new(),
+            supports_render_texture_gathered_extent: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -20324,6 +20375,43 @@ mod tests {
             default.declares_render_support(),
             declared.declares_render_support(),
             "the shape bit is the capability frame's own tail block, not one of the render bits"
+        );
+    }
+
+    /// The gathered-extent shape's bit is a declaration, not a default
+    /// (`research/docs/23` §3.3, E-TX10).
+    ///
+    /// A snapshot that never spoke about the shape must be read as "do not
+    /// submit a sampled source of another extent": the bit defaults to
+    /// `false`, the predicate answers the same thing, and setting the bit is
+    /// the only way to flip either reading. The bit is deliberately *not* one
+    /// of the three render-sampler fields — it travels in the capability
+    /// frame's own tagged tail block, beside the folded stage-buffer shape —
+    /// so flipping it has to leave those three readings exactly where they
+    /// were, which is what a consumer reads "can this snapshot sample" from.
+    #[test]
+    fn the_default_snapshot_does_not_declare_the_gathered_extent_shape() {
+        let default = render_texture_capabilities();
+        assert!(!default.supports_render_texture_gathered_extent);
+        assert!(!default.declares_render_texture_gathered_extent_support());
+
+        let mut declared = default.clone();
+        declared.supports_render_texture_gathered_extent = true;
+        assert!(declared.declares_render_texture_gathered_extent_support());
+        assert_eq!(
+            declared.supports_render_texture_sampling,
+            default.supports_render_texture_sampling
+        );
+        assert_eq!(declared.max_render_textures, default.max_render_textures);
+        assert_eq!(
+            declared.supported_render_texture_formats,
+            default.supported_render_texture_formats
+        );
+        assert_eq!(
+            default.declares_render_texture_support(),
+            declared.declares_render_texture_support(),
+            "the shape bit is the capability frame's own tail block, not one of the three \
+             render-sampler fields"
         );
     }
 
