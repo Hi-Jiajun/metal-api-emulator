@@ -6480,6 +6480,48 @@ mod tests {
         );
     }
 
+    /// The sampler codes §109 appended (`research/docs/23` §109) travel the same
+    /// block byte for byte: a declaration naming one of the widened filters and
+    /// address modes re-encodes to the very frame it came from, and the two
+    /// codes the first increment published keep their meanings.
+    #[test]
+    fn the_widened_sampler_names_travel_the_published_block() {
+        let mut widened = textured_pipeline();
+        widened.contract.texture_bindings[0].sampler =
+            Some(metal_api_core::provider::SamplerPolicy {
+                filter: metal_api_core::provider::SamplerFilter::LinearMipLinear,
+                address: metal_api_core::provider::SamplerAddressMode::ClampToZero,
+            });
+        let request = CommandRequest::Submit {
+            trace: textured_trace(&widened),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // The published block with the two appended codes in the filter and
+        // address bytes: finding it is what says the block kept its layout, and
+        // its own bytes are the two codes §109 appended.
+        let mut widened_block = R32UINT_DECLARATION_BLOCK.to_vec();
+        widened_block[8] = 0x05;
+        widened_block[9] = 0x04;
+        let block = frame
+            .windows(widened_block.len())
+            .position(|window| window == widened_block)
+            .expect("the declaration block is on the wire");
+        eprintln!(
+            "widened sampler block: filter={:#04x} address={:#04x}",
+            frame[block + 8],
+            frame[block + 9]
+        );
+        assert_eq!(frame[block + 8], 0x05, "linear min/mag + linear mip");
+        assert_eq!(frame[block + 9], 0x04, "clamp-to-zero");
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the widened declaration re-encodes byte for byte"
+        );
+    }
+
     #[test]
     fn the_compiled_response_carries_declarations_only_when_the_contract_has_them() {
         let plain = CommandResponse::Compiled {
@@ -6757,11 +6799,14 @@ mod tests {
         eprintln!("refused: {refused}");
 
         // Every enum in a tuple keeps its named refusal: a guess here would
-        // change which texels a remote read returns.
+        // change which texels a remote read returns. The sampler codes §109
+        // appended are *not* refused — they are the widened family's own
+        // names, read back below — so the probes are the first code past the
+        // appended range (`research/docs/23` §109).
         for (offset, field, code) in [
             (6, "texture type", 0x07),
-            (8, "sampler filter", 0x02),
-            (9, "sampler address", 0x02),
+            (8, "sampler filter", 0x06),
+            (9, "sampler address", 0x05),
             (10, "texture footprint", 0x02),
         ] {
             let mut patched = frame.clone();

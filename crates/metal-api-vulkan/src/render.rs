@@ -9674,6 +9674,34 @@ impl<'a> OffscreenObjects<'a> {
         if textures.is_empty() {
             return Ok(());
         }
+        // The one device question the state family asks before any object is
+        // created (`research/docs/23` §109): `mirrorClampToEdge` is the only
+        // address mode whose Vulkan feature is not core-and-enabled-by-default,
+        // so a device that never reported `samplerMirrorClampToEdge` answers
+        // the mode by name here — before an image is uploaded — instead of
+        // being handed a mode it was never told about. Every other family name
+        // needs no feature.
+        for texture in textures {
+            let Some(policy) = texture.slot.sampler() else {
+                continue;
+            };
+            if let Some(feature) = crate::sampler_address_mode_feature(policy.address) {
+                if !self.context.sampler_mirror_clamp_to_edge() {
+                    return Err(capability_refusal("render_sampler_address_mode_unsupported")
+                        .with_field(
+                            "address",
+                            FieldValue::Text(format!("{:?}", policy.address)),
+                        )
+                        .with_field("feature", FieldValue::Text(feature.to_owned()))
+                        .with_detail(
+                            "the render sampler's address mode is only valid on a device created \
+                             with this feature enabled, and this device did not report it; the \
+                             mode is refused by name rather than created as a sampler the device \
+                             was never told about",
+                        ));
+                }
+            }
+        }
         for texture in textures {
             let [width, height] = texture.extent;
             let format = texture.format;
@@ -13317,6 +13345,225 @@ mod tests {
         assert_eq!(
             refused.fields.get("module_filter"),
             Some(&FieldValue::Text("Linear".to_owned()))
+        );
+    }
+
+    /// The state the translation was given reaches the widened family
+    /// (`research/docs/23` §109), and the request's half is compared against it
+    /// by name.
+    ///
+    /// The translation is given the census's own shape — linear minification
+    /// and magnification with a linear mip filter and mirrored-repeat
+    /// addressing — and the request that states that very policy is admitted;
+    /// a request that moves the address half alone is refused with both halves
+    /// spelled by their widened names.
+    #[test]
+    fn a_mipmapped_mirrored_state_enters_the_family_and_a_disagreeing_pass_is_refused() {
+        use metal2vulkan::passes::{Stage, TransformOptions};
+        use metal2vulkan::reflect::{
+            SamplerAddressMode as AirAddress, SamplerBorderColor, SamplerCompareFunction,
+            SamplerCoordinates, SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+        };
+        use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+        let fixture = include_str!("../tests/fixtures/render_sample_texture_2d_boundary.frag.ll");
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        let state = metal2vulkan::reflect::RuntimeSamplerState {
+            min_filter: AirFilter::Linear,
+            mag_filter: AirFilter::Linear,
+            mip_filter: SamplerMipFilter::Linear,
+            address_mode_s: AirAddress::MirroredRepeat,
+            address_mode_t: AirAddress::MirroredRepeat,
+            address_mode_r: AirAddress::MirroredRepeat,
+            coordinates: SamplerCoordinates::Normalized,
+            compare_function: SamplerCompareFunction::Never,
+            max_anisotropy: 1,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            border_color: SamplerBorderColor::TransparentBlack,
+            reduction: SamplerReduction::WeightedAverage,
+            lod_bias: 0.0,
+        };
+        let options = TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .expect("runtime sampler state");
+        let (fragment_spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            fixture,
+            Stage::Fragment,
+            scratch.path(),
+            options,
+        )
+        .expect("the boundary fixture translates");
+        assert_eq!(reflection.runtime_sampler_specializations.len(), 1);
+
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d_boundary".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract {
+                    sampler: None,
+                    runtime_sampler: Some(0),
+                    ..TextureBindingContract::sampled(
+                        0,
+                        TextureFormat::Rgba8Unorm,
+                        REVIEWED_SAMPLER_POLICY,
+                    )
+                }],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        stages
+            .validate_stage_pair()
+            .expect("the module's own pairing is executable");
+
+        let declared = SamplerPolicy {
+            filter: SamplerFilter::LinearMipLinear,
+            address: SamplerAddressMode::MirrorRepeat,
+        };
+        let mut pass = sampled_pass(4);
+        pass.samplers = vec![RenderSamplerBinding::new(0, declared)];
+        prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the request states the very state the translation was given");
+
+        // The address half alone moves: the descriptor would be created from
+        // the request, so the pair is refused with both halves by name.
+        let other = SamplerPolicy {
+            filter: SamplerFilter::LinearMipLinear,
+            address: SamplerAddressMode::Repeat,
+        };
+        let mut moved = sampled_pass(4);
+        moved.samplers = vec![RenderSamplerBinding::new(0, other)];
+        let refused = match prepare_render_request(
+            &stages,
+            &moved,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the request names an address mode the translation did not"),
+        };
+        eprintln!("mipmapped mirrored state disagreement: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_sampler_unsupported");
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            refused.fields.get("sampler_binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(
+            refused.fields.get("filter"),
+            Some(&FieldValue::Text("LinearMipLinear".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("address"),
+            Some(&FieldValue::Text("Repeat".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("module_filter"),
+            Some(&FieldValue::Text("LinearMipLinear".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("module_address"),
+            Some(&FieldValue::Text("MirrorRepeat".to_owned()))
+        );
+    }
+
+    /// A translation given a state the widened family cannot state is refused
+    /// by name at the stage gate (`research/docs/23` §109): `clampToBorderColor`
+    /// reads a border colour that is a state of its own, so the rail refuses
+    /// the registration instead of creating a sampler that answers another
+    /// colour.
+    #[test]
+    fn a_border_colour_translation_stays_outside_the_family() {
+        use metal2vulkan::passes::{Stage, TransformOptions};
+        use metal2vulkan::reflect::{
+            SamplerAddressMode as AirAddress, SamplerBorderColor, SamplerCompareFunction,
+            SamplerCoordinates, SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+        };
+
+        let fixture = include_str!("../tests/fixtures/render_sample_texture_2d_boundary.frag.ll");
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        let state = metal2vulkan::reflect::RuntimeSamplerState {
+            min_filter: AirFilter::Linear,
+            mag_filter: AirFilter::Linear,
+            mip_filter: SamplerMipFilter::None,
+            address_mode_s: AirAddress::ClampToBorder,
+            address_mode_t: AirAddress::ClampToBorder,
+            address_mode_r: AirAddress::ClampToBorder,
+            coordinates: SamplerCoordinates::Normalized,
+            compare_function: SamplerCompareFunction::Never,
+            max_anisotropy: 1,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            border_color: SamplerBorderColor::OpaqueWhite,
+            reduction: SamplerReduction::WeightedAverage,
+            lod_bias: 0.0,
+        };
+        let options = TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .expect("runtime sampler state");
+        let (fragment_spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            fixture,
+            Stage::Fragment,
+            scratch.path(),
+            options,
+        )
+        .expect("the boundary fixture translates");
+
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d_boundary".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract {
+                    sampler: None,
+                    runtime_sampler: Some(0),
+                    ..TextureBindingContract::sampled(
+                        0,
+                        TextureFormat::Rgba8Unorm,
+                        REVIEWED_SAMPLER_POLICY,
+                    )
+                }],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        let refused = stages
+            .validate_stage_pair()
+            .expect_err("a border colour is not a state the family names");
+        eprintln!("border colour translation: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_unsupported_interface");
+        assert_eq!(
+            refused.fields.get("field"),
+            Some(&FieldValue::Text("textures".to_owned()))
+        );
+        let detail = refused.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("states no border colour"),
+            "the refusal names the state it cannot create: {detail}"
         );
     }
 
