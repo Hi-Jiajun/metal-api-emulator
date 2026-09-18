@@ -5593,12 +5593,80 @@ fn resolve_attachment_landing(
     attachment: usize,
     expected_bytes: u64,
 ) -> Result<AttachmentLanding, ProviderError> {
+    let windows = resolve_landing_windows(view, leases, |source, detail| {
+        landing_refusal(attachment, source, detail)
+    })?;
+    let landing = AttachmentLanding { windows };
+    let resolved = u64::try_from(landing.byte_len()).unwrap_or(u64::MAX);
+    if resolved != expected_bytes {
+        return Err(args_refusal("render_attachment_landing_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+            .with_field("expected_bytes", FieldValue::Unsigned(expected_bytes))
+            .with_field("resolved_bytes", FieldValue::Unsigned(resolved))
+            .with_detail(
+                "the windows an owner-window store lands in have to be the attachment's own tightly packed \
+                 byte extent",
+            ));
+    }
+    Ok(landing)
+}
+
+/// Resolve the owner windows a *landing-only* entry writes
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// The declaration is the entry's own second view — the same one
+/// [`StoreOp::BorrowedLanding`] names — so both landing arms answer the window
+/// question with one implementation and one vocabulary: the two live source
+/// arms are accepted, and the two copy arms and a window whose bytes are not
+/// the kept frame's extent are refused by name. What differs is the name the
+/// refusal states, which is why the shared walk takes it from the caller: a
+/// census has to be able to tell "a pass could not land its own frame" from "a
+/// kept frame could not be delivered".
+pub(crate) fn resolve_kept_frame_landing(
+    view: &BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    expected_bytes: u64,
+) -> Result<AttachmentLanding, ProviderError> {
+    let windows = resolve_landing_windows(view, leases, kept_frame_landing_refusal)?;
+    let landing = AttachmentLanding { windows };
+    let resolved = u64::try_from(landing.byte_len()).unwrap_or(u64::MAX);
+    if resolved != expected_bytes {
+        return Err(args_refusal("kept_frame_landing_mismatch")
+            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+            .with_field("allocation", FieldValue::Unsigned(view.allocation_id.get()))
+            .with_field("expected_bytes", FieldValue::Unsigned(expected_bytes))
+            .with_field("resolved_bytes", FieldValue::Unsigned(resolved))
+            .with_detail(
+                "the owner window a landing-only entry writes has to be the kept frame's own \
+                 tightly packed byte extent",
+            ));
+    }
+    Ok(landing)
+}
+
+/// The windows one landing declaration resolves to
+/// (`research/docs/23` §114，E-TX8；§115 之后的增量，E-TX13/E-TX14).
+///
+/// Two source arms carry live owner pages and are accepted: the single
+/// registered window (`BufferSource::BorrowedNoCopy`) and the ordered run list
+/// whose concatenation is the declaration's byte range
+/// (`BufferSource::GuestRuns`). The two *copy* arms are refused by name: their
+/// bytes are the trace's own image (or the provider's staged copy of one
+/// reservation), so landing in them would be a write into a buffer no owner's
+/// ledger holds, and the writeback channel already carries the frame for every
+/// caller that wants it. The caller supplies the refusal's own name, so the two
+/// landing arms keep two vocabularies over one walk.
+fn resolve_landing_windows(
+    view: &BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    refusal: impl Fn(&str, &str) -> ProviderError,
+) -> Result<Vec<AttachmentWindow>, ProviderError> {
     let leases = leases.ok_or_else(|| {
-        landing_refusal(
-            attachment,
+        refusal(
             "no_lease_channel",
-            "the render submission carries no lease channel, so the owner's window a borrowed \
-             store lands in cannot be resolved",
+            "the submission carries no lease channel, so the owner's window a landing \
+             declaration names cannot be resolved",
         )
     })?;
     let windows =
@@ -5629,33 +5697,28 @@ fn resolve_attachment_landing(
                 }
                 windows
             }
-            BufferSource::OwnedBytes(_) => return Err(landing_refusal(
-                attachment,
+            BufferSource::OwnedBytes(_) => return Err(refusal(
                 "owned_bytes",
-                "an owner-window store lands in the owner's own registered window; trace-owned bytes are \
-                 the writeback channel's source, not a window an owner's ledger holds",
+                "a landing writes the owner's own registered window; trace-owned bytes are the \
+                 writeback channel's source, not a window an owner's ledger holds",
             )),
-            BufferSource::StagedLease(_) => return Err(landing_refusal(
-                attachment,
-                "staged_lease",
-                "an owner-window store lands in the owner's own registered window; a staged lease is the \
+            BufferSource::StagedLease(_) => {
+                return Err(refusal(
+                    "staged_lease",
+                    "a landing writes the owner's own registered window; a staged lease is the \
                  provider's copy of one reservation rather than the owner's live pages",
-            )),
+                ))
+            }
         };
-    let landing = AttachmentLanding { windows };
-    let resolved = u64::try_from(landing.byte_len()).unwrap_or(u64::MAX);
-    if resolved != expected_bytes {
-        return Err(args_refusal("render_attachment_landing_mismatch")
-            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
-            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
-            .with_field("expected_bytes", FieldValue::Unsigned(expected_bytes))
-            .with_field("resolved_bytes", FieldValue::Unsigned(resolved))
-            .with_detail(
-                "the windows an owner-window store lands in have to be the attachment's own tightly packed \
-                 byte extent",
-            ));
-    }
-    Ok(landing)
+    Ok(windows)
+}
+
+/// The refusal a landing-only entry's declaration that names no owner window is
+/// answered with (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+fn kept_frame_landing_refusal(source: &str, detail: &str) -> ProviderError {
+    capability_refusal("kept_frame_landing_unsupported")
+        .with_field("source", FieldValue::Text(source.to_owned()))
+        .with_detail(detail)
 }
 
 /// The refusal a `StoreOp::Borrowed` attachment's declaration that names no
@@ -5708,6 +5771,234 @@ fn land_owner_windows(
         };
         landing.land(leases.borrowed, texels)?;
     }
+    Ok(())
+}
+
+/// Read the frame a provider kept back out of its own image and write it into
+/// the owner's windows (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// This is the one copy outside a render pass that starts at a
+/// [`ProviderTargetImage`]: the entry's whole point is that the frame a pass
+/// left in the provider's image is delivered *later*, so the bytes have to come
+/// out of that image rather than out of the pass's own readback. The layout
+/// guard is the same serialization point a pass takes — two submissions naming
+/// one resident identity cannot interleave their transitions — and the image is
+/// left in `TRANSFER_SRC_OPTIMAL`, which is the layout a completed pass
+/// publishes, so the next round trip starts from the layout the registry holds.
+/// The write into the owner's pages is the same retain/copy/retire shape every
+/// landing uses (`AttachmentLanding::land`), so a delivered frame and a landed
+/// pass frame cannot disagree about *how* the owner's bytes are written.
+///
+/// The frame is copied out through the provider's own host readback, exactly as
+/// a landed pass's frame is. What the entry saves its caller is the caller's
+/// relay — the frame no longer has to travel through the engine and back — not
+/// a bus trip this rail can avoid while its landing channel is a host-side
+/// write into the owner's pages.
+///
+/// `width`/`height` are the extent the caller (and the registry) already agreed
+/// with, and they are what the copy's own region is stated with. The staging
+/// destination is sized from the landing's own byte length, which resolution
+/// has already held equal to the kept frame's tightly packed extent.
+pub(crate) fn land_kept_frame(
+    context: &VulkanContext,
+    target: &ProviderTargetImage,
+    width: u32,
+    height: u32,
+    landing: &AttachmentLanding,
+    registry: &BorrowedLeaseRegistry,
+) -> Result<(), ProviderError> {
+    let byte_length = landing.byte_len();
+    if byte_length == 0 {
+        return Err(contract_refusal(
+            "a kept-frame landing copies a non-empty frame",
+        ));
+    }
+    let byte_length = u64::try_from(byte_length)
+        .map_err(|_| contract_refusal("a kept-frame landing's bytes exceed u64"))?;
+    crate::terminal_refusal(&context.lock_lifecycle())?;
+    let queue_index = select_graphics_queue(context)?;
+    let family = context
+        .queue_families
+        .get(queue_index)
+        .copied()
+        .ok_or_else(|| execution_refusal("land a kept frame", "queue index is unknown"))?;
+    // The same serialization point a render pass takes on a resident target:
+    // the value the guard holds is the layout this copy has to declare as its
+    // old layout, and the layout the next round trip starts from is published
+    // through the guard before it drops (`research/docs/23` §76, R7).
+    let mut layout = target.begin_target_pass();
+    let source_layout = *layout;
+    let (readback, mapping) = allocate_host_readback(context, byte_length)?;
+    let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(family);
+    let pool = unsafe { context.device.create_command_pool(&pool_info, None) }
+        .map_err(|error| execution_refusal("create landing command pool", &error.to_string()))?;
+    let result = (|| -> Result<(), ProviderError> {
+        let command = unsafe {
+            context.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|error| {
+            execution_refusal("allocate landing command buffer", &error.to_string())
+        })?[0];
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            context
+                .device
+                .begin_command_buffer(command, &begin)
+                .map_err(|error| {
+                    execution_refusal("begin landing command buffer", &error.to_string())
+                })?;
+            // A published layout is `TRANSFER_SRC_OPTIMAL` for a frame a
+            // completed pass kept; the barrier is only needed when the image
+            // sits somewhere else (a sentinel-preset target, or a layout an
+            // earlier round trip published as `UNDEFINED`). Declaring the
+            // registry's own value as the old layout is what keeps the copy
+            // legal in either case.
+            if source_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+                let release = vk::ImageMemoryBarrier::default()
+                    .old_layout(source_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                            | vk::AccessFlags::TRANSFER_WRITE
+                            | vk::AccessFlags::SHADER_WRITE,
+                    )
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(target.image())
+                    .subresource_range(subresource);
+                context.device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[release],
+                );
+            }
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            context.device.cmd_copy_image_to_buffer(
+                command,
+                target.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback.buffer,
+                &[region],
+            );
+            let available = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(readback.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            context.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[available],
+                &[],
+            );
+            context
+                .device
+                .end_command_buffer(command)
+                .map_err(|error| {
+                    execution_refusal("end landing command buffer", &error.to_string())
+                })?;
+        }
+        context.notify_enqueue(queue_index);
+        let fence = unsafe {
+            context
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|error| execution_refusal("create landing fence", &error.to_string()))?;
+        let commands = [command];
+        let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+        let submitted = context
+            .submit_commands(queue_index, &submits, fence)
+            .map_err(|result| {
+                driver_refusal(
+                    context,
+                    ProviderPhase::Submit,
+                    "submit kept-frame landing",
+                    result,
+                )
+            });
+        if let Err(error) = submitted {
+            unsafe { context.device.destroy_fence(fence, None) };
+            return Err(error);
+        }
+        context.record_queue_submission(queue_index);
+        let waited = context
+            .wait_for_fence(fence, crate::FENCE_TIMEOUT_NS)
+            .map_err(|result| {
+                driver_refusal(
+                    context,
+                    ProviderPhase::Wait,
+                    "wait for kept-frame landing",
+                    result,
+                )
+            });
+        unsafe { context.device.destroy_fence(fence, None) };
+        if let Err(error) = waited {
+            // The copy reached the queue and its fence never signalled, so the
+            // image's layout is unknown: `UNDEFINED` is the one old layout that
+            // is always legal to declare, and the provider marks the identity
+            // undefined in the same case, so a later entry refuses instead of
+            // reading an image of unknown state (`research/docs/23` §76, R7).
+            *layout = vk::ImageLayout::UNDEFINED;
+            return Err(error);
+        }
+        context.record_queue_retirement(queue_index);
+        Ok(())
+    })();
+    unsafe { context.device.destroy_command_pool(pool, None) };
+    result?;
+    let bytes =
+        unsafe { std::slice::from_raw_parts(mapping as *const u8, landing.byte_len()).to_vec() };
+    unsafe {
+        context.device.unmap_memory(readback.memory);
+        context.device.destroy_buffer(readback.buffer, None);
+        context.device.free_memory(readback.memory, None);
+    }
+    context.record_buffer_readback();
+    // The owner's pages receive the frame only after the copy has landed and
+    // the window has been written in full; a refused write leaves the identity
+    // unconsumed and the image where the copy found it.
+    landing.land(registry, &bytes)?;
+    *layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
     Ok(())
 }
 
@@ -9459,6 +9750,79 @@ struct ReadbackObjects {
     memory: vk::DeviceMemory,
 }
 
+/// Allocate one host-visible readback destination and map it
+/// (`research/docs/23` §3.3).
+///
+/// A `TRANSFER_DST` buffer whose memory is `HOST_VISIBLE | HOST_COHERENT`,
+/// returned with the host mapping the reader slices once the fence has
+/// signalled. Both the render pass's own readback destinations and the
+/// kept-frame landing's copy-out use this one allocation shape
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b), so a landing cannot end up
+/// with a destination the pass's readback would refuse.
+fn allocate_host_readback(
+    context: &VulkanContext,
+    byte_length: u64,
+) -> Result<(ReadbackObjects, usize), ProviderError> {
+    let info = vk::BufferCreateInfo::default()
+        .size(byte_length)
+        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { context.device.create_buffer(&info, None) }
+        .map_err(|error| execution_refusal("create readback buffer", &error.to_string()))?;
+    let requirements = unsafe { context.device.get_buffer_memory_requirements(buffer) };
+    let memory_type = match context.memory_type(
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            unsafe { context.device.destroy_buffer(buffer, None) };
+            return Err(execution_refusal(
+                "find readback memory type",
+                &error.to_string(),
+            ));
+        }
+    };
+    let allocation = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type);
+    let memory = match unsafe { context.device.allocate_memory(&allocation, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { context.device.destroy_buffer(buffer, None) };
+            return Err(execution_refusal(
+                "allocate readback memory",
+                &error.to_string(),
+            ));
+        }
+    };
+    if let Err(error) = unsafe { context.device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            context.device.destroy_buffer(buffer, None);
+            context.device.free_memory(memory, None);
+        }
+        return Err(execution_refusal(
+            "bind readback memory",
+            &error.to_string(),
+        ));
+    }
+    let mapping = match unsafe {
+        context
+            .device
+            .map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
+    } {
+        Ok(mapping) => mapping as usize,
+        Err(error) => {
+            unsafe {
+                context.device.destroy_buffer(buffer, None);
+                context.device.free_memory(memory, None);
+            }
+            return Err(execution_refusal("map readback memory", &error.to_string()));
+        }
+    };
+    Ok((ReadbackObjects { buffer, memory }, mapping))
+}
+
 impl<'a> OffscreenObjects<'a> {
     fn new(context: &'a VulkanContext) -> Self {
         Self {
@@ -12802,64 +13166,7 @@ impl<'a> OffscreenObjects<'a> {
         context: &VulkanContext,
         byte_length: u64,
     ) -> Result<(ReadbackObjects, usize), ProviderError> {
-        let info = vk::BufferCreateInfo::default()
-            .size(byte_length)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { context.device.create_buffer(&info, None) }
-            .map_err(|error| execution_refusal("create readback buffer", &error.to_string()))?;
-        let requirements = unsafe { context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match context.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                unsafe { context.device.destroy_buffer(buffer, None) };
-                return Err(execution_refusal(
-                    "find readback memory type",
-                    &error.to_string(),
-                ));
-            }
-        };
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = match unsafe { context.device.allocate_memory(&allocation, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe { context.device.destroy_buffer(buffer, None) };
-                return Err(execution_refusal(
-                    "allocate readback memory",
-                    &error.to_string(),
-                ));
-            }
-        };
-        if let Err(error) = unsafe { context.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                context.device.destroy_buffer(buffer, None);
-                context.device.free_memory(memory, None);
-            }
-            return Err(execution_refusal(
-                "bind readback memory",
-                &error.to_string(),
-            ));
-        }
-        let mapping = match unsafe {
-            context
-                .device
-                .map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(mapping) => mapping as usize,
-            Err(error) => {
-                unsafe {
-                    context.device.destroy_buffer(buffer, None);
-                    context.device.free_memory(memory, None);
-                }
-                return Err(execution_refusal("map readback memory", &error.to_string()));
-            }
-        };
-        Ok((ReadbackObjects { buffer, memory }, mapping))
+        allocate_host_readback(context, byte_length)
     }
 
     /// Encode one `VkDrawIndirectCommand` into a host-visible

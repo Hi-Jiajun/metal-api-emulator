@@ -477,6 +477,11 @@ impl NativeMetalProvider {
                 // is refused by name and the snapshot keeps the default.
                 supports_render_attachment_landing_view: render_bits
                     .supports_render_attachment_landing_view,
+                // The kept-frame landing entry (`research/docs/23` §115
+                // 之后的增量，E-TX14/R4b) is refused by the same walk for the
+                // same reason: no owner-window write route exists here, so the
+                // snapshot keeps the fail-closed default.
+                supports_render_kept_frame_landing: render_bits.supports_render_kept_frame_landing,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled

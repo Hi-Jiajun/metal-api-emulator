@@ -15,12 +15,12 @@ use metal_api_core::provider::{
     BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken,
     ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
     FunctionSource, GuestRun, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind,
-    LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
-    PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-    SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TerminalState, TracePass,
-    ValidatedComputeTrace, ViewId,
+    KeptFrame, KeptFrameLanding, LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest,
+    PipelineContract, PipelineId, PipelineProvider, PresentDescriptor, ProviderCapabilities,
+    ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
+    QueuePriority, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
+    SubmissionId, TerminalState, TracePass, ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -166,6 +166,25 @@ pub struct TranslatedRenderPipelineRequest {
 struct PlannedRenderPass {
     pass: RenderPassDescriptor,
     stages: Arc<render::RenderStages>,
+}
+
+/// One entry of the render group's execution plan
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// The render group runs in trace order, and a landing-only entry takes its own
+/// position among the passes instead of being moved to either end: a landing can
+/// only resolve a frame an earlier *completed* pass left, so where it stands in
+/// the order is part of its meaning rather than a scheduling detail.
+///
+/// The pass arm carries the descriptor, so the enum is sized to the render
+/// pass and the landing arm is the small one. Boxing the pass (or the landing)
+/// would turn every read of the plan into a dereference for the smaller half,
+/// and a submission holds one plan at a time — the same allowance and the same
+/// reason `TracePass` carries it for its own two arms.
+#[allow(clippy::large_enum_variant)]
+enum PlannedRenderEntry {
+    Pass(PlannedRenderPass),
+    Landing(KeptFrameLanding),
 }
 
 struct CompletionSlot {
@@ -328,6 +347,14 @@ struct ResidentTargetEntry {
     /// failed pass from leaving an image a later `LoadOp::Resident` could read
     /// as "the target's contents".
     defined: bool,
+    /// Whether a landing-only entry has already delivered this identity's
+    /// frame into an owner's window (`research/docs/23` §115 之后的增量，
+    /// E-TX14/R4b). A landed identity is consumed: the provider's copy is then a
+    /// stale mirror of bytes the owner's pages hold, so a second landing is
+    /// refused by name instead of writing an old frame over a newer one. A
+    /// completed pass that stores into the identity again (`StoreOp::Resident`)
+    /// clears the flag, because its raster is the new frame.
+    landed: bool,
     last_used: u64,
 }
 
@@ -354,6 +381,22 @@ impl ResidentTargetRetirement {
             Self::Budget => "resident_target_evicted",
             Self::LeaseReleased => "resident_target_released",
             Self::EpochAdvance => "resident_target_stale",
+        }
+    }
+
+    /// The refusal slug a *landing-only entry* for this retired identity states
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// The kept-frame arm spells the same three rules in its own vocabulary.
+    /// The two readers answer differently — a load can be re-rendered by a
+    /// later pass, while a landing is a delivery the caller has to be able to
+    /// count on its own line — and the census has to tell "this pass could not
+    /// read a frame" from "this delivery could not find its frame".
+    const fn kept_slug(self) -> &'static str {
+        match self {
+            Self::Budget => "kept_frame_evicted",
+            Self::LeaseReleased => "kept_frame_released",
+            Self::EpochAdvance => "kept_frame_stale",
         }
     }
 
@@ -1014,8 +1057,8 @@ impl VulkanComputeProvider {
     fn plan_render_passes(
         &self,
         trace: &ComputeTrace,
-    ) -> Result<Vec<PlannedRenderPass>, ProviderError> {
-        if !trace.has_render_passes() {
+    ) -> Result<Vec<PlannedRenderEntry>, ProviderError> {
+        if !trace.has_render_entries() {
             return Ok(Vec::new());
         }
         refuse_reordered_render_reads(trace)?;
@@ -1023,24 +1066,36 @@ impl VulkanComputeProvider {
             .render_pipelines
             .lock()
             .map_err(|_| registry_poisoned())?;
-        let mut plan = Vec::with_capacity(trace.render_passes().count());
-        for pass in trace.render_passes() {
-            let registered = registrations
-                .get(&pass.pipeline)
-                .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
-            let requested = trace.pipeline(pass.pipeline).map_err(|error| {
-                refusal(
-                    ProviderPhase::Resolve,
-                    ProviderErrorClass::Resource,
-                    "render_pipeline_identity_mismatch",
-                )
-                .with_detail(error.to_string())
-            })?;
-            validate_pipeline_identity(requested, &registered.metadata)?;
-            plan.push(PlannedRenderPass {
-                pass: pass.clone(),
-                stages: Arc::clone(&registered.stages),
-            });
+        let mut plan = Vec::with_capacity(trace.passes.len());
+        // The walk is over the trace's own entries, not over
+        // `trace.render_passes()`, because a landing-only entry has to keep its
+        // position among the passes (`research/docs/23` §115 之后的增量，
+        // E-TX14/R4b). A landing is planned as itself and its kept identity is
+        // resolved at execution time: the pass that keeps it may be the entry
+        // right before it in this very plan.
+        for entry in &trace.passes {
+            match entry {
+                TracePass::Compute(_) => {}
+                TracePass::Landing(landing) => plan.push(PlannedRenderEntry::Landing(*landing)),
+                TracePass::Render(pass) => {
+                    let registered = registrations
+                        .get(&pass.pipeline)
+                        .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
+                    let requested = trace.pipeline(pass.pipeline).map_err(|error| {
+                        refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Resource,
+                            "render_pipeline_identity_mismatch",
+                        )
+                        .with_detail(error.to_string())
+                    })?;
+                    validate_pipeline_identity(requested, &registered.metadata)?;
+                    plan.push(PlannedRenderEntry::Pass(PlannedRenderPass {
+                        pass: pass.clone(),
+                        stages: Arc::clone(&registered.stages),
+                    }));
+                }
+            }
         }
         Ok(plan)
     }
@@ -1106,7 +1161,7 @@ impl VulkanComputeProvider {
         &self,
         trace: &ComputeTrace,
         pool: &[BufferView],
-        plan: &[PlannedRenderPass],
+        plan: &[PlannedRenderEntry],
         resources: &ResourceTableSnapshot,
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         // The render rail's indirect payload replays one draw or indexed draw
@@ -1125,7 +1180,19 @@ impl VulkanComputeProvider {
             )
         });
         if render_replays_indirect {
-            if plan.is_empty() {
+            // Only a *pass* can be replayed into, so the count below is the
+            // plan's pass entries rather than its length: a landing-only entry
+            // beside an indirect draw would otherwise be read as the one shape
+            // the command replays into (`research/docs/23` §115 之后的增量，
+            // E-TX14/R4b).
+            let planned_passes = plan
+                .iter()
+                .filter_map(|entry| match entry {
+                    PlannedRenderEntry::Pass(pass) => Some(pass),
+                    PlannedRenderEntry::Landing(_) => None,
+                })
+                .collect::<Vec<_>>();
+            if planned_passes.is_empty() {
                 return Err(refusal(
                     ProviderPhase::Resolve,
                     ProviderErrorClass::Capability,
@@ -1133,7 +1200,7 @@ impl VulkanComputeProvider {
                 )
                 .with_detail("the first indirect increment needs a render pass to replay into"));
             }
-            if plan.len() != 1 {
+            if planned_passes.len() != 1 || planned_passes.len() != plan.len() {
                 return Err(refusal(
                     ProviderPhase::Resolve,
                     ProviderErrorClass::Capability,
@@ -1143,9 +1210,15 @@ impl VulkanComputeProvider {
                     "passes",
                     FieldValue::Unsigned(u64::try_from(plan.len()).unwrap_or(u64::MAX)),
                 )
-                .with_detail("the first indirect increment replays into exactly one render pass"));
+                .with_detail(
+                    "the first indirect increment replays into exactly one render pass and \
+                     nothing else",
+                ));
             }
-            if plan.iter().any(|planned| planned.pass.present.is_some()) {
+            if planned_passes
+                .iter()
+                .any(|planned| planned.pass.present.is_some())
+            {
                 return Err(refusal(
                     ProviderPhase::Resolve,
                     ProviderErrorClass::Capability,
@@ -1189,6 +1262,18 @@ impl VulkanComputeProvider {
         // trace's own order produced before it.
         let mut produced_latest = BTreeMap::<(AllocationId, ViewId), usize>::new();
         for planned in plan {
+            // A landing-only entry takes its own step in the render group's
+            // order (`research/docs/23` §115 之后的增量，E-TX14/R4b): the kept
+            // frame is resolved against the registry *now*, which is what makes
+            // "a pass earlier in this same plan kept it" work and what makes an
+            // entry that stands before its keeping pass refuse by name.
+            let planned = match planned {
+                PlannedRenderEntry::Pass(pass) => pass,
+                PlannedRenderEntry::Landing(landing) => {
+                    self.land_kept_frame_entry(landing, pool, &leases)?;
+                    continue;
+                }
+            };
             if let Some(present) = &planned.pass.present {
                 // The present rail renders exactly one attachment into the
                 // provider-owned target; the pre-MRT gate stays in place rather
@@ -1321,6 +1406,11 @@ impl VulkanComputeProvider {
             // disagree about *which* target a pass means.
             let mut resident = Vec::with_capacity(planned.pass.color_attachments.len());
             let mut resident_identities = Vec::new();
+            // The identities this pass *re-arms* (`research/docs/23` §115
+            // 之后的增量，E-TX14/R4b): a `StoreOp::Resident` store defines a new
+            // frame in the identity's image, so an identity a landing had
+            // consumed becomes deliverable again once this pass completes.
+            let mut rekept_identities = Vec::new();
             for attachment in &planned.pass.color_attachments {
                 let declared = pool.iter().find(|view| {
                     view.view_id == attachment.view_id
@@ -1336,6 +1426,9 @@ impl VulkanComputeProvider {
                     let image =
                         self.resident_target(attachment, attachment.loads_resident_target())?;
                     resident_identities.push(identity);
+                    if attachment.store == metal_api_core::provider::StoreOp::Resident {
+                        rekept_identities.push(identity);
+                    }
                     resident.push(Some(image));
                 } else {
                     if self.resident_target_identity_is_resident(
@@ -1578,6 +1671,7 @@ impl VulkanComputeProvider {
                     // `LoadOp::Resident` for those identities resolves instead
                     // of being refused as undefined.
                     self.note_resident_targets(&resident_identities, true)?;
+                    self.note_kept_frames_rekept(&rekept_identities)?;
                     readback
                 }
                 Err(error) => {
@@ -1897,6 +1991,8 @@ impl VulkanComputeProvider {
                 // The pass that creates the identity has not run yet, so its
                 // bytes are not defined until it completes.
                 defined: false,
+                // Nothing has been delivered out of this image yet.
+                landed: false,
                 last_used: stamp,
             },
         );
@@ -1928,6 +2024,264 @@ impl VulkanComputeProvider {
             .map_err(|_| registry_poisoned())?
             .remove(&key);
         Ok(image)
+    }
+
+    /// Resolve the frame a landing-only entry names out of the resident
+    /// registry (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// Every miss is a name of its own, and none of them is read as "copy
+    /// whatever the image happens to hold":
+    ///
+    /// * an identity no pass kept in this epoch is `kept_frame_not_held`;
+    /// * an identity the budget, a lease release or a device epoch retired is
+    ///   named by that rule (`kept_frame_evicted` / `kept_frame_released` /
+    ///   `kept_frame_stale`) from its tombstone;
+    /// * an image no completed pass has defined is `kept_frame_undefined`;
+    /// * a frame whose declared shape is not the image's is
+    ///   `kept_frame_shape_changed`;
+    /// * an identity an earlier landing consumed is
+    ///   `kept_frame_already_landed`.
+    fn kept_frame_target(
+        &self,
+        frame: &KeptFrame,
+    ) -> Result<Arc<render::ProviderTargetImage>, ProviderError> {
+        let key = (frame.allocation_id, frame.view_id);
+        let mut registry = self
+            .resident_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        if let Some(entry) = registry.get_mut(&key) {
+            if entry.format != frame.format
+                || entry.width != frame.width
+                || entry.height != frame.height
+            {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "kept_frame_shape_changed",
+                )
+                .with_field("view", FieldValue::Unsigned(frame.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(frame.allocation_id.get()),
+                )
+                .with_field(
+                    "format",
+                    FieldValue::Unsigned(u64::from(frame.format.code())),
+                )
+                .with_field("width", FieldValue::Unsigned(frame.width))
+                .with_field("height", FieldValue::Unsigned(frame.height))
+                .with_field(
+                    "expected_format",
+                    FieldValue::Unsigned(u64::from(entry.format.code())),
+                )
+                .with_field("expected_width", FieldValue::Unsigned(entry.width))
+                .with_field("expected_height", FieldValue::Unsigned(entry.height))
+                .with_detail(
+                    "a kept frame is one image under one identity, so an entry that declares a \
+                     different shape is refused instead of landing bytes of another extent",
+                ));
+            }
+            if !entry.defined {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "kept_frame_undefined",
+                )
+                .with_field("view", FieldValue::Unsigned(frame.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(frame.allocation_id.get()),
+                )
+                .with_detail(
+                    "the provider holds the identity's image but no completed pass has defined \
+                     its bytes: the pass that created it was refused or failed",
+                ));
+            }
+            if entry.landed {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "kept_frame_already_landed",
+                )
+                .with_field("view", FieldValue::Unsigned(frame.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(frame.allocation_id.get()),
+                )
+                .with_detail(
+                    "a landing consumes the frame it delivers, so a second landing of the same \
+                     identity would write an old frame over the owner's newer bytes; a pass that \
+                     keeps the identity again re-arms it",
+                ));
+            }
+            entry.last_used = self.next_resident_target_stamp();
+            return Ok(Arc::clone(&entry.image));
+        }
+        // The identity is gone. The tombstone names the rule that retired it;
+        // an identity with no tombstone was never kept in this epoch at all.
+        let tombstones = self
+            .resident_target_tombstones
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        let retirement = tombstones.get(&key).copied();
+        let mut error = refusal(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            retirement.map_or("kept_frame_not_held", |rule| rule.kept_slug()),
+        )
+        .with_field("view", FieldValue::Unsigned(frame.view_id.get()))
+        .with_field(
+            "allocation",
+            FieldValue::Unsigned(frame.allocation_id.get()),
+        );
+        if let Some(rule) = retirement {
+            error = error.with_field("retired_by", FieldValue::Text(rule.name().to_owned()));
+        }
+        Err(error.with_detail(
+            "a landing-only entry delivers the frame the provider kept for this identity; the \
+             identity holds none, so the caller has to keep the frame again before landing it",
+        ))
+    }
+
+    /// Consume a kept-frame identity once its frame has landed in the owner's
+    /// window (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// The provider's image is a stale mirror from this point on: the owner's
+    /// pages hold the delivered frame, so a second landing of the same identity
+    /// is refused by [`Self::kept_frame_target`] until a completed pass keeps
+    /// the identity again.
+    fn note_kept_frame_landed(
+        &self,
+        identity: (AllocationId, ViewId),
+    ) -> Result<(), ProviderError> {
+        let mut registry = self
+            .resident_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        if let Some(entry) = registry.get_mut(&identity) {
+            entry.landed = true;
+        }
+        Ok(())
+    }
+
+    /// Re-arm the identities a completed pass kept again
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// A `StoreOp::Resident` store defines a *new* frame in the identity's
+    /// image, so an identity a landing had consumed becomes deliverable again:
+    /// the mirror is not stale any more, it is the pass's own raster. The
+    /// identities arrive from a pass that completed, exactly as the `defined`
+    /// flag's own bookkeeping does.
+    fn note_kept_frames_rekept(
+        &self,
+        identities: &[(AllocationId, ViewId)],
+    ) -> Result<(), ProviderError> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let mut registry = self
+            .resident_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        for identity in identities {
+            if let Some(entry) = registry.get_mut(identity) {
+                entry.landed = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deliver one kept frame into the owner's window
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// Three resolutions run in the order their refusals are named in: the
+    /// identity (is there a frame, and is it still the one this entry means),
+    /// the landing view's own declaration in the trace's serial view list, and
+    /// the window the declaration resolves to — with the frame's tightly packed
+    /// extent as the measure the window has to meet. Only then does the copy
+    /// run, and only a copy that reached the owner's pages consumes the
+    /// identity: every failure leaves the registry exactly as it was, so the
+    /// caller can retry against the same frame rather than against a
+    /// half-delivered one.
+    fn land_kept_frame_entry(
+        &self,
+        landing: &KeptFrameLanding,
+        pool: &[BufferView],
+        leases: &render::RenderLeaseContext<'_>,
+    ) -> Result<(), ProviderError> {
+        let identity = landing.identity();
+        let image = self.kept_frame_target(&landing.frame)?;
+        let view = pool
+            .iter()
+            .find(|view| {
+                view.view_id == landing.landing.view_id
+                    && view.allocation_id == landing.landing.allocation_id
+            })
+            .ok_or_else(|| {
+                refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "kept_frame_landing_undeclared",
+                )
+                .with_field("view", FieldValue::Unsigned(landing.landing.view_id.get()))
+                .with_field(
+                    "allocation",
+                    FieldValue::Unsigned(landing.landing.allocation_id.get()),
+                )
+                .with_detail(
+                    "a landing-only entry writes the owner's registered window a second view \
+                     declaration names, and this trace declares no view covering that identity",
+                )
+            })?;
+        let expected_bytes = landing.frame.expected_bytes().map_err(|error| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "trace_contract_invalid",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let windows = render::resolve_kept_frame_landing(view, Some(leases), expected_bytes)?;
+        // The registry held this identity's shape equal to the entry's own, and
+        // the image it answered with was created from a narrowed extent, so the
+        // copy's 32-bit region cannot disagree with either.
+        let width = u32::try_from(landing.frame.width).map_err(|_| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "trace_contract_invalid",
+            )
+            .with_detail("a kept frame's width does not fit the copy's own region")
+        })?;
+        let height = u32::try_from(landing.frame.height).map_err(|_| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "trace_contract_invalid",
+            )
+            .with_detail("a kept frame's height does not fit the copy's own region")
+        })?;
+        let executor = self.lock_executor()?;
+        match render::land_kept_frame(
+            &executor.context,
+            &image,
+            width,
+            height,
+            &windows,
+            &self.borrowed,
+        ) {
+            Ok(()) => self.note_kept_frame_landed(identity),
+            Err(error) => {
+                // The copy did not reach the owner's pages, so the identity is
+                // not consumed — and whatever the image's state was after the
+                // attempt, no pass has defined it since: the next reader
+                // refuses rather than reading a layout the rail cannot vouch
+                // for (`research/docs/23` §76, R7).
+                self.note_resident_targets(&[identity], false)?;
+                Err(error)
+            }
+        }
     }
 
     /// Retire resident target identities and record the rule that retired them
@@ -3321,6 +3675,10 @@ fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), ProviderErr
                     render_written.entry(attachment.view_id).or_insert(index);
                 }
             }
+            // A landing-only entry writes the owner's window, not a view of
+            // this trace's pool, so the ordering walk below has nothing to
+            // register for it (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+            TracePass::Landing(_) => {}
             TracePass::Compute(pass) => {
                 let bound = pass
                     .buffers

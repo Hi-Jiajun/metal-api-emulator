@@ -1429,18 +1429,19 @@ mod tests {
         GuestRun, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
         IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
         IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
-        IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
-        MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
-        PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
-        PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
-        ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-        RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding,
-        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, Retryability,
-        SampleCount, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest,
-        ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
-        StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
-        StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
+        IndirectCommandRange, InitialState, KeptFrame, KeptFrameLanding, LeaseId, LeaseImporter,
+        LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
+        MultisampleStencilResolve, OperationId, PipelineCompileRequest, PipelineContract,
+        PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+        ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+        ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
+        RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+        RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
+        RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount,
+        SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
+        StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
+        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp,
+        SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
         TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
@@ -5300,6 +5301,219 @@ mod tests {
         assert!(!decoded.supports_render_texture_sampling);
     }
 
+    /// The kept-frame landing block is the tail's second family's *sixth* tag,
+    /// so it follows the landing-view block and touches nothing before it
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// A decoder of the previous increment reads the escape byte followed by a
+    /// family tag it does not know — a typed refusal rather than a snapshot
+    /// silently read as "the entry was not declared".
+    #[test]
+    fn the_kept_frame_landing_block_is_the_tail_familys_sixth_tag() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_attachment_landing_view = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(&without[without.len() - 3..], &[0x00, 0x05, 0x01]);
+
+        capabilities.supports_render_kept_frame_landing = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the kept-frame landing capability frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x06, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the kept-frame landing block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        assert_eq!(
+            &frame[frame.len() - 6..frame.len() - 3],
+            &[0x00, 0x05, 0x01],
+            "the landing-view block keeps its place in front of the new one"
+        );
+    }
+
+    /// A snapshot that declares *only* the kept-frame landing entry still
+    /// writes the extended payload (`research/docs/23` §115 之后的增量，
+    /// E-TX14/R4b): the declaration travels in the frame's own tagged tail, so
+    /// the bits beside it keep their own readings.
+    #[test]
+    fn an_only_kept_frame_landing_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_kept_frame_landing = true;
+        assert!(capabilities.declares_render_kept_frame_landing_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x06, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_kept_frame_landing);
+        assert!(!decoded.supports_render_attachment_landing_view);
+        assert!(!decoded.supports_render_texture_gathered_extent);
+        assert!(!decoded.supports_render_texture_gathered_extent_no_copy);
+        assert!(!decoded.supports_render_texture_sampling);
+
+        // A frame that ends before the block reads the bit as the fail-closed
+        // `false`, so a consumer refuses the entry rather than assuming it.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_kept_frame_landing);
+    }
+
+    /// A landing-only entry is a pass kind of its own: one tag, then the kept
+    /// frame's identity and shape and the window's second declaration, in a
+    /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// The reading is that removing exactly that window from the frame gives the
+    /// frame without the entry back, byte for byte: the entry adds its own tag
+    /// and payload and moves nothing else.
+    #[test]
+    fn a_kept_frame_landing_is_one_tag_and_a_fixed_payload() {
+        let entry = KeptFrameLanding {
+            frame: KeptFrame {
+                allocation_id: AllocationId::new(70),
+                view_id: ViewId::new(71),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+            },
+            landing: AttachmentLandingView {
+                allocation_id: AllocationId::new(72),
+                view_id: ViewId::new(73),
+            },
+        };
+        let frame_for = |entry: Option<KeptFrameLanding>| {
+            let mut trace = render_only_trace();
+            if let Some(entry) = entry {
+                trace.passes.push(TracePass::Landing(entry));
+            }
+            CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .unwrap()
+        };
+        let without = frame_for(None);
+        let with = frame_for(Some(entry));
+        // `view_id`, `allocation_id`, `format`, `width`, `height`, the landing
+        // view's `view_id` and its `allocation_id`, plus the tag.
+        let mut payload = Vec::new();
+        for id in [entry.frame.view_id.get(), entry.frame.allocation_id.get()] {
+            payload.extend_from_slice(&id.to_be_bytes());
+        }
+        payload.push(entry.frame.format.code());
+        for dimension in [entry.frame.width, entry.frame.height] {
+            payload.extend_from_slice(&dimension.to_be_bytes());
+        }
+        for id in [
+            entry.landing.view_id.get(),
+            entry.landing.allocation_id.get(),
+        ] {
+            payload.extend_from_slice(&id.to_be_bytes());
+        }
+        let mut window = vec![0x19];
+        window.extend_from_slice(&payload);
+        assert_eq!(window.len(), 50, "the tag and its seven fields");
+        assert_eq!(
+            with.len(),
+            without.len() + window.len(),
+            "the entry adds its own bytes and nothing else"
+        );
+        let at = with
+            .windows(window.len())
+            .position(|candidate| candidate == window.as_slice())
+            .expect("the entry's tag and payload are on the wire");
+        // The entry is the last pass, so it is the last bytes before the
+        // completion policy: the two frames agree on everything the entry does
+        // not touch, and the one it adds is the entry itself.
+        let CommandRequest::Submit {
+            trace: with_trace, ..
+        } = CommandCodec::decode_request(&with).unwrap()
+        else {
+            panic!("a render submit decodes as a submit");
+        };
+        let CommandRequest::Submit {
+            trace: without_trace,
+            ..
+        } = CommandCodec::decode_request(&without).unwrap()
+        else {
+            panic!("a render submit decodes as a submit");
+        };
+        assert_eq!(with_trace.pipelines, without_trace.pipelines);
+        assert_eq!(
+            with_trace.encoder_dispatch_type,
+            without_trace.encoder_dispatch_type
+        );
+        assert_eq!(
+            with_trace.completion_policy,
+            without_trace.completion_policy
+        );
+        assert_eq!(
+            with_trace.passes.len(),
+            without_trace.passes.len() + 1,
+            "the entry is the one pass the frame adds"
+        );
+        assert_eq!(
+            with_trace.passes[..without_trace.passes.len()],
+            without_trace.passes[..],
+            "every pass before the entry keeps its own bytes"
+        );
+        assert_eq!(
+            with_trace.passes.last(),
+            Some(&TracePass::Landing(entry)),
+            "the entry round-trips through the codec"
+        );
+        // A tag this version does not know is refused by name rather than read
+        // as the entry's payload or as the next pass: that is the answer an
+        // older decoder gives this frame, and the reason the tag carries the
+        // whole entry.
+        let mut unknown = with.clone();
+        unknown[at] = 0x1a;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown).unwrap_err(),
+            CodecError::UnknownPassTag(0x1a)
+        ));
+        // The payload is fixed-length: a frame whose entry is cut short is
+        // refused rather than read as a shorter pass, whichever layer names the
+        // truncation (the frame's own length check or the walk's).
+        let truncated = with[..with.len() - window.len() + 8].to_vec();
+        assert!(
+            CommandCodec::decode_request(&truncated).is_err(),
+            "a truncated landing entry is not a shorter pass"
+        );
+    }
+
     /// A frame that ends before the superset block reads the bit as `false`,
     /// and the family's closed set now names three tags
     /// (`research/docs/23` §3.3, E-TX11).
@@ -5334,18 +5548,19 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x06` is the next tag the
+        // The family's tags are a closed set and `0x07` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
-        // E-TX12 assigned it to the gathered extent's no-copy block and `0x05`
-        // until E-TX13 assigned it to the attachment landing view, which is
-        // exactly the drift the closed set exists to make visible.)
+        // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
+        // until E-TX13 assigned it to the attachment landing view, and `0x06`
+        // until E-TX14 assigned it to the kept-frame landing entry — exactly
+        // the drift the closed set exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x06;
+        unknown_tag[tag_at] = 0x07;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x06)
+            CodecError::UnknownCapabilityTail(0x07)
         ));
     }
 
@@ -6490,6 +6705,7 @@ mod tests {
             CommandResponse::Capabilities {
                 epoch: DeviceEpoch::new(7),
                 capabilities: ProviderCapabilities {
+                    supports_render_kept_frame_landing: false,
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
                     supports_render_stage_buffer_namespace_split: false,
@@ -6874,6 +7090,7 @@ mod tests {
 
     fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_kept_frame_landing: false,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             supports_render_stage_buffer_namespace_split: false,
@@ -8717,6 +8934,7 @@ mod tests {
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
                 TracePass::Compute(_) => None,
+                TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass")
     }
@@ -8729,6 +8947,7 @@ mod tests {
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
                 TracePass::Compute(_) => None,
+                TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass")
     }

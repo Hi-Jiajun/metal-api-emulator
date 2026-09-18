@@ -272,6 +272,15 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // bit: those describe a *sampled source's* extent, this one describes
         // where an attachment's stored frame lands.
         supports_render_attachment_landing_view: true,
+        // A landing-only entry is executed (`research/docs/23` §115 之后的增量，
+        // E-TX14/R4b): `compute_provider.rs` resolves the kept identity out of
+        // the resident registry, `render.rs` copies the provider image back and
+        // writes the owner's window, and the identity is consumed on success.
+        // Evidence: `tests/render_kept_frame_landing_e2e.rs`. The bit is its own
+        // field rather than the landing-view bit's second reading: this one is
+        // about a frame a *previous* submission kept, that one is about where a
+        // pass's own frame lands.
+        supports_render_kept_frame_landing: true,
         // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
         // `render.rs` uploads each bound view into a host-visible
         // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1

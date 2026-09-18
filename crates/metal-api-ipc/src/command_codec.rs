@@ -19,21 +19,22 @@ use metal_api_core::provider::{
     DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
     GuestRun, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
     IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
-    MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
-    PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor, PresentMode,
-    PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
-    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
-    RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
-    RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SamplerAddressMode,
-    SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource, StageBufferBinding,
-    StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-    StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess,
-    TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
-    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-    VertexStep, ViewId, Winding, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_SAMPLERS,
-    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, KeptFrame, KeptFrameLanding,
+    LeaseId, LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
+    MultisampleStencilResolve, OperationId, PipelineCompileRequest, PipelineContract, PipelineId,
+    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+    RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding,
+    RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, Retryability,
+    SampleCount, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
+    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
+    TextureAccess, TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout, VertexStep, ViewId, Winding, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES,
+    MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -373,6 +374,22 @@ const PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS: u8 = 0x17;
 /// is still one frame.
 const PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS: u8 = 0x18;
 
+/// A landing-only entry: a frame the provider already kept in its own image
+/// lands in an owner's registered window and nothing is drawn
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// The entry is the first trace pass kind that is not a pass at all — it names
+/// no pipeline, no draw and no attachment — so it takes a tag of its own
+/// instead of a feature bit on either render kind: there is no legacy payload
+/// it could share bits with, and a decoder that does not know the tag has no
+/// pass to fall back to. Its payload is the fixed eight fields
+/// [`KeptFrameLanding`] carries, in declaration order:
+/// `frame.view_id`, `frame.allocation_id`, `frame.format`, `frame.width`,
+/// `frame.height`, `landing.view_id`, `landing.allocation_id`. An older
+/// decoder refuses the frame with [`CodecError::UnknownPassTag`] rather than
+/// skipping the payload and reading the next entry out of its bytes.
+const PASS_KIND_LANDING_KEPT_FRAME: u8 = 0x19;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
@@ -681,6 +698,21 @@ const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL: u8 = 0x04;
 /// section added later in the same position rule.
 const CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL: u8 = 0x05;
 
+/// Tag, inside the tail's second family, of the kept-frame landing block
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// The section follows the attachment landing-view block and carries one bool:
+/// whether the snapshot executes a landing-only entry — a frame it already kept
+/// in its own image handed into an owner's registered window by a later entry
+/// ([`ProviderCapabilities::supports_render_kept_frame_landing`]). It is the
+/// family's sixth tag rather than a reuse of the fifth, because the two bits
+/// answer two different questions: the fifth is about where *one pass's own*
+/// frame lands, this one is about delivering a frame a *previous* submission
+/// kept. A snapshot may answer either without the other, so folding them would
+/// publish a fact the snapshot never made. Its own escape byte keeps the
+/// position rule every section before it follows.
+const CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL: u8 = 0x06;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -920,6 +952,12 @@ impl CommandCodec {
                     // write the extended payload, or its declaration would be
                     // dropped on the wire.
                     || capabilities.declares_render_attachment_landing_view_support()
+                    // The kept-frame landing bit is a face of its own
+                    // (`research/docs/23` §115 之后的增量，E-TX14/R4b): a
+                    // snapshot that declares only it still has to write the
+                    // extended payload, or its declaration would be dropped on
+                    // the wire.
+                    || capabilities.declares_render_kept_frame_landing_support()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -2985,7 +3023,13 @@ fn get_completion_policy(decoder: &mut Decoder<'_>) -> Result<CompletionPolicy, 
 fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecError> {
     let tagged = trace.has_render_passes()
         || trace.has_heap_or_icb()
-        || trace_carries_compute_texture_declarations(trace);
+        || trace_carries_compute_texture_declarations(trace)
+        // A landing-only entry is a render-group entry that carries no render
+        // pass, so `has_render_passes` answers `false` for it and the extended
+        // layout below is where its tag lives (`research/docs/23` §115 之后的
+        // 增量，E-TX14/R4b). A trace that carries neither keeps the legacy
+        // bytes exactly.
+        || trace.has_landing_entries();
     if tagged && trace.passes.len() > MAX_TAGGED_TRACE_PASSES {
         return Err(CodecError::TracePassCount {
             count: trace.passes.len(),
@@ -3345,6 +3389,16 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 });
                 put_render_pass(encoder, pass, true)?;
             }
+            // A landing-only entry is one tag and a fixed payload: the kept
+            // frame's identity and shape, then the window's second declaration
+            // (`research/docs/23` §115 之后的增量，E-TX14/R4b). There is no
+            // legacy shape to keep byte-exact — the entry itself is the new
+            // thing — so the tag carries the whole of it and an older decoder
+            // refuses the frame at the tag.
+            TracePass::Landing(landing) => {
+                encoder.u8(PASS_KIND_LANDING_KEPT_FRAME);
+                put_kept_frame_landing(encoder, landing);
+            }
         }
     }
     put_completion_policy(encoder, trace.completion_policy);
@@ -3365,6 +3419,26 @@ fn put_compute_pass(encoder: &mut Encoder, pass: &ComputePass) {
         put_texture(encoder, texture);
     }
     put_dispatch(encoder, &pass.dispatch);
+}
+
+/// Encode one landing-only entry's payload (`research/docs/23` §115 之后的增量，
+/// E-TX14/R4b): the kept frame's identity and shape, then the owner window's
+/// second declaration.
+///
+/// Every identity in this frame is written `view_id` first, exactly as the
+/// landing-view store arm beside it writes its own second declaration, so the
+/// two spellings of "which view" cannot drift apart. The fields are fixed in
+/// number and width — there is nothing optional to skip — which is what makes
+/// the older decoder's answer a flat [`CodecError::UnknownPassTag`] rather than
+/// a partially-read entry.
+fn put_kept_frame_landing(encoder: &mut Encoder, landing: &KeptFrameLanding) {
+    encoder.u64(landing.frame.view_id.get());
+    encoder.u64(landing.frame.allocation_id.get());
+    encoder.u8(landing.frame.format.code());
+    encoder.u64(landing.frame.width);
+    encoder.u64(landing.frame.height);
+    encoder.u64(landing.landing.view_id.get());
+    encoder.u64(landing.landing.allocation_id.get());
 }
 
 /// Encode one render pass's base payload: the pipeline, the colour
@@ -3954,6 +4028,13 @@ fn get_trace_tagged(
                     decoder, features,
                 )?)
             }
+            // A landing-only entry is not a pass at all
+            // (`research/docs/23` §115 之后的增量，E-TX14/R4b): the tag's
+            // payload is the whole entry, so the walk below reads its fixed
+            // fields and nothing else. A decoder that predates the tag refuses
+            // the frame at the fallback arm instead of reading these bytes as
+            // whatever pass it was expecting.
+            PASS_KIND_LANDING_KEPT_FRAME => TracePass::Landing(get_kept_frame_landing(decoder)?),
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -3973,6 +4054,35 @@ fn get_trace_tagged(
         completion_policy,
         heap,
         indirect,
+    })
+}
+
+/// Decode one landing-only entry's payload (`research/docs/23` §115 之后的增量，
+/// E-TX14/R4b), in the one order [`put_kept_frame_landing`] writes it.
+///
+/// The format byte goes through [`get_attachment_format`], so the closed
+/// family and its refusal stay the same one the attachment payloads use: a
+/// landing cannot name a colour surface the attachment walk would refuse.
+fn get_kept_frame_landing(decoder: &mut Decoder<'_>) -> Result<KeptFrameLanding, CodecError> {
+    let frame_view = ViewId::new(decoder.u64()?);
+    let frame_allocation = AllocationId::new(decoder.u64()?);
+    let format = get_attachment_format(decoder)?;
+    let width = decoder.u64()?;
+    let height = decoder.u64()?;
+    let landing_view = ViewId::new(decoder.u64()?);
+    let landing_allocation = AllocationId::new(decoder.u64()?);
+    Ok(KeptFrameLanding {
+        frame: KeptFrame {
+            allocation_id: frame_allocation,
+            view_id: frame_view,
+            format,
+            width,
+            height,
+        },
+        landing: AttachmentLandingView {
+            allocation_id: landing_allocation,
+            view_id: landing_view,
+        },
     })
 }
 
@@ -5698,6 +5808,12 @@ fn put_capabilities(
         // has to write the heap/ICB half the decoder reads by position before
         // the family's escape, or its declaration would be dropped on the wire.
         || capabilities.declares_render_attachment_landing_view_support()
+        // The kept-frame landing bit joins the same guard for the same reason
+        // (`research/docs/23` §115 之后的增量，E-TX14/R4b): a snapshot that
+        // declares only it still has to write the heap/ICB half the decoder
+        // reads by position before the family's escape, or its declaration
+        // would be dropped on the wire.
+        || capabilities.declares_render_kept_frame_landing_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -5902,6 +6018,17 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL);
             encoder.bool(capabilities.supports_render_attachment_landing_view);
         }
+        // The kept-frame landing block is the family's sixth tag and follows
+        // the landing-view block (`research/docs/23` §115 之后的增量，
+        // E-TX14/R4b). A snapshot whose bit stays at its default writes nothing
+        // here, and the decoder reads the missing section as `false` — the
+        // "refuse the entry by name" default every consumer of the bit keeps
+        // its fail-closed direction with.
+        if capabilities.declares_render_kept_frame_landing_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL);
+            encoder.bool(capabilities.supports_render_kept_frame_landing);
+        }
     }
     Ok(())
 }
@@ -5969,6 +6096,11 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // fail-closed default — the owner's no-copy window of another extent
         // keeps its own refusal until a snapshot says otherwise.
         supports_render_texture_gathered_extent_no_copy: false,
+        // The kept-frame landing bit (`research/docs/23` §115 之后的增量，
+        // E-TX14/R4b) is the family's sixth block, so a legacy payload cannot
+        // carry it either: a landing-only entry keeps its by-name refusal until
+        // a snapshot says otherwise.
+        supports_render_kept_frame_landing: false,
         supports_render_attachment_landing_view: false,
         // The superset vertex interface's bit (`research/docs/23` §3.3,
         // E-TX11) is the family's third block: a legacy payload cannot carry
@@ -6091,7 +6223,8 @@ fn decode_capability_extended_tail(
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL
             | CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL
-            | CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL => {}
+            | CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL
+            | CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6115,8 +6248,11 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL => {
                 capabilities.supports_render_texture_gathered_extent_no_copy = decoder.bool()?;
             }
-            _ => {
+            CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL => {
                 capabilities.supports_render_attachment_landing_view = decoder.bool()?;
+            }
+            _ => {
+                capabilities.supports_render_kept_frame_landing = decoder.bool()?;
             }
         }
         // The run ends with the frame, so a byte after a family section is

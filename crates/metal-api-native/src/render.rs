@@ -1030,6 +1030,11 @@ pub(crate) struct RenderCapabilityBits {
     /// beside the two gathered-extent bits so the snapshot has one place that
     /// answers "does this rail execute the arm" — this one always says no.
     pub(crate) supports_render_attachment_landing_view: bool,
+    /// The kept-frame landing entry (`research/docs/23` §115 之后的增量，
+    /// E-TX14/R4b). Kept beside the landing-view bit for the same reason, and
+    /// also always `false` here: this rail has no owner-window write route, so
+    /// it refuses the entry by name.
+    pub(crate) supports_render_kept_frame_landing: bool,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -1112,6 +1117,7 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         // input channel with no route that writes one, so the snapshot keeps the
         // fail-closed default beside the two bits above.
         supports_render_attachment_landing_view: false,
+        supports_render_kept_frame_landing: false,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -1156,6 +1162,7 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
         // destination grid's index nor a Metal primitive that expresses it. The
         // bit keeps the consumer's fail-closed default.
         supports_render_texture_gathered_extent_no_copy: false,
+        supports_render_kept_frame_landing: false,
         supports_render_attachment_landing_view: false,
     }
 }
@@ -1182,6 +1189,10 @@ pub(crate) struct RenderTextureCapabilityBits {
     /// Whether this rail's snapshot declares the landing-view arm. It never
     /// does: `store_action` refuses the arm by name.
     pub(crate) supports_render_attachment_landing_view: bool,
+    /// Whether this rail's snapshot declares the kept-frame landing entry
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b). It never does: the
+    /// entry is refused by name before any plan exists.
+    pub(crate) supports_render_kept_frame_landing: bool,
 }
 
 /// The first render-sampler increment's binding cap, spelled once so the
@@ -4849,6 +4860,11 @@ pub(crate) fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), 
                     render_written.entry(attachment.view_id).or_insert(index);
                 }
             }
+            // A landing-only entry writes the owner's window, not a view of
+            // this trace's pool, so it registers nothing for the ordering walk
+            // below (`research/docs/23` §115 之后的增量，E-TX14/R4b). It is the
+            // rail that refuses the entry by name, in its own plan gate.
+            TracePass::Landing(_) => {}
             TracePass::Compute(pass) => {
                 let bound = pass
                     .buffers
@@ -5198,6 +5214,28 @@ pub(crate) fn plan_trace_with_leases<'a>(
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
 ) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
+    // A landing-only entry has no rail here (`research/docs/23` §115 之后的增量，
+    // E-TX14/R4b). The native provider keeps resident images (its registry is the
+    // sibling of the Vulkan one), but its owner-window channel is an *input*
+    // route: there is no code path that writes an owner's pages, which is why
+    // `StoreOp::Borrowed` has been refused by name since E-TX8. Delivering a kept
+    // frame would need that write route, so the entry is refused here — before
+    // the early return below, which a landing-only trace would otherwise take
+    // (it carries no render pass at all).
+    if let Some(landing) = trace.landings().next() {
+        return Err(capability_refusal("kept_frame_landing_unsupported")
+            .with_field("view", FieldValue::Unsigned(landing.frame.view_id.get()))
+            .with_field(
+                "allocation",
+                FieldValue::Unsigned(landing.frame.allocation_id.get()),
+            )
+            .with_field("source", FieldValue::Text("native_rail".to_owned()))
+            .with_detail(
+                "a landing-only entry writes a frame the provider kept into an owner's \
+                 registered window; this rail has no owner-window write route, so it refuses \
+                 the entry instead of landing it somewhere else",
+            ));
+    }
     if !trace.has_render_passes() {
         return Ok(Vec::new());
     }
@@ -7149,21 +7187,21 @@ fn resource_refusal(slug: &'static str) -> ProviderError {
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BlendAttachment, BlendFactor,
-        BlendOperation, BorrowedLease, BufferAccess, BufferBindingContract, BufferLease,
-        BufferSource, ColorWriteMask, CompareFunction, CompiledComputePipeline, CompletionPolicy,
-        ComputePass, DepthFormat, DepthLoadOp, DepthStoreOp, DeviceEpoch, Dispatch, DispatchKind,
-        DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
-        IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
-        IndirectCommandRange, InitialState, LeaseId, LeaseRegistry, LeaseReservation,
-        MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
-        PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPipelineStage,
-        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SamplerAddressMode,
-        SamplerFilter, SamplerPolicy, SemanticDigest, StageBufferBinding, StageBufferView,
-        StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter,
-        StencilTest, StorageMode, TextureAccess, VertexAttribute, VertexBufferLayout, VertexLayout,
-        ViewId, PROVIDER_SCHEMA_VERSION,
+        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, AttachmentLandingView,
+        BlendAttachment, BlendFactor, BlendOperation, BorrowedLease, BufferAccess,
+        BufferBindingContract, BufferLease, BufferSource, ColorWriteMask, CompareFunction,
+        CompiledComputePipeline, CompletionPolicy, ComputePass, DepthFormat, DepthLoadOp,
+        DepthStoreOp, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
+        FunctionIdentity, FunctionSource, IndirectCommandBufferDescriptor, IndirectCommandKind,
+        IndirectCommandPayload, IndirectCommandRange, InitialState, KeptFrame, KeptFrameLanding,
+        LeaseId, LeaseRegistry, LeaseReservation, MultisampleDepthResolve, MultisampleState,
+        MultisampleStencilResolve, OperationId, PipelineContract, PresentTarget,
+        ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
+        RenderPassBlend, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
+        ResourceTableSnapshot, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest,
+        StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
+        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, TextureAccess,
+        VertexAttribute, VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -10497,6 +10535,11 @@ mod tests {
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
+            // The kept-frame landing entry (`research/docs/23` §115 之后的增量，
+            // E-TX14/R4b) is refused by this rail's own plan gate, so the test
+            // snapshot spells the fail-closed default out beside the landing
+            // view's bit.
+            supports_render_kept_frame_landing: false,
             supports_render_attachment_landing_view: false,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
@@ -10933,6 +10976,7 @@ mod tests {
                         }
                     }
                 }
+                TracePass::Landing(_) => {}
                 TracePass::Render(pass) => {
                     for view in &mut pass.vertex_buffers {
                         if view.view_id == QUAD_VERTEX_VIEW {
@@ -11817,6 +11861,50 @@ mod tests {
         );
     }
 
+    /// A landing-only entry has no rail here (`research/docs/23` §115 之后的
+    /// 增量，E-TX14/R4b). This provider keeps resident images — its registry is
+    /// the sibling of the Vulkan one — but its owner-window channel is an
+    /// *input* route: no code path writes an owner's pages, which is why
+    /// `StoreOp::Borrowed` has been refused since E-TX8. Delivering a kept frame
+    /// would need exactly that write route, so the entry is refused by name
+    /// before any plan exists — and before the early return a landing-only trace
+    /// would otherwise take.
+    #[test]
+    fn plan_trace_refuses_a_kept_frame_landing_by_name() {
+        let (mut trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        trace.passes.push(TracePass::Landing(KeptFrameLanding {
+            frame: KeptFrame {
+                allocation_id: AllocationId::new(9),
+                view_id: ViewId::new(8),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+            },
+            landing: AttachmentLandingView {
+                allocation_id: AllocationId::new(11),
+                view_id: ViewId::new(10),
+            },
+        }));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let error = plan_trace(&trace, &pool, &milestone_contracts(), 0, 0).unwrap_err();
+        assert_eq!(error.slug, "kept_frame_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("source"),
+            Some(&FieldValue::Text("native_rail".to_owned())),
+            "the refusal names the rail that has no owner-window write route"
+        );
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(8)),
+            "the refusal names the kept frame it could not deliver"
+        );
+        // The snapshot says the same thing the rail does: the bit stays at its
+        // fail-closed default on this rail.
+        assert!(!capabilities(&capability_bits(16384)).supports_render_kept_frame_landing);
+    }
+
     /// The landing rail is the writeback channel: an attachment no declared view
     /// covers has nowhere to land, so it is refused instead of executed and
     /// dropped.
@@ -11957,6 +12045,7 @@ mod tests {
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
                 TracePass::Compute(_) => None,
+                TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass");
         pass.color_attachments[0].store = StoreOp::DontCare;
@@ -13625,6 +13714,7 @@ mod tests {
     fn re_source_quad_vertices(trace: &mut ComputeTrace, source: BufferSource) {
         for pass in &mut trace.passes {
             match pass {
+                TracePass::Landing(_) => {}
                 TracePass::Compute(pass) => {
                     for view in &mut pass.buffers {
                         if view.view_id == QUAD_VERTEX_VIEW {
