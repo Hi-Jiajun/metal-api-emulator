@@ -1431,15 +1431,17 @@ mod tests {
         ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
         ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
         RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-        RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment,
-        RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest,
-        ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
-        StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
-        StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
+        RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
+        RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount,
+        SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
+        StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
+        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp,
+        SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
         TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-        MAX_RENDER_STAGE_BUFFERS, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_BUFFERS,
+        PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2243,13 +2245,14 @@ mod tests {
         let request = render_submit_with_formats(vec![AttachmentFormat::Rgba8Unorm]);
         let frame = CommandCodec::encode_request(&request).unwrap();
         let mut unknown = frame.clone();
-        // `0x05` is a kind no version of this walk assigns: compute `0x00`,
-        // render `0x01`/`0x02`/`0x03` and the compute texture face `0x04`
-        // (`research/docs/23` §91).
-        unknown[pipeline_entry_kind_offset()] = 0x05;
+        // `0x07` is a kind no version of this walk assigns: compute `0x00`,
+        // render `0x01`/`0x02`/`0x03`, the compute texture face `0x04`, the
+        // render texture face `0x05` and the combined render face `0x06`
+        // (`research/docs/23` §91, §3.3 v100).
+        unknown[pipeline_entry_kind_offset()] = 0x07;
         assert!(matches!(
             CommandCodec::decode_request(&unknown).unwrap_err(),
-            CodecError::UnknownPipelineTag(0x05)
+            CodecError::UnknownPipelineTag(0x07)
         ));
     }
 
@@ -6942,5 +6945,903 @@ mod tests {
         let refusal = narrow.admit(&trace, &resources).unwrap_err();
         assert_eq!(refusal.slug, "compute_texture_limit");
         eprintln!("refused: slug={} fields={:?}", refusal.slug, refusal.fields);
+    }
+
+    /// One runtime sampler state from the widened family (`research/docs/23`
+    /// §109, v109): the two newest names — `LinearMipLinear` and
+    /// `ClampToZero` — both travel as their own codes, so a frame built from
+    /// this state is the one that has to survive the wire.
+    fn widened_runtime_sampler(binding: u32) -> RenderSamplerBinding {
+        RenderSamplerBinding {
+            metal_binding: binding,
+            policy: SamplerPolicy {
+                filter: SamplerFilter::LinearMipLinear,
+                address: SamplerAddressMode::ClampToZero,
+            },
+        }
+    }
+
+    /// A render trace whose pass states one runtime `[[sampler(n)]]` state and
+    /// binds nothing else the newer tags carry: the shape the runtime-sampler
+    /// kind `0x15` exists for (`research/docs/23` §3.3, v102).
+    fn runtime_sampler_trace() -> ComputeTrace {
+        let mut trace = render_only_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.samplers = vec![widened_runtime_sampler(0)];
+        trace
+    }
+
+    /// The sampled fixture plus one runtime sampler state, so the v70 texture
+    /// block and the runtime sampler block travel in one frame
+    /// (`research/docs/23` §3.3, v70/v102). The contract keeps the plain
+    /// shape, so the frame differs from [`sampled_multisample_trace`] in the
+    /// pass alone.
+    fn sampled_runtime_sampler_trace() -> ComputeTrace {
+        let mut trace = sampled_multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.samplers = vec![widened_runtime_sampler(0)];
+        trace
+    }
+
+    /// The stage buffer fixture plus one runtime sampler state
+    /// (`research/docs/23` §3.3, v83/v102): the shape the census's
+    /// `texture_sampler_wire` lines are made of, stated on the wire.
+    fn stage_buffer_runtime_sampler_trace() -> ComputeTrace {
+        let mut trace = stage_buffer_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.samplers = vec![widened_runtime_sampler(0)];
+        trace
+    }
+
+    /// The sampled *and* stage-buffer fixture plus one runtime sampler state,
+    /// so all three blocks the newer tags carry travel in one frame
+    /// (`research/docs/23` §3.3, v70/v83/v102).
+    fn full_runtime_sampler_trace() -> ComputeTrace {
+        let mut trace = sampled_stage_buffer_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.samplers = vec![widened_runtime_sampler(0)];
+        trace
+    }
+
+    /// The four bytes that spell a runtime-sampler pass's fixed head: the tag,
+    /// the wide feature word — all zero, because that fixture's pass states no
+    /// optional section — and the block's count (`research/docs/23` §3.3,
+    /// v102).
+    const RUNTIME_SAMPLER_HEAD: [u8; 4] = [0x15, 0x00, 0x00, 0x01];
+
+    /// Where [`RUNTIME_SAMPLER_HEAD`] sits in a frame, by position.
+    fn runtime_sampler_head_at(frame: &[u8]) -> usize {
+        frame
+            .windows(RUNTIME_SAMPLER_HEAD.len())
+            .position(|window| window == RUNTIME_SAMPLER_HEAD)
+            .expect("the frame carries the runtime-sampler head")
+    }
+
+    /// The seven bytes one runtime sampler entry adds to a frame that already
+    /// carries the tag: the block's count and the entry's index, filter and
+    /// address (`research/docs/23` §3.3, v102).
+    const RUNTIME_SAMPLER_BLOCK: [u8; 7] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04];
+
+    #[test]
+    fn a_runtime_sampler_pass_takes_its_own_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: runtime_sampler_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the runtime sampler frame re-encodes byte for byte"
+        );
+        // The tag, the wide word the pass's other sections did not touch, the
+        // block's count and the entry's own bytes: the Metal index (0), the
+        // filter code `0x05` (`LinearMipLinear`) and the address code `0x04`
+        // (`ClampToZero`) — the two names §109 appended, so the widened family
+        // is exactly what a decoded frame states back (`research/docs/23`
+        // §3.3, v102/v109).
+        let head = runtime_sampler_head_at(&frame);
+        assert_eq!(
+            &frame[head..head + 10],
+            &[0x15, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04],
+            "the sampler pass carries its own tag, the wide word and the entry"
+        );
+        eprintln!(
+            "runtime sampler frame: len={} tag={:#04x} entry={:02x?}",
+            frame.len(),
+            frame[head],
+            &frame[head + 4..head + 10]
+        );
+    }
+
+    #[test]
+    fn a_sampled_runtime_sampler_pass_keeps_both_halves_in_one_frame() {
+        let request = CommandRequest::Submit {
+            trace: sampled_runtime_sampler_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the combined frame re-encodes byte for byte"
+        );
+        // The combined tag is the sampled tag's payload with the sampler block
+        // appended (`research/docs/23` §3.3, v102): the tag changes, the wide
+        // word and the texture block keep their bytes, the sampler block
+        // follows the texels, and every section after it is the sampled
+        // frame's.
+        let sampled = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: sampled_multisample_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let sampled_head = sampled
+            .windows(3)
+            .position(|window| window == [0x12, 0x20, 0x01])
+            .expect("the sampled fixture takes the sampled tag");
+        let texels: Vec<u8> = (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect();
+        let texels_end = frame
+            .windows(texels.len())
+            .position(|window| window == texels)
+            .expect("the sampled texture's own bytes travel in the frame")
+            + texels.len();
+        let block_at = frame
+            .windows(RUNTIME_SAMPLER_BLOCK.len())
+            .position(|window| window == RUNTIME_SAMPLER_BLOCK)
+            .expect("the sampler block is on the wire");
+        // The block's bytes are the count and the entry, and the encoder
+        // appends them directly after the texture block's texels: the tag and
+        // the wide word sit three bytes in front of them.
+        assert_eq!(
+            block_at, texels_end,
+            "the sampler block follows the texels with nothing between"
+        );
+        // The tag sits where the sampled fixture's tag does: the two frames
+        // are the same bytes up to it, because the pass, the pipeline table
+        // and every section before them are unchanged.
+        let head = sampled_head;
+        assert_eq!(sampled[head], 0x12, "the sampled fixture's own tag");
+        assert_eq!(frame[head], 0x16, "the combined tag");
+        assert_eq!(
+            &frame[head + 1..head + 3],
+            &sampled[sampled_head + 1..sampled_head + 3],
+            "the combined tag carries the same wide word"
+        );
+        assert_eq!(
+            &frame[head + 3..texels_end],
+            &sampled[sampled_head + 3..texels_end],
+            "the texture block keeps its bytes"
+        );
+        assert_eq!(
+            &frame[texels_end..texels_end + RUNTIME_SAMPLER_BLOCK.len()],
+            &RUNTIME_SAMPLER_BLOCK,
+            "the sampler block follows the texels"
+        );
+        assert_eq!(
+            &frame[texels_end + RUNTIME_SAMPLER_BLOCK.len()..],
+            &sampled[texels_end..],
+            "every section after the sampler block is byte identical"
+        );
+        eprintln!(
+            "sampled + runtime sampler: len={} sampled={} head={head}",
+            frame.len(),
+            sampled.len()
+        );
+    }
+
+    #[test]
+    fn a_stage_buffer_runtime_sampler_pass_keeps_both_blocks_in_one_frame() {
+        let request = CommandRequest::Submit {
+            trace: stage_buffer_runtime_sampler_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the stage-buffer + sampler frame re-encodes byte for byte"
+        );
+        // The combined tag is the stage-buffer tag's payload with the sampler
+        // block appended, so the block is the whole difference plus the tag
+        // (`research/docs/23` §3.3, v83/v102).
+        let stage_only = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        // The tag, the empty wide word and the stage buffer block's count and
+        // stage code are the combined frame's fixed head (`[0x13, …]` in the
+        // stage-buffer-only frame).
+        let head = frame
+            .windows(5)
+            .position(|window| window == [0x17, 0x00, 0x00, 0x01, 0x01])
+            .expect("the combined frame carries the stage-buffer block behind its tag");
+        assert_eq!(frame[head], 0x17, "the combined tag");
+        assert_eq!(
+            frame.len(),
+            stage_only.len() + RUNTIME_SAMPLER_BLOCK.len(),
+            "the sampler block is the whole addition"
+        );
+        assert!(
+            frame
+                .windows(RUNTIME_SAMPLER_BLOCK.len())
+                .any(|window| window == RUNTIME_SAMPLER_BLOCK),
+            "the sampler block travels in the same frame"
+        );
+        eprintln!(
+            "stage buffer + runtime sampler: len={} stage_only={} head={head}",
+            frame.len(),
+            stage_only.len()
+        );
+    }
+
+    #[test]
+    fn a_full_render_pass_carries_all_three_blocks_in_one_frame() {
+        let request = CommandRequest::Submit {
+            trace: full_runtime_sampler_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the three-block frame re-encodes byte for byte"
+        );
+        // The combined tag's payload is the sampled + stage-buffer tag's with
+        // the sampler block appended, so the block is the whole difference
+        // (`research/docs/23` §3.3, v70/v83/v102).
+        let sampled_stage_only = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: sampled_stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        assert_eq!(
+            frame.len(),
+            sampled_stage_only.len() + RUNTIME_SAMPLER_BLOCK.len(),
+            "the sampler block is the whole addition"
+        );
+        // The three blocks are written in the one order the decoder reads:
+        // textures, stage buffers, then the sampler states. Locating each by
+        // its own bytes pins that order on the wire instead of on the encoder.
+        let texels: Vec<u8> = (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect();
+        let texels_at = frame
+            .windows(texels.len())
+            .position(|window| window == texels)
+            .expect("the sampled texture's own bytes travel in the frame");
+        let stage_payload = stage_buffer_payload();
+        let stage_payload_at = frame
+            .windows(stage_payload.len())
+            .position(|window| window == stage_payload)
+            .expect("the stage buffer's own bytes travel in the frame");
+        let stage_payload_end = stage_payload_at + stage_payload.len();
+        let sampler_at = frame
+            .windows(RUNTIME_SAMPLER_BLOCK.len())
+            .position(|window| window == RUNTIME_SAMPLER_BLOCK)
+            .expect("the sampler block travels in the frame");
+        assert!(
+            texels_at < stage_payload_at && stage_payload_end <= sampler_at,
+            "the blocks travel in the encoder's order: textures {texels_at}, \
+             stage buffers {stage_payload_at}, sampler states {sampler_at}"
+        );
+        assert_eq!(
+            sampler_at, stage_payload_end,
+            "the sampler block follows the stage buffer block with nothing between"
+        );
+        eprintln!(
+            "three blocks: len={} sampled_stage={} texels_at={texels_at} \
+             stage_payload_at={stage_payload_at} sampler_at={sampler_at}",
+            frame.len(),
+            sampled_stage_only.len()
+        );
+    }
+
+    #[test]
+    fn a_runtime_sampler_pass_refuses_a_count_above_the_contract_cap() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: runtime_sampler_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let head = runtime_sampler_head_at(&frame);
+        let mut patched = frame.clone();
+        // One above the contract's own ceiling (`research/docs/23` §3.3,
+        // v102): the count byte is refused before a single entry is read, so
+        // the patched frame needs no matching entries behind it.
+        patched[head + 3] = u8::try_from(MAX_RENDER_SAMPLERS + 1).unwrap();
+        assert!(matches!(
+            CommandCodec::decode_request(&patched).unwrap_err(),
+            CodecError::RenderSamplerCount { count, maximum }
+                if count == MAX_RENDER_SAMPLERS + 1 && maximum == MAX_RENDER_SAMPLERS
+        ));
+        // The encoder refuses the same protocol bound instead of writing a
+        // frame the decoder would reject.
+        let mut trace = runtime_sampler_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.samplers = (0..=MAX_RENDER_SAMPLERS as u32)
+            .map(widened_runtime_sampler)
+            .collect();
+        let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::RenderSamplerCount { count, maximum }
+                if count == MAX_RENDER_SAMPLERS + 1 && maximum == MAX_RENDER_SAMPLERS
+        ));
+        eprintln!("runtime sampler count refusals: {refused}");
+    }
+
+    #[test]
+    fn a_runtime_sampler_pass_refuses_an_unknown_state_by_name() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: runtime_sampler_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let head = runtime_sampler_head_at(&frame);
+        // The entry's two state bytes follow the index: filter first, then
+        // address. `0x06` names no filter and `0x05` no address, so each is
+        // refused by name rather than folded onto a neighbouring state — a
+        // state the decoder guessed would change which texels a remote read
+        // returns (`research/docs/23` §3.3, v102/v109).
+        let mut foreign_filter = frame.clone();
+        foreign_filter[head + 8] = 0x06;
+        let refused = CommandCodec::decode_request(&foreign_filter).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::UnknownEnumValue {
+                field: "sampler filter",
+                value: 6,
+            }
+        ));
+        let mut foreign_address = frame.clone();
+        foreign_address[head + 9] = 0x05;
+        let refused = CommandCodec::decode_request(&foreign_address).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::UnknownEnumValue {
+                field: "sampler address",
+                value: 5,
+            }
+        ));
+        eprintln!("foreign runtime sampler states refused: {refused}");
+    }
+
+    /// A render contract whose texture declarations state both sampler forms
+    /// (`research/docs/23` §3.3, v100/v102): binding 3 samples through the
+    /// runtime `[[sampler(0)]]` argument whose state the pass states, and
+    /// binding 5 through the state the module's own AIR constexpr sampler
+    /// carries.
+    fn render_texture_contract() -> RenderPipelineContract {
+        RenderPipelineContract {
+            textures: vec![
+                TextureBindingContract::sampled_runtime(3, TextureFormat::Rgba8Unorm, 0),
+                TextureBindingContract::sampled(
+                    5,
+                    TextureFormat::Bgra8Unorm,
+                    SamplerPolicy {
+                        filter: SamplerFilter::LinearMipNearest,
+                        address: SamplerAddressMode::MirrorRepeat,
+                    },
+                ),
+            ],
+            ..render_contract()
+        }
+    }
+
+    /// The declaration block [`render_texture_contract`] writes: the count,
+    /// then `(binding, access, type, format, form, payload, footprint)` per
+    /// entry — the runtime form (`0x02`) with the Metal sampler index, then
+    /// the static form (`0x01`) with its filter `0x04`
+    /// (`LinearMipNearest`) and address `0x03` (`MirrorRepeat`)
+    /// (`research/docs/23` §3.3, v102/v109).
+    const RENDER_TEXTURE_DECLARATION_BLOCK: [u8; 25] = [
+        0x02, // two declarations
+        0x00, 0x00, 0x00, 0x03, // binding 3
+        0x00, // Sampled
+        0x02, // D2
+        0x02, // Rgba8Unorm
+        0x02, // the runtime form
+        0x00, 0x00, 0x00, 0x00, // [[sampler(0)]]
+        0x00, // WholeView
+        0x00, 0x00, 0x00, 0x05, // binding 5
+        0x00, // Sampled
+        0x02, // D2
+        0x03, // Bgra8Unorm
+        0x01, // the static form
+        0x04, // LinearMipNearest
+        0x03, // MirrorRepeat
+        0x00, // WholeView
+    ];
+
+    #[test]
+    fn a_render_contract_with_texture_declarations_takes_its_own_pipeline_kind() {
+        let plain = CommandCodec::encode_request(&render_submit_with_formats(vec![
+            AttachmentFormat::Rgba8Unorm,
+        ]))
+        .unwrap();
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(render_texture_contract());
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the declaration frame re-encodes byte for byte"
+        );
+        // The tag is the texture face's own (`research/docs/23` §3.3, v100):
+        // the entry writes its colour formats the MRT way and appends the
+        // declaration block after the vertex layout, where both sampler forms
+        // travel.
+        assert_eq!(plain[pipeline_entry_kind_offset()], 0x01, "plain entry tag");
+        assert_eq!(
+            frame[pipeline_entry_kind_offset()],
+            0x05,
+            "texture declaration entry tag"
+        );
+        assert!(
+            frame
+                .windows(RENDER_TEXTURE_DECLARATION_BLOCK.len())
+                .any(|window| window == RENDER_TEXTURE_DECLARATION_BLOCK),
+            "both sampler forms travel in the declaration block"
+        );
+        let block_at = frame
+            .windows(RENDER_TEXTURE_DECLARATION_BLOCK.len())
+            .position(|window| window == RENDER_TEXTURE_DECLARATION_BLOCK)
+            .expect("the declaration block is on the wire");
+        assert_eq!(
+            frame.len(),
+            plain.len() + 8 + RENDER_TEXTURE_DECLARATION_BLOCK.len(),
+            "the block and the list's length prefix are the whole difference"
+        );
+        eprintln!(
+            "render texture declaration frame: len={} plain={} kind={:#04x} block_at={block_at}",
+            frame.len(),
+            plain.len(),
+            frame[pipeline_entry_kind_offset()]
+        );
+    }
+
+    #[test]
+    fn a_render_contract_with_both_declaration_halves_takes_the_combined_kind() {
+        // A contract may declare stage buffers and texture bindings at once;
+        // the combined kind writes the stage buffer block first and the
+        // texture declarations after it, in the one order the decoder reads
+        // (`research/docs/23` §3.3, v83/v100).
+        let mut contract = stage_buffer_render_contract();
+        contract.textures = render_texture_contract().textures;
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(contract);
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the combined declaration frame re-encodes byte for byte"
+        );
+        assert_eq!(
+            frame[pipeline_entry_kind_offset()],
+            0x06,
+            "the combined declaration entry tag"
+        );
+        // The stage buffer declaration block is the v83 fixture's own — its
+        // bytes do not depend on this tag — and it sits before the texture
+        // declarations.
+        let stage_at = frame
+            .windows(STAGE_BUFFER_DECLARATION_BLOCK.len())
+            .position(|window| window == STAGE_BUFFER_DECLARATION_BLOCK)
+            .expect("the combined frame carries the stage buffer block");
+        let textures_at = frame
+            .windows(RENDER_TEXTURE_DECLARATION_BLOCK.len())
+            .position(|window| window == RENDER_TEXTURE_DECLARATION_BLOCK)
+            .expect("the combined frame carries the texture block");
+        assert!(
+            stage_at < textures_at,
+            "the stage buffer block precedes the texture declarations: \
+             {stage_at} < {textures_at}"
+        );
+        eprintln!(
+            "combined declaration frame: len={} stage_at={stage_at} textures_at={textures_at}",
+            frame.len()
+        );
+    }
+
+    #[test]
+    fn a_render_texture_declaration_block_refuses_a_count_above_the_contract_cap() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: {
+                let mut trace = render_only_trace();
+                trace.pipelines[0].render = Some(render_texture_contract());
+                trace
+            },
+            resources: resources(),
+        })
+        .unwrap();
+        let block_at = frame
+            .windows(RENDER_TEXTURE_DECLARATION_BLOCK.len())
+            .position(|window| window == RENDER_TEXTURE_DECLARATION_BLOCK)
+            .expect("the declaration block is on the wire");
+        let mut patched = frame.clone();
+        // One above the contract's own ceiling (`research/docs/23` §3.3,
+        // v102): the count byte is refused before a single tuple is read.
+        patched[block_at] = u8::try_from(MAX_RENDER_TEXTURES + 1).unwrap();
+        assert!(matches!(
+            CommandCodec::decode_request(&patched).unwrap_err(),
+            CodecError::RenderTextureDeclarationCount { count, maximum }
+                if count == MAX_RENDER_TEXTURES + 1 && maximum == MAX_RENDER_TEXTURES
+        ));
+        // The encoder refuses the same protocol bound instead of writing a
+        // frame the decoder would reject.
+        let mut contract = render_texture_contract();
+        contract.textures = (0..=MAX_RENDER_TEXTURES as u32)
+            .map(|binding| {
+                TextureBindingContract::sampled_runtime(binding, TextureFormat::Rgba8Unorm, 0)
+            })
+            .collect();
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(contract);
+        let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::RenderTextureDeclarationCount { count, maximum }
+                if count == MAX_RENDER_TEXTURES + 1 && maximum == MAX_RENDER_TEXTURES
+        ));
+        eprintln!("render texture declaration count refusals: {refused}");
+    }
+
+    #[test]
+    fn a_render_texture_declaration_refuses_both_sampler_forms() {
+        // The two forms are exclusive (`research/docs/23` §3.3, v102): the
+        // block's form byte has no position that could mean "the module's own
+        // state *and* the pass's argument", so the sender refuses the pair by
+        // name rather than framing one of the two.
+        let mut contract = render_texture_contract();
+        contract.textures[0] = TextureBindingContract {
+            sampler: Some(SamplerPolicy::reviewed_render_sampler()),
+            ..contract.textures[0].clone()
+        };
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(contract);
+        let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::RenderTextureSamplerFormUnsupported { binding: 3 }
+        ));
+        eprintln!("both sampler forms refused: {refused}");
+    }
+
+    #[test]
+    fn a_render_texture_declaration_block_refuses_an_unknown_sampler_form() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: {
+                let mut trace = render_only_trace();
+                trace.pipelines[0].render = Some(render_texture_contract());
+                trace
+            },
+            resources: resources(),
+        })
+        .unwrap();
+        let block_at = frame
+            .windows(RENDER_TEXTURE_DECLARATION_BLOCK.len())
+            .position(|window| window == RENDER_TEXTURE_DECLARATION_BLOCK)
+            .expect("the declaration block is on the wire");
+        // The first entry's form byte is the eighth byte of the block: the
+        // count byte and the entry's binding, access, type and format bytes
+        // precede it.
+        let mut patched = frame.clone();
+        patched[block_at + 8] = 0x03;
+        let refused = CommandCodec::decode_request(&patched).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::UnknownEnumValue {
+                field: "render texture sampler form",
+                value: 3,
+            }
+        ));
+        eprintln!("unknown render texture sampler form refused: {refused}");
+    }
+
+    /// The runtime-sampler shape both halves of the pairing state
+    /// (`research/docs/23` §3.3, v102): the contract declares binding 0 as
+    /// sampling through the runtime `[[sampler(0)]]` argument, and the pass
+    /// binds both the texture view and the state that argument executes with.
+    ///
+    /// The attachment's view is declared the way a submission declares a
+    /// landing — a one-thread compute pass that reads the same view — because
+    /// admission resolves the render attachment against the trace's own
+    /// declarations (`research/docs/23` §3.6), and the declaring pass's
+    /// contract is narrowed to the read the declaration states.
+    fn admitted_runtime_sampler_trace() -> ComputeTrace {
+        let mut compiled = pipeline(&compile_request());
+        compiled.contract.buffer_bindings[0].access = BufferAccess::Read;
+        compiled.render = Some(RenderPipelineContract {
+            textures: vec![TextureBindingContract::sampled_runtime(
+                0,
+                TextureFormat::Rgba8Unorm,
+                0,
+            )],
+            ..render_contract()
+        });
+        let landing = BufferView {
+            view_id: ViewId::new(71),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(41),
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 16]),
+        };
+        let mut pass = render_pass_descriptor(&compiled, 2, 2);
+        pass.textures = vec![sampled_texture_view(0)];
+        pass.samplers = vec![widened_runtime_sampler(0)];
+        ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: compiled.device_epoch,
+            operation_id: OperationId::new(21),
+            pipelines: vec![compiled.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(ComputePass {
+                    pipeline: compiled.pipeline_id,
+                    buffers: vec![landing],
+                    textures: Vec::new(),
+                    dispatch: Dispatch {
+                        kind: DispatchKind::ThreadsExact,
+                        grid: [1, 1, 1],
+                        threads_per_threadgroup: [1, 1, 1],
+                    },
+                }),
+                TracePass::Render(pass),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        }
+    }
+
+    /// The snapshot the runtime-sampler reading admits on: the render bits the
+    /// fixture needs, the render-sampler bits (`research/docs/23` §3.3, v70)
+    /// and the stage buffer bits whose shapes travel beside them (v83). The
+    /// three pairs are the capability the decoded trace is handed to — the
+    /// `supports_render_texture_sampling` bit is the one the runtime sampler
+    /// face rides on, because a runtime `[[sampler(n)]]` argument is only
+    /// meaningful for a texture a declaration pairs it with.
+    fn runtime_sampler_capabilities() -> ProviderCapabilities {
+        let mut capabilities = fake_capabilities();
+        capabilities.max_passes = 8;
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_texture_sampling = true;
+        capabilities.max_render_textures = MAX_RENDER_TEXTURES as u32;
+        capabilities.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        capabilities
+    }
+
+    /// The allocations [`admitted_runtime_sampler_trace`] declares: the
+    /// attachment's landing (sixteen bytes, the packed 2×2 `Rgba8Unorm`
+    /// extent) and the sampled texture's own bytes (a 4×4 texel block).
+    fn runtime_sampler_resources() -> ResourceTableSnapshot {
+        let mut resources = ResourceTableSnapshot::new();
+        for (allocation, size) in [(41_u64, 16_u64), (53, 64)] {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: AllocationId::new(allocation),
+                    owner_epoch: DeviceEpoch::new(7),
+                    size,
+                })
+                .unwrap();
+        }
+        resources
+    }
+
+    /// Decode one submission frame into the trace and resource snapshot a
+    /// provider process would see.
+    fn carried_submission(frame: &[u8]) -> (ComputeTrace, ResourceTableSnapshot) {
+        match CommandCodec::decode_request(frame).unwrap() {
+            CommandRequest::Submit { trace, resources } => (trace, resources),
+            other => panic!("the frame is a submission, got a {} request", other.kind()),
+        }
+    }
+
+    /// The render entry of a fixture whose trace also carries the declaring
+    /// compute pass (`research/docs/23` §3.6).
+    fn declared_render_entry(trace: &mut ComputeTrace) -> &mut RenderPassDescriptor {
+        trace
+            .passes
+            .iter_mut()
+            .find_map(|pass| match pass {
+                TracePass::Render(pass) => Some(pass),
+                TracePass::Compute(_) => None,
+            })
+            .expect("the fixture carries a render pass")
+    }
+
+    /// The render entry of a decoded fixture.
+    fn decoded_render_entry(trace: &ComputeTrace) -> &RenderPassDescriptor {
+        trace
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                TracePass::Render(pass) => Some(pass),
+                TracePass::Compute(_) => None,
+            })
+            .expect("the fixture carries a render pass")
+    }
+
+    #[test]
+    fn a_decoded_runtime_sampler_pass_admits_on_a_snapshot_that_declares_the_face() {
+        // The reading this increment exists for (`research/docs/23` §3.3,
+        // v102): the states the pass's `[[sampler(n)]]` arguments execute with
+        // travel the frame, decode back into the pass, and the decoded trace
+        // reaches admission with the pairing intact — instead of every
+        // runtime-sampler frame decoding to an empty list.
+        let request = CommandRequest::Submit {
+            trace: admitted_runtime_sampler_trace(),
+            resources: runtime_sampler_resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let (trace, resources) = carried_submission(&frame);
+        let pass = decoded_render_entry(&trace);
+        assert_eq!(
+            pass.samplers,
+            vec![widened_runtime_sampler(0)],
+            "the decoded pass states the very list the owner sent"
+        );
+        let Some(contract) = trace.pipelines[0].render.as_ref() else {
+            panic!("the fixture pipeline carries a render half");
+        };
+        assert_eq!(
+            contract.textures,
+            vec![TextureBindingContract::sampled_runtime(
+                0,
+                TextureFormat::Rgba8Unorm,
+                0
+            )],
+            "the decoded contract states the declaration the pass is paired against"
+        );
+        runtime_sampler_capabilities()
+            .validate_trace(trace, resources)
+            .expect("a snapshot that declares the render-sampler face admits the decoded pass");
+        eprintln!(
+            "decoded runtime sampler pass admitted: len={} samplers={:02x?}",
+            frame.len(),
+            RUNTIME_SAMPLER_BLOCK
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_the_render_sampler_capability_refuses_the_decoded_pass_by_name() {
+        // Capability fail-closed (`research/docs/23` §3.3, v70): a snapshot
+        // that never declared render-side sampling refuses the decoded pass by
+        // name instead of executing it against descriptor bytes nobody
+        // declared. The bit comes first, so this is the refusal a device
+        // without the face answers however the frame was framed.
+        let request = CommandRequest::Submit {
+            trace: admitted_runtime_sampler_trace(),
+            resources: runtime_sampler_resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let (trace, resources) = carried_submission(&frame);
+        let mut missing = runtime_sampler_capabilities();
+        missing.supports_render_texture_sampling = false;
+        let refusal = missing.validate_trace(trace, resources).unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_input_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        // The render entry is the trace's second pass: the declaring compute
+        // pass that owns the attachment lands first (`research/docs/23` §3.6).
+        assert_eq!(refusal.fields.get("pass"), Some(&FieldValue::Unsigned(1)));
+        assert_eq!(
+            refusal.fields.get("textures"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        eprintln!(
+            "missing render-sampler capability refused: slug={} class={:?} fields={:?}",
+            refusal.slug, refusal.class, refusal.fields
+        );
+    }
+
+    #[test]
+    fn a_frame_without_the_sampler_block_refuses_the_pairing_by_name() {
+        // The shape a pre-v102 frame decodes to (`research/docs/23` §3.3,
+        // v102): the contract still pairs the texture with the runtime
+        // `[[sampler(0)]]` argument, but the pass carries no state — exactly
+        // what dropping the block would produce — so the pairing refuses the
+        // frame by name instead of executing it under a sampler nobody
+        // stated.
+        let mut dropped = admitted_runtime_sampler_trace();
+        let pass = declared_render_entry(&mut dropped);
+        pass.samplers = Vec::new();
+        let request = CommandRequest::Submit {
+            trace: dropped,
+            resources: runtime_sampler_resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let (trace, resources) = carried_submission(&frame);
+        let pass = decoded_render_entry(&trace);
+        assert!(
+            pass.samplers.is_empty(),
+            "the frame carries no sampler block"
+        );
+        let refusal = runtime_sampler_capabilities()
+            .validate_trace(trace, resources)
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_runtime_sampler_missing");
+        eprintln!(
+            "dropped sampler states refused: slug={} detail={:?}",
+            refusal.slug, refusal.detail
+        );
+    }
+
+    #[test]
+    fn a_pass_that_states_a_sampler_nothing_pairs_with_is_refused_by_name() {
+        // The other direction of the same pairing (`research/docs/23` §3.3,
+        // v102): a state nothing samples through would fill a descriptor slot
+        // no declaration names, so it is refused by name too.
+        let mut unpaired = admitted_runtime_sampler_trace();
+        let Some(contract) = unpaired.pipelines[0].render.as_mut() else {
+            panic!("the fixture pipeline carries a render half");
+        };
+        contract.textures = vec![TextureBindingContract::sampled(
+            0,
+            TextureFormat::Rgba8Unorm,
+            SamplerPolicy::reviewed_render_sampler(),
+        )];
+        let request = CommandRequest::Submit {
+            trace: unpaired,
+            resources: runtime_sampler_resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let (trace, resources) = carried_submission(&frame);
+        let refusal = runtime_sampler_capabilities()
+            .validate_trace(trace, resources)
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_runtime_sampler_unpaired");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        eprintln!(
+            "unpaired sampler state refused: slug={} fields={:?}",
+            refusal.slug, refusal.fields
+        );
     }
 }

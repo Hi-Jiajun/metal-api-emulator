@@ -25,15 +25,15 @@ use metal_api_core::provider::{
     PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
     ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
     RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, Retryability, SampleCount, SamplerAddressMode, SamplerFilter,
-    SamplerPolicy, SemanticDigest, ShaderSource, StageBufferBinding, StageBufferView, StagedLease,
-    StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
-    StorageMode, StoreOp, SubmissionId, TextureAccess, TextureBindingContract,
-    TextureFootprintProof, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
-    MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
+    RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SamplerAddressMode,
+    SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource, StageBufferBinding,
+    StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
+    StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess,
+    TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
+    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+    VertexStep, ViewId, Winding, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_SAMPLERS,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -325,6 +325,54 @@ const PASS_KIND_RENDER_STAGE_BUFFERS: u8 = 0x13;
 /// [`PASS_KIND_RENDER_STAGE_BUFFERS`].
 const PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS: u8 = 0x14;
 
+/// A render pass that executes its fragment stage's runtime `[[sampler(n)]]`
+/// arguments (`research/docs/23` §3.3, v102/v111).
+///
+/// The runtime sampler list is the pass's own statement of the *states* its
+/// `[[sampler(n)]]` arguments execute with — Metal binds the `MTLSamplerState`
+/// when the draw is encoded, so the module carries no state and the request
+/// states it here — and it is the request-side half of a pairing whose other
+/// half is the render contract's texture declarations. The list is a section
+/// of its own because the wide feature word has no bit left and the three
+/// blocks before it each took a tag: this tag is the shape for a pass that
+/// carries the sampler block alone, and the three tags below are its
+/// combinations with the two blocks a pass may also carry, so a pass states
+/// any subset in one frame instead of forcing the caller to drop one half.
+/// The sampler block is written after every earlier block, so the walk reads
+/// it where the encoder wrote it. A pass that binds no runtime sampler keeps
+/// writing the tags above and every pre-v102 frame keeps its exact bytes; a
+/// decoder that predates this tag answers [`CodecError::UnknownPassTag`] for
+/// it.
+const PASS_KIND_RENDER_SAMPLERS: u8 = 0x15;
+
+/// A render pass that binds sampled textures and carries its runtime sampler
+/// states ([`PASS_KIND_RENDER_SAMPLERS`], `research/docs/23` §3.3, v102/v111).
+///
+/// The payload is [`PASS_KIND_RENDER_SAMPLED`]'s — the same `u16` feature word
+/// and the texture block — with the sampler block appended after it. The two
+/// halves of the runtime-sampler pairing are exactly a sampled texture and the
+/// state its `[[sampler(n)]]` argument executes with, so this is the combined
+/// tag those shapes travel under.
+const PASS_KIND_RENDER_SAMPLED_SAMPLERS: u8 = 0x16;
+
+/// A render pass that binds stage buffers and carries its runtime sampler
+/// states ([`PASS_KIND_RENDER_SAMPLERS`], `research/docs/23` §3.3, v102/v111).
+///
+/// The payload is [`PASS_KIND_RENDER_STAGE_BUFFERS`]'s — the same `u16`
+/// feature word and the stage buffer block — with the sampler block appended
+/// after it, in the one order the decoder walks.
+const PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS: u8 = 0x17;
+
+/// A render pass that binds sampled textures, binds stage buffers and carries
+/// its runtime sampler states ([`PASS_KIND_RENDER_SAMPLERS`],
+/// `research/docs/23` §3.3, v102/v111).
+///
+/// The payload is [`PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS`]'s — the wide
+/// feature word, the texture block and the stage buffer block — with the
+/// sampler block appended after them, so a pass that states all three blocks
+/// is still one frame.
+const PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS: u8 = 0x18;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
@@ -393,6 +441,34 @@ const PIPELINE_KIND_RENDER_MRT: u8 = 0x02;
 /// bytes; a decoder that predates this tag answers
 /// [`CodecError::UnknownPipelineTag`] for it.
 const PIPELINE_KIND_RENDER_STAGE_BUFFERS: u8 = 0x03;
+
+/// Render entry whose contract declares the fragment stage's texture bindings
+/// (`research/docs/23` §3.3, v100/v102).
+///
+/// The contract's texture half is the declaration the pass's own views are
+/// paired against — the Metal index, the access, the format and the sampler
+/// form each binding reads through — and no pre-v100 entry could carry it: the
+/// render kinds' bodies are fixed, so the block needs a kind of its own behind
+/// the same kind byte [`PIPELINE_KIND_RENDER_STAGE_BUFFERS`] used. The body
+/// always writes its colour formats the way [`PIPELINE_KIND_RENDER_MRT`] does
+/// — a length-prefixed list, because the tag already is the new shape — and
+/// appends the declaration block after the vertex layout. A contract whose
+/// declaration list is empty keeps writing `PIPELINE_KIND_RENDER` /
+/// `PIPELINE_KIND_RENDER_MRT` and every pre-v100 registration keeps its exact
+/// bytes; a decoder that predates this tag answers
+/// [`CodecError::UnknownPipelineTag`] for it.
+const PIPELINE_KIND_RENDER_TEXTURES: u8 = 0x05;
+
+/// Render entry whose contract declares both stage buffer bindings and texture
+/// bindings (`research/docs/23` §3.3, v83/v100).
+///
+/// A contract may state both halves — a fragment stage that reads a buffer and
+/// samples a texture is one registration — and each half already has a kind of
+/// its own, so the combination takes this one: the colour formats the MRT way,
+/// the vertex layout, then the stage buffer block, then the texture
+/// declaration block, in the one order the decoder reads. A contract that
+/// declares only one half keeps writing that half's kind and its exact bytes.
+const PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES: u8 = 0x06;
 
 /// Compute entry whose contract declares the texture bindings its module
 /// reads (`research/docs/23` §91).
@@ -1672,16 +1748,21 @@ fn put_pipeline_tagged(
 
 /// The pipeline-table tag one render contract wears.
 ///
-/// The tag is a function of two facts the earlier bodies cannot express: the
-/// format count and whether the contract declares stage buffer bindings. One
-/// format and no declaration keeps `PIPELINE_KIND_RENDER` and the exact bytes
-/// it always had; two to [`MAX_COLOR_ATTACHMENTS`] formats and no declaration
-/// take `PIPELINE_KIND_RENDER_MRT`; a contract that declares at least one
-/// stage buffer takes `PIPELINE_KIND_RENDER_STAGE_BUFFERS`, whose body writes
-/// the formats the MRT way and appends the declaration block. A contract with
-/// no format at all, with more than the render track admits, or with more
-/// declarations than [`MAX_RENDER_STAGE_BUFFERS`] is refused here — before the
-/// tag is written — so a refused registration never emits a partial entry.
+/// The tag is a function of three facts the earlier bodies cannot express: the
+/// format count, whether the contract declares stage buffer bindings and
+/// whether it declares texture bindings. One format and no declaration keeps
+/// `PIPELINE_KIND_RENDER` and the exact bytes it always had; two to
+/// [`MAX_COLOR_ATTACHMENTS`] formats and no declaration take
+/// `PIPELINE_KIND_RENDER_MRT`; a contract that declares at least one stage
+/// buffer takes `PIPELINE_KIND_RENDER_STAGE_BUFFERS`, whose body writes the
+/// formats the MRT way and appends the declaration block; a contract that
+/// declares texture bindings takes the texture tag of its own, and one that
+/// declares both halves takes the combined tag, in the one order the decoder
+/// reads (`research/docs/23` §3.3, v83/v100). A contract with no format at
+/// all, with more than the render track admits, or with more declarations
+/// than [`MAX_RENDER_STAGE_BUFFERS`] / [`MAX_RENDER_TEXTURES`] is refused here
+/// — before the tag is written — so a refused registration never emits a
+/// partial entry.
 fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecError> {
     let format_count = bounded_color_format_count(contract.color_formats.len() as u64)?;
     if contract.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
@@ -1690,12 +1771,25 @@ fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecEr
             maximum: MAX_RENDER_STAGE_BUFFERS,
         });
     }
-    if !contract.stage_buffers.is_empty() {
-        return Ok(PIPELINE_KIND_RENDER_STAGE_BUFFERS);
+    if contract.textures.len() > MAX_RENDER_TEXTURES {
+        return Err(CodecError::RenderTextureDeclarationCount {
+            count: contract.textures.len(),
+            maximum: MAX_RENDER_TEXTURES,
+        });
     }
-    match format_count {
-        1 => Ok(PIPELINE_KIND_RENDER),
-        _ => Ok(PIPELINE_KIND_RENDER_MRT),
+    match (
+        contract.stage_buffers.is_empty(),
+        contract.textures.is_empty(),
+    ) {
+        // A contract that declares neither block keeps the two tags the
+        // format count alone used to pick.
+        (true, true) => match format_count {
+            1 => Ok(PIPELINE_KIND_RENDER),
+            _ => Ok(PIPELINE_KIND_RENDER_MRT),
+        },
+        (false, true) => Ok(PIPELINE_KIND_RENDER_STAGE_BUFFERS),
+        (true, false) => Ok(PIPELINE_KIND_RENDER_TEXTURES),
+        (false, false) => Ok(PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES),
     }
 }
 
@@ -1731,8 +1825,17 @@ fn put_render_pipeline_contract(
         }
     }
     put_vertex_layout(encoder, &contract.vertex_layout)?;
-    if kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS {
+    // The two declaration blocks follow the layout in the one order the
+    // decoder reads (`research/docs/23` §3.3, v83/v100): the stage buffer
+    // block first when the tag carries it, then the texture declarations.
+    if kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS
+        || kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES
+    {
         put_stage_buffer_declarations(encoder, &contract.stage_buffers)?;
+    }
+    if kind == PIPELINE_KIND_RENDER_TEXTURES || kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES
+    {
+        put_render_texture_declarations(encoder, &contract.textures)?;
     }
     Ok(())
 }
@@ -1786,6 +1889,136 @@ fn get_stage_buffer_declarations(
             index: decoder.u32()?,
             access: get_access(decoder)?,
             footprint: get_footprint(decoder)?,
+        });
+    }
+    Ok(bindings)
+}
+
+/// The sampler form byte of one render texture declaration
+/// (`research/docs/23` §3.3, v102).
+///
+/// The render face's declaration states its sampler in exactly one of three
+/// ways, and the block's byte says which one it is rather than letting the
+/// decoder infer a form from the access: [`RENDER_TEXTURE_SAMPLER_NONE`] is a
+/// storage image or a texel-fetch binding, which reads through no sampler at
+/// all; [`RENDER_TEXTURE_SAMPLER_STATIC`] is the state the module's own AIR
+/// constexpr sampler carries, followed by the filter and address codes;
+/// [`RENDER_TEXTURE_SAMPLER_RUNTIME`] names the `[[sampler(n)]]` *argument*
+/// the binding samples through, followed by its Metal index, whose state the
+/// pass's own list states. Any other byte is refused by name, exactly as every
+/// other discriminant on this channel is.
+const RENDER_TEXTURE_SAMPLER_NONE: u8 = 0x00;
+const RENDER_TEXTURE_SAMPLER_STATIC: u8 = 0x01;
+const RENDER_TEXTURE_SAMPLER_RUNTIME: u8 = 0x02;
+
+/// Encode one render contract's texture declaration block
+/// (`research/docs/23` §3.3, v100/v102): a `u8` count and that many
+/// `(binding, access, type, format, sampler form, footprint)` tuples, in the
+/// canonical order the contract's own rules state.
+///
+/// The block is what lets a remote provider run the pairing rules
+/// [`RenderPipelineContract::validate_against`] states instead of refusing
+/// every bound texture as undeclared: the pass carries the views, this
+/// carries the module's own declarations the views are paired against —
+/// including, for a runtime `[[sampler(n)]]` binding, the index the pass's
+/// runtime sampler list has to answer with. The list is bound the way every
+/// other length prefix is: a count above [`MAX_RENDER_TEXTURES`] is refused
+/// before a single tuple is written, so a refused registration never emits a
+/// partial block.
+fn put_render_texture_declarations(
+    encoder: &mut Encoder,
+    bindings: &[TextureBindingContract],
+) -> Result<(), CodecError> {
+    if bindings.len() > MAX_RENDER_TEXTURES {
+        return Err(CodecError::RenderTextureDeclarationCount {
+            count: bindings.len(),
+            maximum: MAX_RENDER_TEXTURES,
+        });
+    }
+    encoder.u8(bindings.len() as u8);
+    for binding in bindings {
+        encoder.u32(binding.metal_binding);
+        put_texture_access(encoder, binding.access);
+        put_texture_type(encoder, binding.texture_type);
+        put_texture_format(encoder, binding.format);
+        // The two forms are exclusive, so the byte states which of the three
+        // shapes the declaration has rather than a pair of optional fields a
+        // decoder would have to disambiguate. A declaration that states both
+        // is refused by name: no byte of this block could mean it.
+        match (binding.sampler, binding.runtime_sampler) {
+            (Some(policy), None) => {
+                encoder.u8(RENDER_TEXTURE_SAMPLER_STATIC);
+                put_sampler_filter(encoder, policy.filter);
+                put_sampler_address(encoder, policy.address);
+            }
+            (None, Some(index)) => {
+                encoder.u8(RENDER_TEXTURE_SAMPLER_RUNTIME);
+                encoder.u32(index);
+            }
+            (None, None) => encoder.u8(RENDER_TEXTURE_SAMPLER_NONE),
+            (Some(_), Some(_)) => {
+                return Err(CodecError::RenderTextureSamplerFormUnsupported {
+                    binding: binding.metal_binding,
+                })
+            }
+        }
+        put_texture_footprint(encoder, binding.footprint);
+    }
+    Ok(())
+}
+
+/// Decode one render texture declaration block (`research/docs/23` §3.3,
+/// v100/v102).
+///
+/// The count is read as one byte and refused above the contract's own cap
+/// before a single tuple — or a `Vec` of that length — is produced, so a
+/// corrupt count cannot drive the decoder. Every discriminant and every enum
+/// in a tuple is refused by name rather than folded onto a neighbour, because
+/// the declaration is what the pass is paired against: a sampler form the
+/// decoder guessed would change which texels a remote read returns, or which
+/// `[[sampler(n)]]` argument the pass has to answer for.
+fn get_render_texture_declarations(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<TextureBindingContract>, CodecError> {
+    let count = usize::from(decoder.u8()?);
+    if count > MAX_RENDER_TEXTURES {
+        return Err(CodecError::RenderTextureDeclarationCount {
+            count,
+            maximum: MAX_RENDER_TEXTURES,
+        });
+    }
+    let mut bindings = Vec::with_capacity(count);
+    for _ in 0..count {
+        let metal_binding = decoder.u32()?;
+        let access = get_texture_access(decoder)?;
+        let texture_type = get_texture_type(decoder)?;
+        let format = get_texture_format(decoder)?;
+        let form = decoder.u8()?;
+        let (sampler, runtime_sampler) = match form {
+            RENDER_TEXTURE_SAMPLER_STATIC => (
+                Some(SamplerPolicy {
+                    filter: get_sampler_filter(decoder)?,
+                    address: get_sampler_address(decoder)?,
+                }),
+                None,
+            ),
+            RENDER_TEXTURE_SAMPLER_RUNTIME => (None, Some(decoder.u32()?)),
+            RENDER_TEXTURE_SAMPLER_NONE => (None, None),
+            value => {
+                return Err(CodecError::UnknownEnumValue {
+                    field: "render texture sampler form",
+                    value,
+                })
+            }
+        };
+        bindings.push(TextureBindingContract {
+            metal_binding,
+            access,
+            texture_type,
+            format,
+            sampler,
+            runtime_sampler,
+            footprint: get_texture_footprint(decoder)?,
         });
     }
     Ok(bindings)
@@ -2015,7 +2248,11 @@ fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipel
             pipeline.contract.texture_bindings = get_compute_texture_declarations(decoder)?;
             None
         }
-        PIPELINE_KIND_RENDER | PIPELINE_KIND_RENDER_MRT | PIPELINE_KIND_RENDER_STAGE_BUFFERS => {
+        PIPELINE_KIND_RENDER
+        | PIPELINE_KIND_RENDER_MRT
+        | PIPELINE_KIND_RENDER_STAGE_BUFFERS
+        | PIPELINE_KIND_RENDER_TEXTURES
+        | PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES => {
             Some(get_render_pipeline_contract(decoder, kind)?)
         }
         tag => return Err(CodecError::UnknownPipelineTag(tag)),
@@ -2026,13 +2263,15 @@ fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipel
 /// Decode the render half of one pipeline-table entry.
 ///
 /// `kind` selects the shape of the format field and whether the declaration
-/// block follows it: `PIPELINE_KIND_RENDER` is a single format byte,
-/// `PIPELINE_KIND_RENDER_MRT` a length-prefixed list, and
+/// blocks follow it: `PIPELINE_KIND_RENDER` is a single format byte,
+/// `PIPELINE_KIND_RENDER_MRT` a length-prefixed list,
 /// `PIPELINE_KIND_RENDER_STAGE_BUFFERS` the same list plus the stage buffer
-/// declarations after the vertex layout (`research/docs/23` §3.3, v83). A
-/// list length outside `1..=MAX_COLOR_ATTACHMENTS` is refused rather than read
-/// as a shorter or longer entry, so a corrupt prefix cannot shift the vertex
-/// layout that follows it.
+/// declarations after the vertex layout (`research/docs/23` §3.3, v83), and
+/// `PIPELINE_KIND_RENDER_TEXTURES` / the combined kind the texture
+/// declarations after that (`v100`/`v102`). A list length outside
+/// `1..=MAX_COLOR_ATTACHMENTS` is refused rather than read as a shorter or
+/// longer entry, so a corrupt prefix cannot shift the vertex layout that
+/// follows it.
 fn get_render_pipeline_contract(
     decoder: &mut Decoder<'_>,
     kind: u8,
@@ -2051,8 +2290,21 @@ fn get_render_pipeline_contract(
         }
     };
     let vertex_layout = get_vertex_layout(decoder)?;
-    let stage_buffers = if kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS {
+    let stage_buffers = if kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS
+        || kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES
+    {
         get_stage_buffer_declarations(decoder)?
+    } else {
+        Vec::new()
+    };
+    // The texture declarations follow the stage buffer block when the tag
+    // carries both halves (`research/docs/23` §3.3, v100/v102), in the one
+    // order the encoder writes them. A kind the block does not belong to
+    // states the empty list every pre-v100 entry decodes to.
+    let textures = if kind == PIPELINE_KIND_RENDER_TEXTURES
+        || kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS_TEXTURES
+    {
+        get_render_texture_declarations(decoder)?
     } else {
         Vec::new()
     };
@@ -2062,7 +2314,7 @@ fn get_render_pipeline_contract(
         fragment_entry,
         color_formats,
         vertex_layout,
-        textures: Vec::new(),
+        textures,
     })
 }
 
@@ -2719,6 +2971,20 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         maximum: MAX_RENDER_STAGE_BUFFERS,
                     });
                 }
+                // The runtime sampler block follows the same rule one more
+                // time (`research/docs/23` §3.3, v102): the wide word has no
+                // bit left for the states the pass's `[[sampler(n)]]`
+                // arguments execute with, so a pass that binds one takes a tag
+                // of its own and every pre-v102 frame keeps its exact bytes.
+                // The list is bound before a single entry is written, exactly
+                // as its decoder bounds it.
+                let has_render_samplers = !pass.samplers.is_empty();
+                if has_render_samplers && pass.samplers.len() > MAX_RENDER_SAMPLERS {
+                    return Err(CodecError::RenderSamplerCount {
+                        count: pass.samplers.len(),
+                        maximum: MAX_RENDER_SAMPLERS,
+                    });
+                }
                 let wide = has_depth_store
                     || has_depth_resource
                     || has_stencil
@@ -2737,6 +3003,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     || wide
                     || has_render_textures
                     || has_stage_buffers
+                    || has_render_samplers
                 {
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
@@ -2764,7 +3031,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     if has_blend {
                         features |= RENDER_FEATURE_BLEND;
                     }
-                    if wide || has_render_textures || has_stage_buffers {
+                    if wide || has_render_textures || has_stage_buffers || has_render_samplers {
                         // The wide word's low byte is the narrow byte, so a
                         // decoder reads both tags through one section walker
                         // and only the extra bits differ.
@@ -2795,16 +3062,23 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         }
                         // The wide word is full, so each block the word has no
                         // bit for rides a tag of its own, and a pass that
-                        // carries both blocks takes the tag that appends
-                        // them in the one order the decoder reads
-                        // (`research/docs/23` §3.3, v70/v83). A pass with
-                        // neither block keeps the plain wide tag.
-                        let tag = match (has_render_textures, has_stage_buffers) {
-                            (false, false) => PASS_KIND_RENDER_EXT_WIDE,
-                            (true, false) => PASS_KIND_RENDER_SAMPLED,
-                            (false, true) => PASS_KIND_RENDER_STAGE_BUFFERS,
-                            (true, true) => PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS,
-                        };
+                        // carries more than one block takes the tag that
+                        // appends them in the one order the decoder reads
+                        // (`research/docs/23` §3.3, v70/v83/v102). A pass with
+                        // no block keeps the plain wide tag.
+                        let tag =
+                            match (has_render_textures, has_stage_buffers, has_render_samplers) {
+                                (false, false, false) => PASS_KIND_RENDER_EXT_WIDE,
+                                (true, false, false) => PASS_KIND_RENDER_SAMPLED,
+                                (false, true, false) => PASS_KIND_RENDER_STAGE_BUFFERS,
+                                (true, true, false) => PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS,
+                                (false, false, true) => PASS_KIND_RENDER_SAMPLERS,
+                                (true, false, true) => PASS_KIND_RENDER_SAMPLED_SAMPLERS,
+                                (false, true, true) => PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS,
+                                (true, true, true) => {
+                                    PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS
+                                }
+                            };
                         encoder.u8(tag);
                         encoder.u16(wide_features);
                         if has_render_textures {
@@ -2812,6 +3086,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         }
                         if has_stage_buffers {
                             put_stage_buffer_block(encoder, &pass.stage_buffers)?;
+                        }
+                        if has_render_samplers {
+                            put_render_sampler_block(encoder, &pass.samplers)?;
                         }
                     } else {
                         encoder.u8(PASS_KIND_RENDER_EXT);
@@ -3035,6 +3312,37 @@ fn put_stage_buffer_block(
     for view in views {
         encoder.u8(view.stage.code());
         put_view(encoder, &view.view);
+    }
+    Ok(())
+}
+
+/// Encode the runtime sampler block of a [`PASS_KIND_RENDER_SAMPLERS`] pass and
+/// its three combinations (`research/docs/23` §3.3, v102): a `u8` count and
+/// that many `(metal_binding, filter, address)` tuples.
+///
+/// Each entry is the state one `[[sampler(n)]]` argument executes with, and
+/// the entry's own `metal_binding` is that argument's Metal index, exactly as a
+/// texture view carries its own. The two state bytes are the codes
+/// [`put_sampler_filter`] / [`put_sampler_address`] write everywhere else, so
+/// the widened `v109` family crosses unchanged. The count is bound before a
+/// single entry is written, exactly as the decoder bounds it; the list's
+/// canonical-order and index rules stay the contract's
+/// (`validate_render_sampler_bindings`), which runs in admission.
+fn put_render_sampler_block(
+    encoder: &mut Encoder,
+    samplers: &[RenderSamplerBinding],
+) -> Result<(), CodecError> {
+    if samplers.len() > MAX_RENDER_SAMPLERS {
+        return Err(CodecError::RenderSamplerCount {
+            count: samplers.len(),
+            maximum: MAX_RENDER_SAMPLERS,
+        });
+    }
+    encoder.u8(samplers.len() as u8);
+    for sampler in samplers {
+        encoder.u32(sampler.metal_binding);
+        put_sampler_filter(encoder, sampler.policy.filter);
+        put_sampler_address(encoder, sampler.policy.address);
     }
     Ok(())
 }
@@ -3435,6 +3743,48 @@ fn get_trace_tagged(
                 }
                 TracePass::Render(get_render_sampled_stage_buffer_pass(decoder, features)?)
             }
+            // The runtime-sampler kind carries the same wide feature word and,
+            // right after it, the sampler block (`research/docs/23` §3.3,
+            // v102). An unknown bit is refused exactly as it is above: a
+            // section this decoder does not know cannot be skipped to reach
+            // the ones after it.
+            PASS_KIND_RENDER_SAMPLERS => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_sampler_pass(decoder, features)?)
+            }
+            // The three combined kinds write the blocks the tags above carry
+            // and then the sampler block after them, in the one order the
+            // encoder writes and this walk reads.
+            PASS_KIND_RENDER_SAMPLED_SAMPLERS => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_sampled_sampler_pass(decoder, features)?)
+            }
+            PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_stage_buffer_sampler_pass(decoder, features)?)
+            }
+            PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_sampled_stage_buffer_sampler_pass(
+                    decoder, features,
+                )?)
+            }
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -3562,6 +3912,80 @@ fn get_render_sampled_stage_buffer_pass(
     Ok(pass)
 }
 
+/// Decode the runtime-sampler render pass of [`PASS_KIND_RENDER_SAMPLERS`]
+/// (`research/docs/23` §3.3, v102).
+///
+/// The layout repeats the wide tag's — the same `u16` feature word, then the
+/// section walker below — with the sampler block read immediately after the
+/// word, where the encoder writes it. The block carries the states the pass's
+/// `[[sampler(n)]]` arguments execute with, so a decoded pass states the same
+/// list the owner sent instead of the empty list every pre-v102 frame decodes
+/// to.
+fn get_render_sampler_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let samplers = get_render_sampler_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.samplers = samplers;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the combined sampled-texture and runtime-sampler render pass of
+/// [`PASS_KIND_RENDER_SAMPLED_SAMPLERS`] (`research/docs/23` §3.3, v102).
+///
+/// The two blocks are read in the one order the encoder writes them — the
+/// texture block first — so the pairing's two halves travel in one frame and
+/// cannot be read in either order.
+fn get_render_sampled_sampler_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let textures = get_render_texture_block(decoder)?;
+    let samplers = get_render_sampler_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.textures = textures;
+    pass.samplers = samplers;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the combined stage-buffer and runtime-sampler render pass of
+/// [`PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS`] (`research/docs/23` §3.3,
+/// v102): the same walk, with the stage buffer block read first.
+fn get_render_stage_buffer_sampler_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let stage_buffers = get_stage_buffer_block(decoder)?;
+    let samplers = get_render_sampler_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.stage_buffers = stage_buffers;
+    pass.samplers = samplers;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the combined sampled-texture, stage-buffer and runtime-sampler render
+/// pass of [`PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS`]
+/// (`research/docs/23` §3.3, v102): all three blocks in the one order the
+/// encoder writes them — textures, stage buffers, then the sampler states.
+fn get_render_sampled_stage_buffer_sampler_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let textures = get_render_texture_block(decoder)?;
+    let stage_buffers = get_stage_buffer_block(decoder)?;
+    let samplers = get_render_sampler_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.textures = textures;
+    pass.stage_buffers = stage_buffers;
+    pass.samplers = samplers;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
 /// Decode one sampled-texture block (`research/docs/23` §3.3, v70): a `u8`
 /// count and that many full [`TextureView`]s.
 ///
@@ -3606,6 +4030,37 @@ fn get_stage_buffer_block(decoder: &mut Decoder<'_>) -> Result<Vec<StageBufferVi
         });
     }
     Ok(views)
+}
+
+/// Decode one runtime sampler block (`research/docs/23` §3.3, v102): a `u8`
+/// count and that many `(metal_binding, filter, address)` tuples.
+///
+/// The count is refused above the contract's own cap before a single entry is
+/// read, and each state byte goes through the named filter/address decoders, so
+/// a value this version does not know is refused by name rather than folded
+/// onto a neighbouring state: a filter or address the decoder guessed would
+/// change which texels a remote read returns.
+fn get_render_sampler_block(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<RenderSamplerBinding>, CodecError> {
+    let count = usize::from(decoder.u8()?);
+    if count > MAX_RENDER_SAMPLERS {
+        return Err(CodecError::RenderSamplerCount {
+            count,
+            maximum: MAX_RENDER_SAMPLERS,
+        });
+    }
+    let mut samplers = Vec::with_capacity(count);
+    for _ in 0..count {
+        samplers.push(RenderSamplerBinding {
+            metal_binding: decoder.u32()?,
+            policy: SamplerPolicy {
+                filter: get_sampler_filter(decoder)?,
+                address: get_sampler_address(decoder)?,
+            },
+        });
+    }
+    Ok(samplers)
 }
 
 /// Decode the optional sections an extended render pass's feature word names,
@@ -3866,12 +4321,14 @@ fn get_render_pass(
         stage_buffers: Vec::new(),
         blend: None,
         cull: None,
-        // The runtime sampler list is a request fact this frame format does not
-        // carry yet (`research/docs/23` §3.3, v102): a decoded pass states no
-        // sampler, so a remote owner's runtime-sampler pass is refused by the
+        // The runtime sampler list rides the tags of its own
+        // (`research/docs/23` §3.3, v102): every tag this base walker serves
+        // is a frame that predates the block, so a decoded pass states no
+        // sampler — the empty list every earlier frame meant — and a
+        // declaration that pairs a texture with one is refused by the
         // contract's own pair rules rather than executed under a state nobody
-        // stated — the same rule the texture declarations follow until their
-        // own carrying increment lands.
+        // stated. The same rule the texture declarations kept until their own
+        // carrying increment landed one tag over.
         samplers: Vec::new(),
         // A frame without the wide multisample bit runs the single-sample
         // raster every pre-v51 frame ran (`research/docs/23` §3.3, v51).
