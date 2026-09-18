@@ -122,6 +122,19 @@ rect = viewport ∩ scissor ∩ extent
 
 ## 6. 证据与复跑
 
+真机两轮（同一 exe，只差 `METAL_API_VULKAN_FULL_READBACK`，各 300 s，
+`evidence/readback-rect-3651d73-2026-09-19/`）的每提交均值：
+
+| bar | 增量臂（fp12） | 对照臂（fp12c） | 比值 |
+|---|---|---|---|
+| `total` | **5 462.0 µs** | 6 841.4 µs | 0.798 |
+| `render_readback` | **2 294.3 µs** | 3 624.0 µs | **0.633** |
+| `render_setup` | 954.8 µs | 1 016.5 µs | 0.939 |
+| 宿主读出的字节 | **11.63 GB**（0.259 个矩形附件/提交） | 15.82 GB | — |
+
+8 090 / 19 622 个 stored 附件（41.2%）走了矩形臂：**66.5 MB 顶替 7.15 GB**；
+剩下的整幅臂里 10 178 个是 `shape`（resident / 未定义 load），1 354 个是「矩形恰好是整幅」。
+
 ```sh
 W=/home/hiliang/hackintosh/worktrees/metal-readback-rect
 # 单元：矩形决策与重建的纯函数

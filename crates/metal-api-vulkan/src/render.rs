@@ -7150,8 +7150,9 @@ pub(crate) struct StageBufferReadback {
 struct AttachmentReadback<'a> {
     rect: Option<WrittenRect>,
     /// What the texels outside `rect` hold, which is the seed `record` opens the
-    /// pass's image with. `Some` exactly when `rect` is `Some`: a whole
-    /// readback needs no seed, because the frame *is* what the device copied.
+    /// pass's image with. Every `Some(rect)` carries one — a proof without the
+    /// bytes it is rebuilt from would name texels the rail cannot state — while
+    /// a whole readback may carry none: the frame *is* what the device copied.
     base: Option<ReadbackBase<'a>>,
     /// The attachment's whole tightly packed extent, in bytes: the length of the
     /// frame the readback publishes, and the copy-out length of a whole
