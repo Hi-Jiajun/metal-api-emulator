@@ -750,11 +750,15 @@ fn a_landing_window_of_another_length_is_refused_by_name() {
         allocation_id: LANDING_ALLOCATION,
         view_id: LANDING_VIEW,
     };
-    // Eight bytes of window against a sixteen-byte frame: the declaration has
-    // to be the frame's own tightly packed extent.
+    // A thirty-two-byte window against a sixteen-byte frame: the declaration
+    // has to be the frame's own tightly packed extent. (The window is twice the
+    // frame rather than half of it because a host import smaller than the
+    // device's own granularity is refused by some ICDs at buffer creation —
+    // Dozen on the RTX 5060 run does — and that refusal would be a reading about
+    // the import, not about this rail's own length rule.)
     let Some(fixture) = fixture(
         Some(landing),
-        8,
+        32,
         BufferSource::BorrowedNoCopy(SHORT_LANDING_LEASE),
         SHORT_LANDING_LEASE,
         false,
@@ -766,7 +770,13 @@ fn a_landing_window_of_another_length_is_refused_by_name() {
         return;
     };
     let mut window = AlignedBuffer::new(64 * 1024, alignment);
-    import_window(&provider, &mut window, 8, WINDOW_TEXEL, SHORT_LANDING_LEASE);
+    import_window(
+        &provider,
+        &mut window,
+        32,
+        WINDOW_TEXEL,
+        SHORT_LANDING_LEASE,
+    );
 
     let error = submit(&provider, &fixture.trace, &fixture.resources)
         .expect_err("a window of another length cannot receive the frame");
