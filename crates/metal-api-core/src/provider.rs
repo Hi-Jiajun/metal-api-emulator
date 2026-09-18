@@ -647,24 +647,60 @@ pub enum TextureFormat {
     /// UNORM byte orders — so an unsampled `rgba16_float` binding is refused by
     /// name rather than sampled with a module no review covered.
     Rgba16Float,
+    /// `VK_FORMAT_R8_UNORM` / `MTLPixelFormat::R8Unorm`.
+    ///
+    /// The first **single-channel** texel the texture list admits
+    /// (`research/docs/23` §113): the census's `texture_bind` bucket is
+    /// dominated by guest views whose every other axis is inside the render
+    /// sampler's window and whose texel is this one byte
+    /// (`evidence/gate3-census-v25b-2026-09-18/`, 1,778 of 1,785 rows), so the
+    /// contract has to be able to *name* it before any rail can execute a pass
+    /// that samples it. A sample of this format reads its one normalised
+    /// component into the shader's red channel, with the channels the format
+    /// does not carry filled by the API's own rule (green/blue zero, alpha
+    /// one) — the fixture's expected bytes follow from that rule rather than
+    /// from a device reading.
+    R8Unorm,
+    /// `VK_FORMAT_R8G8_UNORM` / `MTLPixelFormat::RG8Unorm`.
+    ///
+    /// The two-byte sibling of [`Self::R8Unorm`] (`research/docs/23` §113): the
+    /// census's `R8G8_UNORM` binds are 40 of the same 1,785 rows, and a sample
+    /// fills red and green from the texel's two bytes while blue and alpha keep
+    /// the API's fill rule. Both narrow formats are *sampling* sources only;
+    /// neither is a colour attachment, so [`AttachmentFormat`] does not name
+    /// them and an R8 view bound as a render target keeps its existing refusal.
+    R8G8Unorm,
 }
 
 impl TextureFormat {
     /// The formats the render sampler admits as a sampled texture source
-    /// (`research/docs/23` §3.3, §107), in the canonical order the rails'
-    /// capability lists name them: the two four-byte 8-bit UNORM byte orders.
+    /// (`research/docs/23` §3.3, §107, §113), in the canonical order the rails'
+    /// capability lists name them: the two four-byte 8-bit UNORM byte orders,
+    /// then the two narrow-channel formats.
     ///
-    /// Both name one texel the fragment stage reads as four normalised
+    /// The first two name one texel the fragment stage reads as four normalised
     /// components; which byte holds which channel is the *format's* fact, not
     /// the module's statement, exactly as the colour-attachment table's
     /// `rgba8_unorm`/`bgra8_unorm` pair is (`research/docs/23` §15/§78). The
     /// guest's own BGRA8 views are the census's dominant shape
     /// (`evidence/gate3-census-v13-2026-09-17/`), so the Vulkan rail's
-    /// capability snapshot advertises both; the native rail's reviewed table
-    /// stays narrower because its Apple-side reading is the increment that
-    /// would widen it (`metal-api-native/src/render.rs`,
+    /// capability snapshot advertises both.
+    ///
+    /// The two narrow formats carry one and two bytes per texel and are
+    /// therefore *not* a byte order of the same four components: a sample of
+    /// `r8_unorm` reads `(r, 0, 0, 1)` and `rg8_unorm` reads `(r, g, 0, 1)`
+    /// (`research/docs/23` §113). They join this list because it answers "which
+    /// formats may a render pass sample", which is a different question from
+    /// "which formats share the four-component layout". The native rail's
+    /// reviewed table stays narrower because its Apple-side reading is the
+    /// increment that would widen it (`metal-api-native/src/render.rs`,
     /// `SUPPORTED_RENDER_TEXTURE_FORMATS`).
-    pub const RENDER_SAMPLED: [Self; 2] = [Self::Rgba8Unorm, Self::Bgra8Unorm];
+    pub const RENDER_SAMPLED: [Self; 4] = [
+        Self::Rgba8Unorm,
+        Self::Bgra8Unorm,
+        Self::R8Unorm,
+        Self::R8G8Unorm,
+    ];
 
     /// Tightly packed bytes one texel occupies in this format. Sampling and
     /// row padding are provider concerns; this is the byte extent the contract
@@ -674,6 +710,8 @@ impl TextureFormat {
             Self::R32Uint | Self::R32Float => 4,
             Self::Rgba8Unorm | Self::Bgra8Unorm => 4,
             Self::Rgba16Float => 8,
+            Self::R8Unorm => 1,
+            Self::R8G8Unorm => 2,
         }
     }
 }
@@ -9266,8 +9304,12 @@ pub struct ProviderCapabilities {
     /// Texture formats this snapshot admits as render-pass sampling sources.
     /// Empty means none; the render sampler admits
     /// [`TextureFormat::RENDER_SAMPLED`] — the two four-byte 8-bit UNORM byte
-    /// orders (`research/docs/23` §107) — and a snapshot that executes only
-    /// one of them names only that one. Compared by value rather than by wire
+    /// orders and, since the narrow lanes landed, the one- and two-byte
+    /// formats (`research/docs/23` §107/§113) — and a snapshot that executes
+    /// fewer than all of them names only those. The list answers which formats
+    /// a pass may *sample*; the narrow members carry no four-component layout,
+    /// so their samples fill the channels the format lacks by the API's own
+    /// rule rather than by a byte order. Compared by value rather than by wire
     /// code so the contract's own enum is the single vocabulary, exactly as
     /// [`Self::supported_color_formats`] is.
     pub supported_render_texture_formats: Vec<TextureFormat>,
@@ -22052,12 +22094,84 @@ mod tests {
             .admit(&bgra, &landing_resources())
             .expect("a snapshot that names both byte orders admits the BGRA8 bind");
 
+        // The narrow lanes (`research/docs/23` §113): the same three bits'
+        // question once the snapshot names the one- and two-byte formats. The
+        // pass's view and the pipeline's declaration agree on `R8Unorm` here,
+        // so the snapshot's own format list is again what decides — the
+        // four-byte-only snapshot refuses the pair by name and the widened
+        // window admits it.
+        let mut narrow = render_texture_trace();
+        render_entry(&mut narrow).textures[0].format = TextureFormat::R8Unorm;
+        narrow.pipelines[0].render.as_mut().unwrap().textures[0].format = TextureFormat::R8Unorm;
+        // One byte per texel, not four (`research/docs/23` §113): the source a
+        // narrow view states is its own one-byte-extent, which is exactly the
+        // reading `bytes_per_texel` decides the length against.
+        match &mut render_entry(&mut narrow).textures[0].source {
+            TextureSource::OwnedBytes(bytes) => bytes.truncate(16),
+            other => panic!("the fixture's source is its own bytes, not {other:?}"),
+        }
+        narrow
+            .validate()
+            .expect("the R8 pair is structurally valid");
+        let four_byte_only = render_texture_capabilities();
+        let refusal = four_byte_only
+            .admit(&narrow, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("R8Unorm".to_owned()))
+        );
+        let mut narrow_window = render_texture_capabilities();
+        narrow_window.supported_render_texture_formats = TextureFormat::RENDER_SAMPLED.to_vec();
+        narrow_window
+            .admit(&narrow, &landing_resources())
+            .expect("a snapshot that names the narrow lanes admits the R8 bind");
+
         // A pass that binds no texture never enters the walk, so every pre-v70
         // trace keeps the admission path it had.
         let plain = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
         render_capabilities()
             .admit(&plain, &landing_resources())
             .expect("the pre-v70 pass keeps admitting without the bits");
+    }
+
+    #[test]
+    fn the_narrow_sampled_formats_are_one_and_two_byte_texels() {
+        // The narrow lanes (`research/docs/23` §113): the census's `R8_UNORM`
+        // and `R8G8_UNORM` binds are the same sampled-texel vocabulary one and
+        // two bytes wide, so the contract's own per-texel width is where their
+        // size lives. The five formats before them keep their readings, and
+        // the sampler-admitted members are exactly the readable window in the
+        // canonical order the capability lists state.
+        assert_eq!(TextureFormat::R8Unorm.bytes_per_texel(), 1);
+        assert_eq!(TextureFormat::R8G8Unorm.bytes_per_texel(), 2);
+        let existing = [
+            (TextureFormat::R32Uint, 4),
+            (TextureFormat::R32Float, 4),
+            (TextureFormat::Rgba8Unorm, 4),
+            (TextureFormat::Bgra8Unorm, 4),
+            (TextureFormat::Rgba16Float, 8),
+        ];
+        for (format, bytes) in existing {
+            assert_eq!(format.bytes_per_texel(), bytes);
+        }
+        assert_eq!(
+            TextureFormat::RENDER_SAMPLED,
+            [
+                TextureFormat::Rgba8Unorm,
+                TextureFormat::Bgra8Unorm,
+                TextureFormat::R8Unorm,
+                TextureFormat::R8G8Unorm,
+            ]
+        );
+        // A narrow format is a sampling source only: the colour-attachment
+        // table is untouched, so an R8 view bound as a render target keeps the
+        // refusal it had.
+        assert!(!AttachmentFormat::ADMITTED.iter().any(|format| {
+            format.as_texture_format() == TextureFormat::R8Unorm
+                || format.as_texture_format() == TextureFormat::R8G8Unorm
+        }));
     }
 
     /// The render texture face's binding rules (`research/docs/23` §3.3,

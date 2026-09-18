@@ -4026,6 +4026,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // case runs on the Vulkan rails alone (the stages are the translator's),
         // so this table pins the declaring pass, which every rail executes.
         (1, "compute-buffer-v36") => &["render_declaring_gathered_extent"],
+        // The render sampler's narrow lanes (`research/docs/23` §3.3, §113):
+        // the declaring pass of the render case whose sampled texture is
+        // one-byte `r8_unorm`. Its render case runs on the Vulkan rails alone
+        // (this provider's reviewed table names the four-component surface),
+        // so this table pins the declaring pass, which every rail executes.
+        (1, "compute-buffer-v37") => &["render_declaring_quad_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4269,17 +4275,22 @@ struct FragmentTextureDefinition {
 
 impl FragmentTextureDefinition {
     /// The `TextureFormat` this declaration names (`research/docs/23` §3.3,
-    /// §107): the two four-byte 8-bit UNORM byte orders the render sampler
-    /// admits. Which byte holds which channel is the format's own fact, so the
-    /// declared name travels into the trace and the object rail's texture
-    /// handle rather than being normalised to one of them.
+    /// §107, §113): the render sampler's four admitted lanes — the two
+    /// four-byte 8-bit UNORM byte orders and the two narrow formats. Which byte
+    /// holds which channel is the format's own fact, so the declared name
+    /// travels into the trace and the object rail's texture handle rather than
+    /// being normalised to one of them; a narrow format's missing channels are
+    /// the API's own fill rather than a byte of its source.
     fn format(&self) -> Result<TextureFormat> {
         match self.format.as_str() {
             "rgba8_unorm" => Ok(TextureFormat::Rgba8Unorm),
             "bgra8_unorm" => Ok(TextureFormat::Bgra8Unorm),
+            "r8_unorm" => Ok(TextureFormat::R8Unorm),
+            "rg8_unorm" => Ok(TextureFormat::R8G8Unorm),
             other => Err(format!(
-                "the reviewed sampling stage reads one 8-bit four-component unorm surface, in \
-                 either byte order (rgba8_unorm/bgra8_unorm), not {other:?}"
+                "the reviewed sampling stage reads one 8-bit unorm surface, in either \
+                 four-component byte order (rgba8_unorm/bgra8_unorm) or in the narrow \
+                 r8_unorm/rg8_unorm lanes, not {other:?}"
             )
             .into()),
         }
@@ -4290,10 +4301,11 @@ impl FragmentTextureDefinition {
         match (&self.initial_hex, &self.texel_rule) {
             (Some(hex_), None) => {
                 let bytes = unhex(hex_)?;
+                let stride = self.format()?.bytes_per_texel();
                 let expected = self
                     .width
                     .checked_mul(self.height)
-                    .and_then(|texels| texels.checked_mul(4))
+                    .and_then(|texels| texels.checked_mul(stride))
                     .ok_or("texture extent overflows")?;
                 if bytes.len() as u64 != expected {
                     return Err("the uploaded texels do not match the extent".into());
@@ -4385,12 +4397,36 @@ fn sampled_expectation(
     };
     let source = slots(texture);
     let target = slots(attachment.as_texture_format());
-    let mut wanted = Vec::with_capacity(texels.len());
-    for offset in (0..texels.len()).step_by(4) {
-        let texel = &texels[offset..offset + 4];
+    // The sampled texel as four bytes: a four-component format reads its own
+    // memory order, while a narrow format reads its one or two bytes with the
+    // channels it does not carry filled by the API's sampling rule
+    // (`research/docs/23` §113) — zero for green and blue, one for alpha. The
+    // fill is why this is a *derivation* rather than a copy for the narrow
+    // lanes: a rail that logged the byte into another lane would land a
+    // different frame.
+    let sampled = |texel: &[u8]| -> [u8; 4] {
+        let mut value = [0u8, 0, 0, 0xff];
+        match texture {
+            TextureFormat::R8Unorm => value[0] = texel[0],
+            TextureFormat::R8G8Unorm => {
+                value[0] = texel[0];
+                value[1] = texel[1];
+            }
+            _ => {
+                for channel in 0..4 {
+                    value[channel] = texel[usize::from(source[channel])];
+                }
+            }
+        }
+        value
+    };
+    let stride = texture.bytes_per_texel() as usize;
+    let mut wanted = Vec::with_capacity((texels.len() / stride) * 4);
+    for texel in texels.chunks_exact(stride) {
+        let value = sampled(texel);
         let mut out = [0_u8; 4];
         for channel in 0..4 {
-            out[usize::from(target[channel])] = texel[usize::from(source[channel])];
+            out[usize::from(target[channel])] = value[channel];
         }
         wanted.extend_from_slice(&out);
     }
@@ -5705,18 +5741,24 @@ fn reviewed_sampled_geometry(
         )
         .into());
     }
-    let unique = texels
+    // The distinctness and clear-collision scans run over the *frame's* texels
+    // rather than the source's bytes (`research/docs/23` §113): a narrow source
+    // states one or two bytes per texel, so its distinctness is the distinctness
+    // of the four-component texel each one is read out as, and a source texel
+    // that equals the clear colour only matters if the attachment would carry
+    // that colour.
+    let frame_texels = expected
         .chunks_exact(4)
-        .map(|texel| texel.to_vec())
+        .map(<[u8]>::to_vec)
         .collect::<std::collections::BTreeSet<_>>();
-    if unique.len() != texels.len() / 4 {
+    if frame_texels.len() != texels.len() / texture_format.bytes_per_texel() as usize {
         return Err(format!(
-            "{where_}.fragment_textures[0]: the uploaded texels have to be pairwise distinct, or \
+            "{where_}.fragment_textures[0]: the frame's texels have to be pairwise distinct, or \
              a repeated read could pass"
         )
         .into());
     }
-    if unique.contains(&clear) {
+    if frame_texels.contains(&clear) {
         return Err(format!(
             "{where_}.fragment_textures[0]: an uploaded texel equals the clear colour, so \
              ignoring the texture could pass"

@@ -4454,6 +4454,75 @@ mod tests {
     }
 
     #[test]
+    fn the_narrow_texture_format_codes_are_appended_and_read_back() {
+        // The narrow lanes (`research/docs/23` §113): the wire's texture-format
+        // code is the *last* byte of the render-sampler block, so a snapshot
+        // declaring one format is one frame whose tail is that code. The five
+        // codes before this increment keep their values — a renumbering would
+        // read an old frame as another format — and the two narrow formats are
+        // appended at 5 and 6.
+        let codes = [
+            (TextureFormat::R32Uint, 0u8),
+            (TextureFormat::R32Float, 1),
+            (TextureFormat::Rgba8Unorm, 2),
+            (TextureFormat::Bgra8Unorm, 3),
+            (TextureFormat::Rgba16Float, 4),
+            (TextureFormat::R8Unorm, 5),
+            (TextureFormat::R8G8Unorm, 6),
+        ];
+        for (format, code) in codes {
+            let mut capabilities = fake_capabilities();
+            capabilities.supports_render_passes = true;
+            capabilities.max_color_attachments = 1;
+            capabilities.max_attachment_dimension = [2, 2];
+            capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+            capabilities.supports_render_texture_sampling = true;
+            capabilities.max_render_textures = 1;
+            capabilities.supported_render_texture_formats = vec![format];
+            let response = CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities,
+            };
+            let frame = CommandCodec::encode_response(&response).unwrap();
+            assert_eq!(frame.last(), Some(&code), "{format:?} travels as {code}");
+            assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn a_legacy_decoder_refuses_the_narrow_codes_by_name() {
+        // The other direction of the same append (`research/docs/23` §113): a
+        // frame from a future version that names a code this one has never
+        // assigned is refused whole rather than read as an older format. The
+        // code sits in the render-sampler block's format list, so the patched
+        // byte is the frame's last one.
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_texture_sampling = true;
+        capabilities.max_render_textures = 1;
+        capabilities.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        })
+        .unwrap();
+        for unknown in [7u8, 0x80, 0xff] {
+            let mut patched = frame.clone();
+            *patched.last_mut().expect("the frame is non-empty") = unknown;
+            assert!(matches!(
+                CommandCodec::decode_response(&patched),
+                Err(CodecError::UnknownEnumValue {
+                    field: "texture format",
+                    value,
+                }) if value == unknown
+            ));
+        }
+    }
+
+    #[test]
     fn stage_buffer_capability_bits_round_trip_and_extend_the_render_texture_frame() {
         let mut capabilities = fake_capabilities();
         capabilities.supports_render_passes = true;

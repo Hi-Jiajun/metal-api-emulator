@@ -8590,6 +8590,55 @@ mod tests {
         assert_eq!(error.slug, "render_texture_source_unsupported");
     }
 
+    /// The narrow lanes are the *other* rail's widening and stay refused here
+    /// (`research/docs/23` §113).
+    ///
+    /// Metal can express both formats (`.r8Unorm` / `.rg8Unorm`), but this rail
+    /// executes its reviewed MSL module and declares exactly the formats that
+    /// review covers; a snapshot that listed a format it refuses would be a
+    /// claim without a reading. So both narrow formats keep the format
+    /// refusal, with the same slug and the same fields as every other
+    /// unadmitted format, and the refusal happens before the first Metal
+    /// object exists (the plan step is where it lands).
+    #[test]
+    fn the_narrow_sampled_formats_stay_refused_by_name() {
+        let sampled = sampled_pipeline();
+        for format in [TextureFormat::R8Unorm, TextureFormat::R8G8Unorm] {
+            let mut pass = sampled_pass(4);
+            let mut view = sampled_texture_view(4);
+            view.format = format;
+            // One byte and two bytes per texel (`TextureFormat::bytes_per_texel`):
+            // the arm's own byte extent, so the contract's length rule is not
+            // the one that answers.
+            view.source =
+                TextureSource::OwnedBytes(vec![0x5a; (4 * 4 * format.bytes_per_texel()) as usize]);
+            pass.textures = vec![view];
+            let mut pipeline = sampled.clone();
+            pipeline.textures[0].format = format;
+            let error = plan_pass(&OffscreenRenderRequest {
+                pass: &pass,
+                pipeline: &pipeline,
+                source: REVIEWED_SAMPLED_SOURCE,
+                initial: vec![None],
+                resident: Vec::new(),
+            })
+            .unwrap_err();
+            eprintln!("{format:?} refused: {error:?}");
+            assert_eq!(error.slug, "render_texture_format_unsupported");
+            assert_eq!(
+                error.fields.get("format"),
+                Some(&metal_api_core::provider::FieldValue::Text(format!(
+                    "{format:?}"
+                ))),
+                "the refusal names the format it read"
+            );
+            assert_eq!(
+                error.fields.get("binding"),
+                Some(&metal_api_core::provider::FieldValue::Unsigned(0))
+            );
+        }
+    }
+
     /// The declaration repeats the state the reviewed module's own `constexpr
     /// sampler` carries (`research/docs/23` §3.3, v100).
     ///
@@ -8756,6 +8805,16 @@ mod tests {
             bits.supported_render_texture_formats,
             vec![TextureFormat::Rgba8Unorm]
         );
+        // The narrow lanes belong to the other rail (`research/docs/23` §113):
+        // Metal can express `.r8Unorm` / `.rg8Unorm`, but this rail's table is
+        // the reviewed MSL module's window, so a snapshot that listed either
+        // one would claim a shape whose Apple-side reading does not exist yet.
+        for narrow in [TextureFormat::R8Unorm, TextureFormat::R8G8Unorm] {
+            assert!(
+                !bits.supported_render_texture_formats.contains(&narrow),
+                "{narrow:?} belongs to the widened rail, not this one"
+            );
+        }
         // The gathered extent is this rail's own boundary rather than a
         // missing measurement (`research/docs/23` §3.3, E-TX10): every sampled
         // source of another extent is refused by name, so the declaration

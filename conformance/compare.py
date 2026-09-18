@@ -120,38 +120,92 @@ MAX_READBACK_WINDOWS = 8
 MAX_READBACK_WINDOW_DIMENSION = 64
 
 # The sampled textures the render sampler admits (`research/docs/23` §3.3,
-# §107), in the order the rails' capability lists name them: the two four-byte
-# 8-bit UNORM byte orders. A case's sampled texture and its colour attachment
-# may name either one, and the case's hex expectation is the sampled *colours*
-# spelled in the attachment's own order — which is what the slot table below
-# computes. The rule form stays the same-format pair's, because its closed-form
-# expectation is stated over one layout.
-SAMPLED_TEXTURE_FORMATS = ("rgba8_unorm", "bgra8_unorm")
+# §107, §113), in the order the rails' capability lists name them: the two
+# four-byte 8-bit UNORM byte orders and the two narrow lanes. A sampled
+# texture may name any of the four; the colour attachment stays one of the two
+# four-component layouts, and the case's hex expectation is the sampled
+# *colours* spelled in the attachment's own order — which is what the slot
+# table below computes. A narrow source's missing channels are the API
+# sampling rule's own fill (zero, and one for alpha), so its expectation is a
+# derivation rather than a copy. The rule form stays the same four-component
+# pair's, because its closed-form expectation is stated over one layout.
+SAMPLED_TEXTURE_FORMATS = ("rgba8_unorm", "bgra8_unorm", "r8_unorm", "rg8_unorm")
+# The colour attachment's admitted layouts: the sampled shape renders into the
+# eight-bit four-component surface both rails read back, which is what the
+# loaded clear colour is stated in.
+COLOUR_ATTACHMENT_FORMATS = ("rgba8_unorm", "bgra8_unorm")
 # The byte slot each channel occupies in one 8-bit four-component layout: the
 # two layouts differ in the red and blue halves alone.
 SAMPLED_CHANNEL_SLOTS = {
     "rgba8_unorm": {"red": 0, "green": 1, "blue": 2, "alpha": 3},
     "bgra8_unorm": {"red": 2, "green": 1, "blue": 0, "alpha": 3},
 }
+# How many bytes one texel of each sampled format occupies, and which of its
+# channels the format itself carries (`research/docs/23` §113). The channels a
+# narrow format does not carry keep the sampling rule's fill.
+SAMPLED_TEXEL_BYTES = {
+    "rgba8_unorm": 4,
+    "bgra8_unorm": 4,
+    "r8_unorm": 1,
+    "rg8_unorm": 2,
+}
+SAMPLED_FILL = {"r8_unorm": {"green": 0x00, "blue": 0x00, "alpha": 0xff},
+                "rg8_unorm": {"blue": 0x00, "alpha": 0xff}}
 
 
-def _sampled_expectation(texture_format, attachment_format, texels):
+def _sampled_expectation(texture_format, attachment_format, texels, texel_count=None):
     """The sampled colours of `texels`, spelled in the attachment's own order.
 
     `texels` are the texture's memory bytes as the fixture declares them; a
     texel-centre sample is an identity copy, so the attachment holds the same
     colours. When the two sides name the same layout the bytes are the same
     byte for byte; across the two layouts every texel is the red/blue swap of
-    the other (`research/docs/23` §107).
+    the other (`research/docs/23` §107). A narrow source states one or two
+    bytes per texel and the sampling rule fills the channels it does not carry
+    (`research/docs/23` §113), so the expectation is that fill spelled in the
+    attachment's own order.
+
+    `texel_count` is the extent's own texel count when the caller knows it: a
+    narrow source's byte string is *shorter* than the frame it derives, so the
+    count cannot be read off `texels` for those lanes.
     """
-    source = SAMPLED_CHANNEL_SLOTS[texture_format]
     target = SAMPLED_CHANNEL_SLOTS[attachment_format]
-    slots = [0, 0, 0, 0]
-    for channel in ("red", "green", "blue", "alpha"):
-        slots[target[channel]] = source[channel]
-    return bytes(texels[offset + slots[index]]
-                 for offset in range(0, len(texels), 4)
-                 for index in range(4))
+    # Where each of the four sampled channels comes from in the source's own
+    # texel: a byte slot for a layout that carries it, the sampling rule's fill
+    # for a narrow format that does not.
+    stride = SAMPLED_TEXEL_BYTES[texture_format]
+    if texture_format in SAMPLED_CHANNEL_SLOTS:
+        slots = SAMPLED_CHANNEL_SLOTS[texture_format]
+        source = {channel: slots[channel] for channel in slots}
+    else:
+        # A narrow format carries one or two channels and the sampling rule
+        # fills the rest: a channel with no byte slot has that rule's value.
+        fill = SAMPLED_FILL[texture_format]
+        source = {"red": 0,
+                  "green": 1 if "green" not in fill else None,
+                  "blue": None,
+                  "alpha": None}
+    # A caller that states the extent's texel count means the *whole* extent;
+    # the derivation never reads past the bytes it was handed, so a source
+    # shorter than that count derives what it can and the caller's own length
+    # rule is what refuses the short spelling.
+    count = len(texels) // stride
+    if texel_count is not None:
+        count = min(count, texel_count)
+    wanted = bytearray()
+    for index in range(count):
+        offset = index * stride
+        order = [None, None, None, None]
+        for channel in ("red", "green", "blue", "alpha"):
+            slot = source[channel]
+            if texture_format in SAMPLED_CHANNEL_SLOTS:
+                order[target[channel]] = texels[offset + slot]
+            elif slot is None:
+                order[target[channel]] = fill[channel]
+            else:
+                order[target[channel]] = texels[offset + slot]
+        wanted.extend(order)
+    return bytes(wanted)
 
 
 def _rule_texel(rule, x, y):
@@ -2409,13 +2463,15 @@ def _render_plan(plan, suite):
             texture_format = _string(texture.get("format"), f"{texture_where}.format")
             _require(texture_format in SAMPLED_TEXTURE_FORMATS,
                      f"{texture_where}: the reviewed sampling stage reads one 8-bit "
-                     "four-component unorm surface, in either byte order "
-                     "(rgba8_unorm/bgra8_unorm)")
+                     "unorm surface, in either four-component byte order "
+                     "(rgba8_unorm/bgra8_unorm) or in the narrow r8_unorm/rg8_unorm "
+                     "lanes")
             attachment_format = _string(attachment.get("format"),
                                         f"{where}.attachment.format")
-            _require(attachment_format in SAMPLED_TEXTURE_FORMATS,
+            _require(attachment_format in COLOUR_ATTACHMENT_FORMATS,
                      f"{where}.attachment: the sampled shape's colour attachment is one "
-                     "8-bit four-component unorm surface, in either byte order")
+                     "8-bit four-component unorm surface, in either byte order "
+                     "(rgba8_unorm/bgra8_unorm)")
             if translated is None:
                 _require(texture.get("width") == attachment.get("width")
                          and texture.get("height") == attachment.get("height"),
@@ -2481,18 +2537,34 @@ def _render_plan(plan, suite):
                          f"{where}: readback windows travel with the texture's own texel rule")
                 texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
                 expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
-                chunks = [texels[offset:offset + 4] for offset in range(0, len(texels), 4)]
-                _require(len(chunks) == texture_width * texture_height,
-                         f"{texture_where}: the uploaded texels do not match the extent")
-                _require(len(set(chunks)) == len(chunks),
-                         f"{texture_where}: the uploaded texels have to be pairwise distinct, "
-                         "or a repeated read could pass")
-                _require(clear not in chunks,
-                         f"{texture_where}: an uploaded texel equals the clear colour, so a "
-                         "rail that ignored the texture could pass")
+                # The texels the *frame* carries, not the source's bytes
+                # (`research/docs/23` §113): a narrow source states one or two
+                # bytes per texel, so the distinctness and clear-collision scans
+                # run over the four-component texel each one is read out as. The
+                # frame is the render area's, which the same-extent window makes
+                # equal to the source's and the gathered arm states separately.
                 if translated is None:
+                    # The source's own byte extent, one texel wide for a narrow
+                    # lane (`research/docs/23` §113): a spelling that disagrees
+                    # with it states bytes the texture does not have, so the
+                    # length rule answers before the expectation is derived.
+                    _require(len(texels) == texture_width * texture_height
+                             * SAMPLED_TEXEL_BYTES[texture_format],
+                             f"{texture_where}: texture initial length does not match "
+                             "its extent")
+                    chunks = [expected[offset:offset + 4]
+                              for offset in range(0, len(expected), 4)]
+                    _require(len(chunks) == texture_width * texture_height,
+                             f"{texture_where}: the frame's texels do not match the extent")
+                    _require(len(set(chunks)) == len(chunks),
+                             f"{texture_where}: the frame's texels have to be pairwise "
+                             "distinct, or a repeated read could pass")
+                    _require(clear not in chunks,
+                             f"{texture_where}: a frame texel equals the clear colour, so a "
+                             "rail that ignored the texture could pass")
                     _require(expected == _sampled_expectation(texture_format, attachment_format,
-                                                              texels),
+                                                              texels,
+                                                              texture_width * texture_height),
                              f"{where}: the expectation has to be the uploaded texels in the "
                              "attachment's own byte order: the sampling stage's sample at a "
                              "texel centre is an identity copy")

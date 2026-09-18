@@ -1047,13 +1047,13 @@ impl StageBufferSlot {
 /// rail uploads these bytes into an image of its own, exactly as the compute
 /// rail uploads a pass's texture bindings; the no-copy arm imports the owner's
 /// own pages as the copy's transfer source instead (`research/docs/23` §75,
-/// R5c). The render sampler executes one 8-bit four-component UNORM 2D surface
-/// — `rgba8_unorm` or `bgra8_unorm`, whichever the view itself names
-/// (`research/docs/23` §107) — read at the render area's own extent: a view of
-/// another extent is read through the destination grid before it is uploaded
-/// (`research/docs/23` §111, E-TX5), so the surface the fragment stage samples
-/// is always the render area's and every fragment still stands on a texel
-/// centre of the bytes it reads.
+/// R5c). The render sampler executes one 8-bit UNORM 2D surface — the four
+/// byte orders/lanes `rgba8_unorm`, `bgra8_unorm`, `r8_unorm` or `rg8_unorm`,
+/// whichever the view itself names (`research/docs/23` §107/§113) — read at
+/// the render area's own extent: a view of another extent is read through the
+/// destination grid before it is uploaded (`research/docs/23` §111, E-TX5), so
+/// the surface the fragment stage samples is always the render area's and
+/// every fragment still stands on a texel centre of the bytes it reads.
 pub(crate) struct OffscreenRenderTexture<'a> {
     /// Where the texture's tightly packed, row-major texel bytes come from.
     /// The arms are the [`TextureSource`] arms, resolved before any device
@@ -1082,6 +1082,13 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// descriptor's channel mapping stays Vulkan's identity default and the
     /// guest's own channel order is what the fragment stage reads.
     pub format: vk::Format,
+    /// Tightly packed bytes one texel of those bytes occupies
+    /// (`research/docs/23` §113): four for the two four-component byte orders,
+    /// one and two for the narrow lanes. The upload derives its row pitch from
+    /// this, because a narrow surface's rows are not `width * 4` bytes apart
+    /// and the pre-v113 spelling would land every row after the first inside
+    /// the previous one.
+    pub texel_bytes: u64,
     /// The descriptor slot the fragment stage reads this texture from, and the
     /// sampler state it samples it with (`research/docs/23` §3.3, v100). The
     /// slot is the reviewed pair's own binding order or the one a translated
@@ -1089,6 +1096,22 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// the module's AIR state, which the registration gate has already held the
     /// contract's declaration to.
     pub slot: RenderTextureSlot,
+}
+
+/// One sampled texture's freshly created image and what an upload needs of it
+/// (`research/docs/23` §3.3, §113): the object pair, the driver's own memory
+/// requirements, the extent and the format's texel width. Grouped so the
+/// upload's own signature carries one thing per question instead of five
+/// positional values.
+struct RenderTextureImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    requirements: vk::MemoryRequirements,
+    width: u32,
+    height: u32,
+    /// Tightly packed bytes one texel occupies: four for the two
+    /// four-component byte orders, one and two for the narrow lanes.
+    texel_bytes: u64,
 }
 
 /// The depth attachment one offscreen pass opens (`research/docs/23` §3.3,
@@ -2419,8 +2442,9 @@ fn translated_texture_pairs(
                 .with_field("binding", index)
                 .with_field("format", FieldValue::Text(format!("{:?}", declared.format)))
                 .with_detail(
-                    "the render sampler uploads and reads one 8-bit four-component unorm \
-                     surface, in either byte order (`rgba8_unorm`/`bgra8_unorm`)",
+                    "the render sampler uploads and reads an 8-bit unorm surface — the two \
+                     four-component byte orders (`rgba8_unorm`/`bgra8_unorm`) or the narrow \
+                     `r8_unorm`/`rg8_unorm` lanes — and refuses every other format by name",
                 ));
         }
         // Whether the module samples this texture or texel-fetches it is the
@@ -4435,10 +4459,10 @@ fn prepare_render_request_with_resident<'a>(
 /// single-sample requirement, and the pass's list the canonical order and the
 /// index bound (`RenderPassDescriptor::validate`); this is the rail's own
 /// window, restated for a directly-constructed pass and narrowed to what the
-/// reviewed sampling module covers: one 8-bit four-component UNORM 2D surface
-/// (`rgba8_unorm`/`bgra8_unorm`, `research/docs/23` §107). A view whose extent
-/// is not the render area's is answered by which module reads it
-/// (`research/docs/23` §111, E-TX5):
+/// reviewed sampling module covers: one 8-bit UNORM 2D surface in one of the
+/// four admitted lanes (`rgba8_unorm`/`bgra8_unorm`/`r8_unorm`/`rg8_unorm`,
+/// `research/docs/23` §107/§113). A view whose extent is not the render area's
+/// is answered by which module reads it (`research/docs/23` §111, E-TX5):
 ///
 /// * the *reviewed* pair samples at the fragment's own normalized centre, so
 ///   the rail resolves that centre's texel itself — the destination grid —
@@ -4500,9 +4524,11 @@ fn resolve_render_textures<'a>(
                 .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
                 .with_detail(
-                    "the reviewed sampling module reads one 8-bit four-component unorm \
-                     surface, in either byte order (`rgba8_unorm`/`bgra8_unorm`); which byte \
-                     holds which channel is the view's own format fact",
+                    "the reviewed sampling module reads one 8-bit unorm surface in either \
+                     four-component byte order (`rgba8_unorm`/`bgra8_unorm`) or in the narrow \
+                     `r8_unorm`/`rg8_unorm` lanes; which byte holds which channel is the \
+                     view's own format fact, and a narrow format's missing channels are the \
+                     API's own fill (zero, and one for alpha)",
                 ));
         }
         if view.texture_type != TextureType::D2
@@ -4593,6 +4619,7 @@ fn resolve_render_textures<'a>(
             gathered,
             extent: upload_extent,
             format: render_texture_vk_format(view.format)?,
+            texel_bytes: view.format.bytes_per_texel(),
             slot: slots[position],
         });
     }
@@ -6145,29 +6172,37 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
 }
 
 /// The `VkFormat` a sampled render texture's own `TextureFormat` names
-/// (`research/docs/23` §3.3, §107).
+/// (`research/docs/23` §3.3, §107, §113).
 ///
-/// The two admitted formats are the same four-byte 8-bit UNORM texel in two
-/// byte orders, which is what the census's BGRA8 binds state
-/// (`evidence/gate3-census-v13-2026-09-17/`): the guest view's
-/// `B8G8R8A8_UNORM` texels are uploaded into the image the *name* selects, so
-/// the fragment stage reads the channels the guest's own view states and no
-/// component mapping is needed — [`crate::create_color_image_view`] leaves the
-/// descriptor's mapping at Vulkan's identity default. A format outside the
-/// window is refused with the view's own name rather than uploaded under
-/// another.
+/// The four admitted formats are two four-byte 8-bit UNORM byte orders plus
+/// the one- and two-byte narrow lanes. The first pair is what the census's
+/// BGRA8 binds state (`evidence/gate3-census-v13-2026-09-17/`): the guest
+/// view's `B8G8R8A8_UNORM` texels are uploaded into the image the *name*
+/// selects, so the fragment stage reads the channels the guest's own view
+/// states and no component mapping is needed — [`crate::create_color_image_view`]
+/// leaves the descriptor's mapping at Vulkan's identity default. The narrow
+/// pair is the same rule one and two bytes wide
+/// (`evidence/gate3-census-v25b-2026-09-18/`): `VK_FORMAT_R8_UNORM` and
+/// `VK_FORMAT_R8G8_UNORM` carry the texel's own bytes, and Vulkan's sampling
+/// rule fills the channels the format lacks (zero for green/blue, one for
+/// alpha), which is what the fixture's expectation is derived from. A format
+/// outside the window is refused with the view's own name rather than uploaded
+/// under another.
 pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Format, ProviderError> {
     if !TextureFormat::RENDER_SAMPLED.contains(&format) {
         return Err(capability_refusal("render_texture_format_unsupported")
             .with_field("format", FieldValue::Text(format!("{format:?}")))
             .with_detail(
-                "the render sampler uploads and reads one 8-bit four-component unorm surface, \
-                 in either byte order (`rgba8_unorm`/`bgra8_unorm`)",
+                "the render sampler uploads and reads an 8-bit unorm surface — the two \
+                 four-component byte orders (`rgba8_unorm`/`bgra8_unorm`) or the narrow \
+                 `r8_unorm`/`rg8_unorm` lanes — and refuses every other format by name",
             ));
     }
     Ok(match format {
         TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        TextureFormat::R8Unorm => vk::Format::R8_UNORM,
+        TextureFormat::R8G8Unorm => vk::Format::R8G8_UNORM,
         // Refused above; the arm keeps the match exhaustive so a widened
         // contract format forces a decision here.
         TextureFormat::R32Uint | TextureFormat::R32Float | TextureFormat::Rgba16Float => {
@@ -10244,20 +10279,32 @@ impl<'a> OffscreenObjects<'a> {
     ///
     /// The two uploaded arms' half of [`Self::create_render_textures`],
     /// unchanged from the pre-lease increments: the source bytes are tightly
-    /// packed `width * 4`-byte rows, while the driver's `row_pitch` is where
-    /// each row actually starts. Writing row `r` at `r * width * 4` would land
-    /// every row after the first in bytes the driver never reads, the same trap
-    /// the compute rail's upload documents. A failure disposes the image and
-    /// its memory, because nothing else owns them yet.
+    /// packed `width * texel_bytes`-byte rows, while the driver's `row_pitch`
+    /// is where each row actually starts. Writing row `r` at
+    /// `r * width * texel_bytes` would land every row after the first in bytes
+    /// the driver never reads, the same trap the compute rail's upload
+    /// documents. A failure disposes the image and its memory, because nothing
+    /// else owns them yet.
+    ///
+    /// `texel_bytes` is the view's own format width (`research/docs/23` §113):
+    /// the two four-component byte orders are four bytes per texel while the
+    /// narrow lanes are one and two, so a row of a narrow surface is a quarter
+    /// or a half of the four-byte row the pre-v113 rail assumed. Deriving it
+    /// from the format is what keeps an upload of a narrow texture from landing
+    /// its second row where the first row's last texels are.
     fn upload_render_texture(
         &self,
-        image: vk::Image,
-        memory: vk::DeviceMemory,
-        requirements: &vk::MemoryRequirements,
-        width: u32,
-        height: u32,
+        target: &RenderTextureImage,
         texels: &[u8],
     ) -> Result<(), ProviderError> {
+        let RenderTextureImage {
+            image,
+            memory,
+            requirements,
+            width,
+            height,
+            texel_bytes,
+        } = *target;
         let mapped = match unsafe {
             self.context.device.map_memory(
                 memory,
@@ -10280,7 +10327,7 @@ impl<'a> OffscreenObjects<'a> {
         };
         let tight_row_bytes = usize::try_from(width)
             .ok()
-            .and_then(|width| width.checked_mul(4))
+            .and_then(|width| width.checked_mul(usize::try_from(texel_bytes).ok()?))
             .ok_or_else(|| {
                 unsafe {
                     self.context.device.unmap_memory(memory);
@@ -10440,6 +10487,14 @@ impl<'a> OffscreenObjects<'a> {
                 "render texture",
             )
             .map_err(|error| execution_refusal("create render texture image", &error.detail))?;
+            let target = RenderTextureImage {
+                image,
+                memory,
+                requirements,
+                width,
+                height,
+                texel_bytes: texture.texel_bytes,
+            };
             // The imported buffer's lifetime is the pass's: the copy reads it
             // until the fence signals, so it is destroyed with the image.
             let copy_source = match &texture.source {
@@ -10461,26 +10516,12 @@ impl<'a> OffscreenObjects<'a> {
                 }
                 RenderInputSource::TraceBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(
-                        image,
-                        memory,
-                        &requirements,
-                        width,
-                        height,
-                        texels,
-                    )?;
+                    self.upload_render_texture(&target, texels)?;
                     None
                 }
                 RenderInputSource::StagedBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(
-                        image,
-                        memory,
-                        &requirements,
-                        width,
-                        height,
-                        texels,
-                    )?;
+                    self.upload_render_texture(&target, texels)?;
                     None
                 }
                 // The trace's own production uploads exactly as the two
@@ -10489,14 +10530,7 @@ impl<'a> OffscreenObjects<'a> {
                 // how the rail gets them into the sampled image.
                 RenderInputSource::ProducedBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(
-                        image,
-                        memory,
-                        &requirements,
-                        width,
-                        height,
-                        texels,
-                    )?;
+                    self.upload_render_texture(&target, texels)?;
                     None
                 }
                 // A gathered guest-runs window is the provider's own copy
@@ -10504,14 +10538,7 @@ impl<'a> OffscreenObjects<'a> {
                 // same host-visible path as the staged arm.
                 RenderInputSource::GatheredBytes { bytes, .. } => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(
-                        image,
-                        memory,
-                        &requirements,
-                        width,
-                        height,
-                        texels,
-                    )?;
+                    self.upload_render_texture(&target, texels)?;
                     None
                 }
             };
