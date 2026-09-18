@@ -3934,6 +3934,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // reviewed table names one layout — so the declaring pass is the one
         // this table pins.
         (1, "compute-buffer-v33") => &["render_declaring_quad_extent"],
+        // The widened stage-buffer ceiling (`research/docs/23` §3.3, §108,
+        // E-SB1): the declaring pass of the six-slot render case, whose render
+        // cases the Vulkan rails alone run — the six slots fill one set's
+        // descriptor floor rather than a reviewed module's fixed pairs — so
+        // this table pins the declaring pass, which every rail executes.
+        (1, "compute-buffer-v34") => &["render_declaring_widened_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -8582,6 +8588,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             &[(0, "read", 16), (1, "write", 4), (2, "read", 16)][..],
         ),
         "render_declaring_stage_buffer_lease" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4)][..],
+        ),
+        // E-SB1: the widened stage-buffer ceiling's declaring pass is the same
+        // plain copy kernel over the 2x2 attachment's own sixteen-byte view
+        // (`research/docs/23` §3.3, §108).
+        "render_declaring_widened_extent" => (
             "copy_word",
             [1, 1, 1],
             [1, 1, 1],

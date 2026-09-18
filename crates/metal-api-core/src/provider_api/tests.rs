@@ -2191,6 +2191,58 @@ fn a_render_pass_binds_its_stage_buffers_in_canonical_order() {
     );
 }
 
+/// The widened ceiling's object-API edge (E-SB1, `research/docs/23` §108):
+/// the first eight bindings record, the ninth is refused by name with the
+/// requested count and the ceiling on the contract error — the object rail
+/// cannot record a list the contract's own bound does not state, so a
+/// submission can never drop a declaration silently.
+#[test]
+fn the_ninth_stage_buffer_binding_is_refused_by_the_widened_ceiling() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_stage_buffers());
+    let device = Device::new(provider.clone());
+    let render_metadata = render_metadata_with_stage_buffers(
+        &provider,
+        (0..MAX_RENDER_STAGE_BUFFERS as u32)
+            .map(|index| contract::StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 4 },
+            })
+            .collect(),
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let tint = device.new_buffer_with_bytes(vec![0x11; 4]).unwrap();
+    let tint_view = tint.view(0, 4).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    for index in 0..MAX_RENDER_STAGE_BUFFERS as u32 {
+        encoder
+            .set_stage_buffer(RenderPipelineStage::Fragment, index, &tint_view)
+            .expect("a slot inside the widened ceiling records");
+    }
+    let refusal = encoder
+        .set_stage_buffer(
+            RenderPipelineStage::Fragment,
+            MAX_RENDER_STAGE_BUFFERS as u32,
+            &tint_view,
+        )
+        .expect_err("the ninth stage-buffer binding exceeds the widened ceiling");
+    eprintln!("object stage-buffer ceiling refusal: {refusal:?}");
+    assert!(matches!(
+        refusal,
+        Error::Contract(ContractError::RenderStageBufferLimitExceeded { requested, maximum })
+            if requested == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
+    ));
+}
+
 #[test]
 fn a_writable_stage_buffer_slot_carries_the_declarations_own_access() {
     // A writable slot is the landing the writeback channel publishes

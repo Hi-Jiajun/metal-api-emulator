@@ -4954,6 +4954,272 @@ fn a_translated_stage_reads_its_stage_buffer_and_lands_its_bytes() {
     );
 }
 
+/// The widened stage-buffer shape (`research/docs/23` §3.3, §108, E-SB1): the
+/// milestone's own vertex stage beside a fragment stage that reads six
+/// `[[buffer(n)]]` arguments — the pipeline-level list census v13's deep tail
+/// states (`stage_buffer_shape_gt4`, 334 rows), one past the first
+/// increment's four.
+///
+/// The six declarations are `Static { max_bytes: 16 }` each, all on the
+/// fragment stage, so the whole list fills one descriptor set — the
+/// arrangement whose per-set floor (eight storage buffers) is what the
+/// widened ceiling rests on.
+const WIDENED_STAGE_BUFFER_FRAGMENT_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_six.frag.ll");
+const WIDENED_STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_stage_buffer_six_rgba8";
+
+/// The six slots the widened list declares: one view and one allocation each,
+/// so a rail that folds two declarations into one slot cannot pass.
+const WIDENED_STAGE_BUFFER_VIEW_BASE: u64 = 720;
+const WIDENED_STAGE_BUFFER_ALLOCATION_BASE: u64 = 820;
+
+/// The six payloads: five slots carry `32/255` in every channel, the last
+/// `64/255`, so the summed colour is `224/255` on every channel — far from a
+/// quantisation tie, and a rail that binds four (or five) of the six
+/// declarations lands `128/255` (or `160/255`) instead.
+fn widened_stage_buffer_payloads() -> Vec<Vec<u8>> {
+    (0..6)
+        .map(|index| {
+            let value = if index == 5 {
+                64.0_f32 / 255.0
+            } else {
+                32.0_f32 / 255.0
+            };
+            [value; 4].into_iter().flat_map(f32::to_le_bytes).collect()
+        })
+        .collect()
+}
+
+/// The six declarations the widened pipeline states, canonical by construction
+/// (one stage, ascending indices).
+fn widened_stage_buffer_declarations() -> Vec<StageBufferBinding> {
+    (0..6)
+        .map(|index| StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 16 },
+        })
+        .collect()
+}
+
+/// The widened fixture's registrations: the declaring pass's compute kernel
+/// and the translated pair whose fragment stage reads six contract-declared
+/// slots.
+///
+/// `set` is the descriptor set the fragment stage is translated into, the same
+/// arrangement control the two-slot translated fixture runs: the translator's
+/// default (set 0) or the reviewed pair's fragment set (set 2).
+fn widened_stage_buffer_fixture(
+    set: u32,
+) -> Option<(
+    VulkanComputeProvider,
+    CompiledComputePipeline,
+    CompiledComputePipeline,
+)> {
+    let executor = executor()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(
+            &function,
+            digest(b"render_e2e_widened_stage_buffer_compute"),
+        )
+        .expect("the compute pipeline registers");
+    let vertex_library = device
+        .new_library_with_air(TRANSLATED_STAGE_BUFFER_VERTEX_AIR)
+        .expect("the translated vertex fixture loads");
+    let vertex_function = vertex_library
+        .function(TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY)
+        .expect("the translated vertex entry exists");
+    let vertex = TranslatedRenderStage::translate(RenderStage::Vertex, &vertex_function)
+        .expect("the vertex stage translates");
+    let fragment_library = device
+        .new_library_with_air(WIDENED_STAGE_BUFFER_FRAGMENT_AIR)
+        .expect("the widened fragment fixture loads");
+    let fragment_function = fragment_library
+        .function(WIDENED_STAGE_BUFFER_FRAGMENT_ENTRY)
+        .expect("the widened fragment entry exists");
+    let fragment = TranslatedRenderStage::translate_with_policy_and_layout(
+        RenderStage::Fragment,
+        &fragment_function,
+        executor.spirv_feature_policy(),
+        DescriptorLayout {
+            set,
+            ..DescriptorLayout::default()
+        },
+    )
+    .expect("the widened fragment stage translates");
+    let descriptors = fragment
+        .reflection()
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::Buffer)
+        .map(|binding| (binding.metal_index, binding.descriptor))
+        .collect::<Vec<_>>();
+    eprintln!("widened stage-buffer reflection: buffers={descriptors:?}");
+    let render = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: TRANSLATED_STAGE_BUFFER_VERTEX_ENTRY.to_owned(),
+                fragment_entry: WIDENED_STAGE_BUFFER_FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: widened_stage_buffer_declarations(),
+                textures: Vec::new(),
+            },
+            vertex,
+            fragment,
+            logical_digest: digest(b"render_e2e_widened_stage_buffer"),
+        })
+        .expect("the widened stage-buffer pair registers");
+    Some((provider, compute, render))
+}
+
+/// One render-bearing trace whose pass binds all six declarations the widened
+/// pipeline states.
+fn widened_stage_buffer_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    payloads: &[Vec<u8>],
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            stage_buffer_view(
+                RenderPipelineStage::Fragment,
+                u32::try_from(index).expect("six slots"),
+                ViewId::new(WIDENED_STAGE_BUFFER_VIEW_BASE + index as u64),
+                AllocationId::new(WIDENED_STAGE_BUFFER_ALLOCATION_BASE + index as u64),
+                bytes,
+            )
+        })
+        .collect();
+    stage_buffer_trace_with_pass(provider, compute, render, pass)
+}
+
+/// Submit the widened trace and return the attachment's readback.
+fn widened_stage_buffer_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    payloads: &[Vec<u8>],
+) -> Vec<u8> {
+    let (trace, resources) = widened_stage_buffer_trace(provider, compute, render, payloads);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the widened stage-buffer trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    readback(&writebacks, ATTACHMENT_VIEW)
+}
+
+/// The widened face's execution reading (E-SB1, `research/docs/23` §108): six
+/// declarations — past the first increment's four, inside the widened eight —
+/// enter the provider, the submission completes, and every texel of the 2×2
+/// attachment is the six payloads' sum through the format's quantisation. The
+/// arrangement control runs the same list translated into set 0 and set 2: the
+/// two frames have to be byte-identical, so the six slots really are the
+/// module's own rather than the reviewed pair's fixed ones.
+#[test]
+fn a_widened_stage_buffer_shape_enters_the_rail_and_lands_its_bytes() {
+    let payloads = widened_stage_buffer_payloads();
+    let expected = [0xe0_u8; 4].repeat(4);
+    let mut frames = Vec::new();
+    for set in [0_u32, 2] {
+        let Some((provider, compute, render)) = widened_stage_buffer_fixture(set) else {
+            return;
+        };
+        let frame = widened_stage_buffer_readback(&provider, &compute, &render, &payloads);
+        eprintln!("widened stage-buffer readback (set {set}): {}", hex(&frame));
+        assert_eq!(
+            frame, expected,
+            "every texel is the six payloads' sum (224/255) through the format's quantisation"
+        );
+        frames.push(frame);
+    }
+    assert_eq!(
+        frames[0], frames[1],
+        "the two descriptor arrangements land the same bytes"
+    );
+}
+
+/// The widened ceiling's refusal (E-SB1, `research/docs/23` §108): a pass that
+/// binds nine slots — one past `MAX_RENDER_STAGE_BUFFERS` — is refused by name
+/// with the count and the ceiling on the error, instead of running with a
+/// declaration dropped. Both halves of the pair state nine (the pass's list and
+/// the pipeline's), so the refusal is the count rule rather than a pairing
+/// disagreement; the slug, class, fields and detail are the reading.
+#[test]
+fn a_stage_buffer_list_above_the_widened_ceiling_is_refused_by_name() {
+    let Some((provider, compute, render, _other)) = stage_buffer_fixture() else {
+        return;
+    };
+    let ceiling = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS;
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = (0..=u32::try_from(ceiling).expect("ceiling"))
+        .map(|index| {
+            stage_buffer_view(
+                RenderPipelineStage::Fragment,
+                index,
+                ViewId::new(730 + u64::from(index)),
+                AllocationId::new(830 + u64::from(index)),
+                &[0_u8; 16],
+            )
+        })
+        .collect();
+    let (mut trace, resources) = stage_buffer_trace_with_pass(&provider, &compute, &render, pass);
+    let wide = trace
+        .pipelines
+        .iter_mut()
+        .find(|pipeline| pipeline.pipeline_id == render.pipeline_id)
+        .expect("the render pipeline is in the trace");
+    wide.render = Some(RenderPipelineContract {
+        vertex_entry: "stage_buffer_positions_main".to_owned(),
+        fragment_entry: "stage_buffer_tint_main".to_owned(),
+        color_formats: vec![AttachmentFormat::Rgba8Unorm],
+        vertex_layout: VertexLayout::None,
+        stage_buffers: (0..=u32::try_from(ceiling).expect("ceiling"))
+            .map(|index| StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 16 },
+            })
+            .collect(),
+        textures: Vec::new(),
+    });
+    let refusal = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect_err("nine stage-buffer slots exceed the widened ceiling");
+    eprintln!(
+        "widened stage-buffer refusal: phase={:?} class={:?} slug={} fields={:?} detail={:?}",
+        refusal.phase, refusal.class, refusal.slug, refusal.fields, refusal.detail
+    );
+    assert_eq!(refusal.slug, "render_stage_buffer_limit");
+    assert_eq!(refusal.class, ProviderErrorClass::Capability);
+}
+
 /// R9i (E side): the present rail executes the reviewed stage-buffer pair.
 ///
 /// Both rails render the same two modules into their own target, and the
