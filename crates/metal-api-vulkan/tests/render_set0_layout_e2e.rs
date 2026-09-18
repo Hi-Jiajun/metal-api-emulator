@@ -39,8 +39,8 @@ use metal_api_core::provider::{
 };
 use metal_api_core::{provider_api as objects, ComputeExecutor, Device};
 use metal_api_vulkan::{
-    RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage, VulkanComputeProvider,
-    VulkanExecutor,
+    stage_buffer_namespace_layout, RenderStage, TranslatedRenderPipelineRequest,
+    TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor,
 };
 use std::sync::Arc;
 
@@ -690,21 +690,93 @@ fn a_combined_translation_above_the_set_ceiling_is_refused() {
 /// each read `[[buffer(0)]]` in set 0 folds both writes onto one descriptor —
 /// refused by name beside the texture rather than executed with one stage
 /// reading the other's bytes.
+///
+/// The companion reading (`a_two_stage_fold_executes_under_the_namespace_layout`)
+/// is the same request translated another way: the vertex stage's own layout
+/// moved to the set the provider publishes for this shape, so the two index
+/// spaces no longer collide. The pair is what makes the refusal's remedy
+/// falsifiable — the same declaration, the same bytes, one axis of difference.
 #[test]
 fn two_stage_buffers_on_one_set_zero_slot_are_still_refused() {
     let Some((executor, provider)) = executor_and_provider() else {
         return;
     };
     let compute = compile_declaring_kernel(&provider, &executor);
-    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let (vertex, fragment, declaration) = folded_pair(&executor, DescriptorLayout::default());
+    let render = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: declaration,
+            vertex,
+            fragment,
+            logical_digest: digest(b"two-stage-buffers-one-set-0-slot"),
+        })
+        .expect("each stage's own pairing holds");
+    let (trace, resources) = trace_for(
+        &provider,
+        &compute,
+        &render,
+        vec![sampled_texture_view(false)],
+        vec![
+            // Canonical order again: the vertex stage's slot first, then the
+            // fragment stage's.
+            positions_view(vec![0x00; 32]),
+            stage_buffer_view(TINT),
+        ],
+    );
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect("the trace's declarations are the contract's own");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("the two stages' slots fold onto one descriptor");
+    eprintln!("refused the folded stage-buffer slots: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_buffer_layout_unsupported");
+    assert_eq!(refused.fields.get("set"), Some(&FieldValue::Unsigned(0)));
+    assert_eq!(
+        refused.fields.get("binding"),
+        Some(&FieldValue::Unsigned(0))
+    );
+    // The remedy the refusal names is the layout the companion reading uses
+    // (`research/docs/23` §3.3, E-TX9): the detail points at the published
+    // arrangement rather than leaving the caller to guess one.
+    let detail = refused
+        .detail
+        .as_deref()
+        .expect("the refusal carries a detail");
+    assert!(
+        detail.contains("stage_buffer_namespace_layout"),
+        "the refusal points at the canonical namespace layout: {detail}"
+    );
+}
+
+/// The folded request both tests in this pair state (`research/docs/23` §3.3,
+/// v112/E-TX9): the vertex stage reads its positions from `[[buffer(0)]]`, the
+/// fragment stage reads its tint from `[[buffer(0)]]` and samples a texture
+/// from the same set 0, and one declaration names both slots. The only axis the
+/// pair varies is the layout the *vertex* module is translated against.
+fn folded_pair(
+    executor: &Arc<VulkanExecutor>,
+    vertex_layout: DescriptorLayout,
+) -> (
+    TranslatedRenderStage,
+    TranslatedRenderStage,
+    RenderPipelineContract,
+) {
+    let device = Device::new(Arc::clone(executor) as Arc<dyn ComputeExecutor>);
     let library = device
         .new_library_with_air(POSITIONS_AIR)
         .expect("the positions fixture loads");
     let function = library
         .function(POSITIONS_ENTRY)
         .expect("the positions entry exists");
-    let vertex = TranslatedRenderStage::translate(RenderStage::Vertex, &function)
-        .expect("the positions stage translates");
+    let vertex = TranslatedRenderStage::translate_with_policy_and_layout(
+        RenderStage::Vertex,
+        &function,
+        executor.spirv_feature_policy(),
+        vertex_layout,
+    )
+    .expect("the positions stage translates under the layout");
     let library = device
         .new_library_with_air(FRAGMENT_AIR)
         .expect("the combined fragment fixture loads");
@@ -739,12 +811,82 @@ fn two_stage_buffers_on_one_set_zero_slot_are_still_refused() {
         },
     );
     declaration.vertex_entry = POSITIONS_ENTRY.to_owned();
+    (vertex, fragment, declaration)
+}
+
+/// The vertex stage's own slot as a pass binds it: the three `vec2` positions
+/// the fixture reads, at `[[buffer(0)]]`.
+fn positions_view(bytes: Vec<u8>) -> StageBufferView {
+    StageBufferView {
+        stage: RenderPipelineStage::Vertex,
+        view: BufferView {
+            view_id: POSITIONS_VIEW,
+            metal_binding: 0,
+            allocation_id: POSITIONS_ALLOCATION,
+            offset: 0,
+            length: u64::try_from(bytes.len()).expect("the positions fit a u64"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes),
+        },
+    }
+}
+
+/// The three Metal-NDC `vec2` positions the reviewed stage-buffer fixture
+/// reads (`research/docs/23` §3.3, v83): `(-0.9, 0.9)`, `(0.0, 0.9)`,
+/// `(-0.9, 0.0)`. Translated, the rail flips y into Vulkan's clip space, so
+/// the triangle covers the render area's top-left corner.
+fn reviewed_positions() -> Vec<u8> {
+    [-0.9_f32, 0.9, 0.0, 0.9, -0.9, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+/// The same request, executed (`research/docs/23` §3.3, E-TX9).
+///
+/// The vertex stage's `[[buffer(0)]]` arguments are translated into the
+/// provider's published namespace layout, so they land in set 1 while the
+/// fragment stage keeps set 0 — the two stages' Metal index spaces stay
+/// separate, the sampled texture still shares set 0 with the fragment half, and
+/// the frame is therefore both payloads' own: the vertex bytes decide which
+/// texels are covered and the texture and tint decide what they hold.
+#[test]
+fn a_two_stage_fold_executes_under_the_namespace_layout() {
+    let Some((executor, provider)) = executor_and_provider() else {
+        return;
+    };
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let (vertex, fragment, declaration) = folded_pair(&executor, stage_buffer_namespace_layout());
+    // The reading the whole test rests on: the two stages' buffer descriptors
+    // are in different sets, so nothing folds.
+    eprintln!(
+        "namespace pair slots: vertex={:?} fragment={:?}",
+        vertex
+            .reflection()
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::Buffer)
+            .map(|binding| binding
+                .descriptor
+                .map(|descriptor| (descriptor.set, descriptor.binding)))
+            .collect::<Vec<_>>(),
+        fragment
+            .reflection()
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::Buffer)
+            .map(|binding| binding
+                .descriptor
+                .map(|descriptor| (descriptor.set, descriptor.binding)))
+            .collect::<Vec<_>>(),
+    );
     let render = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
             contract: declaration,
             vertex,
             fragment,
-            logical_digest: digest(b"two-stage-buffers-one-set-0-slot"),
+            logical_digest: digest(b"two-stage-fold-namespace-layout"),
         })
         .expect("each stage's own pairing holds");
     let (trace, resources) = trace_for(
@@ -753,36 +895,41 @@ fn two_stage_buffers_on_one_set_zero_slot_are_still_refused() {
         &render,
         vec![sampled_texture_view(false)],
         vec![
-            // Canonical order again: the vertex stage's slot first, then the
-            // fragment stage's.
-            StageBufferView {
-                stage: RenderPipelineStage::Vertex,
-                view: BufferView {
-                    view_id: POSITIONS_VIEW,
-                    metal_binding: 0,
-                    allocation_id: POSITIONS_ALLOCATION,
-                    offset: 0,
-                    length: 32,
-                    access: BufferAccess::Read,
-                    attribute_stride: None,
-                    source: BufferSource::OwnedBytes(vec![0x00; 32]),
-                },
-            },
+            positions_view(reviewed_positions()),
             stage_buffer_view(TINT),
         ],
     );
     let admitted = provider
         .capabilities()
-        .validate_trace(trace, resources)
+        .validate_trace(trace.clone(), resources)
         .expect("the trace's declarations are the contract's own");
-    let refused = provider
+    let submitted = provider
         .submit(admitted)
-        .expect_err("the two stages' slots fold onto one descriptor");
-    eprintln!("refused the folded stage-buffer slots: {refused:?}");
-    assert_eq!(refused.slug, "render_stage_buffer_layout_unsupported");
-    assert_eq!(refused.fields.get("set"), Some(&FieldValue::Unsigned(0)));
-    assert_eq!(
-        refused.fields.get("binding"),
-        Some(&FieldValue::Unsigned(0))
-    );
+        .expect("the two stages' slots are separate, so the pair executes");
+    assert!(matches!(
+        submitted.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ));
+    let bytes = submitted
+        .writebacks
+        .into_iter()
+        .find(|writeback| writeback.view_id == ATTACHMENT_VIEW)
+        .map(|writeback| writeback.bytes)
+        .expect("the attachment has a writeback");
+    eprintln!("namespace-layout frame: {}", hex(&bytes));
+    // The vertex bytes cover the top-left corner of the 4×4 render area: three
+    // texels (`(0,0)`, `(1,0)`, `(0,1)`) carry the fragment stage's own bytes —
+    // the texture's clamped edge texel in red, the tint's second and third
+    // components in green and blue — and every other texel keeps the clear
+    // sentinel. A rail that folded the two slots would land one stage's bytes
+    // under the other's, which this frame cannot read as.
+    assert_eq!(bytes.len(), 64, "four texels per row, four rows");
+    let mut expected = Vec::with_capacity(64);
+    for row in 0..EXTENT {
+        for column in 0..EXTENT {
+            let covered = matches!((column, row), (0, 0) | (1, 0) | (0, 1));
+            expected.extend_from_slice(if covered { &EXPECTED } else { &CLEAR_SENTINEL });
+        }
+    }
+    assert_eq!(bytes, expected);
 }

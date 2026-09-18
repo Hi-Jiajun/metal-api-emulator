@@ -43,6 +43,38 @@ pub use compute_provider::{
     PRESENT_TARGET_BUDGET, RESIDENT_TARGET_BUDGET,
 };
 pub use render::RenderStage;
+pub use render::STAGE_BUFFER_NAMESPACE_SET;
+
+/// The canonical descriptor layout for a folded pair of render stages
+/// (`research/docs/23` §3.3, E-TX9).
+///
+/// One translated render stage's `[[buffer(n)]]` arguments land in the set this
+/// layout names; every other resource class keeps the translator's own bands.
+/// It is the arrangement a caller reaches for when two rendered stages each
+/// read a `[[buffer(n)]]` argument with the same `n`: Metal's
+/// `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`
+/// name independent index spaces, so translating both stages under the
+/// translator's default layout folds the two descriptors onto one
+/// `(set, binding)` and the rail refuses the pass by name
+/// (`render_stage_buffer_layout_unsupported`).
+///
+/// The layout belongs to the *vertex* half of the pair and moves it to
+/// [`STAGE_BUFFER_NAMESPACE_SET`] — the set the reviewed stage-buffer pair
+/// already binds its vertex stage at, and still inside the rail's own pipeline
+/// layout. The fragment half keeps the translator's default, so the rail's
+/// fragment-only image path (which pins set 0) is untouched.
+///
+/// The caller picks the stage it translates with this layout; the rail reads
+/// the slot back out of the returned reflection, so the layout is the module's
+/// own Vulkan ABI rather than a second declaration that could disagree with it.
+/// The shape the rail can execute is advertised as
+/// [`metal_api_core::provider::ProviderCapabilities::supports_render_stage_buffer_namespace_split`].
+pub fn stage_buffer_namespace_layout() -> DescriptorLayout {
+    DescriptorLayout {
+        set: STAGE_BUFFER_NAMESPACE_SET,
+        ..DescriptorLayout::default()
+    }
+}
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 const MAX_SERIAL_DISPATCHES: usize = 8;

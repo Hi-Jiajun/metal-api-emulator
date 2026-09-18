@@ -230,6 +230,21 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // refused by core admission rather than silently narrowed.
         supports_render_stage_buffers: true,
         max_render_stage_buffers: MAX_RENDER_STAGE_BUFFERS as u32,
+        // The folded shape is executed (`research/docs/23` §3.3, E-TX9): the
+        // rail publishes one canonical arrangement for it
+        // ([`metal_api_vulkan::stage_buffer_namespace_layout`], the vertex
+        // stage's `[[buffer(n)]]` arguments in set 1 and the fragment stage's
+        // in the translator's own set 0) and reads each module's slot back out
+        // of its reflection, so a pair whose two stages read the same Metal
+        // index executes with each stage's own bytes. The bit names exactly
+        // that shape: a pair still folded into one slot under the translator's
+        // default layout is refused by name
+        // (`render_stage_buffer_layout_unsupported`), and the declaration says
+        // "this rail can execute the separated arrangement", not "submit the
+        // folded one". Evidence: the translated stage-buffer pair in
+        // `tests/render_stage_buffer_namespace_e2e.rs`, its object-API frame,
+        // and the conformance case the capture archives keep.
+        supports_render_stage_buffer_namespace_split: true,
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:
@@ -831,6 +846,17 @@ mod tests {
             MAX_PRESENT_IMAGE_COUNT
         );
         assert!(capabilities.declares_presentation_support());
+        // The stage-buffer face and its folded shape (`research/docs/23` §3.3,
+        // v83/E-TX9): the pair's readings are unchanged by the new bit, and
+        // the shape bit is declared beside them because this rail arranges the
+        // two stages' buffers in different descriptor slots.
+        assert!(capabilities.supports_render_stage_buffers);
+        assert_eq!(
+            capabilities.max_render_stage_buffers,
+            MAX_RENDER_STAGE_BUFFERS as u32
+        );
+        assert!(capabilities.supports_render_stage_buffer_namespace_split);
+        assert!(capabilities.declares_render_stage_buffer_namespace_split());
     }
 
     #[test]

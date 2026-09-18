@@ -563,6 +563,30 @@ const STAGE_BUFFER_REVIEWED_SET_BASE: u32 = 1;
 /// sets the module's own ABI never asked for.
 const STAGE_BUFFER_SET_CEILING: u32 = 2;
 
+/// The descriptor set the canonical namespace layout gives one stage's whole
+/// layout (`research/docs/23` §3.3, E-TX9).
+///
+/// `metal2vulkan`'s default descriptor layout puts every Metal resource of a
+/// stage in set 0, so a translated pair whose two stages each read
+/// `[[buffer(n)]]` with the *same* `n` folds both descriptors onto one slot —
+/// the shape the rail refuses by name (`render_stage_buffer_layout_unsupported`)
+/// because the two stages' Metal buffer index spaces
+/// (`setVertexBuffer(_:offset:index:)` and
+/// `setFragmentBuffer(_:offset:index:)`) are independent and one write would
+/// land under the other's declaration.
+///
+/// The published namespace layout moves the *vertex* stage's layout here — the
+/// reviewed pair's own vertex slot — and leaves the fragment stage at the
+/// layout's default set 0. Vertex and not fragment because the rail's image
+/// path is fragment-only and pins set 0 (`translated_texture_pairs` returns
+/// nothing for a non-fragment stage and the translated texture slots state
+/// `set: 0`), so moving the vertex half only ever moves its buffer
+/// descriptor. It is spelled as the reviewed base rather than a second literal
+/// so the two arrangements cannot drift, and it has to stay at or below
+/// `STAGE_BUFFER_SET_CEILING` — the pipeline layout's positional list names no
+/// set above it.
+pub const STAGE_BUFFER_NAMESPACE_SET: u32 = STAGE_BUFFER_REVIEWED_SET_BASE;
+
 /// The fragment stage this rail owns for the reviewed stage-buffer pair
 /// (`research/docs/23` §3.3, v83).
 ///
@@ -10909,7 +10933,10 @@ impl<'a> OffscreenObjects<'a> {
                         "two stage buffers resolve to one descriptor slot, so the second \
                              write would overwrite the first's bytes; the two stages' Metal buffer \
                              namespaces are independent and have to stay so in the module's own \
-                             descriptor layout",
+                             descriptor layout. Translate one stage of the pair with the \
+                             provider's canonical namespace layout \
+                             (`metal_api_vulkan::stage_buffer_namespace_layout`) to give the two \
+                             index spaces separate descriptor slots",
                     ));
             }
         }
@@ -13534,6 +13561,8 @@ fn driver_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal2vulkan::passes::{Stage, TransformOptions};
+    use metal2vulkan::reflect::DescriptorLayout;
     use metal_api_core::provider::{
         AcquirePolicy, AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease,
         DepthFormat, DepthLoadOp, IndexBufferBinding, InitialState, LeaseReservation, PipelineId,
@@ -18969,5 +18998,124 @@ mod tests {
         assert_eq!(refused.slug, "lease_range_out_of_bounds");
         assert_eq!(refused.class, ProviderErrorClass::Resource);
         assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(37)));
+    }
+
+    /// Translate one fixture with the translator's own options, the way
+    /// `TranslatedRenderStage::translate_with_policy_and_layout` builds them
+    /// (the crate arm adds the vertex y flip on top; the reflection and the
+    /// module's bytes are this call's to state).
+    fn translate_fixture_with_layout(
+        fixture: &str,
+        stage: Stage,
+        layout: DescriptorLayout,
+    ) -> (Vec<u8>, metal2vulkan::reflect::ShaderReflection) {
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        let options = TransformOptions::default()
+            .with_descriptor_layout(layout)
+            .expect("the layout states the translator's own bands");
+        metal2vulkan::translate_sanitized_native_reflected(fixture, stage, scratch.path(), options)
+            .expect("the fixture translates")
+    }
+
+    /// The published namespace layout is the reviewed vertex slot and the one
+    /// place the folded shape's ABI is stated (`research/docs/23` §3.3,
+    /// E-TX9).
+    ///
+    /// Three readings, all of them the increment's own contract: the helper's
+    /// set is inside the ceiling the rail's pipeline layout names, the same
+    /// fixture's `[[buffer(0)]]` lands in `(set 0, binding 0)` under the
+    /// translator's default layout (the fold the rail refuses) and in
+    /// `(set 1, binding 0)` under the published layout.
+    #[test]
+    fn the_namespace_layout_moves_a_folded_vertex_stage_out_of_set_zero() {
+        // The layout has to stay inside the ceiling the pipeline layout names.
+        // The two are constants in one crate, so the reading is a compile-time
+        // one: a drift between them is a build failure rather than a test the
+        // suite happens to run.
+        const {
+            assert!(
+                STAGE_BUFFER_NAMESPACE_SET <= STAGE_BUFFER_SET_CEILING,
+                "the pipeline layout names no set above the ceiling"
+            )
+        };
+        assert_eq!(
+            crate::stage_buffer_namespace_layout().set,
+            STAGE_BUFFER_NAMESPACE_SET
+        );
+        // The layout the reviewed pair's vertex stage is bound at, stated once.
+        assert_eq!(
+            STAGE_BUFFER_NAMESPACE_SET,
+            STAGE_BUFFER_REVIEWED_SET_BASE + u32::from(RenderPipelineStage::Vertex.code())
+        );
+
+        let fixture = include_str!("../tests/fixtures/render_stage_buffer_positions.vert.ll");
+        let slot = |layout: DescriptorLayout| {
+            let (_, reflection) = translate_fixture_with_layout(fixture, Stage::Vertex, layout);
+            let binding = reflection
+                .bindings
+                .iter()
+                .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == 0)
+                .expect("the fixture reads `[[buffer(0)]]`");
+            let descriptor = binding
+                .descriptor
+                .expect("the binding consumes a descriptor");
+            (descriptor.set, descriptor.binding)
+        };
+        assert_eq!(
+            slot(DescriptorLayout::default()),
+            (0, 0),
+            "the translator's default layout folds both stages' buffers onto set 0"
+        );
+        assert_eq!(
+            slot(crate::stage_buffer_namespace_layout()),
+            (STAGE_BUFFER_NAMESPACE_SET, 0),
+            "the published layout keeps the vertex stage's index space apart"
+        );
+    }
+
+    /// A module that binds no stage buffer translates to the same bytes under
+    /// both layouts (`research/docs/23` §3.3, E-TX9).
+    ///
+    /// The default and the namespace layout differ in one field, and a module
+    /// whose interface names no buffer has nothing for that field to move.
+    /// Comparing the emitted modules byte for byte is what makes "the new
+    /// layout changes only the folded shape" falsifiable rather than asserted:
+    /// a translation that drifted for every module would differ here.
+    #[test]
+    fn a_module_without_stage_buffers_translates_byte_identically_under_both_layouts() {
+        let fixture = include_str!("../tests/fixtures/render_offscreen_2x2.frag.ll");
+        let (default, default_reflection) =
+            translate_fixture_with_layout(fixture, Stage::Fragment, DescriptorLayout::default());
+        let (namespaced, namespaced_reflection) = translate_fixture_with_layout(
+            fixture,
+            Stage::Fragment,
+            crate::stage_buffer_namespace_layout(),
+        );
+        assert_eq!(
+            default, namespaced,
+            "a bufferless module's SPIR-V is the same module under both layouts"
+        );
+        // The reflection carries the layout the module was emitted against, so
+        // the one field that differs is the layout itself; the interface the
+        // module states (no binding at all) is the same two readings.
+        assert_eq!(default_reflection.bindings, namespaced_reflection.bindings);
+        assert_eq!(
+            (
+                default_reflection.descriptor_layout.set,
+                namespaced_reflection.descriptor_layout.set,
+            ),
+            (0, STAGE_BUFFER_NAMESPACE_SET)
+        );
+        assert!(
+            default_reflection
+                .bindings
+                .iter()
+                .all(|binding| binding.kind != ResourceKind::Buffer),
+            "the fixture is the bufferless half of the reading"
+        );
+        eprintln!(
+            "bufferless fragment: {} bytes under both layouts",
+            default.len()
+        );
     }
 }

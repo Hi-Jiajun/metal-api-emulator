@@ -326,6 +326,12 @@ impl NativeMetalProvider {
                 // stage-buffer trace instead of refusing it by name.
                 supports_render_stage_buffers: stage_buffer_bits.supports_render_stage_buffers,
                 max_render_stage_buffers: stage_buffer_bits.max_render_stage_buffers,
+                // The folded shape's bit (`research/docs/23` §3.3, E-TX9):
+                // the reviewed pair binds its two stages at set 1 and set 2,
+                // so this snapshot declares the arrangement the pair's Apple
+                // device readings measured rather than a new native path.
+                supports_render_stage_buffer_namespace_split: stage_buffer_bits
+                    .supports_render_stage_buffer_namespace_split,
                 max_passes: 8,
                 supports_threads_exact: true,
                 supports_threadgroups: false,
