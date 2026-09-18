@@ -3515,6 +3515,12 @@ fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
         // R7 (`research/docs/23` §76): the resident store's source of bytes is
         // the pass's own raster, so the tag is the whole declaration.
         StoreOp::Resident => 2,
+        // E-TX8 (`research/docs/23` §114): the owner-window store names the
+        // window the attachment's own view declaration carries, so its tag is
+        // the whole declaration too — the frame still travels the writeback
+        // channel beside it, which is why no byte of the frame is added here
+        // and every pre-E-TX8 tag keeps its own value.
+        StoreOp::Borrowed => 3,
     });
 }
 
@@ -4919,6 +4925,7 @@ fn get_store_op(decoder: &mut Decoder<'_>) -> Result<StoreOp, CodecError> {
         0 => Ok(StoreOp::Store),
         1 => Ok(StoreOp::DontCare),
         2 => Ok(StoreOp::Resident),
+        3 => Ok(StoreOp::Borrowed),
         value => Err(CodecError::UnknownEnumValue {
             field: "attachment store op",
             value,

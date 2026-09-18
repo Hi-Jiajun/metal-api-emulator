@@ -1743,7 +1743,12 @@ fn discarded_only_attachments(trace: &ComputeTrace) -> BTreeSet<(AllocationId, V
             // declares one (`plan_trace`), so reaching here means a
             // hand-built plan — and the bytes land nowhere a collect can read,
             // exactly as a discarded attachment's do.
-            StoreOp::Resident | StoreOp::DontCare => {
+            //
+            // The owner-window store (`research/docs/23` §114, E-TX8) is
+            // refused by the same plan for the same reason, so it is on this
+            // side of the split too: the frame lands in the owner's window
+            // rather than in a writeback this collect could read.
+            StoreOp::Resident | StoreOp::Borrowed | StoreOp::DontCare => {
                 discarded.insert(identity);
             }
         }

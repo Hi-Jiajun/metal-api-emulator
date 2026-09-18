@@ -1361,9 +1361,18 @@ impl VulkanComputeProvider {
                 // no landing view even when the trace asks for a host readback
                 // (`research/docs/23` §76, R7). Every other store arm keeps the
                 // pre-R7 rule unchanged.
+                //
+                // The owner-window store (`research/docs/23` §114, E-TX8) is
+                // the exception on the other side: the window it lands in *is*
+                // the declaration's own source arm, so the view is required
+                // whatever the completion policy asks for — a trace that
+                // publishes no readback still has to name the guest's pages the
+                // frame lands in.
                 let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
-                let landing_needed = host_readback
-                    && attachment.store != metal_api_core::provider::StoreOp::Resident;
+                let borrowing = attachment.store == metal_api_core::provider::StoreOp::Borrowed;
+                let landing_needed = borrowing
+                    || (host_readback
+                        && attachment.store != metal_api_core::provider::StoreOp::Resident);
                 let view = if landing_needed || loading {
                     Some(declared.ok_or_else(|| {
                         refusal(
@@ -1385,7 +1394,11 @@ impl VulkanComputeProvider {
                 } else {
                     None
                 };
-                previous.push(view.filter(|_| loading));
+                // The rail reads this slice as the attachment's own
+                // declaration: the previous contents for a `Load`, and the
+                // window a borrowed store lands in. One declaration serves both
+                // because the contract names the attachment by one identity.
+                previous.push(view.filter(|_| loading || borrowing));
                 views.push(view);
             }
             // The stored depth attachment's landing view, resolved before the

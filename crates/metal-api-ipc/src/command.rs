@@ -4861,6 +4861,79 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_window_store_is_one_tag_and_round_trips() {
+        // E-TX8 (`research/docs/23` §114): the borrowed store's whole
+        // declaration is the store tag — the window it lands in is the
+        // attachment's own view declaration, which the frame already carries.
+        // The reading is therefore a *byte* reading: the frame with the new arm
+        // differs from the pre-E-TX8 store frame in exactly the one tag byte,
+        // and no window, pointer or length is added anywhere.
+        let sentinel = [0xfe_u8; 4];
+        let clear_tape = LEGACY_RENDER_SUBMIT_FRAME
+            .windows(sentinel.len())
+            .position(|window| window == sentinel)
+            .expect("the frozen frame carries the fixture's clear payload");
+
+        let frame_for = |store: StoreOp| {
+            let mut trace = render_only_trace();
+            let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+                panic!("the fixture ends in a render pass");
+            };
+            pass.color_attachments[0].store = store;
+            let request = CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            };
+            CommandCodec::encode_request(&request).unwrap()
+        };
+        let stored = frame_for(StoreOp::Store);
+        let borrowed = frame_for(StoreOp::Borrowed);
+        assert_eq!(
+            stored, LEGACY_RENDER_SUBMIT_FRAME,
+            "the frozen frame states the pre-E-TX8 store arm"
+        );
+        assert_eq!(stored.len(), borrowed.len());
+        let store_tag = clear_tape + sentinel.len();
+        assert_eq!(stored[store_tag], 0x00, "the `Store` tag");
+        assert_eq!(borrowed[store_tag], 0x03, "the owner-window store's tag");
+        for (index, (left, right)) in stored.iter().zip(borrowed.iter()).enumerate() {
+            if index == store_tag {
+                continue;
+            }
+            assert_eq!(
+                left, right,
+                "the frame differs from the pre-E-TX8 bytes in the store tag alone (byte {index})"
+            );
+        }
+
+        let decoded = CommandCodec::decode_request(&borrowed).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        let pass = trace.passes[0]
+            .as_render()
+            .expect("the fixture is a render pass");
+        assert_eq!(pass.color_attachments[0].store, StoreOp::Borrowed);
+
+        // A tag no arm owns is a decoder error, so an older bridge refuses the
+        // frame it does not know instead of reading it as a plain store.
+        let mut unknown = borrowed.clone();
+        unknown[store_tag] = 0x04;
+        let error = CommandCodec::decode_request(&unknown)
+            .expect_err("an unknown store tag is refused by name");
+        assert!(
+            matches!(
+                error,
+                CodecError::UnknownEnumValue {
+                    field: "attachment store op",
+                    value: 0x04,
+                }
+            ),
+            "the refusal names the field and the tag: {error:?}"
+        );
+    }
+
+    #[test]
     fn render_frames_without_a_present_keep_their_pre_present_bytes() {
         let request = CommandRequest::Submit {
             trace: render_only_trace(),
