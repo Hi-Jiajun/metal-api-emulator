@@ -3585,6 +3585,22 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     && attachments[0].store == "store",
                     "\(definition.id): the reviewed sampling shape stores one 8-bit "
                     + "four-component unorm attachment, in either byte order")
+        // The narrow-lane sampling case (`research/docs/23` §3.3, §113, v37): the
+        // source surface is one- or two-component 8-bit UNORM, which this
+        // oracle's reviewed sampling module does not model — the rail's own
+        // format table refuses such a source by name. A case that names no
+        // native capture rail is refused for this rail rather than read as the
+        // four-component surface; a case that *did* name one is a mistake and
+        // says so instead of quietly executing another format's module.
+        if sampledChannelSlots[textures[0].format] == nil {
+            try require(!definition.capture_rails.contains("native-metal"),
+                        "\(definition.id): this oracle's reviewed sampling stage models one "
+                        + "8-bit four-component unorm surface, in either byte order; a case "
+                        + "that samples \(textures[0].format) cannot name a native capture rail")
+            return ValidatedRender(definition: definition, source: "", attachments: [],
+                                   vertexStreams: [], stageBuffers: [], indexStream: nil,
+                                   depth: nil, stencil: nil)
+        }
         let texture = textures[0]
         try require(sampledChannelSlots[texture.format] != nil,
                     "\(definition.id): the reviewed sampling stage reads one 8-bit "
