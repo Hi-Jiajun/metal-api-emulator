@@ -1848,12 +1848,16 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     }
     switch definition.id {
-    case "render_declaring_quad_extent", "render_declaring_multisample_seed":
+    case "render_declaring_quad_extent", "render_declaring_multisample_seed",
+         "render_declaring_gathered_extent":
         // v27's declaring case: the reviewed copy_word kernel over a 4x4
         // attachment view (64 bytes) and a 4-byte output view. v82's seed
         // declaring case is the same shape over the same view, holding the one
         // repeated texel the multisampled load's seed pass clears every sample
-        // with (`research/docs/23` §82).
+        // with (`research/docs/23` §82). E-TX10's declaring case (v36) keeps the
+        // same shape: the gathered-extent render case is Vulkan-only
+        // (`capture_rails` names neither native rail), so the shared declaring
+        // view set is validated here and never executed on this rail.
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "\(definition.id): unsupported entry or dispatch shape")
