@@ -33,17 +33,18 @@ use metal2vulkan::reflect::{
     BufferFootprint, BufferIndexSource, ResourceAccess, ResourceKind, ShaderReflection, ShaderStage,
 };
 use metal_api_core::provider::{
-    AffineAccess, AffineTerm, AttachmentFormat, BlendFactor, BlendOperation, BorrowedLeaseRegistry,
-    BorrowedView, BufferAccess, BufferSource, BufferView, ClearColor, ColorWriteMask,
-    CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest,
-    DeviceEpoch, FieldValue, FootprintProof, IndexFormat, IndirectCommandDescriptor, LeaseId,
-    LeaseRegistry, LoadOp, MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve,
-    ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot,
-    Retryability, SampleCount, SamplerPolicy, StencilCompare, StencilLoadOp, StencilOp,
-    StencilResolveFilter, StencilTest, StoreOp, TextureAccess, TextureFormat, TextureSource,
-    TextureType, TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId, Winding,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    AffineAccess, AffineTerm, AllocationId, AttachmentFormat, BlendFactor, BlendOperation,
+    BorrowedLeaseRegistry, BorrowedView, BufferAccess, BufferSource, BufferView, BufferWriteback,
+    ClearColor, ColorWriteMask, CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter,
+    DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, FootprintProof, IndexFormat,
+    IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp, MultisampleDepthResolve,
+    MultisampleState, MultisampleStencilResolve, ProviderError, ProviderErrorClass, ProviderPhase,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    RenderPipelineStage, ResourceTableSnapshot, Retryability, SampleCount, SamplerPolicy,
+    StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp,
+    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout,
+    VertexFormat, VertexStep, ViewId, Winding, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
+    MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -3533,6 +3534,7 @@ pub(crate) fn execute_render_pass<'a>(
     previous: &'a [Option<&'a BufferView>],
     resident: &[Option<&'a ProviderTargetImage>],
     leases: Option<&RenderLeaseContext<'_>>,
+    produced: Option<&'a ProducedTraceViews<'a>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     refuse_attachment_extent(context, pass)?;
     let request = prepare_render_request_with_resident(
@@ -3545,6 +3547,7 @@ pub(crate) fn execute_render_pass<'a>(
             Some(resident)
         },
         leases,
+        produced,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
         context.spirv_feature_policy(),
@@ -3561,6 +3564,7 @@ pub(crate) fn execute_render_pass<'a>(
 /// present tail action follows, not about the pass's own contract. Keeping the
 /// agreement check in one place means a present pass cannot reach execution
 /// through a weaker gate than the offscreen one.
+#[cfg(test)]
 fn prepare_render_request<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
@@ -3580,6 +3584,7 @@ fn prepare_render_request<'a>(
         previous,
         None,
         leases,
+        None,
         depth_resolve_modes,
         stencil_resolve_modes,
         policy,
@@ -3592,6 +3597,11 @@ fn prepare_render_request<'a>(
 /// `resident` is `None` for a pass that declares no resident target, and
 /// otherwise carries one entry per colour attachment, exactly as `previous`
 /// does.
+///
+/// `produced` carries the bytes the executing trace's own earlier passes have
+/// landed so far (`research/docs/23` §110, E-TX3), or `None` for a pass
+/// executed outside a trace: a `TextureSource::TraceView` declaration is
+/// resolved through it and refused by name without it.
 // The parameter list is the pass's own declaration surface: attachments,
 // their previous contents, their resident targets, the lease context, the two
 // admitted resolve-mode masks, and the device's SPIR-V policy. The blank
@@ -3604,6 +3614,7 @@ fn prepare_render_request_with_resident<'a>(
     previous: &'a [Option<&'a BufferView>],
     resident: Option<&[Option<&'a ProviderTargetImage>]>,
     leases: Option<&RenderLeaseContext<'_>>,
+    produced: Option<&'a ProducedTraceViews<'a>>,
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
     policy: SpirvFeaturePolicy,
@@ -4100,7 +4111,7 @@ fn prepare_render_request_with_resident<'a>(
     // fragment stage reads the slots its reflection names with the state its
     // AIR carries.
     let texture_slots = render_texture_slots(stages, pass)?;
-    let textures = resolve_render_textures(pass, extent, leases, &texture_slots)?;
+    let textures = resolve_render_textures(pass, extent, leases, &texture_slots, produced)?;
     // Stage buffers (`research/docs/23` §3.3, v83) resolve right beside them:
     // the same three-arm channel, one list carrying both stages' index spaces,
     // and every binding the pipeline declared already paired with the pass in
@@ -4331,15 +4342,17 @@ fn prepare_render_request_with_resident<'a>(
 /// The texture's bytes are resolved through the same three-arm channel the
 /// streams and the loading attachments use (`research/docs/23` §75, R5c): the
 /// trace's own bytes, the provider's staged copy of an owner lease, or the
-/// owner's own mapping. The resolution runs before the first device object
-/// exists, and the window a lease resolves to has to be the texture's own
-/// tightly packed extent — the shape the trace-owned arm's `validate_shape`
-/// already holds.
+/// owner's own mapping — plus the trace-produced arm this increment adds
+/// (`research/docs/23` §110, E-TX3), whose bytes `produced` carries. The
+/// resolution runs before the first device object exists, and the window a
+/// lease resolves to has to be the texture's own tightly packed extent — the
+/// shape the trace-owned arm's `validate_shape` already holds.
 fn resolve_render_textures<'a>(
     pass: &'a RenderPassDescriptor,
     extent: [u32; 2],
     leases: Option<&RenderLeaseContext<'_>>,
     slots: &[RenderTextureSlot],
+    produced: Option<&'a ProducedTraceViews<'a>>,
 ) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
     if pass.textures.len() > MAX_RENDER_TEXTURES {
         return Err(capability_refusal("render_texture_limit")
@@ -4386,6 +4399,7 @@ fn resolve_render_textures<'a>(
             view,
             leases,
             usize::try_from(binding).unwrap_or(usize::MAX),
+            produced,
         )?;
         let width = narrow_dimension(view.width)?;
         let height = narrow_dimension(view.height)?;
@@ -4496,8 +4510,11 @@ impl RenderInputRole {
 ///
 /// One type serves every render input the rail reads from a declaration: the
 /// bytes a vertex stream or index buffer carries, and the previous contents a
-/// `LoadOp::Load` attachment uploads. The three arms are the three
-/// [`BufferSource`] arms, resolved before any device object exists.
+/// `LoadOp::Load` attachment uploads. The first three arms are the three
+/// [`BufferSource`] arms, resolved before any device object exists; the
+/// fourth serves the render sampler's trace-produced arm
+/// (`research/docs/23` §110, E-TX3), whose bytes the trace itself produced
+/// earlier in the same submission.
 #[derive(Debug)]
 pub(crate) enum RenderInputSource<'a> {
     /// The trace's own bytes (`BufferSource::OwnedBytes`), unchanged from the
@@ -4513,6 +4530,13 @@ pub(crate) enum RenderInputSource<'a> {
         lease: LeaseId,
         window: BorrowedView,
     },
+    /// The trace's own earlier GPU output (`TextureSource::TraceView`,
+    /// `research/docs/23` §110, E-TX3): the bytes an earlier pass of this
+    /// same submission stored into the view this declaration names. The rail
+    /// uploads them exactly as it uploads [`Self::TraceBytes`] — what differs
+    /// is where they came from, which is the trace's own execution rather
+    /// than a copy the request carried in.
+    ProducedBytes(&'a [u8]),
 }
 
 impl RenderInputSource<'_> {
@@ -4526,6 +4550,7 @@ impl RenderInputSource<'_> {
             Self::TraceBytes(bytes) => bytes.len(),
             Self::StagedBytes(bytes) => bytes.len(),
             Self::Borrowed { window, .. } => window.len,
+            Self::ProducedBytes(bytes) => bytes.len(),
         }
     }
 
@@ -4541,6 +4566,7 @@ impl RenderInputSource<'_> {
         match self {
             Self::TraceBytes(bytes) => bytes,
             Self::StagedBytes(bytes) => bytes,
+            Self::ProducedBytes(bytes) => bytes,
             // SAFETY: the window was resolved by the no-copy registry for an
             // imported lease, whose contract keeps the mapping readable over
             // exactly this window until the import is released.
@@ -4553,7 +4579,7 @@ impl RenderInputSource<'_> {
     /// The no-copy lease this source reads, when it is one.
     const fn borrowed_lease(&self) -> Option<LeaseId> {
         match self {
-            Self::TraceBytes(_) | Self::StagedBytes(_) => None,
+            Self::TraceBytes(_) | Self::StagedBytes(_) | Self::ProducedBytes(_) => None,
             Self::Borrowed { lease, .. } => Some(*lease),
         }
     }
@@ -4795,6 +4821,44 @@ fn resolve_multisample_seed(
     })
 }
 
+/// The bytes the executing trace's own earlier passes produced
+/// (`research/docs/23` §110, E-TX3).
+///
+/// One submission's trace is the unit that owns a production: as the
+/// provider executes its passes in trace order, every stored attachment's
+/// bytes land in the same writeback channel the completion hands back, and
+/// this value is the rail's read-only view of what has landed *so far* —
+/// `latest` names, per `(allocation_id, view_id)` identity, the index of the
+/// most recent landing in `writebacks`, so a view stored twice is read through
+/// its latest production exactly as the trace's order states.
+///
+/// The identity key is the one `BufferWriteback` already carries: the pair
+/// core's serial walk holds to the sampled declaration, which is what lets a
+/// `TextureSource::TraceView` declaration resolve without a second name.
+pub(crate) struct ProducedTraceViews<'a> {
+    writebacks: &'a [BufferWriteback],
+    /// The most recent landing per identity, as an index into `writebacks`.
+    latest: &'a BTreeMap<(AllocationId, ViewId), usize>,
+}
+
+impl<'a> ProducedTraceViews<'a> {
+    pub(crate) fn new(
+        writebacks: &'a [BufferWriteback],
+        latest: &'a BTreeMap<(AllocationId, ViewId), usize>,
+    ) -> Self {
+        Self { writebacks, latest }
+    }
+
+    /// The bytes the trace has landed for one view identity, or `None` when
+    /// no earlier pass of the executing trace stored them.
+    fn bytes(&self, allocation_id: AllocationId, view_id: ViewId) -> Option<&'a [u8]> {
+        self.latest
+            .get(&(allocation_id, view_id))
+            .and_then(|position| self.writebacks.get(*position))
+            .map(|writeback| writeback.bytes.as_slice())
+    }
+}
+
 /// Resolve one sampled texture's bytes into the source the rail uploads or
 /// imports (`research/docs/23` §75, R5c).
 ///
@@ -4806,13 +4870,40 @@ fn resolve_multisample_seed(
 /// `StagedLease` uploads the provider's own copy of the owner's window, and a
 /// `BorrowedNoCopy` imports the owner's pages, so `vkCmdCopyBufferToImage`
 /// reads what the owner wrote rather than a snapshot of it.
+///
+/// The fourth arm is the trace-produced one (`research/docs/23` §110, E-TX3):
+/// `TraceView` names no bytes of its own, so the source is looked up in
+/// `produced` — the bytes the trace's own earlier passes landed for that
+/// view's identity — and the rail uploads them exactly as it uploads
+/// `OwnedBytes`. A pass executed outside a trace (or one whose trace has not
+/// produced the bytes yet) is refused by name rather than sampled from
+/// whatever the driver happens to leave in a fresh image.
 fn resolve_render_texture_source<'a>(
     view: &'a TextureView,
     leases: Option<&RenderLeaseContext<'_>>,
     binding: usize,
+    produced: Option<&'a ProducedTraceViews<'a>>,
 ) -> Result<RenderInputSource<'a>, ProviderError> {
     match &view.source {
         TextureSource::OwnedBytes(bytes) => Ok(RenderInputSource::TraceBytes(bytes)),
+        TextureSource::TraceView => {
+            let bytes = produced
+                .and_then(|produced| produced.bytes(view.allocation_id, view.view_id))
+                .ok_or_else(|| {
+                    capability_refusal("render_texture_source_unwritten")
+                        .with_field("binding", FieldValue::Unsigned(binding as u64))
+                        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+                        .with_field("allocation", FieldValue::Unsigned(view.allocation_id.get()))
+                        .with_detail(
+                            "the source names the trace's own production, and no earlier pass \
+                             of the executing trace has landed these bytes: a store of this \
+                             view's identity has to precede the pass in the trace's own order, \
+                             and its store arm has to be the one the trace's host channel \
+                             carries",
+                        )
+                })?;
+            Ok(RenderInputSource::ProducedBytes(bytes))
+        }
         TextureSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
@@ -5276,6 +5367,13 @@ fn color_subresource() -> vk::ImageSubresourceRange {
 /// is not admitted as a render pass cannot reach it. Compute dispatches and the
 /// un-reviewed indexed shapes are outside the first indirect increment and are
 /// refused with the capability slug the contract publishes for them.
+// The parameter list is the indirect shape's own declaration surface: the
+// context, the stages, the pass, the replayed command, the previous-contents
+// and resident lists, the lease context, and the produced-bytes view
+// (`research/docs/23` §110, E-TX3). Every one of them is the pass's own
+// statement, and the offscreen sibling above is the blank shape; splitting
+// this into a struct would move the same eight fields somewhere else.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_indirect_render_pass<'a>(
     context: &VulkanContext,
     stages: &'a RenderStages,
@@ -5284,6 +5382,7 @@ pub(crate) fn execute_indirect_render_pass<'a>(
     previous: &'a [Option<&'a BufferView>],
     resident: &[Option<&'a ProviderTargetImage>],
     leases: Option<&RenderLeaseContext<'_>>,
+    produced: Option<&'a ProducedTraceViews<'a>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     let replay = match command {
         IndirectCommandDescriptor::Draw {
@@ -5339,6 +5438,7 @@ pub(crate) fn execute_indirect_render_pass<'a>(
             Some(resident)
         },
         leases,
+        produced,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
         context.spirv_feature_policy(),
@@ -7268,6 +7368,7 @@ pub(crate) fn execute_present_render<'a>(
     target: &ProviderTargetImage,
     previous: Option<&'a BufferView>,
     leases: Option<&RenderLeaseContext<'_>>,
+    produced: Option<&'a ProducedTraceViews<'a>>,
 ) -> Result<Vec<u8>, ProviderError> {
     // The present path stays single-attachment: it renders into one
     // provider-owned target and hands that target on, so a pass whose
@@ -7275,11 +7376,18 @@ pub(crate) fn execute_present_render<'a>(
     // present shape.
     let previous = [previous];
     refuse_attachment_extent(context, pass)?;
-    let request = prepare_render_request(
+    // The present rail declares no provider-resident target of its own (its
+    // target is the present action's, `docs/24` §5.2), so it hands the
+    // general form no resident list; the produced-bytes view travels beside
+    // it for the same reason it does on the offscreen path: a presenting pass
+    // may sample the trace's own earlier production exactly as any other.
+    let request = prepare_render_request_with_resident(
         stages,
         pass,
         &previous,
+        None,
         leases,
+        produced,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
         context.spirv_feature_policy(),
@@ -9777,6 +9885,14 @@ impl<'a> OffscreenObjects<'a> {
                     self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
                     None
                 }
+                // The trace's own production uploads exactly as the two
+                // trace-carried arms do (`research/docs/23` §110, E-TX3):
+                // what makes it different is where the bytes came from, not
+                // how the rail gets them into the sampled image.
+                RenderInputSource::ProducedBytes(bytes) => {
+                    self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
+                    None
+                }
             };
             let view =
                 crate::create_color_image_view(self.context, image, format, "render texture")
@@ -10231,7 +10347,13 @@ impl<'a> OffscreenObjects<'a> {
                 // filled, which the readback re-maps.
                 if stream.writable {
                     self.stage_buffer_landings.push(match &stream.source {
-                        RenderInputSource::TraceBytes(_) | RenderInputSource::StagedBytes(_) => {
+                        // A stage buffer's source is a `BufferSource` arm, so
+                        // the render sampler's produced arm cannot reach this
+                        // list; it joins the rail-owned arm for the same
+                        // reason every other rail-uploaded buffer does.
+                        RenderInputSource::TraceBytes(_)
+                        | RenderInputSource::StagedBytes(_)
+                        | RenderInputSource::ProducedBytes(_) => {
                             StageBufferLanding {
                                 stage: stream.stage,
                                 index: stream.index,
@@ -10667,6 +10789,14 @@ impl<'a> OffscreenObjects<'a> {
                 name,
             ),
             RenderInputSource::StagedBytes(bytes) => self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                usage,
+                bytes,
+                name,
+            ),
+            // The trace's own production is copied in exactly as the two
+            // trace-carried arms are (`research/docs/23` §110, E-TX3).
+            RenderInputSource::ProducedBytes(bytes) => self.create_host_visible_buffer(
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 usage,
                 bytes,
@@ -15736,7 +15866,7 @@ mod tests {
         stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
         let pass = milestone_pass(AttachmentFormat::R32Float);
         pass.validate().expect("the fixture pass is a legal shape");
-        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None)
+        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None, None)
             .expect_err("the mismatched pairing is refused before any Vulkan object exists");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
@@ -15757,7 +15887,7 @@ mod tests {
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
-        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None)
+        let refused = execute_render_pass(&context, &stages, &pass, &[None], &[], None, None)
             .expect_err("`Load` needs an upload rail this increment does not have");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
@@ -16230,7 +16360,7 @@ mod tests {
         let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
-        let error = execute_render_pass(&context, &stages, &pass, &[None], &[], None)
+        let error = execute_render_pass(&context, &stages, &pass, &[None], &[], None, None)
             .expect_err("the substituted driver answer refuses the render submission");
         eprintln!("render device loss: {error:?}");
         assert_eq!(error.class, ProviderErrorClass::DeviceLost);

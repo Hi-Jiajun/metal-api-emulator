@@ -2624,6 +2624,11 @@ fn resolve_render_input<'a>(
 /// `BorrowedNoCopy` uploads the owner's own pages, so a rewrite after the
 /// import reaches the sampled texels instead of leaving the import's first copy
 /// behind.
+///
+/// The widened `TextureSource` arm this rail does not carry is the
+/// trace-produced one (`research/docs/23` §110, E-TX3): it is refused by name
+/// rather than resolved through a guess, exactly as the lease arms are refused
+/// when the submission carries no lease channel.
 fn resolve_render_texture_source<'a>(
     view: &'a TextureView,
     leases: Option<&RenderLeaseContext<'_>>,
@@ -2631,6 +2636,21 @@ fn resolve_render_texture_source<'a>(
 ) -> Result<PlannedInputSource<'a>, ProviderError> {
     match &view.source {
         TextureSource::OwnedBytes(bytes) => Ok(PlannedInputSource::Declared(bytes)),
+        // The trace's own production (`research/docs/23` §110, E-TX3) is
+        // refused by name on this rail for the reason every unflipped arm is:
+        // the arm's resolution needs the trace's own writebacks, and the
+        // Apple-side execution that would carry them has no reading yet. The
+        // Vulkan rail executes the arm; this rail states the boundary instead
+        // of uploading bytes no pass of this submission produced.
+        TextureSource::TraceView => Err(texture_source_refusal(
+            binding,
+            view.view_id,
+            "trace_view",
+            "the texels are the trace's own earlier GPU output, and this rail's trace path \
+             does not resolve the produced-bytes arm yet: the arm is executed by the Vulkan \
+             rail (`research/docs/23` §110), and the Apple-side reading its flip would owe \
+             is a later increment",
+        )),
         TextureSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
                 texture_source_refusal(

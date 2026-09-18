@@ -139,6 +139,21 @@ pub enum Error {
     /// A vertex-buffer draw has no stream bound. The `vertex_id`-only shape is
     /// [`RenderCommandEncoder::draw_render_pass`], which binds no input at all.
     MissingVertexBuffer,
+    /// A trace-view texture has no host bytes to read back
+    /// (`research/docs/23` §110, E-TX3): its texels exist only on the trace
+    /// that produces them, so the observation is the frame the sampling pass
+    /// lands rather than a [`Texture::read`] of the handle.
+    TraceViewTextureHasNoHostBytes {
+        view: ViewId,
+    },
+    /// A trace-view texture was bound to a compute encoder
+    /// (`research/docs/23` §110, E-TX3): the arm is the render sampler's, and
+    /// this increment states no compute-side resolution of the trace's own
+    /// production. The refusal happens here rather than one rail deeper, where
+    /// it would read as "this source needs an owned byte copy".
+    TraceViewTextureIsNotAComputeBinding {
+        view: ViewId,
+    },
     /// An indexed draw has no index buffer bound, so nothing says which indices
     /// it selects through.
     MissingIndexBuffer,
@@ -224,6 +239,16 @@ impl fmt::Display for Error {
             Self::IndexBufferAlreadyBound => {
                 f.write_str("an index buffer is already bound on this encoder")
             }
+            Self::TraceViewTextureHasNoHostBytes { view } => write!(
+                f,
+                "texture view {view:?} is the trace's own production: its texels have no host \
+                 copy to read back"
+            ),
+            Self::TraceViewTextureIsNotAComputeBinding { view } => write!(
+                f,
+                "texture view {view:?} is the trace's own production: the arm is the render \
+                 sampler's, not a compute binding"
+            ),
             Self::FragmentTextureAlreadyBound { index } => {
                 write!(f, "fragment texture binding {index} is bound twice")
             }
@@ -521,6 +546,68 @@ impl Device {
         )
     }
 
+    /// Declare one sampled texture whose texels are the trace's own GPU
+    /// output (`research/docs/23` §110, E-TX3).
+    ///
+    /// `view` is the *producing* view: the recorded pass that renders into it
+    /// with [`StoreOp::Store`] is the pass whose
+    /// bytes every later sampled binding of this handle reads. The handle
+    /// therefore shares that view's identity — its allocation and its view id
+    /// — and carries no bytes of its own, exactly as the trace rail's
+    /// `TextureSource::TraceView` arm states. The producer has to be recorded
+    /// *before* the pass that samples the handle, because the arm is defined
+    /// by the trace's own order: `ComputeTrace::validate_serial_buffer_reuse`
+    /// refuses an unwritten identity, a store that follows the read, and a
+    /// declaration that restates another shape.
+    ///
+    /// `format`, `width` and `height` are the sampled declaration's own
+    /// restatement of the stored surface, and they have to match it, exactly
+    /// as the trace rail states: `view`'s byte length is held to the tightly
+    /// packed extent `width * height * format` here, and core admission holds
+    /// the rest to the attachment's declaration.
+    pub fn new_trace_view_texture(
+        &self,
+        view: &BufferView,
+        format: contract::TextureFormat,
+        width: u64,
+        height: u64,
+    ) -> Result<Texture, Error> {
+        if !Arc::ptr_eq(&self.state, &view.buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        if width == 0 || height == 0 {
+            return Err(ApiError::ZeroSize.into());
+        }
+        let expected = width
+            .checked_mul(height)
+            .and_then(|extent| extent.checked_mul(format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("texture extent"))?;
+        if view.length as u64 != expected {
+            return Err(ContractError::SourceLengthMismatch {
+                view: view.view_id,
+                expected,
+                actual: view.length as u64,
+            }
+            .into());
+        }
+        Ok(Texture {
+            inner: Arc::new(TextureInner {
+                owner: Arc::clone(&self.state),
+                allocation_id: view.allocation_id(),
+                view_id: view.view_id(),
+                format,
+                width,
+                height,
+                length: view.length,
+                access: contract::TextureAccess::Sampled,
+                origin: TextureOrigin::TraceView,
+                bytes: Mutex::new(Vec::new()),
+                reservations: Mutex::new(Vec::new()),
+                available: Condvar::new(),
+            }),
+        })
+    }
+
     fn new_texture(
         &self,
         access: contract::TextureAccess,
@@ -557,6 +644,7 @@ impl Device {
                 height,
                 length: bytes.len(),
                 access,
+                origin: TextureOrigin::DeclaredBytes,
                 bytes: Mutex::new(bytes),
                 reservations: Mutex::new(Vec::new()),
                 available: Condvar::new(),
@@ -1347,9 +1435,30 @@ struct TextureInner {
     height: u64,
     length: usize,
     access: contract::TextureAccess,
+    /// Where every view this handle declares takes its texels from
+    /// (`research/docs/23` §110, E-TX3).
+    origin: TextureOrigin,
     bytes: Mutex<Vec<u8>>,
     reservations: Mutex<Vec<RangeHold>>,
     available: Condvar,
+}
+
+/// Where one texture handle's texels come from.
+///
+/// The object API owns two of the contract's four source arms: the bytes the
+/// constructor was handed (`OwnedBytes`), and — the shape this increment adds
+/// — the trace's own production (`TraceView`), whose texels do not exist until
+/// the command that produces them runs. The lease arms are the trace rail's:
+/// the object API never imports owner backing, exactly as it never uploads a
+/// texture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextureOrigin {
+    /// The handle's bytes are its declared initial contents.
+    DeclaredBytes,
+    /// The handle names one view the trace's own earlier pass stores
+    /// (`research/docs/23` §110, E-TX3): it carries no bytes of its own and
+    /// shares the producing view's identity.
+    TraceView,
 }
 
 /// A texture handle: a sampled or texel-fetched texture is a read-only source,
@@ -1392,6 +1501,16 @@ impl Texture {
     /// command holds a conflicting access (a read waits only on a writer), so a
     /// caller never observes half a landing.
     pub fn read(&self) -> Result<Vec<u8>, Error> {
+        // A trace-view handle has no host image at all: its texels are the
+        // bytes a pass of the same command stores, and those bytes are
+        // observed through the pass that samples them
+        // (`research/docs/23` §110, E-TX3). Returning an empty or stale
+        // vector would read as "the texture holds nothing".
+        if self.inner.origin == TextureOrigin::TraceView {
+            return Err(Error::TraceViewTextureHasNoHostBytes {
+                view: self.inner.view_id,
+            });
+        }
         Ok(self.lock_unreserved(false)?.clone())
     }
 
@@ -1455,6 +1574,15 @@ impl Texture {
 
     /// The contract view for one binding, mirroring `BufferView`'s snapshot.
     fn view(&self, metal_binding: u32) -> Result<contract::TextureView, Error> {
+        let source = match self.inner.origin {
+            TextureOrigin::DeclaredBytes => contract::TextureSource::OwnedBytes(
+                lock(&self.inner.bytes, "provider texture")?.clone(),
+            ),
+            // The producer is the view whose identity this handle shares, so
+            // the declaration resolves against the trace's own stores without
+            // a second name (`research/docs/23` §110, E-TX3).
+            TextureOrigin::TraceView => contract::TextureSource::TraceView,
+        };
         Ok(contract::TextureView {
             view_id: self.inner.view_id,
             metal_binding,
@@ -1467,9 +1595,7 @@ impl Texture {
             array_length: 1,
             sample_count: 1,
             access: self.inner.access,
-            source: contract::TextureSource::OwnedBytes(
-                lock(&self.inner.bytes, "provider texture")?.clone(),
-            ),
+            source,
         })
     }
 }
@@ -2421,6 +2547,14 @@ impl CommandBuffer {
             })?;
         }
         for texture in &textures {
+            // A trace-view texture shares the producing view's allocation
+            // (`research/docs/23` §110, E-TX3), and the buffer reservations
+            // above have already registered it: the identity is one
+            // allocation, so the existing record is the right one and a
+            // second insert of it would be refused as a duplicate of itself.
+            if resources.allocation(texture.inner.allocation_id).is_some() {
+                continue;
+            }
             resources.insert_allocation(AllocationRecord {
                 allocation_id: texture.inner.allocation_id,
                 owner_epoch: owner.epoch,
@@ -2750,6 +2884,16 @@ impl ComputeCommandEncoder {
         self.ensure_open()?;
         if !Arc::ptr_eq(&self.shared.owner, &texture.inner.owner) {
             return Err(Error::ForeignTexture);
+        }
+        // A trace-view texture is the render sampler's arm
+        // (`research/docs/23` §110, E-TX3): its bytes exist only as the
+        // trace's own production, and a compute binding would have to state
+        // how that production reaches the compute rail's image upload. This
+        // increment does not, so it is refused by name here.
+        if texture.inner.origin == TextureOrigin::TraceView {
+            return Err(Error::TraceViewTextureIsNotAComputeBinding {
+                view: texture.inner.view_id,
+            });
         }
         self.textures.insert(index, texture.clone());
         Ok(())

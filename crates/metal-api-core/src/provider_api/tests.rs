@@ -1635,6 +1635,126 @@ fn render_metadata_with_fragment_texture(provider: &FakeProvider) -> CompiledCom
     metadata
 }
 
+/// The object API's trace-view texture (`research/docs/23` §110, E-TX3): the
+/// handle shares the producing view's identity, states the arm in every view it
+/// declares, has no host copy to read, and is refused by name where the arm has
+/// no meaning.
+#[test]
+fn a_trace_view_texture_shares_the_producers_identity_and_has_no_host_copy() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
+    let device = Device::new(provider.clone());
+    let producer = device.new_buffer_with_bytes(vec![0x11; 16]).unwrap();
+    let producer_view = producer.view(0, 16).unwrap();
+    let consumer = device.new_buffer_with_bytes(vec![0x00; 16]).unwrap();
+    let consumer_view = consumer.view(0, 16).unwrap();
+    let input = device
+        .new_texture_with_bytes(TextureFormat::Rgba8Unorm, 2, 2, vec![0x5a; 16])
+        .unwrap();
+    let sampled = device
+        .new_trace_view_texture(&producer_view, TextureFormat::Rgba8Unorm, 2, 2)
+        .expect("the trace-view texture is declared over the producer's identity");
+    assert_eq!(sampled.allocation_id(), producer_view.allocation_id());
+    assert_eq!(sampled.view_id(), producer_view.view_id());
+    assert_eq!(sampled.access(), contract::TextureAccess::Sampled);
+    assert_eq!(sampled.dimensions(), (2, 2));
+
+    // There is no host image: the texels exist only on the trace.
+    assert_eq!(
+        sampled.read().expect_err("no host copy can exist"),
+        Error::TraceViewTextureHasNoHostBytes {
+            view: producer_view.view_id(),
+        }
+    );
+
+    // The render encoder takes the handle and the pass states the arm.
+    let render_metadata = render_metadata_with_fragment_texture(&provider);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &producer_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &consumer_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        // The producing pass: it writes the view the trace-view handle names,
+        // which is what makes the arm resolvable at all
+        // (`research/docs/23` §110, E-TX3).
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder.set_fragment_texture(0, &input).unwrap();
+        encoder
+            .draw_render_pass(
+                &producer_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder.set_fragment_texture(0, &sampled).unwrap();
+        encoder
+            .draw_render_pass(
+                &consumer_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    let traces = provider.traces.lock().unwrap();
+    let sampled_view = traces
+        .last()
+        .and_then(|trace| {
+            trace.render_passes().find_map(|pass| {
+                pass.textures
+                    .iter()
+                    .find(|texture| texture.view_id == producer_view.view_id())
+            })
+        })
+        .expect("the recorded pass carries the sampled declaration");
+    assert_eq!(sampled_view.source, contract::TextureSource::TraceView);
+    drop(traces);
+
+    // The compute encoder refuses the same handle by name: the arm is the
+    // render sampler's, and this increment states no compute-side resolution.
+    let fresh = device.new_command_queue().command_buffer();
+    let mut encoder = fresh.compute_command_encoder().unwrap();
+    assert_eq!(
+        encoder
+            .set_texture(0, &sampled)
+            .expect_err("a compute binding has no trace-view arm"),
+        Error::TraceViewTextureIsNotAComputeBinding {
+            view: producer_view.view_id(),
+        }
+    );
+}
+
 /// The render metadata one runtime-sampler case's pipeline carries
 /// (`research/docs/23` §3.3, v102): the reviewed sampling shape's entries, with
 /// a contract that pairs the one texture with the runtime `[[sampler(0)]]`
