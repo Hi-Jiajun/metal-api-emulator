@@ -6167,6 +6167,7 @@ private func renderSelfTest() throws -> CaseResult {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
+            landing_view: nil,
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
@@ -6249,6 +6250,7 @@ private func presentSelfTest() throws -> CaseResult {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "load", store: "store",
+            landing_view: nil,
             clear_hex: nil, initial_hex: hex(sentinel), expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
@@ -6353,6 +6355,7 @@ private func vertexSelfTest() throws -> CaseResult {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
+            landing_view: nil,
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
@@ -6453,11 +6456,13 @@ private func mrtSelfTest() throws -> CaseResult {
             RenderAttachmentDefinition(
                 allocation: 900, view: 910, format: "rgba8_unorm",
                 width: 2, height: 2, load: "clear", store: "store",
+                landing_view: nil,
                 clear_hex: "fefefefe", initial_hex: nil,
                 expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff"),
             RenderAttachmentDefinition(
                 allocation: 901, view: 911, format: "rgba8_unorm",
                 width: 2, height: 2, load: "clear", store: "store",
+                landing_view: nil,
                 clear_hex: "fefefefe", initial_hex: nil,
                 expected_hex: "ff8040c0ff8040c0ff8040c0ff8040c0"),
         ],
@@ -7355,6 +7360,7 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 4, height: 4, load: "clear", store: "store",
+            landing_view: nil,
             clear_hex: "11223344", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: redImage,
