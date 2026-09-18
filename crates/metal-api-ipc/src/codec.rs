@@ -181,6 +181,36 @@ pub enum CodecError {
         count: usize,
         maximum: usize,
     },
+    /// A runtime sampler list carried more entries than the contract's own cap
+    /// (`research/docs/23` §3.3, v102). The block's count is one byte, so this
+    /// is the protocol's bound; the contract refuses anything above
+    /// [`metal_api_core::provider::MAX_RENDER_SAMPLERS`] before a frame is
+    /// written.
+    RenderSamplerCount {
+        count: usize,
+        maximum: usize,
+    },
+    /// A render texture declaration list carried more entries than the
+    /// contract's own cap (`research/docs/23` §3.3, v100/v102). The block's
+    /// count is one byte, so this is the protocol's bound; the contract
+    /// refuses anything above
+    /// [`metal_api_core::provider::MAX_RENDER_TEXTURES`] before a frame is
+    /// written.
+    RenderTextureDeclarationCount {
+        count: usize,
+        maximum: usize,
+    },
+    /// A render texture declaration stated both sampler forms at once
+    /// (`research/docs/23` §3.3, v102).
+    ///
+    /// The two forms are exclusive: `sampler` is the state the module's own
+    /// AIR constexpr sampler carries and `runtime_sampler` names the
+    /// `[[sampler(n)]]` argument the pass states. The declaration block's form
+    /// byte has no position that could mean both, so the sender refuses the
+    /// pair by name instead of framing one of the two states.
+    RenderTextureSamplerFormUnsupported {
+        binding: u32,
+    },
     /// A stage buffer list carried more entries than the contract's own cap
     /// (`research/docs/23` §3.3, v83). The block's count is one byte, so this
     /// is the protocol's bound; the contract refuses anything above
@@ -376,6 +406,19 @@ impl fmt::Display for CodecError {
             Self::RenderTextureFormatCount { count, maximum } => write!(
                 formatter,
                 "capability snapshot names {count} render texture formats, maximum {maximum}"
+            ),
+            Self::RenderSamplerCount { count, maximum } => write!(
+                formatter,
+                "runtime sampler list carries {count} bindings, maximum {maximum}"
+            ),
+            Self::RenderTextureDeclarationCount { count, maximum } => write!(
+                formatter,
+                "render texture declaration block carries {count} bindings, maximum {maximum}"
+            ),
+            Self::RenderTextureSamplerFormUnsupported { binding } => write!(
+                formatter,
+                "render texture declaration {binding} states a sampler state and a runtime \
+                 sampler index, but the block carries exactly one of the two forms"
             ),
             Self::RenderStageBufferCount { count, maximum } => write!(
                 formatter,
