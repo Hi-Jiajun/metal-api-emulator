@@ -123,10 +123,14 @@ class VertexInputObservationTests(unittest.TestCase):
     def test_v16_prefers_the_reviewed_shape_over_a_stream_without_a_layout(self):
         # A stream without a layout describes nothing, and a layout without its
         # binding cannot be executed: both are refused before any rail runs.
+        # Dropping the index buffer is refused too, and for the reason the
+        # widened class states (`research/docs/23` §3.3, v39): the same 32-byte
+        # stream would have to cover a six-vertex non-indexed draw's whole
+        # `vertices * stride` span, which it does not.
         for mutation, message in (
             ({"vertex_layout": None}, "without a vertex layout"),
             ({"vertex_buffers": []}, "binds one vertex stream"),
-            ({"indices": None}, "is indexed"),
+            ({"indices": None}, "shorter than the reviewed non-indexed draw reads"),
         ):
             broken = copy.deepcopy(self.suite)
             case = broken["render_cases"][0]

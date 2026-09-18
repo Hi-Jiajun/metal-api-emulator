@@ -204,15 +204,59 @@ def covered_render_case(case, suite, where):
     if attachment.get("store") != "store":
         _refuse("render-covered-attachment",
                 f"{where}: store {attachment.get('store')!r} is not the class's Store")
-    if case.get("indices") is None:
-        _refuse("render-covered-draw",
-                f"{where}: the class's one draw is indexed and this case has no index buffer")
     if case.get("instance_count", 1) != 1:
         _refuse("render-covered-draw", f"{where}: the class draws one instance")
     if case.get("base_vertex", 0) != 0:
         _refuse("render-covered-draw", f"{where}: the class draws from base vertex 0")
-    if case.get("vertices") is None:
+    vertices = case.get("vertices")
+    if vertices is None:
         _refuse("render-covered-draw", f"{where}: the case declares no vertex count")
+    # The class's one draw has two arms (`research/docs/23` §3.3, v39; the
+    # covered rule's own widening). The indexed arm names its count through the
+    # index buffer, so the draw's vertex count is whatever its indices reach and
+    # the referenced fixture is the reviewed quad. The non-indexed arm names
+    # its vertices `0..vertices` directly: with no layout at all it is the
+    # milestone's three-vertex triangle, and with a layout every per-vertex
+    # stream has to cover the whole `vertices * stride` span — the same counting
+    # rule the contract states and the stricter of the two footprint rules the
+    # rails prove, so a stream that is one record long cannot stand in for the
+    # shape the class claims.
+    if case.get("indices") is None:
+        layout = case.get("vertex_layout")
+        if layout is None:
+            if vertices != 3:
+                _refuse("render-covered-draw",
+                        f"{where}: the resourceless non-indexed draw is the three-vertex "
+                        "triangle")
+        else:
+            if type(vertices) is not int or vertices < 3:
+                _refuse("render-covered-draw",
+                        f"{where}: a non-indexed draw of {vertices!r} vertices rasterizes no "
+                        "triangle")
+            streams = layout.get("buffers") if isinstance(layout, dict) else None
+            bindings = case.get("vertex_buffers")
+            if not isinstance(streams, list) or not streams or not isinstance(bindings, list):
+                _refuse("render-covered-draw",
+                        f"{where}: the class's non-indexed draw names its streams")
+            if len(bindings) != len(streams):
+                _refuse("render-covered-draw",
+                        f"{where}: one binding per declared stream")
+            for position, stream in enumerate(streams):
+                stride = stream.get("stride") if isinstance(stream, dict) else None
+                step = stream.get("step", "per_vertex") if isinstance(stream, dict) else None
+                if type(stride) is not int or stride < 1:
+                    _refuse("render-covered-draw",
+                            f"{where}: stream {position} declares no stride")
+                if step != "per_vertex":
+                    _refuse("render-covered-draw",
+                            f"{where}: the class's non-indexed draw advances every stream per "
+                            "vertex")
+                binding = bindings[position]
+                length = binding.get("length") if isinstance(binding, dict) else None
+                if type(length) is not int or length < vertices * stride:
+                    _refuse("render-covered-draw",
+                            f"{where}: stream {position} declares {length!r} bytes, fewer than "
+                            f"the {vertices * stride} the draw reads")
     for key in RENDER_INERT_KEYS:
         if key in case:
             _refuse("render-covered-state",

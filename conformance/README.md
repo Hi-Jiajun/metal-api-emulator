@@ -9,7 +9,13 @@ acquire/present counts), `suite-v16.json` (the indexed vertex-input quad),
 colour locations), `suite-v19.json` (the same dual draw with the second
 location discarded), `suite-v20.json` (the same quad drawn from undefined
 pre-pass contents), `suite-v21.json` (a `bgra8_unorm` attachment) and
-`suite-v22.json` (a single-channel `r32float` attachment). The render and present observation rules live in
+`suite-v22.json` (a single-channel `r32float` attachment). Later widenings carry
+their own suites (`suite-v23.json` onward), each with its own test module;
+`suite-v39.json` is the render narrow class's non-indexed draw arm
+(`research/docs/23` §3.3, v39): the milestone's `vertex_id` triangle, the
+reviewed indexed quad, the same streams drawn without an index buffer, and the
+partial-coverage neighbour one triangle of that stream draws. Its boundaries are
+written up in [../docs/NON-INDEXED-DRAW.md](../docs/NON-INDEXED-DRAW.md). The render and present observation rules live in
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10, the
 store/dontcare rules in §11 and the undefined-load rules in §12; the per-suite
 rules are exercised by

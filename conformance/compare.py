@@ -1183,12 +1183,15 @@ def _vertex_input_declaration(case, where):
     """Pin the reviewed vertex-input shape of a render case (`docs/23` §3.3).
 
     Three geometries exist and no fourth: the milestone's `vertex_id` triangle
-    (no `vertex_layout` at all), the reviewed indexed quad — one `float32x2`
-    position stream at stride eight bound at index 0, plus six `uint16` or
-    `uint32` indices whose values all name one of the four vertices the stream
-    carries — and the reviewed instanced pair (`research/docs/23` §3.3, v31):
-    the same position stream at binding 0, a `float32x4` tint stream at
-    binding 1 that advances once per *instance*, and exactly two instances.
+    (no `vertex_layout` at all), the reviewed quad over one `float32x2`
+    position stream at stride eight bound at index 0 — either with six `uint16`
+    or `uint32` indices whose values all name one of the four vertices the
+    stream carries, or, since v39, drawn *without* an index buffer so the draw
+    names its vertices `0..vertices` and the stream has to cover the whole
+    `vertices * stride` span (`research/docs/23` §3.3, v39) — and the reviewed
+    instanced pair (`research/docs/23` §3.3, v31): the same position stream at
+    binding 0, a `float32x4` tint stream at binding 1 that advances once per
+    *instance*, and exactly two instances.
     The rules mirror `provider-capture`'s `render_geometry` and the Swift
     oracle's own validation, so a suite one rail would refuse cannot pass here
     either.
@@ -1250,6 +1253,22 @@ def _vertex_input_declaration(case, where):
     _require((attribute["location"], attribute["offset"], attribute["format"])
              == (0, 0, "float32x2"),
              f"{where}: the reviewed attribute is location 0, offset 0, float32x2")
+    # The non-indexed arm (`research/docs/23` §3.3, v39): the same one-stream
+    # shape drawn without an index buffer. A non-indexed draw names its
+    # vertices `0..vertices`, so every per-vertex stream has to cover the whole
+    # `vertices * stride` span — the footprint rule both rails prove, and the
+    # stricter of the two rules the class carries, since the indexed arm only
+    # has to cover the span its index values reach. A draw of fewer than three
+    # vertices rasterizes no triangle, so it could only ever produce the frame
+    # the pass started from.
+    nonindexed = indices is None
+    if nonindexed:
+        draw = _integer(case.get("vertices"), f"{where}.vertices", 1)
+        _require(draw >= 3,
+                 f"{where}: the reviewed non-indexed draw is at least one triangle")
+        required_span = quad_stride * draw
+    else:
+        required_span = quad_stride * quad_vertices
     bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
     _require(len(bindings) == 1, f"{where}: the reviewed shape binds one vertex stream")
     for position, binding in enumerate(bindings):
@@ -1257,14 +1276,16 @@ def _vertex_input_declaration(case, where):
                 f"{where}.vertex_buffers[{position}]")
         _require(binding["allocation"] > 0 and binding["view"] > 0,
                  f"{where}: zero vertex stream identity")
-        _require(binding["length"] >= quad_stride * quad_vertices,
-                 f"{where}: the vertex stream is shorter than the reviewed quad reads")
+        _require(binding["length"] >= required_span,
+                 f"{where}: the vertex stream is shorter than the reviewed "
+                 + ("non-indexed draw reads" if nonindexed else "quad reads"))
         _require(len(_hex(binding["initial_hex"],
                           f"{where}.vertex_buffers[{position}].initial_hex")) == binding["length"],
                  f"{where}: the vertex stream bytes do not match its length")
         _require("format" not in binding,
                  f"{where}: a vertex stream carries no index format")
-    _require(indices is not None, f"{where}: the reviewed vertex-input shape is indexed")
+    if nonindexed:
+        return {"vertices": draw, "indices": None, "draw": draw}
     _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
             f"{where}.indices")
     _require(indices["allocation"] > 0 and indices["view"] > 0,
@@ -1281,7 +1302,7 @@ def _vertex_input_declaration(case, where):
         index = int.from_bytes(chunk, "little")
         _require(index < quad_vertices,
                  f"{where}: index {position // width} names vertex {index} outside the quad")
-    return {"vertices": quad_vertices, "indices": quad_indices}
+    return {"vertices": quad_vertices, "indices": quad_indices, "draw": quad_indices}
 
 
 def _unorm_texel(record, where):
@@ -1397,7 +1418,7 @@ def _superset_declaration(case, streams, vertex_buffers, indices, where):
                      f"{where}.vertex_buffers[0]: record {index}'s ignored attributes are "
                      "outside the clip space the read attributes cover, or a rail that read "
                      "them would land the same frame")
-    return {"indices": 3, "superset": True}
+    return {"indices": 3, "draw": 3, "superset": True}
 
 
 def _instanced_declaration(case, streams, vertex_buffers, indices, where):
@@ -1481,7 +1502,8 @@ def _instanced_declaration(case, streams, vertex_buffers, indices, where):
         index = int.from_bytes(chunk, "little")
         _require(index < quad_vertices,
                  f"{where}: index {position // width} names vertex {index} outside the quad")
-    return {"vertices": quad_vertices, "indices": quad_indices, "instanced": True,
+    return {"vertices": quad_vertices, "indices": quad_indices, "draw": quad_indices,
+            "instanced": True,
             "tints": tints}
 
 
@@ -1549,7 +1571,7 @@ def _blend_declaration(case, streams, vertex_buffers, indices, where):
             f"{where}.indices")
     _require(indices["initial_hex"] == "000001000200",
              f"{where}: the reviewed blend indices are the reviewed triangle")
-    return {"vertices": 3, "indices": 3}
+    return {"vertices": 3, "indices": 3, "draw": 3}
 
 
 def _cull_declaration(case, streams, vertex_buffers, indices, where):
@@ -1605,7 +1627,7 @@ def _cull_declaration(case, streams, vertex_buffers, indices, where):
             f"{where}.indices")
     _require(indices["initial_hex"] == "000001000200030004000500",
              f"{where}: the reviewed cull indices are the two reviewed triangles")
-    return {"vertices": quad_indices, "indices": quad_indices}
+    return {"vertices": quad_indices, "indices": quad_indices, "draw": quad_indices}
 
 
 def _depth_declaration(case, streams, vertex_buffers, indices, where):
@@ -1737,7 +1759,7 @@ def _depth_declaration(case, streams, vertex_buffers, indices, where):
     # The stored depth attachment, when the case declares one, is the
     # `(allocation, view, expected_texels)` triple the assembly below lands
     # beside the colour attachment (`research/docs/23` §3.3, v43).
-    return {"vertices": quad_indices, "indices": quad_indices,
+    return {"vertices": quad_indices, "indices": quad_indices, "draw": quad_indices,
             "depth_store": depth_store}
 
 
@@ -1998,7 +2020,7 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
     else:
         _require("stencil" in case or "stencil_test" in case,
                  f"{where}: the reviewed stencil shape carries a stencil surface")
-    return {"vertices": stream_indices, "indices": stream_indices,
+    return {"vertices": stream_indices, "indices": stream_indices, "draw": stream_indices,
             "stencil_store": stencil_store, "depth_store": depth_store}
 
 
@@ -2057,7 +2079,7 @@ def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
         index = int.from_bytes(chunk, "little")
         _require(index < quad_vertices,
                  f"{where}: index {position // width} names vertex {index} outside the quad")
-    return {"vertices": quad_vertices, "indices": quad_indices}
+    return {"vertices": quad_vertices, "indices": quad_indices, "draw": quad_indices}
 
 
 def _inside_scissor(index, width, scissor):
@@ -2710,8 +2732,11 @@ def _render_plan(plan, suite):
             _require(not multiple,
                      f"{where}: the milestone vertex_id shape renders one attachment")
         else:
-            _require(case["vertices"] == vertex_input["indices"],
-                     f"{where}: the reviewed indexed quad draws {vertex_input['indices']} indices")
+            # The count the case states is the draw's own: an indexed arm spends
+            # its index count, the non-indexed arm its vertex count
+            # (`research/docs/23` §3.3, v39).
+            _require(case["vertices"] == vertex_input["draw"],
+                     f"{where}: the reviewed draw spends {vertex_input['draw']} vertices")
             _require("present" not in case and "icb" not in case,
                      f"{where}: a vertex-input case carries neither a present action nor an ICB")
         # One attachment at a time: the single shape is the v13-v17 branch with

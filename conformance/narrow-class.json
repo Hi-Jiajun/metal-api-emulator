@@ -38,11 +38,11 @@
     {
       "name": "render-narrow",
       "api": "render",
-      "summary": "the render narrow class's first reviewed shape (research/docs/26 §10, R3): one offscreen colour attachment, Clear load, one indexed draw, the whole attachment read back.",
-      "suite": "suite-v16.json",
-      "fixtures": ["render_declaring_copy_word", "quad_indexed_clear_2x2"],
+      "summary": "the render narrow class's first reviewed shape (research/docs/26 §10, R3), widened once (research/docs/23 §3.3, v39): one offscreen colour attachment, Clear load, one draw — indexed, or non-indexed over the pass's own vertex streams (or the vertex_id triangle when it carries none) — with the whole attachment read back.",
+      "suite": "suite-v39.json",
+      "fixtures": ["render_declaring_copy_word", "offscreen_triangle_clear_2x2", "quad_indexed_clear_2x2", "nonindexed_quad_clear_2x2"],
       "seam_fixture": "quad_indexed_clear_2x2",
-      "seam": "the reims render seam (crates/reims-vgpu/src/backend/provider_render.rs) and its reviewed shape test (crates/reims-vgpu/tests/provider_render_rail.rs) carry the same [declaring compute pass, one colour pass] trace shape; the class's later widenings (W1 chain heads, R6 vertex streams and scissor, W3 wide texels) are not covered by this declaration and owe their own fixtures",
+      "seam": "the reims render seam (crates/reims-vgpu/src/backend/provider_render.rs) and its reviewed shape test (crates/reims-vgpu/tests/provider_render_rail.rs) carry the same [declaring compute pass, one colour pass] trace shape; the draw's two arms are the reviewed quad's index buffer and, since R39 (07b68ca), the same streams drawn without one (the seam's `req.indexed` is the only field that decides, and its vertex-span gate is what keeps a short stream out of the class); the class's other widenings (W1 chain heads, R6 vertex streams and scissor, W3 wide texels) are not covered by this declaration and owe their own fixtures",
       "required_rails": [
         "native-metal",
         "vulkan",
@@ -54,10 +54,10 @@
       "counts": "each rail's own copy-in/copy-out contract is checked against the suite by compare.py; the counters are not compared rail to rail, because the rails observe them through different mechanisms (compare.py ALLOCATION_OBSERVATIONS)",
       "refusals": [
         {
-          "suite": "suite-v13.json",
-          "case": "offscreen_triangle_clear_2x2",
-          "rule": "render-covered-draw",
-          "why": "the class's one draw is indexed; the vertex-id triangle carries no index buffer"
+          "suite": "suite-v39.json",
+          "case": "nonindexed_triangle_clear_2x2",
+          "rule": "render-covered-state",
+          "why": "the class's one draw covers the whole attachment; this case draws one triangle of the quad and states the partial coverage it resolves"
         },
         {
           "suite": "suite-v18.json",
