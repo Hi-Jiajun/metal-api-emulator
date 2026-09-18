@@ -2954,6 +2954,35 @@ private func validateTranslatedStageBufferCase(_ definition: RenderCaseDefinitio
 }
 
 @available(macOS 11.0, *)
+/// Validate one *translated* render case's pins and refuse it for this rail.
+///
+/// The pinned pair is AIR this oracle compiles no part of (`research/docs/23`
+/// §111, v36, E-TX10): the canonical provider translates it, the reviewed MSL
+/// modules this oracle executes are a different set, and the shape itself (a
+/// sampled source of another extent) is what the Vulkan rail gathers into its
+/// render-area grid while this rail refuses it by name. The case therefore
+/// keeps the boundary the translated stage-buffer pair states: the pins are
+/// loaded and checked here, a native capture rail is refused rather than
+/// quietly served by a shape-selected module, and the runner's native
+/// iteration skips the case because `capture_rails` names no native rail.
+private func validateTranslatedRenderCase(_ definition: RenderCaseDefinition,
+                                          root: URL) throws -> ValidatedRender {
+    try require(!definition.capture_rails.contains("native-metal"),
+                "\(definition.id): this oracle compiles the reviewed MSL modules, not the AIR "
+                + "the translated case pins: mark it for the Vulkan rails, which translate that "
+                + "pair")
+    guard let translated = definition.translated_stages else {
+        throw OracleError("\(definition.id): a translated render case pins the sources its "
+                          + "stages read")
+    }
+    for pin in [translated.vertex, translated.fragment] {
+        _ = try loadRenderSource(pin, root: root)
+    }
+    return ValidatedRender(definition: definition, source: "", attachments: [],
+                           vertexStreams: [], stageBuffers: [], indexStream: nil,
+                           depth: nil, stencil: nil)
+}
+
 /// Validate one *reviewed* stage-buffer case's slots and hand the runner the
 /// bindings it has to state (`research/docs/23` §83, R9g; §90, R9i).
 ///
@@ -3166,6 +3195,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         stageBufferSlots = try validateReviewedStageBufferSlots(definition, declared, root: root)
         stageBufferArm = true
+    } else if definition.translated_stages != nil {
+        // The translated render case (research/docs/23 §111, v36, E-TX10): a pair
+        // of AIR modules this oracle compiles no part of — the same boundary the
+        // translated stage-buffer pair states above, minus the stage-buffer
+        // declarations. Its pins are validated here and the case is refused by
+        // name for this rail; a case that ever names a native capture rail is a
+        // case this oracle cannot serve, not one it may execute with a
+        // shape-selected module.
+        return try validateTranslatedRenderCase(definition, root: root)
     }
     // The `try` covers the shape-selected arm alone, so the two selections are
     // stated as branches rather than as a ternary the keyword cannot sit in.
