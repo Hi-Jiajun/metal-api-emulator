@@ -156,8 +156,11 @@ class RenderSamplerByteOrderTests(unittest.TestCase):
         self.assertEqual(sibling.allocations, self.plan().allocations)
 
     def test_a_texture_of_another_layout_is_refused(self):
+        # The narrow lanes are admitted too (`research/docs/23` §113,
+        # `test_suite_v37.py`), so the format outside the window is the
+        # eight-byte `rgba16_float` texel rather than a narrow one.
         self.refused(lambda case: case["fragment_textures"][0].update(
-            format="rgba16_float"), "four-component unorm surface")
+            format="rgba16_float"), "one 8-bit unorm surface")
 
     def test_an_attachment_outside_the_two_layouts_is_refused(self):
         self.refused(lambda case: case["attachment"].update(format="r32float"),

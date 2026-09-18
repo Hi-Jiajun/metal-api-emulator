@@ -645,19 +645,22 @@ const CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_TAIL: u8 = 0x02;
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
-/// The contract's own list is the closed five-value [`TextureFormat`] family,
-/// so this bound can never refuse a well-formed snapshot; it only stops a
-/// corrupt count from driving the decoder — the same rule
+/// The contract's own list is the closed [`TextureFormat`] family (five values
+/// before the narrow lanes, seven after them — `research/docs/23` §113), and
+/// the bound stays above it, so this can never refuse a well-formed snapshot;
+/// it only stops a corrupt count from driving the decoder — the same rule
 /// [`MAX_SUPPORTED_RENDER_TEXTURE_FORMATS`] states for the render side.
 pub const MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS: usize = 8;
 
 /// Maximum texture formats one capability snapshot may declare as render-pass
 /// sampling sources.
 ///
-/// The contract's own list is the closed four-value [`TextureFormat`] family,
-/// so this bound can never refuse a well-formed snapshot; it only stops a
-/// corrupt count from driving the decoder — the same rule
-/// [`MAX_SUPPORTED_COLOR_FORMATS`] states for the attachment formats.
+/// The contract's own list is the closed [`TextureFormat`] family (five values
+/// before the narrow lanes, seven after them — `research/docs/23` §113) and the
+/// render sampler's admitted window is four of those, so this bound can never
+/// refuse a well-formed snapshot; it only stops a corrupt count from driving
+/// the decoder — the same rule [`MAX_SUPPORTED_COLOR_FORMATS`] states for the
+/// attachment formats.
 pub const MAX_SUPPORTED_RENDER_TEXTURE_FORMATS: usize = 8;
 
 /// Maximum number of bytes one present target's sentinel may carry.
@@ -2653,6 +2656,13 @@ fn put_texture_format(encoder: &mut Encoder, format: TextureFormat) {
         TextureFormat::Rgba8Unorm => 2,
         TextureFormat::Bgra8Unorm => 3,
         TextureFormat::Rgba16Float => 4,
+        // The narrow lanes are *appended* rather than inserted
+        // (`research/docs/23` §113): the five codes above are the wire's
+        // existing statements, and a renumbering would read an old frame as
+        // another format. A decoder that predates them refuses the frame by
+        // unknown code instead of silently narrowing its reading.
+        TextureFormat::R8Unorm => 5,
+        TextureFormat::R8G8Unorm => 6,
     });
 }
 
@@ -2663,6 +2673,8 @@ fn get_texture_format(decoder: &mut Decoder<'_>) -> Result<TextureFormat, CodecE
         2 => Ok(TextureFormat::Rgba8Unorm),
         3 => Ok(TextureFormat::Bgra8Unorm),
         4 => Ok(TextureFormat::Rgba16Float),
+        5 => Ok(TextureFormat::R8Unorm),
+        6 => Ok(TextureFormat::R8G8Unorm),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture format",
             value,

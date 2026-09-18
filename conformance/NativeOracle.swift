@@ -2462,8 +2462,16 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // executes it as an ordinary compute case.
     case "compute-buffer-v36":
         expectedIDs = ["render_declaring_gathered_extent"]
+    // The render sampler's narrow lanes (`research/docs/23` §3.3, §113): the
+    // declaring pass of the render case whose sampled texture is one-byte
+    // `r8_unorm`. The render case is marked for the Vulkan rails alone — this
+    // rail's reviewed table names the four-component surface until its own
+    // Apple-side reading lands — so this oracle validates the declaring pass's
+    // metadata and executes it as an ordinary compute case.
+    case "compute-buffer-v37":
+        expectedIDs = ["render_declaring_quad_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v36 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v37 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
