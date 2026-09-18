@@ -2373,13 +2373,21 @@ fn get_texture_access(decoder: &mut Decoder<'_>) -> Result<TextureAccess, CodecE
 
 /// One sampler filter code (`research/docs/23` §91).
 ///
-/// The two codes are the enum's own order — nearest `0`, linear `1` — and any
-/// other byte keeps its named refusal, because a provider that substituted a
-/// filter would change which texels a remote read returns.
+/// The two codes the first increment published are the enum's own order —
+/// nearest `0`, linear `1` — and any other byte keeps its named refusal,
+/// because a provider that substituted a filter would change which texels a
+/// remote read returns. The mipmapped names are appended after them
+/// (`research/docs/23` §109), exactly as `TextureAccess::Fetched` was: the two
+/// published codes keep their meanings, and a decoder that predates §109
+/// answers `UnknownEnumValue` for `2..=5` instead of reading another filter.
 fn put_sampler_filter(encoder: &mut Encoder, filter: SamplerFilter) {
     encoder.u8(match filter {
         SamplerFilter::Nearest => 0,
         SamplerFilter::Linear => 1,
+        SamplerFilter::NearestMipNearest => 2,
+        SamplerFilter::NearestMipLinear => 3,
+        SamplerFilter::LinearMipNearest => 4,
+        SamplerFilter::LinearMipLinear => 5,
     });
 }
 
@@ -2387,6 +2395,10 @@ fn get_sampler_filter(decoder: &mut Decoder<'_>) -> Result<SamplerFilter, CodecE
     match decoder.u8()? {
         0 => Ok(SamplerFilter::Nearest),
         1 => Ok(SamplerFilter::Linear),
+        2 => Ok(SamplerFilter::NearestMipNearest),
+        3 => Ok(SamplerFilter::NearestMipLinear),
+        4 => Ok(SamplerFilter::LinearMipNearest),
+        5 => Ok(SamplerFilter::LinearMipLinear),
         value => Err(CodecError::UnknownEnumValue {
             field: "sampler filter",
             value,
@@ -2395,11 +2407,16 @@ fn get_sampler_filter(decoder: &mut Decoder<'_>) -> Result<SamplerFilter, CodecE
 }
 
 /// One sampler address code (`research/docs/23` §91), ordered like the enum:
-/// clamp-to-edge `0`, repeat `1`.
+/// clamp-to-edge `0`, repeat `1`, and — appended after the published pair
+/// (`research/docs/23` §109) — mirror-clamp-to-edge `2`, mirror-repeat `3`,
+/// clamp-to-zero `4`.
 fn put_sampler_address(encoder: &mut Encoder, address: SamplerAddressMode) {
     encoder.u8(match address {
         SamplerAddressMode::ClampToEdge => 0,
         SamplerAddressMode::Repeat => 1,
+        SamplerAddressMode::MirrorClampToEdge => 2,
+        SamplerAddressMode::MirrorRepeat => 3,
+        SamplerAddressMode::ClampToZero => 4,
     });
 }
 
@@ -2407,6 +2424,9 @@ fn get_sampler_address(decoder: &mut Decoder<'_>) -> Result<SamplerAddressMode, 
     match decoder.u8()? {
         0 => Ok(SamplerAddressMode::ClampToEdge),
         1 => Ok(SamplerAddressMode::Repeat),
+        2 => Ok(SamplerAddressMode::MirrorClampToEdge),
+        3 => Ok(SamplerAddressMode::MirrorRepeat),
+        4 => Ok(SamplerAddressMode::ClampToZero),
         value => Err(CodecError::UnknownEnumValue {
             field: "sampler address",
             value,

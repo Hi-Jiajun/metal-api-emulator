@@ -411,6 +411,17 @@ impl VulkanExecutor {
         self.context.float_controls2_support()
     }
 
+    /// Whether this device was created with `samplerMirrorClampToEdge`
+    /// enabled (`research/docs/23` §109).
+    ///
+    /// The one device fact a family address mode needs: a rail creates
+    /// `MIRROR_CLAMP_TO_EDGE` samplers only when this answers `true`, so the
+    /// reading a host records for a device it cannot create here is the same
+    /// bit the creation refused on.
+    pub fn supports_sampler_mirror_clamp_to_edge(&self) -> bool {
+        self.context.sampler_mirror_clamp_to_edge()
+    }
+
     /// The SPIR-V capability policy this device answers with (R8).
     ///
     /// [`TranslatedComputePipeline::translate_with_policy`] and
@@ -1066,6 +1077,16 @@ pub(crate) struct VulkanContext {
     /// capability gate reads it as [`FloatControls2Support::policy`], so the
     /// snapshot and the gate are the same pair of readings.
     float_controls2: FloatControls2Support,
+    /// Whether the device was created with `samplerMirrorClampToEdge` enabled
+    /// (`research/docs/23` §109).
+    ///
+    /// `VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE` is only valid on a device
+    /// that enabled this feature — the extension being core from Vulkan 1.2
+    /// does not turn the bit on — so the rail records the device's own answer
+    /// and creates that mode only when it was enabled, instead of asking for a
+    /// mode the device was never told about. Every other address mode the
+    /// family names is Vulkan 1.0 core with no feature of its own.
+    sampler_mirror_clamp_to_edge: bool,
     queue_locks: Vec<Mutex<()>>,
     enqueue_probe: Mutex<Option<EnqueueProbe>>,
     /// The single admission and terminal-state authority for this device.
@@ -1223,8 +1244,23 @@ impl VulkanContext {
         if float_controls2.enabled() {
             enabled_extensions.push(shader_float_controls2::NAME.as_ptr());
         }
+        // `samplerMirrorClampToEdge` (`VK_KHR_sampler_mirror_clamp_to_edge`,
+        // core from Vulkan 1.2) is the one feature an address mode the family
+        // names needs (`research/docs/23` §109). The query is a valid
+        // `VkPhysicalDeviceFeatures2` chain on every 1.3 device, and the bit is
+        // enabled iff the device reported it: enabling a feature the device
+        // does not have is a device-creation error, and the rail's refusal for
+        // the mode reads this same bit.
+        let mut mirror_clamp_features = vk::PhysicalDeviceVulkan12Features::default();
+        let mut mirror_clamp_query =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut mirror_clamp_features);
+        unsafe { instance.get_physical_device_features2(physical, &mut mirror_clamp_query) };
+        let sampler_mirror_clamp_to_edge =
+            mirror_clamp_features.sampler_mirror_clamp_to_edge == vk::TRUE;
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
-        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default().shader_int8(shader_int8);
+        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_int8(shader_int8)
+            .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge);
         let physical_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
         let mut float_controls2_enable =
             vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default()
@@ -1323,6 +1359,7 @@ impl VulkanContext {
             memory,
             device_name,
             float_controls2,
+            sampler_mirror_clamp_to_edge,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
             enqueue_probe: Mutex::new(None),
             lifecycle: Mutex::new(ProviderLifecycle::new(
@@ -1377,6 +1414,12 @@ impl VulkanContext {
     /// What this device reported about `VK_KHR_shader_float_controls2` (R8).
     pub(crate) const fn float_controls2_support(&self) -> FloatControls2Support {
         self.float_controls2
+    }
+
+    /// Whether this device was created with `samplerMirrorClampToEdge` enabled
+    /// (`research/docs/23` §109).
+    pub(crate) const fn sampler_mirror_clamp_to_edge(&self) -> bool {
+        self.sampler_mirror_clamp_to_edge
     }
 
     /// The SPIR-V capability policy this device answers with (R8).
@@ -2818,12 +2861,28 @@ fn descriptor_type_for_binding(
 /// Map one AIR-embedded constexpr sampler state onto the contract's closed
 /// sampler family (`research/docs/26` §21.3, C1b).
 ///
-/// The reviewed family is `{nearest, linear} x {clamp-to-edge, repeat}` under
-/// normalized coordinates, no comparison function, no reduction mode and no
-/// anisotropy — exactly the states the contract's [`SamplerPolicy`] can name.
+/// The family is the contract's own ([`SamplerPolicy`]): six filters —
+/// `{nearest, linear}` minification/magnification, each with the mip filter
+/// `{not-mipmapped, nearest, linear}` — crossed with five address modes
+/// (`clamp-to-edge`, `repeat`, `mirror-clamp-to-edge`, `mirror-repeat`,
+/// `clamp-to-zero`), under normalized coordinates, equal address on all three
+/// axes, no comparison function, no reduction mode and no anisotropy.
+/// `research/docs/23` §109 widened the two first-increment names to this list.
 /// Anything else is refused here rather than approximated, because a
 /// substituted sampler changes which texels a sample returns without changing
 /// the module the state came from.
+///
+/// Two states the AIR vocabulary can name stay outside the family by name:
+///
+/// - `bicubic`, whose four taps the family cannot state; and
+/// - `clampToBorderColor`, whose border colour is a state of its own
+///   (`MTLSamplerBorderColor`) that the family does not name — the family's
+///   only border is `clampToZero`'s zero.
+///
+/// The translator's own vocabulary has no `mirrorClampToEdge`, so that family
+/// name is reached through a request that states it (the render pass's
+/// `[[sampler(n)]]` state) rather than through an AIR decode; §109's readings
+/// execute it on the rail and name the gap.
 ///
 /// [`SamplerPolicy`]: metal_api_core::provider::SamplerPolicy
 pub(crate) fn static_sampler_policy(
@@ -2834,21 +2893,40 @@ pub(crate) fn static_sampler_policy(
         SamplerFilter as AirFilter, SamplerMipFilter as AirMipFilter, SamplerReduction,
     };
 
-    let filter = |filter: AirFilter| match filter {
-        AirFilter::Nearest => Ok(metal_api_core::provider::SamplerFilter::Nearest),
-        AirFilter::Linear => Ok(metal_api_core::provider::SamplerFilter::Linear),
-        AirFilter::Bicubic => Err(failure(
-            "the compute sampler family has no bicubic filter; refusing instead of substituting",
+    let filter = |filter: AirFilter, mip: AirMipFilter| match (filter, mip) {
+        (AirFilter::Nearest, AirMipFilter::None) => {
+            Ok(metal_api_core::provider::SamplerFilter::Nearest)
+        }
+        (AirFilter::Linear, AirMipFilter::None) => {
+            Ok(metal_api_core::provider::SamplerFilter::Linear)
+        }
+        (AirFilter::Nearest, AirMipFilter::Nearest) => {
+            Ok(metal_api_core::provider::SamplerFilter::NearestMipNearest)
+        }
+        (AirFilter::Nearest, AirMipFilter::Linear) => {
+            Ok(metal_api_core::provider::SamplerFilter::NearestMipLinear)
+        }
+        (AirFilter::Linear, AirMipFilter::Nearest) => {
+            Ok(metal_api_core::provider::SamplerFilter::LinearMipNearest)
+        }
+        (AirFilter::Linear, AirMipFilter::Linear) => {
+            Ok(metal_api_core::provider::SamplerFilter::LinearMipLinear)
+        }
+        (AirFilter::Bicubic, _) => Err(failure(
+            "the canonical sampler family has no bicubic filter; refusing instead of substituting",
         )),
     };
-    let address = |address: AirAddress| {
-        match address {
+    let address = |address: AirAddress| match address {
         AirAddress::ClampToEdge => Ok(metal_api_core::provider::SamplerAddressMode::ClampToEdge),
         AirAddress::Repeat => Ok(metal_api_core::provider::SamplerAddressMode::Repeat),
-        other => Err(failure(format!(
-            "the compute sampler family has no {other:?} address mode; refusing instead of substituting"
-        ))),
-    }
+        AirAddress::MirroredRepeat => {
+            Ok(metal_api_core::provider::SamplerAddressMode::MirrorRepeat)
+        }
+        AirAddress::ClampToZero => Ok(metal_api_core::provider::SamplerAddressMode::ClampToZero),
+        AirAddress::ClampToBorder => Err(failure(
+            "the canonical sampler family states no border colour, so clampToBorderColor is \
+             refused by name instead of substituting a sampler that answers another colour",
+        )),
     };
     if state.min_filter != state.mag_filter {
         return Err(failure(format!(
@@ -2861,12 +2939,6 @@ pub(crate) fn static_sampler_policy(
         return Err(failure(format!(
             "an AIR sampler whose axes address differently (s {:?}, t {:?}, r {:?}) is outside the reviewed family",
             state.address_mode_s, state.address_mode_t, state.address_mode_r
-        )));
-    }
-    if state.mip_filter != AirMipFilter::None {
-        return Err(failure(format!(
-            "an AIR sampler with a {:?} mip filter is outside the reviewed family",
-            state.mip_filter
         )));
     }
     if state.coordinates != SamplerCoordinates::Normalized {
@@ -2893,7 +2965,7 @@ pub(crate) fn static_sampler_policy(
         )));
     }
     Ok(metal_api_core::provider::SamplerPolicy {
-        filter: filter(state.min_filter)?,
+        filter: filter(state.min_filter, state.mip_filter)?,
         address: address(state.address_mode_s)?,
     })
 }
@@ -2902,29 +2974,88 @@ pub(crate) fn static_sampler_policy(
 ///
 /// Shared by both rails that create a `VkSampler` from a contract policy: the
 /// compute narrow class's AIR-embedded state and the render sampler's
-/// declaration (`research/docs/23` §3.3, v100).
+/// declaration (`research/docs/23` §3.3, v100), plus the render sampler's
+/// widened state family (`research/docs/23` §109).
+///
+/// The policy's two fields are the states that can move a sample on the
+/// canonical one-mip views, and every name maps onto the `VkSamplerCreateInfo`
+/// field that decides it:
+///
+/// | contract | Vulkan |
+/// |---|---|
+/// | `Nearest` / `Linear` (min and mag) | `magFilter` / `minFilter` |
+/// | `…MipNearest` / `…MipLinear` | `mipmapMode` |
+/// | `ClampToEdge` / `Repeat` / `MirrorClampToEdge` / `MirrorRepeat` | `addressMode{U,V,W}` |
+/// | `ClampToZero` | `addressMode{U,V,W}` = `CLAMP_TO_BORDER` + `borderColor` = transparent black |
+///
+/// The fields Metal's other sampler state would name are stated here as the
+/// family's own fixed values: `minLod`/`maxLod` pinned to `0..=0` (every
+/// canonical view carries one mip level, so level zero is the only reachable
+/// level and a mip filter can only name the mode it is selected under), no
+/// comparison, `unnormalizedCoordinates` false and no anisotropy.
 pub(crate) fn sampler_create_info(
     policy: metal_api_core::provider::SamplerPolicy,
 ) -> vk::SamplerCreateInfo<'static> {
     use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
 
-    let filter = match policy.filter {
-        SamplerFilter::Nearest => vk::Filter::NEAREST,
-        SamplerFilter::Linear => vk::Filter::LINEAR,
+    let filter = if policy.filter.is_linear() {
+        vk::Filter::LINEAR
+    } else {
+        vk::Filter::NEAREST
+    };
+    let mip = match policy.filter {
+        SamplerFilter::Nearest
+        | SamplerFilter::Linear
+        | SamplerFilter::NearestMipNearest
+        | SamplerFilter::LinearMipNearest => vk::SamplerMipmapMode::NEAREST,
+        SamplerFilter::NearestMipLinear | SamplerFilter::LinearMipLinear => {
+            vk::SamplerMipmapMode::LINEAR
+        }
     };
     let address = match policy.address {
         SamplerAddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         SamplerAddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
+        SamplerAddressMode::MirrorClampToEdge => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+        SamplerAddressMode::MirrorRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+        // Metal's `clampToZero` is Vulkan's border mode with the
+        // transparent-black border: the built-in border colours need no
+        // extension and the family states no colour of its own.
+        SamplerAddressMode::ClampToZero => vk::SamplerAddressMode::CLAMP_TO_BORDER,
     };
     vk::SamplerCreateInfo::default()
         .mag_filter(filter)
         .min_filter(filter)
-        // The reviewed textures carry one mip level, so `mipmap_mode` is never
-        // consulted; the nearest mode keeps the create-info valid.
-        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .mipmap_mode(mip)
         .address_mode_u(address)
         .address_mode_v(address)
         .address_mode_w(address)
+        .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
+        .min_lod(0.0)
+        .max_lod(0.0)
+}
+
+/// The device feature one contract address mode needs before a sampler may be
+/// created with it, or `None` when the mode needs none.
+///
+/// `VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE` is only valid on a device
+/// created with `samplerMirrorClampToEdge` enabled (`VK_KHR_sampler_mirror_clamp_to_edge`'s
+/// promoted feature; asking for the mode without it is undefined behaviour, not
+/// an error the driver returns). The other four modes are Vulkan 1.0 core with
+/// no feature of their own. The name travels in the refusal, so an observer can
+/// tell "this device never reported the feature" from "the mode is outside the
+/// family".
+pub(crate) const fn sampler_address_mode_feature(
+    address: metal_api_core::provider::SamplerAddressMode,
+) -> Option<&'static str> {
+    match address {
+        metal_api_core::provider::SamplerAddressMode::MirrorClampToEdge => {
+            Some("samplerMirrorClampToEdge")
+        }
+        metal_api_core::provider::SamplerAddressMode::ClampToEdge
+        | metal_api_core::provider::SamplerAddressMode::Repeat
+        | metal_api_core::provider::SamplerAddressMode::MirrorRepeat
+        | metal_api_core::provider::SamplerAddressMode::ClampToZero => None,
+    }
 }
 
 fn validate_storage_buffer_size(
@@ -5463,7 +5594,24 @@ impl ExecutionResources {
                     ))
                 })?;
                 let policy = static_sampler_policy(&state)?;
-                if policy.filter == metal_api_core::provider::SamplerFilter::Linear {
+                // The device question an address mode asks before the sampler
+                // is created (`research/docs/23` §109): the family's
+                // `mirrorClampToEdge` is the one mode whose Vulkan feature is
+                // not core-and-enabled-by-default, so a device that never
+                // reported it is refused by name instead of being handed a
+                // mode it was never told about.
+                if let Some(feature) = sampler_address_mode_feature(policy.address) {
+                    if !self.context.sampler_mirror_clamp_to_edge() {
+                        return Err(failure(format!(
+                            "the device did not report the {feature} feature, which the {:?} \
+                             address mode needs; refusing the mode by name instead of creating \
+                             a sampler the device was never told about",
+                            policy.address
+                        ))
+                        .into());
+                    }
+                }
+                if policy.filter.is_linear() {
                     let features = unsafe {
                         self.context.instance.get_physical_device_format_properties(
                             self.context.physical,
@@ -8398,6 +8546,184 @@ mod tests {
         let still_refused =
             validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64]), admitted).unwrap_err();
         assert!(still_refused.message().contains("capability 10"));
+    }
+
+    /// The widened family states every field it names on the sampler the rail
+    /// creates (`research/docs/23` §109): six filter names x five address
+    /// modes, each one asserted against the `VkSamplerCreateInfo` field that
+    /// decides it, plus the fields the family pins (normalized coordinates, no
+    /// comparison, no anisotropy, LOD range `0..=0`).
+    #[test]
+    fn the_sampler_family_states_every_field_on_the_create_info() {
+        use metal_api_core::provider::{SamplerAddressMode, SamplerFilter, SamplerPolicy};
+
+        for (filter, linear, mipmapped, mip) in [
+            (
+                SamplerFilter::Nearest,
+                false,
+                false,
+                vk::SamplerMipmapMode::NEAREST,
+            ),
+            (
+                SamplerFilter::Linear,
+                true,
+                false,
+                vk::SamplerMipmapMode::NEAREST,
+            ),
+            (
+                SamplerFilter::NearestMipNearest,
+                false,
+                true,
+                vk::SamplerMipmapMode::NEAREST,
+            ),
+            (
+                SamplerFilter::NearestMipLinear,
+                false,
+                true,
+                vk::SamplerMipmapMode::LINEAR,
+            ),
+            (
+                SamplerFilter::LinearMipNearest,
+                true,
+                true,
+                vk::SamplerMipmapMode::NEAREST,
+            ),
+            (
+                SamplerFilter::LinearMipLinear,
+                true,
+                true,
+                vk::SamplerMipmapMode::LINEAR,
+            ),
+        ] {
+            assert_eq!(filter.is_linear(), linear, "{filter:?}");
+            assert_eq!(filter.is_mipmapped(), mipmapped, "{filter:?}");
+            for (address, expected, feature) in [
+                (
+                    SamplerAddressMode::ClampToEdge,
+                    vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                    None,
+                ),
+                (
+                    SamplerAddressMode::Repeat,
+                    vk::SamplerAddressMode::REPEAT,
+                    None,
+                ),
+                (
+                    SamplerAddressMode::MirrorClampToEdge,
+                    vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+                    Some("samplerMirrorClampToEdge"),
+                ),
+                (
+                    SamplerAddressMode::MirrorRepeat,
+                    vk::SamplerAddressMode::MIRRORED_REPEAT,
+                    None,
+                ),
+                (
+                    SamplerAddressMode::ClampToZero,
+                    vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                    None,
+                ),
+            ] {
+                let info = sampler_create_info(SamplerPolicy { filter, address });
+                let vk_filter = if linear {
+                    vk::Filter::LINEAR
+                } else {
+                    vk::Filter::NEAREST
+                };
+                let where_ = format!("{filter:?} {address:?}");
+                assert!(info.mag_filter == vk_filter, "mag filter: {where_}");
+                assert!(info.min_filter == vk_filter, "min filter: {where_}");
+                assert!(info.mipmap_mode == mip, "mipmap mode: {where_}");
+                assert!(info.address_mode_u == expected, "address u: {where_}");
+                assert!(info.address_mode_v == expected, "address v: {where_}");
+                assert!(info.address_mode_w == expected, "address w: {where_}");
+                assert!(
+                    info.border_color == vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+                    "border colour: {where_}"
+                );
+                assert_eq!(info.min_lod, 0.0);
+                assert_eq!(info.max_lod, 0.0);
+                assert!(info.unnormalized_coordinates == vk::FALSE);
+                assert!(info.compare_enable == vk::FALSE);
+                assert!(info.anisotropy_enable == vk::FALSE);
+                assert_eq!(sampler_address_mode_feature(address), feature);
+            }
+        }
+    }
+
+    /// The census's own state reaches the family (`research/docs/23` §109):
+    /// linear minification and magnification with a linear mip filter and
+    /// mirrored-repeat addressing maps onto the two names §109 appended — and
+    /// the states the family cannot state keep their named refusals instead of
+    /// being approximated.
+    #[test]
+    fn the_mapping_admits_the_census_state_and_refuses_the_rest() {
+        use metal2vulkan::reflect::{
+            SamplerAddressMode as AirAddress, SamplerBorderColor, SamplerCompareFunction,
+            SamplerCoordinates, SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+            StaticSamplerState,
+        };
+        use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+        let state = |filter: AirFilter, mip: SamplerMipFilter, address: AirAddress| {
+            StaticSamplerState {
+                min_filter: filter,
+                mag_filter: filter,
+                mip_filter: mip,
+                address_mode_s: address,
+                address_mode_t: address,
+                address_mode_r: address,
+                coordinates: SamplerCoordinates::Normalized,
+                compare_function: SamplerCompareFunction::Never,
+                max_anisotropy: 1,
+                // Metal's own default maximum rather than zero: the family
+                // states one mip level, so a maximum cannot exclude level zero
+                // and the ordinary state has to stay admitted.
+                lod_min_clamp: 0.0,
+                lod_max_clamp: 65504.0,
+                border_color: SamplerBorderColor::TransparentBlack,
+                reduction: SamplerReduction::WeightedAverage,
+                lod_bias: 0.0,
+                raw_words: [0; 2],
+            }
+        };
+
+        let census = static_sampler_policy(&state(
+            AirFilter::Linear,
+            SamplerMipFilter::Linear,
+            AirAddress::MirroredRepeat,
+        ))
+        .expect("linear min/mag with a linear mip filter and mirror-repeat is inside the family");
+        eprintln!("census-shaped state maps onto {census:?}");
+        assert_eq!(census.filter, SamplerFilter::LinearMipLinear);
+        assert_eq!(census.address, SamplerAddressMode::MirrorRepeat);
+
+        let zero = static_sampler_policy(&state(
+            AirFilter::Nearest,
+            SamplerMipFilter::Nearest,
+            AirAddress::ClampToZero,
+        ))
+        .expect("clamp-to-zero is inside the family");
+        assert_eq!(zero.filter, SamplerFilter::NearestMipNearest);
+        assert_eq!(zero.address, SamplerAddressMode::ClampToZero);
+
+        let border = static_sampler_policy(&state(
+            AirFilter::Linear,
+            SamplerMipFilter::None,
+            AirAddress::ClampToBorder,
+        ))
+        .expect_err("clamp-to-border needs a border colour the family does not name");
+        eprintln!("clamp-to-border refused: {}", border.message());
+        assert!(border.message().contains("states no border colour"));
+
+        let bicubic = static_sampler_policy(&state(
+            AirFilter::Bicubic,
+            SamplerMipFilter::None,
+            AirAddress::ClampToEdge,
+        ))
+        .expect_err("bicubic is not a filter the family names");
+        eprintln!("bicubic refused: {}", bicubic.message());
+        assert!(bicubic.message().contains("no bicubic filter"));
     }
 
     /// The support struct is the pair of readings, and the policy is the

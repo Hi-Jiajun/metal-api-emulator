@@ -3642,6 +3642,13 @@ pub(crate) fn plan_with_leases<'a>(
     // refused by name with both halves rather than executed as the reviewed
     // state and reported under another. A second reviewed module per state is
     // what would lift this, not a silently substituted sampler.
+    //
+    // The Vulkan rail's family widened in §109 (the mipmapped filters and the
+    // mirror/clamp-to-zero address modes); this table does **not** follow it.
+    // The reviewed MSL module is a compile-time artifact whose sampler is
+    // spelled in its own source, so every state outside the one it carries —
+    // including the newly named ones — keeps its refusal until a module per
+    // state is reviewed on the Apple side.
     for declared in &request.pipeline.textures {
         // The sampler-free texel-fetch arm is the render face's own
         // (`research/docs/23` §3.3, v105), and no reviewed MSL module reads a

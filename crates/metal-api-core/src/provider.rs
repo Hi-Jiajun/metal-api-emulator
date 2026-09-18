@@ -688,7 +688,7 @@ impl TextureSource {
     }
 }
 
-/// Sampler filtering admitted by the first texture-sampling increment.
+/// Sampler filtering admitted by the canonical rail.
 ///
 /// The translator synthesizes the sampler a sampled texture binding carries
 /// (`research/docs/16` §4.3): the reviewed compute subset binds no Metal
@@ -697,17 +697,83 @@ impl TextureSource {
 /// deliberately closed — a provider must refuse an unlisted filter rather than
 /// substitute one, because substituting one changes sampled bytes without
 /// changing the request (`core` cannot see the difference after the fact).
+///
+/// Metal states filtering in two fields — the minification/magnification
+/// filter (`MTLSamplerMinMagFilter`) and the mip filter
+/// (`MTLSamplerMipFilter`) — and this family names both in one closed list,
+/// because the two halves are what decides which texels a sample returns. The
+/// plain names state the *not-mipmapped* mip filter; the `…Mip…` names state a
+/// minification and magnification filter that agree with each other (the
+/// family never states a module whose two filters differ) with the mip filter
+/// named after `Mip`. `research/docs/23` §109 widened the list from the first
+/// increment's two names: every canonical view carries one mip level, so a
+/// stated mip filter can only name the mode level zero is selected under, and
+/// the readings there hold the mipmapped names to the frame their
+/// not-mipmapped sibling lands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SamplerFilter {
+    /// Nearest minification and magnification, mip filter not-mipmapped.
     Nearest,
+    /// Linear minification and magnification, mip filter not-mipmapped.
     Linear,
+    /// Nearest minification and magnification with a nearest mip filter.
+    NearestMipNearest,
+    /// Nearest minification and magnification with a linear mip filter.
+    NearestMipLinear,
+    /// Linear minification and magnification with a nearest mip filter.
+    LinearMipNearest,
+    /// Linear minification and magnification with a linear mip filter.
+    LinearMipLinear,
 }
 
-/// Sampler addressing admitted by the first texture-sampling increment.
+impl SamplerFilter {
+    /// Whether the minification/magnification half is linear.
+    ///
+    /// The linear-filtering device question (`SAMPLED_IMAGE_FILTER_LINEAR`)
+    /// answers this half alone — a mip filter never asks a device for linear
+    /// filtering — so the rails ask it here instead of matching the six names
+    /// one by one.
+    pub const fn is_linear(self) -> bool {
+        matches!(
+            self,
+            Self::Linear | Self::LinearMipNearest | Self::LinearMipLinear
+        )
+    }
+
+    /// Whether the state mip-filters at all (`MTLSamplerMipFilter` other than
+    /// `notMipmapped`).
+    pub const fn is_mipmapped(self) -> bool {
+        !matches!(self, Self::Nearest | Self::Linear)
+    }
+}
+
+/// Sampler addressing admitted by the canonical rail.
+///
+/// Five of Metal's six `MTLSamplerAddressMode` values travel here:
+/// `clampToEdge`, `repeat`, `mirrorClampToEdge`, `mirrorRepeat` and
+/// `clampToZero`. The sixth, `clampToBorderColor`, is refused by name: its
+/// border colour is a state of its own (`MTLSamplerBorderColor`) that this
+/// family does not name, so a rail that created a sampler for it would answer
+/// with a colour the request never stated (`research/docs/23` §109).
+///
+/// The order is the command channel's own, not Metal's numbering: the first
+/// two keep the codes the channel published before §109, and the three after
+/// them are appended, so every pre-§109 frame keeps its bytes and an older
+/// decoder refuses an appended code by name instead of reading it as another
+/// mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SamplerAddressMode {
     ClampToEdge,
     Repeat,
+    /// Metal's `mirrorClampToEdge`: the coordinate is mirrored to `|t|` and
+    /// then clamped into `[0, 1]` (`VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE`).
+    MirrorClampToEdge,
+    /// Metal's `mirrorRepeat` (`VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT`).
+    MirrorRepeat,
+    /// Metal's `clampToZero`: out-of-range coordinates sample a zero border
+    /// (`VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER` with the transparent-black
+    /// border colour).
+    ClampToZero,
 }
 
 /// The sampler state one sampled texture binding must be executed with.
@@ -718,6 +784,17 @@ pub enum SamplerAddressMode {
 /// pair rules in [`ComputePass::validate`] compare the declaration with the
 /// view's own access, and the execution rails refuse a policy they cannot
 /// create for the binding's format by name.
+///
+/// The two fields are the halves that can move a sample on the canonical
+/// views: the filter (minification/magnification plus the mip mode, see
+/// [`SamplerFilter`]) and the addressing ([`SamplerAddressMode`]). Metal's
+/// remaining sampler fields — the LOD range, the LOD bias and the border
+/// colour — cannot move a sample here: every canonical view carries one mip
+/// level, so level zero is the only reachable level whatever the LOD range or
+/// bias say, and the only mode that reads a border colour is
+/// `clampToBorderColor`, which the family refuses by name. The rail states its
+/// own fixed values for those fields (LOD range `0..=0`, bias `0`,
+/// transparent-black border) rather than letting a provider default decide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SamplerPolicy {
     pub filter: SamplerFilter,
