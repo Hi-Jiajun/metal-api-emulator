@@ -71,12 +71,18 @@
           "rule": "render-covered-attachment",
           "why": "the first reviewed shape admits only a Clear load"
         },
-        {
-          "suite": "suite-v22.json",
-          "case": "r32float_clear_2x2",
-          "rule": "render-covered-attachment",
-          "why": "the covered formats are the reviewed 8-bit colour formats; a wide texel is its own widening"
-        }
+    {
+      "suite": "suite-v22.json",
+      "case": "r32float_clear_2x2",
+      "rule": "render-covered-attachment",
+      "why": "the covered formats are the reviewed 8-bit colour formats; a wide texel is its own widening"
+    },
+    {
+      "suite": "suite-v40.json",
+      "case": "landing_view_quad_2x2",
+      "rule": "render-covered-attachment",
+      "why": "the class's one attachment stores through the pool writeback channel; a landing view names a second declaration whose owner window the frame also lands in, and this rail-fact owes its own fixture"
+    }
       ]
     }
   ]

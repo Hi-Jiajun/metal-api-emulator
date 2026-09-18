@@ -2119,6 +2119,21 @@ pub enum LoadOp {
     DontCare,
 }
 
+/// The view declaration a [`StoreOp::BorrowedLanding`] attachment's frame lands
+/// in (`research/docs/23` §115 之后的增量，E-TX13).
+///
+/// The pair is a *second* declaration beside the attachment's own
+/// `(allocation_id, view_id)`: the attachment's load still comes from its own
+/// view, and this one names the owner's registered window the frame lands in.
+/// Keeping the two apart is the whole point of the arm — a guest-backed surface
+/// whose frame the walk handed on as bytes can land back into the guest's pages
+/// without the pass reading those pages first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachmentLandingView {
+    pub allocation_id: AllocationId,
+    pub view_id: ViewId,
+}
+
 /// How a colour attachment's contents are handed on after a render pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreOp {
@@ -2160,6 +2175,28 @@ pub enum StoreOp {
     /// legal beside a view declaration that names a window, which is the
     /// declaration the rail resolves before any device object exists.
     Borrowed,
+    /// Land the pass's writes in the owner's registered window a *second* view
+    /// declaration names (`research/docs/23` §115 之后的增量，E-TX13).
+    ///
+    /// [`Self::Borrowed`] takes the window from the attachment's *own*
+    /// declaration, which is also where its load comes from — so a record whose
+    /// pre-pass bytes are the walk's own chain value could not land its frame in
+    /// the guest's pages without reading them first, and a record that did
+    /// declare the window as its load source would be silently answered from the
+    /// wrong frame. This arm separates the two facts: the attachment's own view
+    /// stays the load source (caller bytes, `Clear`, or the provider's own
+    /// image), and the carry-along [`AttachmentLandingView`] names the owner
+    /// window the stored frame lands in.
+    ///
+    /// Shape rules: the landing view MUST be a different `(allocation_id,
+    /// view_id)` pair than the attachment's own (naming the attachment's own
+    /// pair is refused by name — that statement is [`Self::Borrowed`]'s), and
+    /// the window its declaration resolves to MUST be the attachment's own
+    /// tightly packed byte extent, exactly as [`Self::Borrowed`]'s is. The
+    /// writeback channel still carries the same frame
+    /// ([`RenderAttachment::publishes_bytes`] stays true for this arm), so every
+    /// pre-E-TX13 reader of the completion is byte-identical.
+    BorrowedLanding(AttachmentLandingView),
     /// Keep the pass's writes in the *provider-resident* target
     /// (`research/docs/23` §76, R7).
     ///
@@ -2180,6 +2217,31 @@ pub enum StoreOp {
     /// attachment disappears from the observable surface instead of passing
     /// as "landed correctly".
     DontCare,
+}
+
+impl StoreOp {
+    /// Whether this arm lands the pass's frame in an *owner's registered
+    /// window* (`research/docs/23` §115 / E-TX13).
+    ///
+    /// Two arms state it: [`Self::Borrowed`] resolves the window from the
+    /// attachment's own view declaration, [`Self::BorrowedLanding`] from the
+    /// view the arm carries.
+    pub const fn lands_in_owner_window(&self) -> bool {
+        matches!(self, Self::Borrowed | Self::BorrowedLanding(_))
+    }
+
+    /// The `(allocation_id, view_id)` pair of the view declaration a
+    /// [`Self::BorrowedLanding`] arm carries, or `None` for every other arm.
+    ///
+    /// `None` is not "no window": [`Self::Borrowed`]'s window is the
+    /// attachment's own declaration, so a reader that needs the identity asks
+    /// [`RenderAttachment::landing_identity`] instead of this method alone.
+    pub const fn landing_view(&self) -> Option<AttachmentLandingView> {
+        match self {
+            Self::BorrowedLanding(view) => Some(*view),
+            Self::Store | Self::Borrowed | Self::Resident | Self::DontCare => None,
+        }
+    }
 }
 
 /// The colour attachments a render pass may declare, which is the MRT shape
@@ -2900,6 +2962,26 @@ impl RenderAttachment {
         if self.load == LoadOp::DontCare && self.store == StoreOp::Resident {
             return Err(ContractError::ResidentStoreUndefinedLoad);
         }
+        // The landing view (`research/docs/23` §115 之后的增量，E-TX13) is a
+        // *second* declaration, so its two rules are structural and answered
+        // here, before any rail sees the pass: the identity has to be complete,
+        // and it has to be a different pair than the attachment's own. Naming
+        // the attachment's own pair would be a second spelling of the statement
+        // `StoreOp::Borrowed` already makes — one fact, two encodings — and the
+        // rail could then resolve the window from either one of two places.
+        if let Some(landing) = self.store.landing_view() {
+            if landing.allocation_id.is_zero() {
+                return Err(ContractError::InvalidIdentity(
+                    "attachment landing view allocation id",
+                ));
+            }
+            if landing.view_id.is_zero() {
+                return Err(ContractError::InvalidIdentity("attachment landing view id"));
+            }
+            if landing.allocation_id == self.allocation_id && landing.view_id == self.view_id {
+                return Err(ContractError::AttachmentLandingViewSameIdentity(landing));
+            }
+        }
         Ok(())
     }
 
@@ -2908,27 +2990,53 @@ impl RenderAttachment {
     /// keeps them in the provider's image instead
     /// (`research/docs/23` §76, R7).
     ///
-    /// [`StoreOp::Borrowed`] publishes as well (`research/docs/23` §114,
-    /// E-TX8): the arm adds the owner-window landing on top of the writeback
-    /// channel rather than replacing it, so every reader of the completion —
-    /// the trace's own later passes and the caller's parity comparison — sees
-    /// the same bytes it saw before the arm existed.
+    /// Both owner-window arms publish as well (`research/docs/23` §115 及
+    /// 其后的增量，E-TX8/E-TX13): the arm adds the owner-window landing on top of
+    /// the writeback channel rather than replacing it, so every reader of the
+    /// completion — the trace's own later passes and the caller's parity
+    /// comparison — sees the same bytes it saw before the arm existed.
     pub fn publishes_bytes(&self) -> bool {
-        matches!(self.store, StoreOp::Store | StoreOp::Borrowed)
+        matches!(
+            self.store,
+            StoreOp::Store | StoreOp::Borrowed | StoreOp::BorrowedLanding(_)
+        )
     }
 
     /// Whether this attachment's stored bytes land in the *owner's registered
     /// window* rather than only in the writeback channel
-    /// (`research/docs/23` §114, E-TX8).
+    /// (`research/docs/23` §115 及其后的增量，E-TX8/E-TX13).
     ///
-    /// The window itself is not part of this value: it is the source arm of the
-    /// view the trace declares for the attachment's own
-    /// `(allocation_id, view_id)` pair, exactly as a `LoadOp::Load`
-    /// attachment's previous contents are. The rail resolves it (and refuses a
+    /// Which view declaration names the window is
+    /// [`Self::landing_identity`]'s answer: this arm's own pair for
+    /// [`StoreOp::Borrowed`], or the pair the store carries for
+    /// [`StoreOp::BorrowedLanding`]. The rail resolves it (and refuses a
     /// declaration that names no window, or one that is not the attachment's
     /// own tightly packed extent) before any device object exists.
     pub const fn lands_in_owner_window(&self) -> bool {
-        matches!(self.store, StoreOp::Borrowed)
+        self.store.lands_in_owner_window()
+    }
+
+    /// The `(allocation_id, view_id)` pair of the view declaration that names
+    /// the owner's window this attachment's frame lands in, or `None` for an
+    /// attachment whose store is not an owner-window arm
+    /// (`research/docs/23` §115 之后的增量，E-TX13).
+    ///
+    /// The two owner-window arms answer differently on purpose:
+    /// [`StoreOp::Borrowed`]'s window is the attachment's *own* declaration
+    /// (the pair this attachment already names), while
+    /// [`StoreOp::BorrowedLanding`]'s is the second declaration the store
+    /// carries. A consumer that reads this pair is asking "which view's
+    /// declaration has to hold the owner's window", which is exactly the
+    /// question the rail asks before any device object exists.
+    pub const fn landing_identity(&self) -> Option<AttachmentLandingView> {
+        match self.store {
+            StoreOp::Borrowed => Some(AttachmentLandingView {
+                allocation_id: self.allocation_id,
+                view_id: self.view_id,
+            }),
+            StoreOp::BorrowedLanding(view) => Some(view),
+            StoreOp::Store | StoreOp::Resident | StoreOp::DontCare => None,
+        }
     }
 
     /// Whether this attachment names the provider's resident target on either
@@ -4363,15 +4471,18 @@ impl RenderPassDescriptor {
         // depth surface: what it refuses is a pass whose whole output is
         // thrown away, not a pass whose landing is not a guest writeback.
         //
-        // The owner-window store is a landing for that same reason
-        // (`research/docs/23` §114, E-TX8): the frame lands in the guest's own
-        // pages under the attachment's own view declaration, and it is exactly
-        // the shape whose only other observable channel — the writeback — the
-        // guest-backed attachment's own caller does not consume.
+        // Both owner-window stores are landings for that same reason
+        // (`research/docs/23` §115 及其后的增量，E-TX8/E-TX13): the frame lands
+        // in the guest's own pages under the view declaration the store names,
+        // and it is exactly the shape whose only other observable channel — the
+        // writeback — the guest-backed attachment's own caller does not consume.
         let stored_colour = self.color_attachments.iter().any(|attachment| {
             matches!(
                 attachment.store,
-                StoreOp::Store | StoreOp::Resident | StoreOp::Borrowed
+                StoreOp::Store
+                    | StoreOp::Resident
+                    | StoreOp::Borrowed
+                    | StoreOp::BorrowedLanding(_)
             )
         });
         let stored_depth = self
@@ -4844,14 +4955,19 @@ impl RenderPassDescriptor {
                         StoreOp::Resident,
                     ));
                 }
-                // The owner-window store is the colour attachment's arm
-                // (`research/docs/23` §114, E-TX8): the window it names is the
-                // *colour* view declaration's own source arm, and the stencil
-                // surface states no view of its own, so the arm is refused here
-                // for the same reason the resident one is.
+                // Both owner-window stores are the colour attachment's arms
+                // (`research/docs/23` §115 及其后的增量，E-TX8/E-TX13): the window
+                // they name is a *colour* view declaration's source arm, and the
+                // stencil surface states no view of its own, so they are refused
+                // here for the same reason the resident one is.
                 (Some(StoreOp::Borrowed), _) => {
                     return Err(ContractError::UnsupportedAttachmentStoreOp(
                         StoreOp::Borrowed,
+                    ));
+                }
+                (Some(StoreOp::BorrowedLanding(view)), _) => {
+                    return Err(ContractError::UnsupportedAttachmentStoreOp(
+                        StoreOp::BorrowedLanding(view),
                     ));
                 }
                 (None, Some(_))
@@ -8993,11 +9109,12 @@ fn validate_writebacks_for_trace(
             {
                 match attachment.store {
                     StoreOp::Store => stored = true,
-                    // The owner-window store publishes the same bytes through
-                    // the writeback channel (`research/docs/23` §114, E-TX8):
-                    // the arm adds the owner's window as a second landing, so
-                    // the view lands exactly the writeback this rule asks for.
-                    StoreOp::Borrowed => stored = true,
+                    // Both owner-window stores publish the same bytes through
+                    // the writeback channel (`research/docs/23` §115 及其后的
+                    // 增量，E-TX8/E-TX13): the arm adds an owner window as a
+                    // second landing, so the view lands exactly the writeback
+                    // this rule asks for.
+                    StoreOp::Borrowed | StoreOp::BorrowedLanding(_) => stored = true,
                     // A resident store keeps the pass's bytes in the provider's
                     // own image rather than the writeback channel
                     // (`research/docs/23` §76, R7), so the view lands no
@@ -9399,6 +9516,31 @@ pub struct ProviderCapabilities {
     /// default, because it refuses every source of another extent by name and
     /// Apple has no oracle for the shape.
     pub supports_render_texture_gathered_extent_no_copy: bool,
+    /// Whether this snapshot executes a colour attachment whose frame lands in
+    /// the owner's registered window a *second* view declaration names
+    /// (`research/docs/23` §115 之后的增量，E-TX13). Defaults to `false`: a pass
+    /// that carries such a landing view is refused by name instead of being
+    /// executed against the attachment's own declaration.
+    ///
+    /// The bit is a *store-side*, attachment-shaped statement and is
+    /// deliberately separate from the two gathered-extent bits beside it: those
+    /// describe a sampled source whose extent differs from the render area's,
+    /// while this one describes where an attachment's stored frame lands. A
+    /// snapshot may execute either family without the other, and reading this
+    /// bit as a statement about sampling — or the gathered bits as a statement
+    /// about landings — would publish a fact the snapshot never made. It MUST
+    /// NOT be read as "the snapshot lands arbitrary attachments in arbitrary
+    /// views": the window is still an owner's registered mapping
+    /// (`BufferSource::BorrowedNoCopy` / `BufferSource::GuestRuns`), and a
+    /// copy-arm declaration keeps its own by-name refusal.
+    ///
+    /// Declared `true` by the snapshots whose rail executes the arm: the Vulkan
+    /// rail resolves the landing view's own declaration and writes the frame
+    /// into the owner's pages (`tests/render_attachment_landing_view_e2e.rs`).
+    /// The native rail keeps the default, because its owner-window channel is an
+    /// *input* channel with no route that writes one, and Apple has no oracle
+    /// for the shape.
+    pub supports_render_attachment_landing_view: bool,
     /// Whether this snapshot can execute a render pass whose stage binds a
     /// buffer directly (`research/docs/23` §3.3, v83). Defaults to `false`: a
     /// snapshot whose rail cannot fill a stage buffer slot refuses the pass
@@ -9632,6 +9774,23 @@ impl ProviderCapabilities {
     /// other by name.
     pub fn declares_render_texture_gathered_extent_no_copy_support(&self) -> bool {
         self.supports_render_texture_gathered_extent_no_copy
+    }
+
+    /// Whether this snapshot declares the attachment landing-view arm
+    /// (`research/docs/23` §115 之后的增量，E-TX13).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself, and
+    /// it exists for the same reasons its siblings' do: one place answers "did
+    /// this snapshot declare the arm", and the capability frame's payload guard
+    /// asks it, so a snapshot that declares *only* this bit still writes the
+    /// extended payload instead of dropping the declaration on the wire.
+    ///
+    /// Like the two gathered-extent predicates beside it, this one is
+    /// deliberately *not* folded into any other "declares render texture
+    /// support" question: a snapshot that never spoke about landings keeps the
+    /// default "refuse the arm by name" answer.
+    pub fn declares_render_attachment_landing_view_support(&self) -> bool {
+        self.supports_render_attachment_landing_view
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -11164,6 +11323,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MissingSnapshotIdentity(_)
         | E::UnknownSnapshotIdentity(_)
         | E::EmptyAttachmentList
+        | E::AttachmentLandingViewSameIdentity(_)
         | E::ResidentLoadDiscardingStore
         | E::ResidentStoreUndefinedLoad
         | E::AllRenderAttachmentsDiscarded
@@ -12428,6 +12588,13 @@ pub enum ContractError {
     UnsupportedAttachmentFormat(AttachmentFormat),
     UnsupportedAttachmentLoadOp(LoadOp),
     UnsupportedAttachmentStoreOp(StoreOp),
+    /// A `StoreOp::BorrowedLanding` attachment names its own
+    /// `(allocation_id, view_id)` pair as the landing view
+    /// (`research/docs/23` §115 之后的增量，E-TX13): the statement "the frame
+    /// lands in the window the attachment's own declaration names" is
+    /// `StoreOp::Borrowed`'s, and a second spelling of it would leave the rail
+    /// two places to resolve one window from.
+    AttachmentLandingViewSameIdentity(AttachmentLandingView),
     /// A pass loads the provider-resident target and discards the raster it
     /// draws over it (`research/docs/23` §76, R7). The resident image is the
     /// pass's own render target, so a discarded store would leave bytes the
@@ -13421,6 +13588,13 @@ impl fmt::Display for ContractError {
             Self::UnsupportedAttachmentStoreOp(store) => write!(
                 formatter,
                 "attachment store operation {store:?} is outside the first render increment"
+            ),
+            Self::AttachmentLandingViewSameIdentity(landing) => write!(
+                formatter,
+                "the landing view (allocation {}, view {}) is the attachment's own identity; a \
+                 borrowed store already states that window",
+                landing.allocation_id.get(),
+                landing.view_id.get()
             ),
             Self::ResidentLoadDiscardingStore => formatter.write_str(
                 "a pass that loads the provider-resident target cannot discard the raster it \
@@ -15436,6 +15610,7 @@ mod tests {
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
+            supports_render_attachment_landing_view: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -18722,6 +18897,121 @@ mod tests {
             load: LoadOp::Clear(ClearColor::new([0x40, 0x80, 0xc0, 0xff])),
             store: StoreOp::Store,
         }
+    }
+
+    /// The landing-view arm is a *second* declaration with its own shape rules
+    /// (`research/docs/23` §115 之后的增量，E-TX13).
+    ///
+    /// Four readings, each its own falsifier: the arm publishes and lands like
+    /// the borrowed one; its landing identity is the pair the store carries
+    /// (while the borrowed arm's is the attachment's own pair); naming the
+    /// attachment's own pair is refused by name; and a zero identity is refused
+    /// by the same identity rule every other field answers to. The pass-level
+    /// "at least one landing" rule and the stencil surface's own refusal are
+    /// pinned beside them.
+    #[test]
+    fn a_landing_view_is_a_second_declaration_with_its_own_shape_rules() {
+        let landing = AttachmentLandingView {
+            allocation_id: AllocationId::new(960),
+            view_id: ViewId::new(970),
+        };
+
+        let mut attachment = render_attachment(AttachmentFormat::Rgba8Unorm);
+        attachment.store = StoreOp::BorrowedLanding(landing);
+        attachment
+            .validate_shape()
+            .expect("a second declaration is a legal attachment shape");
+        assert!(attachment.publishes_bytes());
+        assert!(attachment.lands_in_owner_window());
+        assert_eq!(attachment.landing_identity(), Some(landing));
+        assert_eq!(attachment.store.landing_view(), Some(landing));
+
+        // The borrowed arm answers the same question with the attachment's own
+        // pair, so a consumer that needs "which declaration holds the window"
+        // asks one method and gets both arms' answers.
+        let mut borrowed = render_attachment(AttachmentFormat::Rgba8Unorm);
+        borrowed.store = StoreOp::Borrowed;
+        assert!(borrowed.lands_in_owner_window());
+        assert_eq!(
+            borrowed.landing_identity(),
+            Some(AttachmentLandingView {
+                allocation_id: borrowed.allocation_id,
+                view_id: borrowed.view_id,
+            })
+        );
+        assert_eq!(borrowed.store.landing_view(), None);
+        assert!(borrowed.publishes_bytes());
+
+        // A store arm that is not an owner-window arm states no landing at all.
+        let plain = render_attachment(AttachmentFormat::Rgba8Unorm);
+        assert!(!plain.lands_in_owner_window());
+        assert_eq!(plain.landing_identity(), None);
+        assert!(plain.publishes_bytes());
+
+        // Naming the attachment's own pair is a second spelling of the borrowed
+        // arm's statement, so it is refused by name — and by the structural
+        // class, not as a capability narrowing.
+        let same = AttachmentLandingView {
+            allocation_id: attachment.allocation_id,
+            view_id: attachment.view_id,
+        };
+        let mut duplicate = attachment;
+        duplicate.store = StoreOp::BorrowedLanding(same);
+        assert_eq!(
+            duplicate.validate_shape(),
+            Err(ContractError::AttachmentLandingViewSameIdentity(same))
+        );
+        let refusal =
+            contract_error_refusal(ContractError::AttachmentLandingViewSameIdentity(landing));
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+
+        // A zero identity is refused before anything could be resolved from it.
+        for incomplete in [
+            AttachmentLandingView {
+                allocation_id: AllocationId::new(0),
+                view_id: landing.view_id,
+            },
+            AttachmentLandingView {
+                allocation_id: landing.allocation_id,
+                view_id: ViewId::new(0),
+            },
+        ] {
+            let mut broken = attachment;
+            broken.store = StoreOp::BorrowedLanding(incomplete);
+            assert!(matches!(
+                broken.validate_shape(),
+                Err(ContractError::InvalidIdentity(_))
+            ));
+        }
+
+        // The pass-level rule counts the arm as a landing: a pass whose one
+        // colour attachment stores through it is observable and stays legal.
+        let mut pass = render_pass();
+        pass.color_attachments[0].store = StoreOp::BorrowedLanding(landing);
+        pass.validate()
+            .expect("the landing-view store is an observable landing point");
+
+        // The stencil surface has no view declaration to name a window with, so
+        // the arm is refused there exactly as the borrowed one is.
+        let mut stencil = render_pass();
+        stencil.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::Clear(0),
+            store: Some(StoreOp::BorrowedLanding(landing)),
+            identity: Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(960),
+                view_id: ViewId::new(970),
+            }),
+        });
+        assert_eq!(
+            stencil.validate(),
+            Err(ContractError::UnsupportedAttachmentStoreOp(
+                StoreOp::BorrowedLanding(landing)
+            ))
+        );
     }
 
     /// A clear payload of exactly one texel of `format`, in the format's memory

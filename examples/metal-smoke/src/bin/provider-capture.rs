@@ -1973,6 +1973,14 @@ struct RenderCase {
     /// absent and spells the expectation on each attachment entry instead.
     #[serde(default)]
     expected_hex: Option<String>,
+    /// The bytes the owner's window holds after a `"landing_view"` store's pass
+    /// (`research/docs/23` §115 之后的增量，E-TX13): the frame the pass landed
+    /// there, spelled the way the attachment's own expectation is. Required
+    /// exactly when an attachment stores through the landing view, because that
+    /// arm's whole statement is *where the frame lands* and a capture that
+    /// reported only the writeback would leave it unobserved.
+    #[serde(default)]
+    expected_landing_hex: Option<String>,
     /// The rule the single attachment's own bytes follow, when the case cannot
     /// spell them (R5a, `research/docs/23` §73). It is the reviewed sampling
     /// shape's identity rule restated: the fragment stage copies the bound
@@ -2665,14 +2673,32 @@ struct RenderAttachmentDefinition {
     /// the observable surface, `"dontcare"` discards them (`docs/23` §3.6,
     /// v19). Defaults to `"store"` so the v13-v18 fixtures that predate the
     /// field deserialize unchanged.
+    /// `"landing_view"` is the owner-window arm whose window a *second* view
+    /// declaration names (`docs/23` §115 之后的增量，E-TX13): the load stays the
+    /// attachment's own declaration and the frame lands in the window the
+    /// `landing_view` section names.
     #[serde(default = "default_attachment_store")]
     store: String,
+    /// The second view declaration a `"landing_view"` store names. The view has
+    /// to be one the declaring case declares as the owner's window
+    /// (`storage_mode: "borrowed_no_copy"`), and the harness reports the window's
+    /// bytes after the pass so the landing is observable rather than assumed.
+    landing_view: Option<LandingViewDefinition>,
     clear_hex: Option<String>,
     initial_hex: Option<String>,
     /// The MRT case's per-attachment expectation; absent for the
     /// single-attachment form, whose expectation is case-level.
     #[serde(default)]
     expected_hex: Option<String>,
+}
+
+/// The identity of the second view declaration a landing-view store names
+/// (`research/docs/23` §115 之后的增量，E-TX13).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LandingViewDefinition {
+    allocation: u64,
+    view: u64,
 }
 
 fn default_attachment_store() -> String {
@@ -3240,6 +3266,13 @@ struct CaseResult {
     /// indirect command.
     #[serde(skip_serializing_if = "Option::is_none")]
     icb: Option<IcbSegment>,
+    /// The owner's window a landing-view store wrote, read back after the
+    /// pass (`research/docs/23` §115 之后的增量，E-TX13). Absent from every case
+    /// whose store is not that arm, and from the Swift reference oracle, which
+    /// is not a provider: the arm's whole statement is where the frame lands,
+    /// so a capture that reported only the writeback would leave it unobserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landing: Option<LandingObservation>,
     /// The source arm each of this case's views ran with
     /// (`research/docs/23` §90, R9i). Absent from cases whose suite declares no
     /// lease arm, and from the Swift reference oracle, which is not a provider:
@@ -3247,6 +3280,15 @@ struct CaseResult {
     /// it to execute.
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_modes: Option<Vec<StorageModeObservation>>,
+}
+
+/// The window bytes one landing-view store landed
+/// (`research/docs/23` §115 之后的增量，E-TX13).
+#[derive(Serialize)]
+struct LandingObservation {
+    allocation: u64,
+    view: u64,
+    bytes_hex: String,
 }
 
 /// One view's source arm as the run used it (`research/docs/23` §90, R9i).
@@ -4073,6 +4115,15 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // quad, the same quad drawn without an index buffer, and the
         // partial-coverage neighbour one triangle of it draws.
         (1, "compute-buffer-v39") => &["render_declaring_copy_word"],
+        // The colour attachment's landing view (`research/docs/23` §115 之后的
+        // 增量，E-TX13): the declaring pass of the render case whose load comes
+        // from the caller's own bytes while its frame lands in an owner window a
+        // *second* view declaration names. That declaration is the declaring
+        // pass's third binding — the reviewed witness kernel reads it, exactly
+        // as the depth-store declaring pass declares its landing view — and the
+        // render case runs on the Vulkan track rail alone, so this table pins the
+        // declaring pass, which every rail executes.
+        (1, "compute-buffer-v40") => &["render_declaring_landing_view"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4394,6 +4445,46 @@ fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition
         return attachments.iter().collect();
     }
     case.attachment.iter().collect()
+}
+
+/// The one attachment that stores through the landing view
+/// (`research/docs/23` §115 之后的增量，E-TX13), with the second view
+/// declaration it names.
+///
+/// A case may declare at most one such attachment: the arm's reading is one
+/// owner window, and two landing views in one pass would need two windows
+/// reported under one case-level expectation.
+fn render_case_landing(
+    case: &RenderCase,
+) -> Result<Option<(&RenderAttachmentDefinition, &LandingViewDefinition)>> {
+    let mut found = None;
+    for attachment in render_case_attachments(case) {
+        if attachment.store != "landing_view" {
+            if attachment.landing_view.is_some() {
+                return Err(format!(
+                    "render case {}: only a landing_view store names a landing view",
+                    case.id
+                )
+                .into());
+            }
+            continue;
+        }
+        let definition = attachment
+            .landing_view
+            .as_ref()
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!(
+                    "render case {}: a landing_view store needs the landing_view section",
+                    case.id
+                )
+                .into()
+            })?;
+        if found.is_some() {
+            return Err(format!("render case {}: one pass lands one owner window", case.id).into());
+        }
+        found = Some((attachment, definition));
+    }
+    Ok(found)
 }
 
 /// The identity a render case's stored depth attachment lands in
@@ -7204,6 +7295,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             format!("{where_}: a rule expectation is the reviewed sampling shape's").into(),
         );
     }
+    // The landing expectation belongs to the landing-view store and nowhere
+    // else (`research/docs/23` §115 之后的增量，E-TX13): a case that states the
+    // bytes an owner window should hold without naming the arm that lands them
+    // would be claiming an observation no pass performs.
+    if case.expected_landing_hex.is_some() && render_case_landing(case)?.is_none() {
+        return Err(format!("{where_}: expected_landing_hex needs a landing_view store").into());
+    }
     let shapes = render_attachment_shapes(case)?;
     if multiple && !(2..=metal_api_core::provider::MAX_COLOR_ATTACHMENTS).contains(&shapes.len()) {
         return Err(format!(
@@ -8156,7 +8254,59 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .ok_or("attachment extent overflows")?,
         )?;
         match attachment.store.as_str() {
-            "store" => {
+            // The landing-view store (`research/docs/23` §115 之后的增量，
+            // E-TX13) is the stored arm *plus* its second declaration: every
+            // expectation rule the stored arm states — the whole attachment is
+            // covered, the frame is falsifiable against the load's own bytes,
+            // the load shape is pinned — applies unchanged, and the landing
+            // view's own rules are checked at the end of this arm.
+            "store" | "landing_view" => {
+                if attachment.store == "landing_view" {
+                    let (_, definition) = render_case_landing(case)?.ok_or(format!(
+                        "{where_}: a landing_view store names the second view declaration it \
+                         lands in"
+                    ))?;
+                    let landed = unhex(case.expected_landing_hex.as_deref().ok_or(format!(
+                        "{where_}: a landing_view store needs expected_landing_hex"
+                    ))?)?;
+                    if landed.len() != extent {
+                        return Err(format!(
+                            "{where_}: the landing expectation does not match the attachment"
+                        )
+                        .into());
+                    }
+                    let declared = suite
+                        .cases
+                        .iter()
+                        .find(|declared| declared.id == case.declaring_case)
+                        .and_then(|declared| {
+                            declared.buffers.iter().find(|buffer| {
+                                buffer.allocation == definition.allocation
+                                    && buffer.view == definition.view
+                            })
+                        })
+                        .ok_or(format!(
+                            "{where_}: the declaring pass does not declare the landing view"
+                        ))?;
+                    if declared.storage_mode.as_deref() != Some("borrowed_no_copy") {
+                        return Err(format!(
+                            "{where_}: a landing view has to be the declaring pass's \
+                             borrowed_no_copy window"
+                        )
+                        .into());
+                    }
+                    if declared.length != u64::try_from(extent)? {
+                        return Err(format!(
+                            "{where_}: the landing view has to be the attachment's own extent"
+                        )
+                        .into());
+                    }
+                } else if attachment.landing_view.is_some() {
+                    return Err(format!(
+                        "{where_}: only a landing_view store names a landing view"
+                    )
+                    .into());
+                }
                 // R5a (`research/docs/23` §73): a rule-expected attachment
                 // states its expectation as the reviewed per-texel rule instead
                 // of a hex string. The rule's own plane is computed here, so
@@ -9373,6 +9523,18 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             &[(0, "read", 16), (1, "write", 4)][..],
         ),
+        // E-TX13: the landing-view declaring pass is the witness kernel over
+        // the 2x2 attachment's own sixteen-byte view (the caller's bytes), the
+        // copy landing, and the *second* view declaration the store arm lands
+        // its frame in — the owner's window, declared beside the attachment
+        // exactly as the depth-store declaring pass declares its own landing
+        // view (`research/docs/23` §115 之后的增量).
+        "render_declaring_landing_view" => (
+            "copy_word_with_witness",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4), (2, "read", 16)][..],
+        ),
         // E-SB1: the widened stage-buffer ceiling's declaring pass is the same
         // plain copy kernel over the 2x2 attachment's own sixteen-byte view
         // (`research/docs/23` §3.3, §108).
@@ -10509,10 +10671,32 @@ fn run_render_case(
         }
         allocations[position].1[start..start + initial.len()].copy_from_slice(&initial);
     }
+    // The declaring pass's own source arms (`research/docs/23` §90, R9i): an
+    // owned view reads the case's own image, while a lease-armed view names one
+    // import the provider already holds. A landing-view fixture declares its
+    // window through the borrowed arm, so the imports are made before the trace
+    // is built: the snapshot admission reads has to carry the same reservations
+    // the trace's `BufferSource` names, and the owner windows the borrowed views
+    // map stay alive in `declaring_windows` until the case has been waited for.
+    let mut declaring_leases = CaseLeases::default();
+    let mut declaring_windows = Vec::new();
+    let declaring_sources = case_sources(
+        declaring,
+        &allocations,
+        provider,
+        leases,
+        guard,
+        &mut declaring_leases,
+        &mut declaring_windows,
+    )?;
+    for reservation in &declaring_leases.reservations {
+        resources.insert_lease(*reservation)?;
+    }
     let views = declaring
         .buffers
         .iter()
-        .map(|buffer| {
+        .enumerate()
+        .map(|(index, buffer)| {
             let access = match buffer.access.as_str() {
                 "read" => BufferAccess::Read,
                 "write" => BufferAccess::Write,
@@ -10533,7 +10717,10 @@ fn run_render_case(
                 length: buffer.length,
                 access,
                 attribute_stride: None,
-                source: BufferSource::OwnedBytes(backing[start..end].to_vec()),
+                source: match &declaring_sources[index] {
+                    CaseSource::Owned => BufferSource::OwnedBytes(backing[start..end].to_vec()),
+                    CaseSource::Lease(source) => source.clone(),
+                },
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -10749,6 +10936,20 @@ fn run_render_case(
             let store = match attachment.store.as_str() {
                 "store" => StoreOp::Store,
                 "dontcare" => StoreOp::DontCare,
+                // The owner-window arm whose window a *second* view declaration
+                // names (`research/docs/23` §115 之后的增量，E-TX13): the load
+                // below still comes from the attachment's own declaration, and
+                // the frame lands in the window the `landing_view` section names.
+                "landing_view" => {
+                    let landing = attachment
+                        .landing_view
+                        .as_ref()
+                        .ok_or("a landing_view store needs the landing_view section")?;
+                    StoreOp::BorrowedLanding(metal_api_core::provider::AttachmentLandingView {
+                        allocation_id: AllocationId::new(landing.allocation),
+                        view_id: ViewId::new(landing.view),
+                    })
+                }
                 other => {
                     return Err(
                         format!("render case {}: unsupported store op {other:?}", case.id).into(),
@@ -10975,7 +11176,11 @@ fn run_render_case(
     let mut writebacks = Vec::new();
     let mut images = Vec::new();
     for (attachment, _) in &attachments {
-        if attachment.store != "store" {
+        // Both stored arms publish their frame through the writeback channel
+        // (`research/docs/23` §115 及其后的增量): the landing-view arm adds the
+        // owner's window as a *second* destination, so the attachment's own
+        // observation stays the one every other stored case reports.
+        if !matches!(attachment.store.as_str(), "store" | "landing_view") {
             continue;
         }
         let declared = declared_views
@@ -11228,6 +11433,82 @@ fn run_render_case(
             .map(Writeback::observed_bytes)
             .sum::<usize>()
     );
+    // The landing-view store's own reading (`research/docs/23` §115 之后的增量，
+    // E-TX13): the owner's window holds the frame the pass landed there, so the
+    // bytes come back out of the same mapping the trace declared and are
+    // compared with the case's own expectation here — the arm's statement *is*
+    // where the frame lands, and a capture that reported only the writeback
+    // would leave it unobserved. The window is read before `declaring_windows`
+    // is dropped, and the borrowed lease stays imported for the same scope.
+    let landing = match render_case_landing(case)? {
+        None => {
+            if case.expected_landing_hex.is_some() {
+                return Err(format!(
+                    "render case {}: expected_landing_hex needs a landing_view store",
+                    case.id
+                )
+                .into());
+            }
+            None
+        }
+        Some((_, definition)) => {
+            let position = declaring
+                .buffers
+                .iter()
+                .filter(|buffer| {
+                    buffer_storage_mode(buffer, &declaring.id)
+                        .is_ok_and(|mode| mode == BufferSourceKind::BorrowedNoCopy)
+                })
+                .position(|buffer| {
+                    buffer.allocation == definition.allocation && buffer.view == definition.view
+                })
+                .ok_or_else(|| -> Box<dyn Error> {
+                    format!(
+                        "render case {}: the declaring pass declares the landing view {} of \
+                         allocation {} as the owner's window",
+                        case.id, definition.view, definition.allocation
+                    )
+                    .into()
+                })?;
+            let declared = declaring
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.allocation == definition.allocation && buffer.view == definition.view
+                })
+                .ok_or("the landing view is one of the declaring pass's buffers")?;
+            let window = declaring_windows
+                .get_mut(position)
+                .ok_or("the landing view's owner window is still alive")?;
+            let start = usize::try_from(declared.offset)?;
+            let end = start + usize::try_from(declared.length)?;
+            let bytes = window
+                .as_mut_slice()
+                .get(start..end)
+                .ok_or("the landing view's window covers the view's own range")?
+                .to_vec();
+            let expected = unhex(
+                case.expected_landing_hex
+                    .as_deref()
+                    .ok_or("a landing_view store needs expected_landing_hex")?,
+            )?;
+            if bytes != expected {
+                return Err(format!(
+                    "render case {}: the landing window holds {} against the reviewed {}",
+                    case.id,
+                    hex(&bytes),
+                    hex(&expected)
+                )
+                .into());
+            }
+            eprintln!("render case landing: {} {}", case.id, hex(&bytes));
+            Some(LandingObservation {
+                allocation: definition.allocation,
+                view: definition.view,
+                bytes_hex: hex(&bytes),
+            })
+        }
+    };
     let storage_modes = stage_buffer_storage_modes(case)?;
     Ok(CaseResult {
         id: case.id.clone(),
@@ -11240,6 +11521,7 @@ fn run_render_case(
         present: None,
         heap: None,
         icb: None,
+        landing,
         storage_modes,
     })
 }
@@ -11460,6 +11742,7 @@ fn run_object_case(
             present: None,
             heap: None,
             icb: None,
+            landing: None,
             // The object API carries no lease channel yet
             // (`research/docs/23` §90): a case that declares one is marked for
             // the trace rails and never reaches this path.
@@ -11622,6 +11905,19 @@ fn run_object_render_case(
             let store = match attachment.store.as_str() {
                 "store" => StoreOp::Store,
                 "dontcare" => StoreOp::DontCare,
+                // The landing-view arm is a *provider* face of the trace API
+                // (`research/docs/23` §115 之后的增量，E-TX13): the object API's
+                // own entries record one attachment per view and have no route
+                // that names a second view declaration for the landing, so the
+                // arm is refused by name here rather than recorded as a plain
+                // store (`§115.5.4`'s boundary).
+                "landing_view" => {
+                    return Err(format!(
+                        "render case {}: the object API records no landing-view attachment",
+                        case.id
+                    )
+                    .into());
+                }
                 other => {
                     return Err(
                         format!("render case {}: unsupported store op {other:?}", case.id).into(),
@@ -12684,6 +12980,7 @@ fn run_object_render_case(
         present: None,
         heap: None,
         icb: None,
+        landing: None,
         storage_modes,
     })
 }
@@ -13031,6 +13328,7 @@ fn run_case(
         present: None,
         heap: None,
         icb: None,
+        landing: None,
         storage_modes,
     })
 }
@@ -14049,6 +14347,102 @@ mod tests {
             let mut drifted = suite;
             drifted.cases[0].id = "render_declaring_something_else".to_owned();
             assert!(validate_suite(&drifted).is_err());
+        }
+    }
+
+    /// The colour attachment's landing view (`research/docs/23` §115 之后的增量，
+    /// E-TX13).
+    ///
+    /// The suite is the fixture: `landing_view_quad_2x2` loads the caller's own
+    /// bytes and stores its frame into the owner window the declaring pass's
+    /// third binding declares. These tests hold the shape rules that admit it —
+    /// and the three refusals that keep a copy arm, a missing expectation and a
+    /// stray declaration out of the arm — without claiming any GPU evidence.
+    mod landing_view {
+        use super::*;
+
+        fn suite() -> Suite {
+            serde_json::from_str(include_str!("../../../../conformance/suite-v40.json")).unwrap()
+        }
+
+        fn case(suite: &Suite) -> RenderCase {
+            suite
+                .render_cases
+                .iter()
+                .find(|case| case.id == "landing_view_quad_2x2")
+                .cloned()
+                .expect("the suite carries the landing-view case")
+        }
+
+        #[test]
+        fn the_suite_is_admitted_and_names_its_landing_view() {
+            let suite = suite();
+            validate_suite(&suite).unwrap();
+            let case = case(&suite);
+            validate_render_case(&suite, &case).unwrap();
+            let (_, definition) = render_case_landing(&case)
+                .unwrap()
+                .expect("the declaring case's third binding is the landing view the store names");
+            assert_eq!((definition.allocation, definition.view), (940, 950));
+        }
+
+        #[test]
+        fn the_store_arm_carries_the_declared_identity() {
+            // The trace rail names the second declaration through the store arm
+            // itself, which is what separates the load's source from the frame's
+            // landing (`research/docs/23` §115 之后的增量).
+            let suite = suite();
+            let case = case(&suite);
+            let attachment = case
+                .attachment
+                .as_ref()
+                .expect("the case has one attachment");
+            let landing = attachment
+                .landing_view
+                .as_ref()
+                .expect("the store arm names a landing view");
+            assert_eq!(attachment.store, "landing_view");
+            assert_eq!(attachment.load, "load");
+            assert_eq!(
+                (
+                    landing.allocation,
+                    landing.view,
+                    attachment.allocation,
+                    attachment.view
+                ),
+                (940, 950, 900, 910),
+                "the landing view is a second declaration, not the attachment's own"
+            );
+        }
+
+        #[test]
+        fn a_landing_expectation_without_the_arm_is_refused() {
+            let mut suite = suite();
+            suite.render_cases[0].attachment.as_mut().unwrap().store = "store".to_owned();
+            assert!(validate_render_case(&suite, &case(&suite)).is_err());
+        }
+
+        #[test]
+        fn a_landing_view_that_is_not_the_declared_window_is_refused() {
+            let mut suite = suite();
+            // The same bytes through a copy arm: nothing is wrong with the
+            // trace, but there is no owner window for the frame to land in.
+            suite.cases[0].buffers[2].storage_mode = None;
+            assert!(validate_render_case(&suite, &case(&suite)).is_err());
+            let mut shortened = self::suite();
+            shortened.cases[0].buffers[2].length = 12;
+            shortened.cases[0].buffers[2].initial_hex = Some("112233441122334411223344".to_owned());
+            assert!(validate_render_case(&shortened, &case(&shortened)).is_err());
+        }
+
+        #[test]
+        fn a_landing_declaration_beside_another_store_arm_is_refused() {
+            let mut suite = suite();
+            suite.render_cases[0].attachment.as_mut().unwrap().store = "store".to_owned();
+            suite.render_cases[0].expected_landing_hex = None;
+            // The landing view stays declared while the arm does not: that is
+            // the stray declaration the harness refuses rather than ignoring.
+            assert!(validate_render_case(&suite, &case(&suite)).is_err());
         }
     }
 }

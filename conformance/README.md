@@ -15,7 +15,13 @@ their own suites (`suite-v23.json` onward), each with its own test module;
 (`research/docs/23` §3.3, v39): the milestone's `vertex_id` triangle, the
 reviewed indexed quad, the same streams drawn without an index buffer, and the
 partial-coverage neighbour one triangle of that stream draws. Its boundaries are
-written up in [../docs/NON-INDEXED-DRAW.md](../docs/NON-INDEXED-DRAW.md). The render and present observation rules live in
+written up in [../docs/NON-INDEXED-DRAW.md](../docs/NON-INDEXED-DRAW.md);
+`suite-v40.json` is the colour attachment's landing view (`research/docs/23`
+§115 之后的增量，E-TX13): one attachment whose load stays the caller's own bytes
+while its frame lands in the owner window a *second* view declaration names —
+the declaring pass's `borrowed_no_copy` binding — with the window's bytes
+reported beside the attachment's and written up in
+[../docs/ATTACHMENT-LANDING-VIEW.md](../docs/ATTACHMENT-LANDING-VIEW.md). The render and present observation rules live in
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10, the
 store/dontcare rules in §11 and the undefined-load rules in §12; the per-suite
 rules are exercised by

@@ -348,6 +348,7 @@ impl ComputeProvider for FakeProvider {
             // through neither entry point.
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
+            supports_render_attachment_landing_view: false,
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self

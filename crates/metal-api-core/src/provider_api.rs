@@ -2962,13 +2962,19 @@ impl CommandBuffer {
             .filter_map(contract::TracePass::as_render)
         {
             for attachment in &pass.color_attachments {
-                if attachment.store != StoreOp::Borrowed {
+                // Which declaration holds the window is the store arm's own
+                // answer (`research/docs/23` §115 及其后的增量，E-TX8/E-TX13):
+                // the attachment's own identity for `Borrowed`, the second view
+                // the landing arm carries for `BorrowedLanding`. Either way the
+                // identity has to appear in the trace's own declaration list,
+                // and the refusal names the identity that is missing.
+                let Some(landing) = attachment.landing_identity() else {
                     continue;
-                }
-                if !declared_windows.contains(&(attachment.view_id, attachment.allocation_id)) {
+                };
+                if !declared_windows.contains(&(landing.view_id, landing.allocation_id)) {
                     return Err(Error::WindowAttachmentUndeclared {
-                        lease: LeaseId::new(attachment.view_id.get()),
-                        view: attachment.view_id,
+                        lease: LeaseId::new(landing.view_id.get()),
+                        view: landing.view_id,
                     });
                 }
             }

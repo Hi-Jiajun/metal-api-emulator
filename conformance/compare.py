@@ -327,7 +327,7 @@ def _readback_windows(case, rule, width, height, where):
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
-    "stencil_filter sample_count_gate texture_uploads rule stage_buffer_modes",
+    "stencil_filter sample_count_gate texture_uploads rule stage_buffer_modes landing",
     defaults=(None, None, None, None, None, None))
 
 # One rule-expected attachment (R5a, `research/docs/23` §73): the rule's name,
@@ -2435,6 +2435,77 @@ def _stage_buffer_section(case, declaring_case, declaring_images, where):
     return writes, images, views, written, None
 
 
+def _landing_view_section(case, declaring_buffers, parsed, where, single):
+    """The landing-view store's own review surface (`research/docs/23` §115
+    之后的增量，E-TX13): the second view declaration the frame lands in, and the
+    bytes the owner's window has to hold afterwards.
+
+    The arm separates two facts the borrowed store states as one, so this
+    section pins both of them here, before any rail runs:
+
+    * exactly one attachment may store through it — the observation is one
+      owner window under one case-level expectation;
+    * the view it names has to be a second declaration of the *declaring*
+      pass, read-only and on the `borrowed_no_copy` arm, covering the
+      attachment's own tightly packed extent — the window the rail resolves is
+      that declaration and nothing else;
+    * naming the attachment's own identity is refused: that statement is
+      `StoreOp::Borrowed`'s, and one fact with two spellings would leave the
+      rail two places to resolve one window from;
+    * the declared `expected_landing_hex` has to be the frame the case's own
+      attachment expectation states, because the arm lands exactly the frame
+      the pass read back.
+
+    Returns `(allocation, view, bytes)` for the case that declares the arm, and
+    `None` for every case that does not.
+    """
+    stored = [attachment for attachment, _, _, _ in parsed
+              if attachment.get("store", "store") == "landing_view"]
+    expectation = case.get("expected_landing_hex")
+    if not stored:
+        _require(expectation is None,
+                 f"{where}: expected_landing_hex needs a landing_view store")
+        for attachment in parsed:
+            _require("landing_view" not in attachment[0],
+                     f"{where}: only a landing_view store names a landing view")
+        return None
+    _require(len(stored) == 1,
+             f"{where}: one pass lands one owner window")
+    _require(single,
+             f"{where}: the landing-view store is the single-attachment shape")
+    attachment = stored[0]
+    definition = attachment.get("landing_view")
+    _object(definition, ("allocation", "view"), f"{where}.attachment.landing_view")
+    allocation = _integer(definition["allocation"],
+                          f"{where}.attachment.landing_view.allocation")
+    view = _integer(definition["view"], f"{where}.attachment.landing_view.view")
+    _require(allocation > 0 and view > 0,
+             f"{where}.attachment.landing_view: zero landing identity")
+    _require((allocation, view) != (attachment["allocation"], attachment["view"]),
+             f"{where}.attachment.landing_view: the landing view is the attachment's own "
+             "identity, which the borrowed store already states")
+    declared = [buffer for buffer in declaring_buffers
+                if buffer["allocation"] == allocation and buffer["view"] == view]
+    _require(len(declared) == 1,
+             f"{where}.attachment.landing_view: the declaring case has to declare exactly "
+             "the landing view")
+    declared = declared[0]
+    _require(declared.get("storage_mode") == "borrowed_no_copy",
+             f"{where}.attachment.landing_view: the landing view has to be the declaring "
+             "pass's borrowed_no_copy window")
+    _require(declared["access"] == "read",
+             f"{where}.attachment.landing_view: the declaring pass reads the landing view")
+    extent = attachment["width"] * attachment["height"] * 4
+    _require(declared["length"] == extent,
+             f"{where}.attachment.landing_view: the landing view has to be the "
+             "attachment's own extent")
+    landed = _hex(expectation, f"{where}.expected_landing_hex")
+    frame = _hex(case.get("expected_hex"), f"{where}.expected_hex")
+    _require(landed == frame,
+             f"{where}.expected_landing_hex: the window holds the frame the pass read back")
+    return allocation, view, landed
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -2481,7 +2552,8 @@ def _render_plan(plan, suite):
                                "stencil", "stencil_test", "multisample", "depth_resolve",
                                "requires_depth_resolve_filter", "stencil_resolve",
                                "requires_stencil_resolve_filter", "requires_sample_count",
-                               "metal", "translated_stages", "stage_buffers"})
+                               "metal", "translated_stages", "stage_buffers",
+                               "expected_landing_hex"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         # A reviewed case pins the MSL module its two stages were written as; a
         # *translated* case pins its two AIR modules instead
@@ -3034,7 +3106,7 @@ def _render_plan(plan, suite):
                                 else f"{where}.attachments[{position}]")
             _require(isinstance(attachment, dict), f"{attachment_where}: expected an object")
             allowed = {"allocation", "view", "format", "width", "height",
-                       "load", "store", "clear_hex", "initial_hex"}
+                       "load", "store", "clear_hex", "initial_hex", "landing_view"}
             if multiple:
                 allowed.add("expected_hex")
             _require(set(attachment).issubset(allowed),
@@ -3088,7 +3160,11 @@ def _render_plan(plan, suite):
                          f"{where}: a scissor has to be a non-empty rectangle inside "
                          "the attachment")
             store = attachment.get("store", "store")
-            _require(store in ("store", "dontcare"),
+            # The landing-view store (`research/docs/23` §115 之后的增量，
+            # E-TX13) is the stored arm plus its own second declaration, so it
+            # keeps every rule the stored arm states; the section below pins the
+            # declaration itself.
+            _require(store in ("store", "dontcare", "landing_view"),
                      f"{attachment_where}: a discarded attachment cannot be compared")
             extent = width * height * 4
             # A discarded attachment carries no expectation and no observation:
@@ -3636,6 +3712,12 @@ def _render_plan(plan, suite):
             identities.append((allocation, view, offset, len(expected)))
             written.add(allocation)
         touched = set(plan[declaring][1])
+        # A borrowed owner window is one of the declaring pass's touched
+        # allocations, but the provider never copies it in: its bytes are the
+        # owner's own pages, imported rather than staged
+        # (`research/docs/23` §90, R9i). The counter rule below is the one place
+        # that difference is observable, exactly as it is on the compute path.
+        touched -= set(plan[declaring][8] or ())
         # The stored depth attachment (`research/docs/23` §3.3, v43) lands
         # through the channel the colour attachments already use: one writeback
         # under the depth view and one allocation image. Its view is declared by
@@ -3768,6 +3850,10 @@ def _render_plan(plan, suite):
         texture_uploads = 0
         if fragment_textures is not None:
             texture_uploads = len(fragment_textures)
+        # The landing-view store's own section (`research/docs/23` §115 之后的
+        # 增量，E-TX13): the second declaration the frame lands in, and the bytes
+        # the owner's window has to hold after the pass.
+        landing = _landing_view_section(case, by_id[declaring]["buffers"], parsed, where, single)
         render_plan[case_id] = RenderExpectation(
             writes=writes,
             allocations=images,
@@ -3790,7 +3876,8 @@ def _render_plan(plan, suite):
             # The lease face of a stage-buffer case (`research/docs/23` §90,
             # R9i): the source arm each of its slots ran with, or `None` for a
             # case whose slots are all trace-owned.
-            stage_buffer_modes=stage_modes)
+            stage_buffer_modes=stage_modes,
+            landing=landing)
     return render_plan
 
 
@@ -3874,6 +3961,7 @@ def validate_capture(suite, digest, report, required_backend=None):
         # replace no existing field and they do not relax the counter-pair rule
         # below.
         _require(set(result) - {"present", "heap", "icb", "storage_modes"}
+                 - {"landing"}
                  in (base, counted, grouped),
                  "capture result: expected fields "
                  + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
@@ -3957,6 +4045,25 @@ def validate_capture(suite, digest, report, required_backend=None):
                          "of a case its marker does not name")
             _require("heap" not in result,
                      f"{where}: a render case carries no heap observation")
+            # The landing-view store's own reading (`research/docs/23` §115
+            # 之后的增量，E-TX13): a case that declares the arm has to report the
+            # owner window's bytes, and a case that does not may not report them.
+            if expectation.landing is None:
+                _require("landing" not in result,
+                         f"{where}: the suite declares no landing observation for this case")
+            else:
+                _require(report["backend"] in expectation.rails,
+                         f"{where}: a rail the case's marker does not name must not report the "
+                         "landing observation")
+                observed = result.get("landing")
+                _object(observed, ("allocation", "view", "bytes_hex"), f"{where}.landing")
+                allocation, view, bytes_ = expectation.landing
+                _require((observed["allocation"], observed["view"]) == (allocation, view),
+                         f"{where}.landing: the observation is not the declared landing view")
+                landed = _hex(observed["bytes_hex"], f"{where}.landing.bytes_hex")
+                _require(landed == bytes_,
+                         f"{where}.landing: the owner window holds {landed} against the "
+                         f"reviewed {bytes_.hex()}")
             if expectation.icb is None:
                 _require("icb" not in result,
                          f"{where}: the suite declares no indirect command for this case")

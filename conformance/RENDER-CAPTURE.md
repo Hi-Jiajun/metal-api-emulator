@@ -263,6 +263,27 @@ same rule a compute case follows; the Swift oracle reports bytes without
 counters, so the contract does not apply to `native-metal`
 (`conformance/compare.py`, `validate_capture`).
 
+## 3.1 The landing view's own observation
+
+One store arm lands its frame somewhere the attachment's own writeback cannot
+show: the *landing view* (`research/docs/23` §115 之后的增量，E-TX13), whose
+window a second view declaration names. A case that stores through it adds one
+field to its result — `landing`, an object `{allocation, view, bytes_hex}` — and
+one case-level expectation, `expected_landing_hex`. The comparator requires the
+identity to be the declared landing view, the bytes to be exactly the frame the
+attachment expectation states (the arm lands what the pass read back), and the
+declaration itself to be the declaring pass's `borrowed_no_copy` binding read
+over the attachment's own tight extent. A case that declares the expectation
+without the arm, names the attachment's own identity, or points at a copy arm is
+refused before any rail runs.
+
+`suite-v40.json` is that case: its attachment loads the caller's bytes
+(`fefefefe…`), the declaring pass's third binding is an owner window that starts
+as `11223344…`, and the frame the capture reports on the drawn texels is the
+fragment output while the rest stay the caller's bytes. A rail that resolved the
+load from the landing window would land `11223344` there; a rail that landed
+nothing would leave the window holding its old bytes.
+
 ## 4. Which rails report a render case
 
 The first render increment has five executable rails: the Vulkan trace rail,
@@ -301,6 +322,11 @@ oracle does not report provider counters, so its present evidence is the
 `--present-selftest` check (§7) rather than a marked capture. The v14 Vulkan
 object rail executes the present action too, because the object encoder carries
 the same optional present tail as the trace path.
+`suite-v40.json` marks `["vulkan"]` alone: the landing-view store (§3.1)
+is a *trace* face this increment published — the Vulkan trace rail executes it, the
+object API has no entry that names a second landing view, and the native rails have
+no route that writes an owner's window — so the arm's capture is the trace rail's
+and every rail it does not name leaves the case out.
 `conformance/test_oracle_coverage.py` checks the marker against `compare.py`'s
 backend vocabulary, refuses a marker that names a rail with no render command
 encoder, and requires every committed suite to be named on every CI rail and in

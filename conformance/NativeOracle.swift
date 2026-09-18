@@ -378,11 +378,22 @@ private struct RenderAttachmentDefinition: Decodable {
     let height: Int
     let load: String
     let store: String
+    /// The second view declaration a landing-view store names
+    /// (`research/docs/23` §115 之后的增量，E-TX13); absent for every other store
+    /// arm, and for every case this oracle compiles.
+    let landing_view: LandingViewDefinition?
     let clear_hex: String?
     let initial_hex: String?
     /// The MRT case's per-attachment expectation; absent for the
     /// single-attachment form, whose expectation is case-level.
     let expected_hex: String?
+}
+
+/// The identity of the owner window a landing-view store lands its frame in
+/// (`research/docs/23` §115 之后的增量，E-TX13).
+private struct LandingViewDefinition: Decodable {
+    let allocation: UInt64
+    let view: UInt64
 }
 
 /// The depth attachment a render case declares (`research/docs/23` §3.3,
@@ -2490,8 +2501,18 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // the arm's own review lives rather than in this table.
     case "compute-buffer-v39":
         expectedIDs = ["render_declaring_copy_word"]
+    // The colour attachment's landing view (`research/docs/23` §115 之后的增量，
+    // E-TX13): the declaring pass of the render case whose load stays the
+    // caller's own bytes while its frame lands in an owner window a *second*
+    // view declaration names. That declaration is the declaring pass's third
+    // binding — the reviewed witness kernel reads it — so this oracle validates
+    // and executes the declaring pass as an ordinary compute case, and the
+    // render case itself names the Vulkan rails alone (this rail has no landing
+    // route that writes an owner's window).
+    case "compute-buffer-v40":
+        expectedIDs = ["render_declaring_landing_view"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v39 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v40 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -3207,6 +3228,29 @@ private func instancedTintTexels(_ stream: ValidatedVertexStream,
 @available(macOS 11.0, *)
 private func validateRenderCase(_ definition: RenderCaseDefinition,
                                 root: URL) throws -> ValidatedRender {
+    // The colour attachment's landing view (`research/docs/23` §115 之后的增量，
+    // E-TX13): the frame lands in the owner's registered window a *second* view
+    // declaration names, while the pass still begins from the attachment's own
+    // bytes. This oracle records one view per attachment and hands the bytes to
+    // its own `MTLBuffer`; it has no route that writes an owner's window, which
+    // is the same boundary its Rust sibling's `store_action` states. A case that
+    // names a native capture rail is a case this oracle cannot serve rather than
+    // one it may execute as a plain store, so it is refused by name here.
+    var landingAttachments = definition.attachments ?? []
+    if let single = definition.attachment { landingAttachments.append(single) }
+    if landingAttachments.contains(where: { $0.store == "landing_view" }) {
+        try require(!definition.capture_rails.contains("native-metal"),
+                    "\(definition.id): this oracle lands an attachment's frame in its own "
+                    + "buffer and has no route that writes the owner's window a landing view "
+                    + "names: mark the case for the Vulkan rails")
+        return ValidatedRender(definition: definition, source: "", attachments: [],
+                               vertexStreams: [], stageBuffers: [], indexStream: nil,
+                               depth: nil, stencil: nil)
+    }
+    for attachment in landingAttachments {
+        try require(attachment.landing_view == nil,
+                    "\(definition.id): only a landing_view store names a landing view")
+    }
     // The stage-buffer shape (`research/docs/23` §3.3, v83-v86) arrives in two
     // arms. A *translated* case pins two AIR modules this oracle compiles no
     // part of, so it keeps its own validation and is refused by name for this
