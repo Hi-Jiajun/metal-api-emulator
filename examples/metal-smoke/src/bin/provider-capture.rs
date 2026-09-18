@@ -1427,12 +1427,16 @@ fn register_render_pipeline(
         "suite-sha256-entry-v1",
         format!("{identity}:offscreen_render_pipeline:{attachment_count}").into_bytes(),
     )?;
-    // A gathered-extent case's stages are translated AIR, so it never reaches
-    // this reviewed-pair registrar: `register_render_case_pipeline` hands it to
-    // the translator's own path instead.
-    if geometry == RenderGeometry::GatheredExtent {
+    // A gathered-extent case's stages and a declared-superset case's are
+    // translated AIR, so neither reaches this reviewed-pair registrar:
+    // `register_render_case_pipeline` hands both to the translator's own path
+    // instead.
+    if matches!(
+        geometry,
+        RenderGeometry::GatheredExtent | RenderGeometry::SupersetVertexInput
+    ) {
         return Err(format!(
-            "render case {}: the gathered-extent arm registers its translated stages",
+            "render case {}: the translated arm registers its translated stages",
             case.id
         )
         .into());
@@ -1578,6 +1582,9 @@ fn register_render_pipeline(
         // Unreachable: the early return above refuses the gathered-extent arm,
         // whose stages the translator registers.
         RenderGeometry::GatheredExtent => unreachable!(),
+        // Unreachable for the same reason: the declared-superset arm's stages
+        // are the translator's too (`research/docs/23` §3.3, E-TX11).
+        RenderGeometry::SupersetVertexInput => unreachable!(),
     };
     // The sampled case's declaration (`research/docs/23` §3.3, v100): the
     // fragment stage reads the pass's one texture at binding 0, and the state
@@ -1713,7 +1720,13 @@ fn register_translated_stage_buffer_pipeline(
     // — every Metal resource in set 0 — which is the arrangement the rail's own
     // `render_texture_extent_e2e` reading measured.
     let gathered = geometry == RenderGeometry::GatheredExtent;
-    let (vertex_set, fragment_set) = if gathered {
+    // The declared-superset pair reads no `[[buffer(N)]]` argument either
+    // (`research/docs/23` §3.3, E-TX11): its vertex module's inputs are the
+    // vertex attributes the contract declares, so it takes the translator's
+    // default layout — every Metal resource in set 0 — exactly as the
+    // gathered-extent pair does.
+    let superset = geometry == RenderGeometry::SupersetVertexInput;
+    let (vertex_set, fragment_set) = if gathered || superset {
         (GATHERED_EXTENT_SET, GATHERED_EXTENT_SET)
     } else {
         (STAGE_BUFFER_VERTEX_SET, STAGE_BUFFER_FRAGMENT_SET)
@@ -1774,7 +1787,15 @@ fn register_translated_stage_buffer_pipeline(
         vertex_entry: case.vertex_entry.clone(),
         fragment_entry: case.fragment_entry.clone(),
         color_formats: formats.to_vec(),
-        vertex_layout: VertexLayout::None,
+        // The declared-superset arm is the one translated shape that states a
+        // vertex layout: the four-attribute stream its module reads two
+        // locations out of (`research/docs/23` §3.3, E-TX11). Every other
+        // translated arm keeps the `vertex_id` triangle's empty layout.
+        vertex_layout: if superset {
+            superset_vertex_layout()
+        } else {
+            VertexLayout::None
+        },
         stage_buffers: stage_buffer_declarations(case)?,
         textures,
     };
@@ -4026,6 +4047,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // case runs on the Vulkan rails alone (the stages are the translator's),
         // so this table pins the declaring pass, which every rail executes.
         (1, "compute-buffer-v36") => &["render_declaring_gathered_extent"],
+        (1, "compute-buffer-v37") => &["render_declaring_vertex_superset"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4246,6 +4268,14 @@ enum RenderGeometry {
     /// the translating rail's, so its marker stays inside the two Vulkan rails
     /// and no MSL sibling exists to pin.
     GatheredExtent,
+    /// The declared-superset vertex interface (`research/docs/23` §3.3,
+    /// E-TX11): two translated AIR stages whose *vertex* stage reads two of the
+    /// four attribute locations its contract's layout declares. The extra
+    /// declared attributes are bound with the stream and ignored, so the
+    /// attachment is a function of the two locations the module reads; the arm
+    /// is the translating rail's, so its marker stays inside the two Vulkan
+    /// rails and no MSL sibling exists to pin.
+    SupersetVertexInput,
 }
 
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
@@ -5912,6 +5942,291 @@ fn reviewed_gathered_extent_geometry(case: &RenderCase, where_: &str) -> Result<
     Ok(RenderGeometry::GatheredExtent)
 }
 
+/// The vertices a declared-superset case draws (`research/docs/23` §3.3,
+/// E-TX11): the translated vertex module reads its own two attribute locations
+/// out of the stream, so the draw is the fixture's three vertices selected in
+/// order.
+const SUPERSET_VERTEX_VERTICES: u64 = 3;
+
+/// The record the declared-superset stream carries: four `float32x2`
+/// attributes, one every eight bytes.
+const SUPERSET_VERTEX_STRIDE: u64 = 32;
+
+/// The attribute locations the declared-superset *layout* names. The module
+/// reads the first two of them; the other two are the shape's whole point.
+const SUPERSET_VERTEX_ATTRIBUTES: usize = 4;
+
+/// The bytes of every record the declared-superset fixture writes past the
+/// attributes the module reads: two `float32x2` values whose components stay
+/// outside the clip space, so a rail that bound one of them to an input the
+/// module reads would rasterize a different frame.
+const SUPERSET_IGNORED_RECORD_BYTES: usize = 16;
+
+/// The declared-superset layout the case's contract states
+/// (`research/docs/23` §3.3, E-TX11): one stream of 32-byte records carrying
+/// four `float32x2` attributes at `8 * location`. The reviewed geometry below
+/// pins the fixture to exactly this shape, so the registration and the bytes
+/// cannot describe two different interfaces.
+fn superset_vertex_layout() -> VertexLayout {
+    VertexLayout::Buffers(vec![VertexBufferLayout {
+        stride: SUPERSET_VERTEX_STRIDE,
+        step: VertexStep::PerVertex,
+        attributes: (0..SUPERSET_VERTEX_ATTRIBUTES)
+            .map(|location| VertexAttribute {
+                location: u32::try_from(location).unwrap_or(u32::MAX),
+                offset: u64::try_from(location).unwrap_or(u64::MAX) * 8,
+                format: VertexFormat::Float32x2,
+            })
+            .collect(),
+    }])
+}
+
+/// Classify the declared-superset vertex interface and pin its shape
+/// (`research/docs/23` §3.3, E-TX11).
+///
+/// The arm is the census's: two translated AIR stages whose vertex module reads
+/// fewer attribute locations than the contract's layout declares. The fixture
+/// states the shape the review covers and nothing else — one stream of 32-byte
+/// records with four `float32x2` attributes at `8 * location`, the three
+/// indices that name the three vertices in order, a 2x2 clearing attachment,
+/// and the partial coverage the fixture's own triangle produces. What makes the
+/// case falsifiable is the stream's own bytes: the two attributes the module
+/// never reads carry values far outside the clip space, so a rail that read them
+/// as an input — or that bound a declared attribute to the wrong location —
+/// lands a different frame, while a rail that binds the stream and ignores them
+/// lands the fixture's own frame.
+fn translated_superset_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    let translated = case.translated_stages.as_ref().ok_or_else(|| {
+        format!("{where_}: the declared-superset shape registers two translated AIR stages")
+    })?;
+    let layout = case.vertex_layout.as_ref().ok_or_else(|| {
+        format!("{where_}: the declared-superset shape declares its vertex layout")
+    })?;
+    if !case.stage_buffers.is_empty() || case.fragment_textures.is_some() {
+        return Err(format!(
+            "{where_}: the declared-superset shape binds no stage buffer and samples no texture"
+        )
+        .into());
+    }
+    if case.attachments.is_some() {
+        return Err(format!("{where_}: the declared-superset shape stores one attachment").into());
+    }
+    if case.depth.is_some()
+        || case.stencil.is_some()
+        || case.cull.is_some()
+        || case.blend.is_some()
+        || case.multisample.is_some()
+        || case.depth_resolve.is_some()
+        || case.stencil_resolve.is_some()
+        || case.present.is_some()
+        || case.icb.is_some()
+        || case.expected_rule.is_some()
+        || case.readback_windows.is_some()
+        || case.scissor.is_some()
+    {
+        return Err(format!(
+            "{where_}: a declared-superset case carries no depth, stencil, cull, blend, \
+             multisample, resolve, present, indirect, rule, readback window or scissor section"
+        )
+        .into());
+    }
+    if case.metal.is_some() {
+        return Err(format!(
+            "{where_}: a translated case has no MSL sibling to pin, so it carries no metal source"
+        )
+        .into());
+    }
+    if translated.vertex.path == translated.fragment.path {
+        return Err(
+            format!("{where_}: the two translated stages name their own AIR modules").into(),
+        );
+    }
+    let allowed = ["vulkan", "vulkan-objects"];
+    if case.capture_rails.is_empty()
+        || case
+            .capture_rails
+            .iter()
+            .any(|rail| !allowed.contains(&rail.as_str()))
+    {
+        return Err(format!(
+            "{where_}: a declared-superset case runs on the rails that translate its stages and \
+             draw through a vertex-buffer entry ({}), so its capture_rails has to stay inside \
+             that list",
+            allowed.join(", ")
+        )
+        .into());
+    }
+    if layout.buffers.len() != 1 {
+        return Err(format!("{where_}: the declared-superset shape is one vertex stream").into());
+    }
+    let stream = &layout.buffers[0];
+    if stream.stride != SUPERSET_VERTEX_STRIDE || stream.step != "per_vertex" {
+        return Err(format!(
+            "{where_}: the declared-superset stream is stride {SUPERSET_VERTEX_STRIDE} and \
+             steps per vertex"
+        )
+        .into());
+    }
+    if stream.attributes.len() != SUPERSET_VERTEX_ATTRIBUTES {
+        return Err(format!(
+            "{where_}: the declared-superset layout declares {SUPERSET_VERTEX_ATTRIBUTES} \
+             attributes"
+        )
+        .into());
+    }
+    for (location, attribute) in stream.attributes.iter().enumerate() {
+        let expected = (location as u32, (location as u64) * 8, "float32x2");
+        if (
+            attribute.location,
+            attribute.offset,
+            attribute.format.as_str(),
+        ) != expected
+        {
+            return Err(format!(
+                "{where_}.vertex_layout.buffers[0].attributes[{location}]: the declared \
+                 attribute is location {location}, offset {}, float32x2",
+                location * 8
+            )
+            .into());
+        }
+    }
+    if case.vertex_buffers.len() != 1 {
+        return Err(
+            format!("{where_}: the declared-superset shape binds one vertex stream").into(),
+        );
+    }
+    let binding = &case.vertex_buffers[0];
+    if binding.allocation == 0 || binding.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    if binding.length != SUPERSET_VERTEX_STRIDE * SUPERSET_VERTEX_VERTICES {
+        return Err(format!(
+            "{where_}.vertex_buffers[0]: the declared-superset stream carries exactly the three \
+             records the fixture's triangle draws"
+        )
+        .into());
+    }
+    let bytes = unhex(&binding.initial_hex)?;
+    if bytes.len() as u64 != binding.length {
+        return Err(format!("{where_}: the vertex stream bytes do not match its length").into());
+    }
+    for record in 0..SUPERSET_VERTEX_VERTICES as usize {
+        let start = record * SUPERSET_VERTEX_STRIDE as usize + SUPERSET_IGNORED_RECORD_BYTES;
+        for chunk in bytes[start..start + SUPERSET_IGNORED_RECORD_BYTES].chunks_exact(4) {
+            let value = f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if value.abs() < 2.0 {
+                return Err(format!(
+                    "{where_}.vertex_buffers[0]: record {record}'s ignored attributes have to \
+                     stay outside the clip space the read attributes cover, or a rail that read \
+                     them would land the same frame"
+                )
+                .into());
+            }
+        }
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!(
+            "{where_}: the declared-superset shape draws through the reviewed indexed entry"
+        )
+        .into());
+    };
+    if indices.allocation == 0 || indices.view == 0 {
+        return Err(format!("{where_}: zero index buffer identity").into());
+    }
+    let width = match indices.format.as_str() {
+        "uint16" => 2_u64,
+        "uint32" => 4,
+        other => return Err(format!("{where_}: unsupported index format {other:?}").into()),
+    };
+    if indices.length != width * SUPERSET_VERTEX_VERTICES {
+        return Err(format!(
+            "{where_}.indices: the declared-superset shape draws the three vertices the stream \
+             carries"
+        )
+        .into());
+    }
+    let index_bytes = unhex(&indices.initial_hex)?;
+    if index_bytes.len() as u64 != indices.length {
+        return Err(format!("{where_}: the index bytes do not match their length").into());
+    }
+    for position in 0..SUPERSET_VERTEX_VERTICES as usize {
+        let chunk = &index_bytes[position * width as usize..(position + 1) * width as usize];
+        let index = match width {
+            2 => u64::from(u16::from_le_bytes([chunk[0], chunk[1]])),
+            _ => u64::from(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+        };
+        if index != position as u64 {
+            return Err(format!(
+                "{where_}.indices: the index at position {position} has to name vertex {position}"
+            )
+            .into());
+        }
+    }
+    if case.vertices != SUPERSET_VERTEX_VERTICES {
+        return Err(format!(
+            "{where_}: the declared-superset shape draws {SUPERSET_VERTEX_VERTICES} vertices"
+        )
+        .into());
+    }
+    if case.instance_count != 1 || case.base_vertex != 0 {
+        return Err(format!(
+            "{where_}: the declared-superset shape draws one instance with no vertex offset"
+        )
+        .into());
+    }
+    let attachment = case
+        .attachment
+        .as_ref()
+        .ok_or_else(|| format!("{where_}: the declared-superset arm stores one attachment"))?;
+    let attachment_layout = attachment_format(&attachment.format)?;
+    if !matches!(
+        attachment_layout,
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+    ) || attachment.store != "store"
+    {
+        return Err(format!(
+            "{where_}: the declared-superset arm stores one 8-bit four-component unorm \
+             attachment, in either byte order"
+        )
+        .into());
+    }
+    if attachment.width != 2 || attachment.height != 2 {
+        return Err(format!(
+            "{where_}: the declared-superset arm draws the fixture's 2x2 attachment"
+        )
+        .into());
+    }
+    let clear = unhex(attachment.clear_hex.as_deref().unwrap_or_default())?;
+    if attachment.load != "clear" || clear.len() != 4 {
+        return Err(format!(
+            "{where_}.attachment: the declared-superset arm clears its attachment, so a rail \
+             that ignored the draw is observable"
+        )
+        .into());
+    }
+    if case.coverage.as_deref() != Some("partial") {
+        return Err(format!(
+            "{where_}: the declared-superset arm claims the partial coverage its three-texel \
+             triangle produces"
+        )
+        .into());
+    }
+    let expected = unhex(case.expected_hex.as_deref().ok_or_else(|| {
+        format!("{where_}: the declared-superset arm states the frame its triangle lands")
+    })?)?;
+    if expected.len() != 16 {
+        return Err(format!("{where_}: the declared-superset expectation is the 2x2 frame").into());
+    }
+    if expected[..4] == clear[..] {
+        return Err(format!(
+            "{where_}: the declared-superset frame's first texel is the fragment output, or a \
+             rail that ignored the draw could pass"
+        )
+        .into());
+    }
+    Ok(RenderGeometry::SupersetVertexInput)
+}
+
 /// Classify a stage-buffer case and pin the declarations the reviewed arms
 /// admit (`research/docs/23` §3.3, v83-v86).
 ///
@@ -6554,6 +6869,14 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     if case.translated_stages.is_some() && case.fragment_textures.is_some() {
         return reviewed_gathered_extent_geometry(case, where_);
     }
+    // The declared-superset vertex interface (`research/docs/23` §3.3, E-TX11)
+    // is the translated arm's other shape: two AIR stages beside a vertex
+    // layout whose declared attribute set is wider than the module's reads. It
+    // is classified before the stage-buffer shape, because a translated case
+    // that declares no slot would otherwise be read as one.
+    if case.translated_stages.is_some() && case.vertex_layout.is_some() {
+        return translated_superset_geometry(case, where_);
+    }
     // The stage-buffer shape is classified first (`research/docs/23` §3.3,
     // v83-v86): its stages read their bytes from `[[buffer(N)]]` arguments
     // rather than from a vertex layout or the vertex index, so a case that
@@ -6817,6 +7140,17 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::SupersetVertexInput => {
+            // The declared-superset arm's own counts were pinned by
+            // `translated_superset_geometry`; what stays here is the rule every
+            // vertex-input case shares (`research/docs/23` §3.3, E-TX11).
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a vertex-input case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
         RenderGeometry::BlendTriangle => {
             if case.vertices != 3 {
                 return Err(
@@ -7049,6 +7383,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // translator's, exactly as the translated stage-buffer case beside it
         // is, and the shape module above pinned that it carries no MSL pin.
         RenderGeometry::GatheredExtent => {
+            (case.vertex_entry.as_str(), case.fragment_entry.as_str())
+        }
+        // The declared-superset arm names its own two AIR entries for the same
+        // reason (`research/docs/23` §3.3, E-TX11): its stages are the
+        // translator's, and the shape module above pinned that it carries no
+        // MSL pin.
+        RenderGeometry::SupersetVertexInput => {
             (case.vertex_entry.as_str(), case.fragment_entry.as_str())
         }
         // A translated stage-buffer case names its own two AIR entries rather
@@ -8937,6 +9278,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4)][..],
+        ),
+        // E-TX11: the declared-superset arm's declaring pass is the same
+        // kernel over the 2x2 render area's own sixteen-byte view beside the
+        // copy landing (`research/docs/23` §3.3).
+        "render_declaring_vertex_superset" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4)][..],
         ),
         // v49: the same read pair with the *stencil* surface's own one-byte
         // extent (4x4 texels = 16 bytes) as the third read binding, so one

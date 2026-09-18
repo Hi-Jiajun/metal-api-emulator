@@ -397,6 +397,14 @@ impl NativeMetalProvider {
                 max_vertex_buffers: vertex_bits.max_vertex_buffers,
                 supported_vertex_formats: vertex_bits.supported_vertex_formats,
                 supported_index_formats: vertex_bits.supported_index_formats,
+                // The superset interface's bit (`research/docs/23` §3.3,
+                // E-TX11): this rail selects its MSL module by the layout's
+                // exact shape (`render.rs::reviewed_module`), so a layout that
+                // declares attributes no reviewed module reads is refused by
+                // name rather than executed — the snapshot therefore declares
+                // the same fail-closed default the contract starts from.
+                supports_render_vertex_interface_superset: vertex_bits
+                    .supports_render_vertex_interface_superset,
                 // Instancing is executed by this rail as of v31: the plan
                 // carries each binding's step function and the draw carries the
                 // pass's instance count, both proved on the host before a

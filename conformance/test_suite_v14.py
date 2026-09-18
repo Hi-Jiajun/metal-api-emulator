@@ -525,7 +525,10 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # v36 carries the gathered-extent arm (`research/docs/23` §3.3, §111,
         # E-TX10), whose translated render case and declaring pass
         # `test_suite_v36.py` pins, so it joins the list as well.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 35)
+        # v37 carries the declared-superset vertex interface
+        # (`research/docs/23` §3.3, E-TX11), whose translated render case and
+        # declaring pass `test_suite_v37.py` pins, so it joins the list too.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 36)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -542,7 +545,7 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v30", "compute-buffer-v31",
                                       "compute-buffer-v32", "compute-buffer-v33",
                                       "compute-buffer-v34", "compute-buffer-v35",
-                                      "compute-buffer-v36"):
+                                      "compute-buffer-v36", "compute-buffer-v37"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

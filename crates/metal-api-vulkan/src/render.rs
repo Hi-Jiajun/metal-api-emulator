@@ -1779,9 +1779,12 @@ pub(crate) fn validate_module_capabilities(
 ///
 /// The raster pipeline needs a clip position, the contract's vertex layout is
 /// the whole input side of the stage, and a vertex stage cannot write a colour
-/// attachment. Each of the three is a field-by-field comparison, so a missing or
-/// an extra reflected field is refused rather than left to a driver's vertex
-/// input state.
+/// attachment. The layout half of that agreement is one-directional
+/// (`research/docs/23` §3.3, E-TX11): the layout has to *cover* every location
+/// the reflection reads, while a declared location the module never reads is
+/// bound and ignored — the shape `MTLVertexDescriptor` gives a stage that names
+/// streams its function does not consume, and the shape the contract's own
+/// vertex input state already describes.
 fn validate_translated_vertex(
     stages: &RenderStages,
     entry: &str,
@@ -1814,11 +1817,16 @@ fn validate_translated_vertex(
 
 /// The contract's vertex layout against the reflection's attributes.
 ///
-/// A stream the layout describes and the reflection does not read (or the
-/// reverse) is a different interface, not a preference: the pipeline's vertex
-/// input state is built from the layout, so a mismatch would either bind a
-/// stream the shader never consumes or leave a location the shader does read
-/// undefined.
+/// The rule is the superset rule (`research/docs/23` §3.3, E-TX11), and it is
+/// deliberately asymmetric because the two directions are not the same
+/// statement. The pipeline's vertex input state is built from the *layout*, so:
+///
+/// * a declared attribute the reflection does not read is a stream the pass
+///   binds and the module ignores — legal in Metal, legal in Vulkan, and the
+///   shape the layout's own description carries;
+/// * a location the reflection reads that no declared attribute covers would
+///   leave that input undefined at draw time, so it is refused by name rather
+///   than executed against a value the contract never stated.
 fn validate_translated_vertex_attributes(
     stages: &RenderStages,
     entry: &str,
@@ -1846,39 +1854,30 @@ fn validate_translated_vertex_attributes(
                 .with_detail("two reflected attributes share one location"));
         }
     }
-    if declared.len() != reflected.len() {
-        return Err(mismatch("vertex_attributes")
-            .with_field(
-                "declared_attributes",
-                FieldValue::Unsigned(declared.len() as u64),
-            )
-            .with_field(
-                "reflected_attributes",
-                FieldValue::Unsigned(reflected.len() as u64),
-            )
-            .with_detail(
-                "the contract's vertex layout and the reflection have to name the same \
-                 attributes, because the layout is what the pipeline's vertex input state is \
-                 built from",
-            ));
-    }
-    for attribute in declared {
-        let Some(reflected) = reflected.get(&attribute.location) else {
+    // Every location the module reads has to be one the layout declares. The
+    // extra declared attributes are what this increment admits: they are bound
+    // with the rest of their stream and simply never consumed.
+    for reflected in reflected.values() {
+        let Some(attribute) = declared
+            .iter()
+            .find(|declared| declared.location == reflected.location)
+        else {
             return Err(mismatch("vertex_attributes")
                 .with_field(
                     "location",
-                    FieldValue::Unsigned(u64::from(attribute.location)),
+                    FieldValue::Unsigned(u64::from(reflected.location)),
                 )
                 .with_detail(
-                    "the reflection does not read the attribute the contract's vertex layout \
-                     declares at this location",
+                    "the reflection reads a vertex attribute the contract's vertex layout does \
+                     not declare at this location, so the pipeline's vertex input state would \
+                     leave it undefined",
                 ));
         };
         if !air_type_name_names_vertex_format(reflected.type_name.as_deref(), attribute.format) {
             return Err(mismatch("vertex_attributes")
                 .with_field(
                     "location",
-                    FieldValue::Unsigned(u64::from(attribute.location)),
+                    FieldValue::Unsigned(u64::from(reflected.location)),
                 )
                 .with_field(
                     "format_code",
