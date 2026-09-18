@@ -2134,6 +2134,127 @@ pub struct AttachmentLandingView {
     pub view_id: ViewId,
 }
 
+/// The identity and shape of a frame the provider kept in its own image
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// The pair is the same key the provider's resident registry uses for the image
+/// a `StoreOp::Resident` pass left behind (`research/docs/23` §76, R7): the
+/// provider's own image, not a guest page and not a trace-declared buffer. The
+/// shape travels with the identity because it is what a landing has to agree
+/// with: the owner's window a kept frame lands in is measured in the same
+/// tightly packed texel bytes [`RenderAttachment::expected_bytes`] states, so a
+/// landing that names a different format or extent is refused by name instead
+/// of moving bytes the two sides disagree about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeptFrame {
+    pub allocation_id: AllocationId,
+    pub view_id: ViewId,
+    pub format: AttachmentFormat,
+    pub width: u64,
+    pub height: u64,
+}
+
+impl KeptFrame {
+    /// Tightly packed byte extent of the kept frame, in the same texel-level
+    /// unit the byte parity compares and the owner-window landings are measured
+    /// in (`docs/23` §3.5). Provider row pitches and allocations are not part
+    /// of the contract, exactly as they are not for an attachment.
+    pub fn expected_bytes(&self) -> Result<u64, ContractError> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|texels| texels.checked_mul(self.format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("kept frame bytes"))
+    }
+
+    /// Structural validation only, on the same vocabulary
+    /// [`RenderAttachment::validate_shape`] uses: the frame is a colour surface
+    /// the provider keeps, so its identity, extent and format are held to the
+    /// attachment rules rather than to a second set of them.
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("kept frame view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("kept frame allocation id"));
+        }
+        for (axis, dimension) in [self.width, self.height].into_iter().enumerate() {
+            if dimension == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "kept frame",
+                    axis,
+                });
+            }
+        }
+        self.expected_bytes()?;
+        if !self.format.is_admitted_for_color_attachment() {
+            return Err(ContractError::UnsupportedAttachmentFormat(self.format));
+        }
+        Ok(())
+    }
+}
+
+/// One landing-only trace entry (`research/docs/23` §115 之后的增量，E-TX14/R4b):
+/// hand a frame the provider already kept in its own image into the owner's
+/// registered window a second view declaration names, without drawing anything.
+///
+/// The entry is the *deferred* sibling of [`StoreOp::BorrowedLanding`]. That arm
+/// lands the frame a pass just drew, in the same completion; this entry lands a
+/// frame a **previous, completed** pass left in the provider's image
+/// ([`StoreOp::Resident`]) — the shape the production profile's held
+/// store-rail records need and the contract had no way to state
+/// (`evidence/reviews/writeback-class-probe-2026-09-17.md`, fp3 §1.3).
+///
+/// What the entry deliberately does *not* carry is the point: there is no
+/// pipeline, no draw, no load source and no store decision, because a landing is
+/// not a rendering. The kept frame's identity and shape and the window's second
+/// declaration are its whole surface, so "this submission only lands a frame"
+/// is a fact of the type rather than a convention an executor has to honour.
+///
+/// A successful landing *consumes* the identity: the provider's copy is then a
+/// stale mirror of a frame the owner's pages hold, and a second landing of the
+/// same identity is refused by name (`kept_frame_already_landed`) until a later
+/// [`StoreOp::Resident`] pass keeps the identity again. That rule is what keeps
+/// an old frame from being written as the authoritative one twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeptFrameLanding {
+    /// The provider-resident frame this entry lands.
+    pub frame: KeptFrame,
+    /// The owner window the frame lands in — the same second declaration
+    /// [`StoreOp::BorrowedLanding`] carries.
+    pub landing: AttachmentLandingView,
+}
+
+impl KeptFrameLanding {
+    /// The identity this entry consumes, which is also the key the provider's
+    /// resident registry answers with.
+    pub const fn identity(&self) -> (AllocationId, ViewId) {
+        (self.frame.allocation_id, self.frame.view_id)
+    }
+
+    /// Structural validation only. The window's own rules — declared, an owner
+    /// window rather than a copy arm, bytes equal to the frame's extent — are
+    /// the rail's, exactly as they are for [`StoreOp::BorrowedLanding`].
+    ///
+    /// The frame and the landing window MAY name the same `(allocation, view)`
+    /// pair: "land the kept frame back in the window its own declaration names"
+    /// is a legal shape here, because this entry carries no load source for that
+    /// declaration to disagree with — the rule that refuses the equal pair on an
+    /// attachment (`AttachmentLandingViewSameIdentity`) is about one declaration
+    /// answering two questions, which cannot happen here.
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        self.frame.validate_shape()?;
+        if self.landing.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity(
+                "kept frame landing view allocation id",
+            ));
+        }
+        if self.landing.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("kept frame landing view id"));
+        }
+        Ok(())
+    }
+}
+
 /// How a colour attachment's contents are handed on after a render pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreOp {
@@ -6271,6 +6392,10 @@ pub enum TracePass {
     Compute(ComputePass),
     /// One offscreen colour render pass (`research/docs/23` §3).
     Render(RenderPassDescriptor),
+    /// One landing-only entry: a frame the provider already kept in its own
+    /// image lands in an owner's registered window, and nothing is drawn
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    Landing(KeptFrameLanding),
 }
 
 impl TracePass {
@@ -6279,6 +6404,7 @@ impl TracePass {
         match self {
             Self::Compute(pass) => Some(pass),
             Self::Render(_) => None,
+            Self::Landing(_) => None,
         }
     }
 
@@ -6287,6 +6413,7 @@ impl TracePass {
         match self {
             Self::Compute(pass) => Some(pass),
             Self::Render(_) => None,
+            Self::Landing(_) => None,
         }
     }
 
@@ -6295,6 +6422,15 @@ impl TracePass {
         match self {
             Self::Compute(_) => None,
             Self::Render(pass) => Some(pass),
+            Self::Landing(_) => None,
+        }
+    }
+
+    /// The landing payload, or `None` for the two drawing entries.
+    pub fn as_landing(&self) -> Option<&KeptFrameLanding> {
+        match self {
+            Self::Compute(_) | Self::Render(_) => None,
+            Self::Landing(landing) => Some(landing),
         }
     }
 }
@@ -8002,6 +8138,36 @@ impl ComputeTrace {
         self.passes.iter().filter_map(TracePass::as_render)
     }
 
+    /// The landing-only entries of `passes`, in trace order
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// A landing is not a render pass: it names no pipeline, draws nothing and
+    /// carries no attachment. It is still executed by the render group, in its
+    /// own position among the render passes, which is why the two iterators
+    /// exist side by side rather than one absorbing the other.
+    pub fn landings(&self) -> impl Iterator<Item = &KeptFrameLanding> {
+        self.passes.iter().filter_map(TracePass::as_landing)
+    }
+
+    /// Whether this trace carries at least one landing-only entry.
+    pub fn has_landing_entries(&self) -> bool {
+        self.passes
+            .iter()
+            .any(|pass| matches!(pass, TracePass::Landing(_)))
+    }
+
+    /// Whether this trace carries an entry the render group executes: a render
+    /// pass or a landing-only entry.
+    ///
+    /// The two rails' render plans and the `MCC1` encoder both ask this
+    /// question rather than [`ComputeTrace::has_render_passes`], because a
+    /// trace whose only render-group work is a landing still needs the
+    /// extended layout and the render execution sequence — it just has no pass
+    /// to draw.
+    pub fn has_render_entries(&self) -> bool {
+        self.has_render_passes() || self.has_landing_entries()
+    }
+
     /// Every colour attachment in pass order, tagged with the index of the
     /// trace entry that carries it.
     ///
@@ -8116,13 +8282,18 @@ impl ComputeTrace {
             }
         }
         for pass in &self.passes {
-            match pass {
+            // A landing-only entry names no pipeline and draws nothing, so it
+            // answers the pipeline walk with `None` and the `used` table below
+            // skips it: its own shape rules are the whole of its validation
+            // (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+            let pipeline = match pass {
                 TracePass::Compute(pass) => {
                     if pass.pipeline.is_zero() {
                         return Err(ContractError::InvalidIdentity("pipeline id"));
                     }
                     let pipeline = self.pipeline(pass.pipeline)?;
                     pass.validate(&pipeline.contract)?;
+                    Some(pass.pipeline)
                 }
                 TracePass::Render(pass) => {
                     // `RenderPassDescriptor::validate` repeats the identity
@@ -8130,12 +8301,14 @@ impl ComputeTrace {
                     // pipeline is in this trace's table and epoch.
                     pass.validate()?;
                     self.pipeline(pass.pipeline)?;
+                    Some(pass.pipeline)
                 }
-            }
-            let pipeline = match pass {
-                TracePass::Compute(pass) => pass.pipeline,
-                TracePass::Render(pass) => pass.pipeline,
+                TracePass::Landing(landing) => {
+                    landing.validate_shape()?;
+                    None
+                }
             };
+            let Some(pipeline) = pipeline else { continue };
             *used
                 .get_mut(&pipeline)
                 .expect("pipeline lookup checked the metadata table") = true;
@@ -9541,6 +9714,28 @@ pub struct ProviderCapabilities {
     /// *input* channel with no route that writes one, and Apple has no oracle
     /// for the shape.
     pub supports_render_attachment_landing_view: bool,
+    /// Whether this snapshot executes a landing-only entry: a
+    /// [`TracePass::Landing`] that hands a frame the provider already kept
+    /// ([`StoreOp::Resident`]) into an owner's registered window
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b). Defaults to `false`: a
+    /// trace that carries such an entry is refused by name during admission
+    /// instead of being handed to a rail that would have to guess.
+    ///
+    /// The bit is deliberately **not** [`Self::supports_render_attachment_landing_view`]
+    /// under another name. That bit says "this snapshot lands a *pass's own*
+    /// frame in the window a second declaration names" (a same-completion
+    /// statement), while this one says "this snapshot keeps frames across
+    /// submissions and delivers them in a later entry". A rail can answer
+    /// either question without the other: the native rail holds a resident
+    /// registry but has no owner-window write route at all, and a rail could
+    /// land a pass's frame in a window without ever keeping one.
+    ///
+    /// Declared `true` by the snapshots whose rail executes the entry: the
+    /// Vulkan rail resolves the kept identity out of its resident registry,
+    /// copies the provider image back and writes the owner's pages
+    /// (`tests/render_kept_frame_landing_e2e.rs`). The native rail keeps the
+    /// default and refuses the entry by name.
+    pub supports_render_kept_frame_landing: bool,
     /// Whether this snapshot can execute a render pass whose stage binds a
     /// buffer directly (`research/docs/23` §3.3, v83). Defaults to `false`: a
     /// snapshot whose rail cannot fill a stage buffer slot refuses the pass
@@ -9793,6 +9988,18 @@ impl ProviderCapabilities {
         self.supports_render_attachment_landing_view
     }
 
+    /// Whether this snapshot executes a landing-only entry
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so a caller asks "does this snapshot deliver a kept frame" in
+    /// the same place it asks every other shape question, and so the capability
+    /// frame's own guard — a snapshot that declares *only* this bit still writes
+    /// the extended payload — has one reader instead of two.
+    pub fn declares_render_kept_frame_landing_support(&self) -> bool {
+        self.supports_render_kept_frame_landing
+    }
+
     /// Whether this snapshot declares the folded stage-buffer shape
     /// (`research/docs/23` §3.3, E-TX9).
     ///
@@ -9874,6 +10081,12 @@ impl ProviderCapabilities {
         // provider that cannot render refuses the whole trace here, and a
         // compute-only trace never enters the walk (`docs/23` §4.2).
         self.admit_render_passes(trace)?;
+
+        // Kept-frame landing admission sits beside the render walk rather than
+        // inside it (`research/docs/23` §115 之后的增量，E-TX14/R4b): a trace
+        // whose only render-group entry is a landing carries no render pass, so
+        // the walk above would answer `Ok` without ever reading the entry.
+        self.admit_kept_frame_landings(trace)?;
 
         // Render texture admission is the second render gate and sits in the
         // same walk (`research/docs/23` §3.3, v70): a pass that binds a
@@ -10133,6 +10346,63 @@ impl ProviderCapabilities {
         resources
             .validate_trace(trace)
             .map_err(contract_error_refusal)?;
+        Ok(())
+    }
+
+    /// Kept-frame landing admission (`research/docs/23` §115 之后的增量，
+    /// E-TX14/R4b).
+    ///
+    /// The gate runs before [`Self::admit_render_passes`]'s own early return on
+    /// purpose: a trace whose only render-group entry is a landing carries **no
+    /// render pass at all**, so the render walk would return `Ok` without ever
+    /// looking at it. The questions are the snapshot's own — does it execute the
+    /// entry, and are the kept frame's format and extent inside its colour
+    /// attachment bits — so the refusal names the entry's position and the
+    /// identity it asked about rather than a pass detail the trace never stated.
+    fn admit_kept_frame_landings(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        for (pass_index, entry) in trace.passes.iter().enumerate() {
+            let Some(landing) = entry.as_landing() else {
+                continue;
+            };
+            if !self.supports_render_kept_frame_landing {
+                return Err(capability_error("kept_frame_landing_unsupported")
+                    .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                    .with_field("view", FieldValue::Unsigned(landing.frame.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(landing.frame.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "a landing-only entry hands a frame the provider kept in its own image \
+                         into an owner's registered window; this snapshot does not declare that \
+                         channel, so the entry is refused instead of being executed against a \
+                         frame the rail may not hold",
+                    ));
+            }
+            if !self.supported_color_formats.contains(&landing.frame.format) {
+                return Err(
+                    capability_error("attachment_format_unsupported").with_field(
+                        "format",
+                        FieldValue::Unsigned(u64::from(landing.frame.format.code())),
+                    ),
+                );
+            }
+            if landing.frame.width > self.max_attachment_dimension[0]
+                || landing.frame.height > self.max_attachment_dimension[1]
+            {
+                return Err(capability_error("attachment_dimension_limit")
+                    .with_field("width", FieldValue::Unsigned(landing.frame.width))
+                    .with_field("height", FieldValue::Unsigned(landing.frame.height))
+                    .with_field(
+                        "maximum_width",
+                        FieldValue::Unsigned(self.max_attachment_dimension[0]),
+                    )
+                    .with_field(
+                        "maximum_height",
+                        FieldValue::Unsigned(self.max_attachment_dimension[1]),
+                    ));
+            }
+        }
         Ok(())
     }
 
@@ -15433,6 +15703,7 @@ mod tests {
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
                 TracePass::Compute(_) => None,
+                TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass")
     }
@@ -15568,6 +15839,7 @@ mod tests {
 
     fn capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
+            supports_render_kept_frame_landing: false,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             supports_render_stage_buffer_namespace_split: false,
@@ -19053,6 +19325,232 @@ mod tests {
         }
     }
 
+    /// A landing-only entry is its own trace shape with its own rules
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    #[test]
+    fn a_kept_frame_landing_is_its_own_entry_with_its_own_shape_rules() {
+        let frame = KeptFrame {
+            allocation_id: AllocationId::new(960),
+            view_id: ViewId::new(970),
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+        };
+        let landing = KeptFrameLanding {
+            frame,
+            landing: AttachmentLandingView {
+                allocation_id: AllocationId::new(961),
+                view_id: ViewId::new(971),
+            },
+        };
+        landing
+            .validate_shape()
+            .expect("a kept-frame landing is a legal shape");
+        assert_eq!(landing.identity(), (frame.allocation_id, frame.view_id));
+        assert_eq!(frame.expected_bytes(), Ok(16));
+
+        // The entry is not a pass: it answers every pass question with `None`,
+        // which is what keeps "this submission only lands a frame" a fact of
+        // the type rather than a convention an executor honours.
+        let entry = TracePass::Landing(landing);
+        assert!(entry.as_compute().is_none());
+        assert!(entry.as_render().is_none());
+        assert_eq!(entry.as_landing(), Some(&landing));
+
+        // The frame and the window MAY be one identity: this entry carries no
+        // load source for that declaration to disagree with, so the rule that
+        // refuses the equal pair on an attachment does not apply.
+        let same_declaration = KeptFrameLanding {
+            landing: AttachmentLandingView {
+                allocation_id: frame.allocation_id,
+                view_id: frame.view_id,
+            },
+            ..landing
+        };
+        same_declaration
+            .validate_shape()
+            .expect("landing back into the frame's own declaration");
+
+        // A zero identity is refused on the same vocabulary the attachment
+        // shape uses, for the frame and for the window alike.
+        for broken in [
+            KeptFrameLanding {
+                frame: KeptFrame {
+                    view_id: ViewId::new(0),
+                    ..frame
+                },
+                ..landing
+            },
+            KeptFrameLanding {
+                frame: KeptFrame {
+                    allocation_id: AllocationId::new(0),
+                    ..frame
+                },
+                ..landing
+            },
+            KeptFrameLanding {
+                landing: AttachmentLandingView {
+                    view_id: ViewId::new(0),
+                    ..landing.landing
+                },
+                ..landing
+            },
+            KeptFrameLanding {
+                landing: AttachmentLandingView {
+                    allocation_id: AllocationId::new(0),
+                    ..landing.landing
+                },
+                ..landing
+            },
+        ] {
+            assert!(
+                matches!(
+                    broken.validate_shape(),
+                    Err(ContractError::InvalidIdentity(_))
+                ),
+                "a zero identity is refused by name: {broken:?}"
+            );
+        }
+
+        // A zero extent is the dimension rule's, and an integer format is not a
+        // colour surface the frame could have been kept as.
+        let zero_extent = KeptFrameLanding {
+            frame: KeptFrame { height: 0, ..frame },
+            ..landing
+        };
+        assert_eq!(
+            zero_extent.validate_shape(),
+            Err(ContractError::ZeroDimension {
+                field: "kept frame",
+                axis: 1,
+            })
+        );
+        let integer_format = KeptFrameLanding {
+            frame: KeptFrame {
+                format: AttachmentFormat::R32Uint,
+                ..frame
+            },
+            ..landing
+        };
+        assert_eq!(
+            integer_format.validate_shape(),
+            Err(ContractError::UnsupportedAttachmentFormat(
+                AttachmentFormat::R32Uint
+            ))
+        );
+    }
+
+    /// A landing entry never travels alone, and the reason is the declaration
+    /// channel rather than a special rule: the window it writes is a view only a
+    /// compute pass can put in the trace's serial pool, so the submission that
+    /// carries the entry carries that declaring pass with it. The shape the
+    /// contract refuses by name is the "only a landing" trace — an empty
+    /// pipeline table — and the shape it admits is the declaring pass beside the
+    /// entry (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+    #[test]
+    fn a_landing_entry_rides_beside_the_declaring_pass_that_names_its_window() {
+        let landing = KeptFrameLanding {
+            frame: KeptFrame {
+                allocation_id: AllocationId::new(960),
+                view_id: ViewId::new(970),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+            },
+            landing: AttachmentLandingView {
+                allocation_id: AllocationId::new(961),
+                view_id: ViewId::new(971),
+            },
+        };
+        // A trace whose only entry is the landing has nothing to declare its
+        // window with, and its pipeline table is empty: the contract refuses it
+        // before any rail could read it.
+        let mut value = trace(Vec::new());
+        value.pipelines.clear();
+        value.passes.push(TracePass::Landing(landing));
+        assert!(value.has_landing_entries());
+        assert!(value.has_render_entries());
+        assert_eq!(value.landings().count(), 1);
+        assert_eq!(value.render_passes().count(), 0);
+        assert_eq!(value.validate(), Err(ContractError::EmptyPipelineTable));
+
+        // The shape that exists: the declaring compute pass puts the window's
+        // view in the serial pool (the same declaration the landing view's store
+        // arm needs), and the entry rides beside it.
+        let mut value = trace(vec![pass(
+            4,
+            vec![landing_view(
+                landing.landing.view_id.get(),
+                landing.landing.allocation_id.get(),
+            )],
+        )]);
+        // The fixture's registration declares its first binding writable;
+        // `ComputePass::validate` compares each binding against that reflection,
+        // so the declaring pass's window view has to be spelled as the read it
+        // is.
+        value.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
+        value.passes.push(TracePass::Landing(landing));
+        value
+            .validate()
+            .expect("the declaring pass and the entry are the shape that exists");
+        assert!(value.serial_resources().is_ok());
+
+        let mut resources = ResourceTableSnapshot::new();
+        // The declaring pass's own view has to resolve in the resource table,
+        // exactly as any other declaration in the serial pool does.
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: landing.landing.allocation_id,
+                owner_epoch: DeviceEpoch::new(1),
+                size: 16,
+            })
+            .expect("the declaring view's allocation");
+        let mut declared = capabilities();
+        declared.supports_render_kept_frame_landing = true;
+        // The frame's own shape is held to the same colour-attachment bits an
+        // attachment is, so the snapshot has to declare the format and extent
+        // the frame states.
+        declared.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        declared.max_attachment_dimension = [2, 2];
+        // The fixture's snapshot admits one pass, and this trace carries the
+        // declaring dispatch beside the entry: a landing is an entry, not a
+        // second pass the caller has to budget for.
+        declared.max_passes = 2;
+        declared
+            .validate_trace(value.clone(), resources.clone())
+            .expect("a snapshot that declares the entry admits it");
+        assert!(declared.declares_render_kept_frame_landing_support());
+
+        // A snapshot whose colour bits do not reach the frame's shape refuses
+        // the entry on the attachment vocabulary, one gate at a time.
+        let mut narrow_format = declared.clone();
+        narrow_format.supported_color_formats.clear();
+        assert_eq!(
+            narrow_format
+                .validate_trace(value.clone(), resources.clone())
+                .expect_err("a format the snapshot never declared")
+                .slug,
+            "attachment_format_unsupported"
+        );
+        let mut narrow_extent = declared.clone();
+        narrow_extent.max_attachment_dimension = [1, 1];
+        assert_eq!(
+            narrow_extent
+                .validate_trace(value.clone(), resources.clone())
+                .expect_err("an extent beyond the snapshot's ceiling")
+                .slug,
+            "attachment_dimension_limit"
+        );
+
+        // The bit is the whole gate: a snapshot that keeps no frames refuses the
+        // entry by name during admission instead of handing it to a rail.
+        let error = capabilities()
+            .validate_trace(value, resources)
+            .expect_err("a snapshot without the bit refuses the entry");
+        assert_eq!(error.slug, "kept_frame_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+    }
+
     #[test]
     fn render_pass_accepts_the_first_increment_shape() {
         let pass = render_pass();
@@ -21840,6 +22338,7 @@ mod tests {
                 match &mut entry {
                     TracePass::Render(descriptor) => descriptor.pipeline = pipeline_id,
                     TracePass::Compute(_) => unreachable!("built as a render entry"),
+                    TracePass::Landing(_) => unreachable!("built as a render entry"),
                 }
                 value.passes.push(entry);
             }
@@ -23859,6 +24358,7 @@ mod tests {
             .filter_map(|pass| match pass {
                 TracePass::Render(render) => Some(render.textures.as_mut_slice()),
                 TracePass::Compute(_) => None,
+                TracePass::Landing(_) => None,
             })
             .find(|textures| !textures.is_empty())
             .and_then(|textures| textures.first_mut())
