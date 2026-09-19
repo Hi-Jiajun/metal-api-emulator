@@ -713,6 +713,20 @@ const CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL: u8 = 0x05;
 /// position rule every section before it follows.
 const CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL: u8 = 0x06;
 
+/// Tag, inside the tail's second family, of the pass-entry snapshot block
+/// (`research/docs/23` §118, E-TX15).
+///
+/// The section follows the per-stage stage-buffer window and carries one bool:
+/// whether the snapshot executes a render pass whose sampled declaration is
+/// the pass-entry snapshot of a colour attachment the *same* pass writes
+/// ([`ProviderCapabilities::supports_render_pass_entry_snapshot`]). It is the
+/// family's eighth tag rather than a reuse of any bit before it, because those
+/// bits answer other questions — the trace-produced source, the gathered
+/// extent, the landing arms — and a snapshot may execute any of them without
+/// the image copy this one promises. Its own escape byte keeps the position
+/// rule every section before it follows.
+const CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL: u8 = 0x08;
+
 /// Tag, inside the tail's second family, of the stage-buffer per-stage
 /// window's block (`research/docs/23` §3.3, §117 E-SB2).
 ///
@@ -987,6 +1001,13 @@ impl CommandCodec {
                     // every consumer would keep reading the stricter list
                     // bound as the whole rule.
                     || capabilities.declares_render_stage_buffer_per_stage_ceiling()
+                    // The pass-entry snapshot arm is a face of its own
+                    // (`research/docs/23` §118, E-TX15): a snapshot that
+                    // declares only it still has to write the extended
+                    // payload, or its declaration would be dropped on the
+                    // wire and every consumer would keep reading the stricter
+                    // "no pass-entry snapshot" default.
+                    || capabilities.declares_render_pass_entry_snapshot_support()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -2991,6 +3012,17 @@ fn put_texture_source(encoder: &mut Encoder, source: &TextureSource) {
         TextureSource::TraceView => {
             encoder.u8(3);
         }
+        // The pass's own attachment, as it stands when the pass opens
+        // (`research/docs/23` §118, E-TX15). Like the trace-produced arm it
+        // carries no bytes and no lease: the view's own `(allocation_id,
+        // view_id)` pair is the attachment's identity, so the declaration and
+        // the pass's attachment list agree by construction. The tag is
+        // appended after the four existing arms, so every older frame keeps
+        // its exact bytes and an older decoder refuses this tag as an unknown
+        // texture source rather than reading the declaration as another arm.
+        TextureSource::PassEntrySnapshot => {
+            encoder.u8(4);
+        }
     }
 }
 
@@ -3000,6 +3032,7 @@ fn get_texture_source(decoder: &mut Decoder<'_>) -> Result<TextureSource, CodecE
         1 => Ok(TextureSource::StagedLease(LeaseId::new(decoder.u64()?))),
         2 => Ok(TextureSource::BorrowedNoCopy(LeaseId::new(decoder.u64()?))),
         3 => Ok(TextureSource::TraceView),
+        4 => Ok(TextureSource::PassEntrySnapshot),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture source",
             value,
@@ -5918,6 +5951,11 @@ fn put_capabilities(
         // only it still has to write the heap/ICB half the decoder reads by
         // position before the family's escape.
         || capabilities.declares_render_stage_buffer_per_stage_ceiling()
+        // The pass-entry snapshot arm joins the same guard for the same reason
+        // (`research/docs/23` §118, E-TX15): a snapshot that declares only it
+        // still has to write the heap/ICB half the decoder reads by position
+        // before the family's escape.
+        || capabilities.declares_render_pass_entry_snapshot_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6145,6 +6183,17 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL);
             encoder.u32(capabilities.max_render_stage_buffers_per_stage);
         }
+        // The pass-entry snapshot block is the family's eighth tag and follows
+        // the per-stage stage-buffer window (`research/docs/23` §118, E-TX15).
+        // A snapshot whose bit stays at its default writes nothing here, and
+        // the decoder reads the missing section as `false` — the "keep the
+        // arm refused by name" default every consumer of the bit keeps its
+        // fail-closed direction with.
+        if capabilities.declares_render_pass_entry_snapshot_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL);
+            encoder.bool(capabilities.supports_render_pass_entry_snapshot);
+        }
     }
     Ok(())
 }
@@ -6221,6 +6270,7 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // carry it either: a landing-only entry keeps its by-name refusal until
         // a snapshot says otherwise.
         supports_render_kept_frame_landing: false,
+        supports_render_pass_entry_snapshot: false,
         supports_render_attachment_landing_view: false,
         // The superset vertex interface's bit (`research/docs/23` §3.3,
         // E-TX11) is the family's third block: a legacy payload cannot carry
@@ -6345,7 +6395,8 @@ fn decode_capability_extended_tail(
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL
             | CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL
             | CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL
-            | CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL => {}
+            | CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL
+            | CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6374,6 +6425,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL => {
                 capabilities.max_render_stage_buffers_per_stage = decoder.u32()?;
+            }
+            CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL => {
+                capabilities.supports_render_pass_entry_snapshot = decoder.bool()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

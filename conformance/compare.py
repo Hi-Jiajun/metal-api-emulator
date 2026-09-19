@@ -334,8 +334,9 @@ def _readback_windows(case, rule, width, height, where):
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
-    "stencil_filter sample_count_gate texture_uploads rule stage_buffer_modes landing",
-    defaults=(None, None, None, None, None, None))
+    "stencil_filter sample_count_gate texture_uploads rule stage_buffer_modes landing "
+    "snapshots",
+    defaults=(None, None, None, None, None, None, None))
 
 # One rule-expected attachment (R5a, `research/docs/23` §73): the rule's name,
 # the extent it covers, the digest of the whole plane the rule describes, and
@@ -2802,24 +2803,56 @@ def _render_plan(plan, suite):
                      f"{where}: the reviewed sampling shape binds exactly one texture")
             _require(single,
                      f"{where}: the reviewed sampling shape stores one attachment")
+            # The pass-entry snapshot arm (`research/docs/23` §118, E-TX15):
+            # the sampled declaration names the pass's own attachment and
+            # carries no bytes, so its identity, format and extent are the
+            # attachment's own, the case states the entry content on the
+            # attachment, and its frame is the module's reading of those bytes.
+            snapshot = any(
+                texture.get("source", "bytes") == "pass_entry_snapshot"
+                for texture in textures
+                if isinstance(texture, dict)
+            )
             for absent in ("vertex_layout", "vertex_buffers", "indices", "scissor",
                            "instance_count", "base_vertex", "cull", "blend",
                            "multisample", "depth", "depth_test", "depth_resolve",
                            "stencil", "stencil_test", "stencil_resolve", "present",
                            "icb", "coverage", "wildcard_texels",
                            "wildcard_allowed_texels"):
+                if snapshot and absent == "scissor":
+                    # The pass-entry snapshot arm's own clip: the drawn
+                    # rectangle carries the module's reading of the entry bytes
+                    # while every texel outside it keeps them, so the frame is
+                    # two falsifiable halves rather than one repeated word
+                    # (`research/docs/23` §118, E-TX15).
+                    _require("scissor" in case and isinstance(case["scissor"], list)
+                             and len(case["scissor"]) == 4,
+                             f"{where}: the pass-entry snapshot case clips its draw to a strict "
+                             "sub-rectangle")
+                    continue
                 _require(absent not in case,
                          f"{where}: the reviewed sampling shape carries no {absent}")
             texture_where = f"{where}.fragment_textures[0]"
             texture = textures[0]
             _require(isinstance(texture, dict), f"{texture_where}: expected an object")
             _require(set(texture).issubset({"allocation", "view", "format", "width",
-                                            "height", "initial_hex", "texel_rule"}),
+                                            "height", "initial_hex", "texel_rule",
+                                            "source"}),
                      f"{texture_where}: unexpected fields")
             _require(_integer(texture.get("allocation"), f"{texture_where}.allocation") > 0
                      and _integer(texture.get("view"), f"{texture_where}.view") > 0,
                      f"{texture_where}: zero texture identity")
             attachment = case["attachment"]
+            _require(texture.get("source", "bytes") in ("bytes", "pass_entry_snapshot"),
+                     f"{texture_where}.source: the render sampler's sources are the "
+                     "uploaded bytes and the pass's own attachment "
+                     "(pass_entry_snapshot)")
+            if snapshot:
+                _require(texture.get("allocation") == attachment.get("allocation")
+                         and texture.get("view") == attachment.get("view"),
+                         f"{texture_where}: a pass-entry snapshot declaration names the "
+                         "pass's own attachment, so its (allocation, view) pair has to be "
+                         "the attachment's")
             texture_format = _string(texture.get("format"), f"{texture_where}.format")
             _require(texture_format in SAMPLED_TEXTURE_FORMATS,
                      f"{texture_where}: the reviewed sampling stage reads one 8-bit "
@@ -2832,7 +2865,7 @@ def _render_plan(plan, suite):
                      f"{where}.attachment: the sampled shape's colour attachment is one "
                      "8-bit four-component unorm surface, in either byte order "
                      "(rgba8_unorm/bgra8_unorm)")
-            if translated is None:
+            if translated is None or snapshot:
                 _require(texture.get("width") == attachment.get("width")
                          and texture.get("height") == attachment.get("height"),
                          f"{texture_where}: the sampled texture has to share the "
@@ -2848,16 +2881,34 @@ def _render_plan(plan, suite):
                          or texture.get("height") != attachment.get("height"),
                          f"{texture_where}: the gathered arm's source has to differ from the "
                          "render area in at least one axis")
-            _require(attachment.get("load") == "clear"
-                     and attachment.get("store", "store") == "store",
-                     f"{texture_where}: the reviewed sampling shape clears and stores "
-                     "its attachment")
+            if snapshot:
+                _require(attachment.get("load") == "load"
+                         and attachment.get("store", "store") == "store",
+                         f"{texture_where}: the pass-entry snapshot reads the bytes the "
+                         "attachment holds when the pass opens, so the case loads and "
+                         "stores its attachment")
+                _require("clear_hex" not in attachment,
+                         f"{where}.attachment: a loaded attachment carries no clear_hex")
+                _require("initial_hex" in attachment,
+                         f"{where}.attachment: the pass-entry snapshot's whole statement is "
+                         "the attachment's own entry bytes, so the case states them")
+            else:
+                _require(attachment.get("load") == "clear"
+                         and attachment.get("store", "store") == "store",
+                         f"{texture_where}: the reviewed sampling shape clears and stores "
+                         "its attachment")
             texture_width = _integer(texture.get("width"), f"{texture_where}.width", 1)
             texture_height = _integer(texture.get("height"), f"{texture_where}.height", 1)
-            clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
-            _require(len(clear) == 4,
-                     f"{where}.attachment.clear_hex: a clear colour is four bytes")
+            if snapshot:
+                clear = b"\x00\x00\x00\x00"
+            else:
+                clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
+                _require(len(clear) == 4,
+                         f"{where}.attachment.clear_hex: a clear colour is four bytes")
             if "texel_rule" in texture:
+                _require(not snapshot,
+                         f"{texture_where}: a pass-entry snapshot statement is the "
+                         "attachment's own bytes, not a rule the case carries")
                 # The rule form (R5a, `research/docs/23` §73): the texture's
                 # texels and the attachment's expectation are one function of
                 # the texel coordinates, because the sampling stage's sample at
@@ -2895,7 +2946,14 @@ def _render_plan(plan, suite):
                          "texel rule")
                 _require("readback_windows" not in case,
                          f"{where}: readback windows travel with the texture's own texel rule")
-                texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
+                if snapshot:
+                    _require("initial_hex" not in texture,
+                             f"{texture_where}: a pass-entry snapshot declaration carries "
+                             "no bytes; the entry content is the attachment's initial_hex")
+                    texels = _hex(attachment.get("initial_hex"),
+                                  f"{where}.attachment.initial_hex")
+                else:
+                    texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
                 expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
                 # The texels the *frame* carries, not the source's bytes
                 # (`research/docs/23` §113): a narrow source states one or two
@@ -2903,7 +2961,61 @@ def _render_plan(plan, suite):
                 # run over the four-component texel each one is read out as. The
                 # frame is the render area's, which the same-extent window makes
                 # equal to the source's and the gathered arm states separately.
-                if translated is None:
+                if snapshot:
+                        # The pass-entry snapshot arm's expectation is the
+                        # *module's* reading of the entry bytes
+                        # (`research/docs/23` §118, E-TX15), and the case pins
+                        # that reading with its own clip: the drawn rectangle
+                        # carries one colour (the module's two samples are
+                        # fixed coordinates) while every texel outside it keeps
+                        # the entry byte the load handed the attachment. Both
+                        # halves have to appear, and the fragment's colour has
+                        # to be unlike every entry texel — that is what makes
+                        # "the snapshot copy ran" and "the draw ran" two
+                        # readings of one frame instead of one repeated word.
+                        scissor = case.get("scissor")
+                        _require(isinstance(scissor, list) and len(scissor) == 4,
+                                 f"{where}.scissor: the pass-entry snapshot case clips its draw "
+                                 "to a strict sub-rectangle")
+                        scissor_x, scissor_y, scissor_width, scissor_height = (
+                            _integer(value, f"{where}.scissor[{position}]", 0)
+                            for position, value in enumerate(scissor)
+                        )
+                        drawn = None
+                        drawn_count = 0
+                        kept_count = 0
+                        for position in range(texture_width * texture_height):
+                            x = position % texture_width
+                            y = position // texture_width
+                            inside = (scissor_x <= x < scissor_x + scissor_width
+                                      and scissor_y <= y < scissor_y + scissor_height)
+                            texel = expected[position * 4:position * 4 + 4]
+                            previous = texels[position * 4:position * 4 + 4]
+                            if inside:
+                                if drawn is None:
+                                    drawn = texel
+                                _require(texel == drawn,
+                                         f"{where}.expected_hex: the drawn texels disagree about "
+                                         "the fragment's reading")
+                                drawn_count += 1
+                            else:
+                                _require(texel == previous,
+                                         f"{where}.expected_hex: a texel outside the scissor has "
+                                         "to keep the entry byte the load handed it")
+                                kept_count += 1
+                        _require(drawn_count > 0 and kept_count > 0,
+                                 f"{where}.scissor: the clip has to leave at least one drawn and "
+                                 "one kept texel")
+                        entry_chunks = [texels[offset:offset + 4]
+                                        for offset in range(0, len(texels), 4)]
+                        _require(drawn not in entry_chunks,
+                                 f"{where}.expected_hex: the fragment's reading equals an entry "
+                                 "texel, so a rail that never sampled the snapshot could pass")
+                        _require(expected != texels,
+                                 f"{where}.expected_hex: a frame equal to the entry content "
+                                 "cannot tell the snapshot from a pass that never read it")
+
+                elif translated is None:
                     # The source's own byte extent, one texel wide for a narrow
                     # lane (`research/docs/23` §113): a spelling that disagrees
                     # with it states bytes the texture does not have, so the
@@ -2922,9 +3034,11 @@ def _render_plan(plan, suite):
                     _require(clear not in chunks,
                              f"{texture_where}: a frame texel equals the clear colour, so a "
                              "rail that ignored the texture could pass")
-                    _require(expected == _sampled_expectation(texture_format, attachment_format,
+                    _require(expected == _sampled_expectation(texture_format,
+                                                              attachment_format,
                                                               texels,
-                                                              texture_width * texture_height),
+                                                              texture_width
+                                                              * texture_height),
                              f"{where}: the expectation has to be the uploaded texels in the "
                              "attachment's own byte order: the sampling stage's sample at a "
                              "texel centre is an identity copy")
@@ -3808,6 +3922,20 @@ def _render_plan(plan, suite):
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
+        # The pass-entry snapshot arm's marker stays on the rail whose texture
+        # walk resolves it (`research/docs/23` §118, E-TX15): the two native
+        # faces refuse the declaration by name (Apple has no oracle for the
+        # shape) and the object rails have no entry for a declaration that
+        # carries no bytes, so a case that named them would claim a capture
+        # they cannot report.
+        if case.get("fragment_textures") and any(
+            isinstance(texture, dict)
+            and texture.get("source", "bytes") == "pass_entry_snapshot"
+            for texture in case["fragment_textures"]
+        ):
+            _require(rails and all(rail == "vulkan" for rail in rails),
+                     f"{where}: a pass-entry snapshot case runs on the rail whose texture walk "
+                     "resolves the arm, so its capture_rails has to stay inside that list")
         # A stage-buffer case names the rails that bind its slots
         # (`research/docs/23` §3.3, v83-v87), and the two arms name different
         # ones. A *translated* case pins two AIR modules only the Vulkan rails
@@ -4035,7 +4163,33 @@ def _render_plan(plan, suite):
         # policy table, so it is counted here rather than added to `touched`.
         texture_uploads = 0
         if fragment_textures is not None:
-            texture_uploads = len(fragment_textures)
+            # A pass-entry snapshot declaration uploads nothing
+            # (`research/docs/23` §118, E-TX15): its image is filled by the
+            # device-side copy the rail records before the pass opens, so the
+            # copy-in count owes one upload per *byte* arm only.
+            texture_uploads = sum(
+                1 for texture in fragment_textures
+                if texture.get("source", "bytes") != "pass_entry_snapshot"
+            )
+        # The pass-entry snapshot arm's provenance reading
+        # (`research/docs/23` §118, E-TX15): one device-side copy of the
+        # attachment's tightly packed extent per snapshot declaration. The
+        # frame alone cannot separate "the sampled image was filled from the
+        # attachment's entry content" from "the sampled image was something
+        # else", so a capture that omits this reading is the one thing that
+        # keeps "the copy never ran" from passing.
+        snapshots = None
+        if fragment_textures is not None:
+            snapshot_declarations = [
+                texture for texture in fragment_textures
+                if texture.get("source", "bytes") == "pass_entry_snapshot"
+            ]
+            if snapshot_declarations:
+                width = _integer(snapshot_declarations[0].get("width"),
+                                 f"{where}.fragment_textures[0].width", 1)
+                height = _integer(snapshot_declarations[0].get("height"),
+                                  f"{where}.fragment_textures[0].height", 1)
+                snapshots = (len(snapshot_declarations), width * height * 4)
         # The landing-view store's own section (`research/docs/23` §115 之后的
         # 增量，E-TX13): the second declaration the frame lands in, and the bytes
         # the owner's window has to hold after the pass.
@@ -4058,6 +4212,7 @@ def _render_plan(plan, suite):
             filter=requires_filter,
             stencil_filter=requires_stencil_filter,
             sample_count_gate=requires_sample_count,
+            snapshots=snapshots,
             rule=rule_expectation,
             # The lease face of a stage-buffer case (`research/docs/23` §90,
             # R9i): the source arm each of its slots ran with, or `None` for a
@@ -4142,12 +4297,18 @@ def validate_capture(suite, digest, report, required_backend=None):
         base = {"id", "completion", "writebacks", "allocations"}
         counted = base | {"copy_in", "copy_out"}
         grouped = counted | {"group_counts"}
+        # The pass-entry snapshot reading (`research/docs/23` §118, E-TX15) is
+        # the fourth optional pair a result may carry, beside the two buffer
+        # counters and the per-command-buffer groups: it is removed before the
+        # shape check and validated on its own below, so a capture of any older
+        # increment keeps the exact field set it always had.
+        snapshot_fields = {"attachment_snapshots", "attachment_snapshot_bytes"}
         # The present, heap, indirect and lease observations are the keys a
         # suite may declare on top of an otherwise unchanged result shape: they
         # replace no existing field and they do not relax the counter-pair rule
         # below.
         _require(set(result) - {"present", "heap", "icb", "storage_modes"}
-                 - {"landing"}
+                 - {"landing"} - snapshot_fields
                  in (base, counted, grouped),
                  "capture result: expected fields "
                  + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
@@ -4155,6 +4316,10 @@ def validate_capture(suite, digest, report, required_backend=None):
         counts = (result.get("copy_in"), result.get("copy_out"))
         _require((counts[0] is None) == (counts[1] is None),
                  "capture result: copy_in and copy_out are recorded together")
+        snapshot_counts = (result.get("attachment_snapshots"),
+                           result.get("attachment_snapshot_bytes"))
+        _require((snapshot_counts[0] is None) == (snapshot_counts[1] is None),
+                 "capture result: the pass-entry snapshot reading is recorded as a pair")
         case_id = _string(result["id"], "capture result.id")
         where = f"case {case_id}"
         _require(case_id in plan or case_id in render_plan, f"{where}: unknown case")
@@ -4163,6 +4328,21 @@ def validate_capture(suite, digest, report, required_backend=None):
         _require(result["completion"] == "CompletedVisible",
                  f"{where}: completion must be CompletedVisible, got {result['completion']!r}")
         if case_id in render_plan:
+            # The pass-entry snapshot reading is the arm's own provenance
+            # (`research/docs/23` §118, E-TX15): a case that declares the arm
+            # must report one copy of the attachment's tightly packed extent,
+            # and every other case must report none — the reading is what
+            # separates "the copy ran" from "the frame happens to match".
+            expected_snapshots = render_plan[case_id].snapshots
+            if expected_snapshots is None:
+                _require(snapshot_counts == (None, None),
+                         f"{where}: this case declares no pass-entry snapshot, so a "
+                         "capture must not report one")
+            else:
+                _require(snapshot_counts
+                         == (expected_snapshots[0], expected_snapshots[1]),
+                         f"{where}: the pass-entry snapshot reading has to be one copy of "
+                         f"{expected_snapshots[1]} bytes, got {snapshot_counts}")
             # A render case reports one observation and one only: the
             # attachments' own allocations and their writebacks, one of each
             # per attachment. The identity check below is the

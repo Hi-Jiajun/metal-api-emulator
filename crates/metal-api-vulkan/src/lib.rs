@@ -639,6 +639,16 @@ impl VulkanExecutor {
         self.context.present_counts()
     }
 
+    /// Cumulative pass-entry snapshot copies and the bytes they moved
+    /// (`research/docs/23` §118, E-TX15). Smoke tests use it as the arm's
+    /// provenance reading: the frame alone cannot tell "the sampled image was
+    /// filled from the attachment's entry content" from "the sampled image was
+    /// something else", while this counter can.
+    #[doc(hidden)]
+    pub fn attachment_snapshot_counts(&self) -> (usize, usize) {
+        self.context.attachment_snapshot_counts()
+    }
+
     /// Cumulative render-readback regions: how many stored attachments were
     /// read back through their written rectangle, how many bytes that cost, and
     /// how many took the whole-extent path with the reason
@@ -1244,6 +1254,15 @@ pub(crate) struct VulkanContext {
     readback_fallback_shape: AtomicUsize,
     readback_fallback_bounds: AtomicUsize,
     readback_whole: AtomicUsize,
+    /// Pass-entry snapshot copies (`research/docs/23` §118, E-TX15): one per
+    /// sampled declaration that reads a colour attachment's own pass-entry
+    /// content, counted where the device copy is recorded, and the bytes each
+    /// copy moves. The counter is the arm's own provenance reading: a pass
+    /// whose frame is read through the snapshot cannot be distinguished from
+    /// one that bound the live attachment image by the frame alone, so the
+    /// fixture reads this beside it.
+    attachment_snapshots: AtomicUsize,
+    attachment_snapshot_bytes: AtomicUsize,
     /// Presentation completions of the first present increment
     /// (`research/docs/24` §3.3, §5.3): one acquire when the provider takes
     /// ownership of a present target for a pass, one present when the target's
@@ -1495,6 +1514,8 @@ impl VulkanContext {
             readback_fallback_shape: AtomicUsize::new(0),
             readback_fallback_bounds: AtomicUsize::new(0),
             readback_whole: AtomicUsize::new(0),
+            attachment_snapshots: AtomicUsize::new(0),
+            attachment_snapshot_bytes: AtomicUsize::new(0),
             present_acquires: AtomicUsize::new(0),
             present_presents: AtomicUsize::new(0),
             render_setup_reuse: Mutex::new(render_setup_reuse),
@@ -1839,6 +1860,27 @@ impl VulkanContext {
         (
             self.buffer_uploads.load(Ordering::Relaxed),
             self.buffer_readbacks.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one pass-entry snapshot copy (`research/docs/23` §118, E-TX15):
+    /// the device-side `vkCmdCopyImage` that fills a sampled image with a
+    /// colour attachment's own entry content, before the render pass opens.
+    /// `bytes` is the attachment's tightly packed extent — the bytes the copy
+    /// moves — so a capture reads "the snapshot was taken" and "how much of it
+    /// was taken" as two numbers.
+    pub(crate) fn record_attachment_snapshot(&self, bytes: usize) {
+        self.attachment_snapshots.fetch_add(1, Ordering::Relaxed);
+        self.attachment_snapshot_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The render half's cumulative pass-entry snapshot copies, as
+    /// `(copies, bytes)`.
+    pub(crate) fn attachment_snapshot_counts(&self) -> (usize, usize) {
+        (
+            self.attachment_snapshots.load(Ordering::Relaxed),
+            self.attachment_snapshot_bytes.load(Ordering::Relaxed),
         )
     }
 

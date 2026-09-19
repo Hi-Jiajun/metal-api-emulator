@@ -1042,6 +1042,11 @@ pub(crate) struct RenderCapabilityBits {
     /// also always `false` here: this rail has no owner-window write route, so
     /// it refuses the entry by name.
     pub(crate) supports_render_kept_frame_landing: bool,
+    /// The pass-entry snapshot arm (`research/docs/23` §118, E-TX15). Kept
+    /// beside the two bits above for the same reason, and always `false` here:
+    /// Apple has no oracle for a fragment reading the attachment it writes, so
+    /// this rail refuses the arm by name.
+    pub(crate) supports_render_pass_entry_snapshot: bool,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -1125,6 +1130,11 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         // fail-closed default beside the two bits above.
         supports_render_attachment_landing_view: false,
         supports_render_kept_frame_landing: false,
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15) is
+        // refused by this rail's own texture walk: Apple has no oracle for a
+        // fragment reading the attachment it writes, so the snapshot keeps the
+        // fail-closed default beside the two bits above.
+        supports_render_pass_entry_snapshot: false,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -1171,6 +1181,10 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
         supports_render_texture_gathered_extent_no_copy: false,
         supports_render_kept_frame_landing: false,
         supports_render_attachment_landing_view: false,
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15): this
+        // rail has no Apple oracle for the shape at all, so the bit keeps the
+        // consumer's fail-closed default.
+        supports_render_pass_entry_snapshot: false,
     }
 }
 
@@ -1200,6 +1214,10 @@ pub(crate) struct RenderTextureCapabilityBits {
     /// (`research/docs/23` §115 之后的增量，E-TX14/R4b). It never does: the
     /// entry is refused by name before any plan exists.
     pub(crate) supports_render_kept_frame_landing: bool,
+    /// Whether this rail's snapshot declares the pass-entry snapshot arm
+    /// (`research/docs/23` §118, E-TX15). It never does: the arm is refused by
+    /// name before any plan exists.
+    pub(crate) supports_render_pass_entry_snapshot: bool,
 }
 
 /// The first render-sampler increment's binding cap, spelled once so the
@@ -2801,6 +2819,23 @@ fn resolve_render_texture_source<'a>(
              does not resolve the produced-bytes arm yet: the arm is executed by the Vulkan \
              rail (`research/docs/23` §110), and the Apple-side reading its flip would owe \
              is a later increment",
+        )),
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15) is
+        // refused by name for the reason every unflipped arm is, plus one of
+        // its own: what the arm promises is a device-side image copy taken
+        // before the render pass opens and bound as the sampled view, and this
+        // rail has no Apple oracle for a fragment reading the attachment the
+        // same pass writes — the reading its flip would owe is a later
+        // increment's. The bit stays `false` beside it, so a consumer refuses
+        // the declaration during admission rather than reaching this walk.
+        TextureSource::PassEntrySnapshot => Err(texture_source_refusal(
+            binding,
+            view.view_id,
+            "pass_entry_snapshot",
+            "the texels are the pass's own colour attachment as it stands when the pass \
+             opens, and this rail's trace path does not carry the before-the-pass image copy \
+             the arm states: the arm is executed by the Vulkan rail (`research/docs/23` \
+             §118), and Apple has no oracle for the shape",
         )),
         TextureSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
@@ -10552,6 +10587,10 @@ mod tests {
             // view's bit.
             supports_render_kept_frame_landing: false,
             supports_render_attachment_landing_view: false,
+            // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15)
+            // is refused by this rail's own plan gate, so the test snapshot
+            // spells the fail-closed default out beside the two bits above.
+            supports_render_pass_entry_snapshot: false,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -11922,6 +11961,51 @@ mod tests {
         // The snapshot says the same thing the rail does: the bit stays at its
         // fail-closed default on this rail.
         assert!(!capabilities(&capability_bits(16384)).supports_render_kept_frame_landing);
+    }
+
+    /// A pass-entry snapshot declaration has no rail here (`research/docs/23`
+    /// §118, E-TX15). The arm promises a device-side image copy taken before
+    /// the render pass opens and bound as the sampled view, and this rail has
+    /// no Apple oracle for a fragment reading the attachment the same pass
+    /// writes — so the declaration is refused under the arm's own name, with
+    /// the rail beside it, and the snapshot's bit stays at its fail-closed
+    /// default.
+    #[test]
+    fn plan_trace_refuses_a_pass_entry_snapshot_by_name() {
+        // The rail resolves the arm at its own texture walk, so the reading is
+        // the plan gate rather than the trace walk: the pass and its pipeline
+        // are the reviewed sampling pair, whose declaration matches the
+        // rewritten texture field for field.
+        let mut pass = sampled_pass(4);
+        pass.color_attachments[0].load = LoadOp::Load;
+        let attachment = pass.color_attachments[0];
+        let mut texture = pass.textures[0].clone();
+        texture.view_id = attachment.view_id;
+        texture.allocation_id = attachment.allocation_id;
+        texture.format = attachment.format.as_texture_format();
+        texture.width = attachment.width;
+        texture.height = attachment.height;
+        texture.source = TextureSource::PassEntrySnapshot;
+        pass.textures = vec![texture];
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &sampled_pipeline(),
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![Some(PlannedInputSource::Declared(&[0x11; 64]))],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        assert_eq!(error.slug, "render_texture_source_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("pass_entry_snapshot".to_owned())),
+            "the refusal names the arm it cannot execute"
+        );
+        // The snapshot says the same thing the rail does: the bit stays at its
+        // fail-closed default on this rail.
+        assert!(!capabilities(&capability_bits(16384)).supports_render_pass_entry_snapshot);
     }
 
     /// The landing rail is the writeback channel: an attachment no declared view

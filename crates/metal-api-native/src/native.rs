@@ -488,6 +488,11 @@ impl NativeMetalProvider {
                 // same reason: no owner-window write route exists here, so the
                 // snapshot keeps the fail-closed default.
                 supports_render_kept_frame_landing: render_bits.supports_render_kept_frame_landing,
+                // The pass-entry snapshot arm (`research/docs/23` §118,
+                // E-TX15) is refused by the texture walk beside the same two
+                // bits, because Apple has no oracle for the shape.
+                supports_render_pass_entry_snapshot: render_bits
+                    .supports_render_pass_entry_snapshot,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled

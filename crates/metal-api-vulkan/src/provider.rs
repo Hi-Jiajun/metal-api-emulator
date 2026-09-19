@@ -322,6 +322,12 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // about a frame a *previous* submission kept, that one is about where a
         // pass's own frame lands.
         supports_render_kept_frame_landing: true,
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15): this
+        // rail copies the attachment's own pass-entry content into a
+        // same-format device-local image before the render pass opens and
+        // binds that image as the sampled view
+        // (`tests/render_pass_entry_snapshot_e2e.rs`).
+        supports_render_pass_entry_snapshot: true,
         // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
         // `render.rs` uploads each bound view into a host-visible
         // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1

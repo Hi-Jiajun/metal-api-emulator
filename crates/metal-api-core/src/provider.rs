@@ -813,12 +813,60 @@ pub enum TextureSource {
     /// stays refused by [`ContractError::RenderTextureAttachmentConflict`],
     /// exactly as it is for every other source arm.
     TraceView,
+    /// The texels are the pass's *own* colour attachment as it stands when the
+    /// pass opens (`research/docs/23` §118, E-TX15): the declaration names the
+    /// attachment's own `(allocation_id, view_id)` pair, and what the fragment
+    /// stage reads is the attachment's pass-entry content — the bytes the
+    /// attachment's load arm established before the first draw ran.
+    ///
+    /// This is the one arm a pass that samples an attachment it also writes
+    /// can state, and it is a *different* statement from
+    /// [`Self::TraceView`]: that arm reads what an earlier pass stored, while
+    /// this one reads what the *same* pass started from. The distinction is
+    /// the whole point — a read of the frame the same draw's raster is
+    /// producing is a race no rail can execute (Vulkan's own render pass data
+    /// race rules admit a fragment reading the sample it covers, and nothing
+    /// wider), while a read of the attachment's entry content is a copy the
+    /// rail can take before the pass opens and is exactly the fallback the
+    /// engine uses when it cannot bind a resident through its own view
+    /// (`crates/reims-vgpu/src/backend/vulkan/engine/exec.rs`: "capture the
+    /// prior resident content into a same-format GPU image before changing the
+    /// attachment").
+    ///
+    /// [`RenderPassDescriptor::validate`] states the whole rule and refuses
+    /// every shape the arm cannot express:
+    ///
+    /// - the view has to be a **colour attachment of this same pass**, matched
+    ///   by its `(allocation_id, view_id)` pair, or the declaration names a
+    ///   read this pass has no entry content for
+    ///   ([`ContractError::RenderPassEntrySnapshotUnattached`]);
+    /// - the declaration has to restate that attachment's format and extent,
+    ///   because the snapshot is the attachment's own texel grid and a
+    ///   declaration that names another one would sample bytes the attachment
+    ///   never held ([`ContractError::RenderPassEntrySnapshotShapeMismatch`]);
+    /// - the attachment's load arm has to *establish* those bytes —
+    ///   [`LoadOp::Load`] or [`LoadOp::Resident`]. A [`LoadOp::Clear`]
+    ///   attachment's entry content is the clear colour and a
+    ///   [`LoadOp::DontCare`] attachment's is undefined, so neither is the
+    ///   "prior content" this arm states
+    ///   ([`ContractError::RenderPassEntrySnapshotLoadUnsupported`]);
+    /// - the view has to be a plain single-sample 2D view: the snapshot is one
+    ///   texel grid of one attachment, and a layered, multisampled or
+    ///   otherwise decorated view has no single pass-entry content to name.
+    ///
+    /// The read's footprint is therefore the attachment's own tightly packed
+    /// extent — the [`TextureFootprintProof::WholeView`] unit the render
+    /// texture face already states — and the read is ordered *before* every
+    /// write of the pass by construction: the rail's copy runs before the
+    /// render pass opens, so no draw of this pass can be a producer of the
+    /// bytes it reads.
+    PassEntrySnapshot,
 }
 
 impl TextureSource {
     pub const fn lease_id(&self) -> Option<LeaseId> {
         match self {
-            Self::OwnedBytes(_) | Self::TraceView => None,
+            Self::OwnedBytes(_) | Self::TraceView | Self::PassEntrySnapshot => None,
             Self::StagedLease(lease_id) | Self::BorrowedNoCopy(lease_id) => Some(*lease_id),
         }
     }
@@ -4814,27 +4862,100 @@ impl RenderPassDescriptor {
             // the same view would be one draw reading and writing the same
             // texels. The rails' execution order cannot express that as
             // anything but a race, so the pass is refused by name instead of
-            // being run with whichever bytes the driver happens to leave.
-            let attachment_views = self
-                .color_attachments
-                .iter()
-                .map(|attachment| attachment.view_id)
-                .chain(
-                    self.depth
-                        .as_ref()
-                        .and_then(|depth| depth.identity)
-                        .map(|identity| identity.view_id),
-                )
-                .chain(
-                    self.stencil
-                        .as_ref()
-                        .and_then(|stencil| stencil.identity)
-                        .map(|identity| identity.view_id),
-                );
-            if attachment_views.clone().any(|view| view == texture.view_id) {
-                return Err(ContractError::RenderTextureAttachmentConflict {
-                    view: texture.view_id,
+            // being run with whichever bytes the driver happens to leave —
+            // unless the declaration is the one arm that names the race
+            // explicitly and resolves it before the pass opens
+            // (`research/docs/23` §118, E-TX15).
+            if matches!(texture.source, TextureSource::PassEntrySnapshot) {
+                // The arm's own identity: the colour attachment this pass
+                // opens, matched by the whole pair the two declarations
+                // carry. A view id that matches while the allocation does not
+                // is a different resource and not this pass's entry content.
+                let attachment = self.color_attachments.iter().find(|attachment| {
+                    attachment.view_id == texture.view_id
+                        && attachment.allocation_id == texture.allocation_id
                 });
+                let Some(attachment) = attachment else {
+                    return Err(ContractError::RenderPassEntrySnapshotUnattached {
+                        index,
+                        view: texture.view_id,
+                        allocation: texture.allocation_id,
+                    });
+                };
+                // The snapshot *is* the attachment's texel grid: the
+                // declaration has to restate it, exactly as the trace-produced
+                // arm has to restate its producer's shape. A declaration that
+                // names another format or another extent would sample texels
+                // (or byte layouts) the attachment never held.
+                if attachment.format.as_texture_format() != texture.format
+                    || [attachment.width, attachment.height] != [texture.width, texture.height]
+                {
+                    return Err(ContractError::RenderPassEntrySnapshotShapeMismatch {
+                        index,
+                        view: texture.view_id,
+                        attachment_format: attachment.format,
+                        texture_format: texture.format,
+                        attachment_extent: [attachment.width, attachment.height],
+                        texture_extent: [texture.width, texture.height],
+                    });
+                }
+                // The bytes the arm promises are the attachment's *prior*
+                // contents. Only the two load arms that keep those contents
+                // state them: a clear establishes the clear colour and
+                // `DontCare` establishes nothing at all, so neither is "the
+                // bytes the attachment held when the pass opened" — the
+                // engine's own fallback copies the prior resident content
+                // before the pass changes it, and a clear or a discarded
+                // attachment has no such content to copy.
+                if !matches!(attachment.load, LoadOp::Load | LoadOp::Resident) {
+                    return Err(ContractError::RenderPassEntrySnapshotLoadUnsupported {
+                        index,
+                        view: texture.view_id,
+                        load: match attachment.load {
+                            LoadOp::Clear(_) => "clear",
+                            LoadOp::DontCare => "dont_care",
+                            LoadOp::Load => "load",
+                            LoadOp::Resident => "resident",
+                        },
+                    });
+                }
+                // One texel grid of one attachment: a layered, multisampled,
+                // 1D/3D or otherwise decorated view names no single pass-entry
+                // content, and the sampled face refuses those shapes for every
+                // other arm anyway.
+                if texture.texture_type != TextureType::D2
+                    || texture.depth != 1
+                    || texture.array_length != 1
+                {
+                    return Err(ContractError::RenderPassEntrySnapshotShapeUnsupported {
+                        index,
+                        view: texture.view_id,
+                        texture_type: texture.texture_type,
+                        array_length: texture.array_length,
+                    });
+                }
+            } else {
+                let attachment_views = self
+                    .color_attachments
+                    .iter()
+                    .map(|attachment| attachment.view_id)
+                    .chain(
+                        self.depth
+                            .as_ref()
+                            .and_then(|depth| depth.identity)
+                            .map(|identity| identity.view_id),
+                    )
+                    .chain(
+                        self.stencil
+                            .as_ref()
+                            .and_then(|stencil| stencil.identity)
+                            .map(|identity| identity.view_id),
+                    );
+                if attachment_views.clone().any(|view| view == texture.view_id) {
+                    return Err(ContractError::RenderTextureAttachmentConflict {
+                        view: texture.view_id,
+                    });
+                }
             }
         }
         // Runtime samplers (`research/docs/23` §3.3, v102): the request's own
@@ -8794,9 +8915,13 @@ impl ComputeTrace {
             };
             // Reads answer against the stores that came *before* them. This
             // pass's own stores join the map below, after the reads; a pass
-            // that both samples a view and writes it as an attachment is
-            // already refused by `RenderPassDescriptor::validate`, so the
-            // split cannot hide a same-pass read-after-write.
+            // that samples a view it also writes is already answered by
+            // `RenderPassDescriptor::validate`: every source arm but the
+            // pass-entry snapshot is refused as an attachment conflict, and
+            // that arm reads the attachment's *entry* content, which the
+            // rail's copy takes before the pass opens (`research/docs/23`
+            // §118, E-TX15). Neither case can hide a same-pass read-after-write
+            // behind this split.
             for texture in &render.textures {
                 if !matches!(texture.source, TextureSource::TraceView) {
                     continue;
@@ -9816,6 +9941,28 @@ pub struct ProviderCapabilities {
     /// (`tests/render_kept_frame_landing_e2e.rs`). The native rail keeps the
     /// default and refuses the entry by name.
     pub supports_render_kept_frame_landing: bool,
+    /// Whether this snapshot executes a render pass whose sampled declaration
+    /// is the pass-entry snapshot of a colour attachment the *same* pass writes
+    /// (`research/docs/23` §118, E-TX15). Defaults to `false`: a pass that
+    /// carries such a declaration is refused by name during admission instead
+    /// of being handed to a rail that would have to guess.
+    ///
+    /// The bit is deliberately **not** [`Self::supports_render_texture_sampling`]
+    /// under another name. That bit says "this snapshot samples textures at
+    /// all"; this one says "it can take the copy of the attachment's own
+    /// pass-entry contents that [`TextureSource::PassEntrySnapshot`] promises"
+    /// — a *device-side image copy issued before the render pass opens*, plus
+    /// the two load arms that have prior contents to copy. A rail can sample
+    /// every pre-pass source and still answer this arm no, which is exactly
+    /// what the native rail does.
+    ///
+    /// Declared `true` by the snapshots whose rail executes the arm: the
+    /// Vulkan rail resolves the attachment's pass-entry content into a
+    /// same-format image before the pass opens and binds that image as the
+    /// sampled view (`tests/render_pass_entry_snapshot_e2e.rs`). The native
+    /// rail keeps the default and refuses the arm by name, because Apple has no
+    /// oracle for the shape.
+    pub supports_render_pass_entry_snapshot: bool,
     /// Whether this snapshot can execute a render pass whose stage binds a
     /// buffer directly (`research/docs/23` §3.3, v83). Defaults to `false`: a
     /// snapshot whose rail cannot fill a stage buffer slot refuses the pass
@@ -10101,6 +10248,20 @@ impl ProviderCapabilities {
     /// the extended payload — has one reader instead of two.
     pub fn declares_render_kept_frame_landing_support(&self) -> bool {
         self.supports_render_kept_frame_landing
+    }
+
+    /// Whether this snapshot executes a pass whose sampled declaration is the
+    /// pass-entry snapshot of a colour attachment the same pass writes
+    /// (`research/docs/23` §118, E-TX15).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so a caller asks "does this snapshot read its own
+    /// attachment's entry content" in the same place it asks every other shape
+    /// question, and so the capability frame's own guard — a snapshot that
+    /// declares *only* this bit still writes the extended payload — has one
+    /// reader instead of two.
+    pub fn declares_render_pass_entry_snapshot_support(&self) -> bool {
+        self.supports_render_pass_entry_snapshot
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -10810,6 +10971,34 @@ impl ProviderCapabilities {
                     ));
             }
             for texture in &pass.textures {
+                // The pass-entry snapshot arm (`research/docs/23` §118,
+                // E-TX15) is the face's fourth question: a snapshot can sample
+                // every pre-pass source and still have no route that copies an
+                // attachment's own entry content before the pass opens. The
+                // refusal names the binding the view states, like its
+                // siblings, so a consumer reads the shape rather than the
+                // declaration's position.
+                if matches!(texture.source, TextureSource::PassEntrySnapshot)
+                    && !self.supports_render_pass_entry_snapshot
+                {
+                    return Err(capability_error("render_pass_entry_snapshot_unsupported")
+                        .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                        .with_field(
+                            "binding",
+                            FieldValue::Unsigned(u64::from(texture.metal_binding)),
+                        )
+                        .with_field("view", FieldValue::Unsigned(texture.view_id.get()))
+                        .with_field(
+                            "allocation",
+                            FieldValue::Unsigned(texture.allocation_id.get()),
+                        )
+                        .with_detail(
+                            "a pass-entry snapshot reads the bytes a colour attachment of the \
+                             same pass holds when it opens; this snapshot does not declare that \
+                             channel, so the pass is refused instead of being executed against \
+                             whichever bytes the rail's own attachment image happens to hold",
+                        ));
+                }
                 if !self
                     .supported_render_texture_formats
                     .contains(&texture.format)
@@ -11444,6 +11633,29 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::RenderTextureSourceShapeMismatch { .. } => (
             ProviderErrorClass::Args,
             "render_texture_source_shape_mismatch",
+        ),
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15). The
+        // load arm is the arm's own narrowing — the request is well formed and
+        // simply names an attachment whose entry content is a clear or
+        // undefined — so it keeps a capability slug; the other three name a
+        // declaration that does not match this pass's own attachment, which is
+        // caller-fixable trace structure and keeps one slug each so a consumer
+        // can tell "not this pass's attachment" from "the wrong shape".
+        E::RenderPassEntrySnapshotLoadUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "render_pass_entry_snapshot_load_unsupported",
+        ),
+        E::RenderPassEntrySnapshotUnattached { .. } => (
+            ProviderErrorClass::Args,
+            "render_pass_entry_snapshot_unattached",
+        ),
+        E::RenderPassEntrySnapshotShapeMismatch { .. } => (
+            ProviderErrorClass::Args,
+            "render_pass_entry_snapshot_shape_mismatch",
+        ),
+        E::RenderPassEntrySnapshotShapeUnsupported { .. } => (
+            ProviderErrorClass::Args,
+            "render_pass_entry_snapshot_shape_unsupported",
         ),
         // Runtime sampler contract (`research/docs/23` §3.3, v102). The cap and
         // the index bound are the texture list's own narrowings one face over;
@@ -13447,6 +13659,72 @@ pub enum ContractError {
     RenderTextureAttachmentConflict {
         view: ViewId,
     },
+    // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15). The four
+    // refusals below are the whole rule
+    // `TextureSource::PassEntrySnapshot` states: which attachment the read
+    // belongs to, what shape that attachment has, whether its load arm
+    // establishes the bytes the arm promises, and whether the sampled
+    // declaration names one texel grid. Each names its own disagreement rather
+    // than folding into one "unsupported source" refusal, because the fix
+    // differs: name this pass's own attachment, restate its format and extent,
+    // load rather than clear or discard it, or declare a plain 2D view.
+    /// A pass-entry snapshot names a view this pass does not open as a colour
+    /// attachment (`research/docs/23` §118, E-TX15).
+    ///
+    /// The arm's whole meaning is "the bytes this pass's own attachment holds
+    /// when it opens", so a declaration whose `(allocation, view)` pair no
+    /// colour attachment of this pass carries has no entry content to read.
+    /// The pair is matched whole: a view id that matches while the allocation
+    /// does not is a different resource, exactly as it is for a landing.
+    RenderPassEntrySnapshotUnattached {
+        index: usize,
+        view: ViewId,
+        allocation: AllocationId,
+    },
+    /// A pass-entry snapshot restates a shape its attachment does not have
+    /// (`research/docs/23` §118, E-TX15).
+    ///
+    /// The snapshot *is* the attachment's texel grid, so the declaration has
+    /// to agree with it field by field — the same rule the trace-produced arm
+    /// holds to its producer's store: another format would sample another byte
+    /// layout and another extent would sample texels (or rows) the attachment
+    /// never held.
+    RenderPassEntrySnapshotShapeMismatch {
+        index: usize,
+        view: ViewId,
+        attachment_format: AttachmentFormat,
+        texture_format: TextureFormat,
+        attachment_extent: [u64; 2],
+        texture_extent: [u64; 2],
+    },
+    /// A pass-entry snapshot names an attachment whose load arm establishes no
+    /// prior content (`research/docs/23` §118, E-TX15).
+    ///
+    /// The arm promises the bytes the attachment *held* when the pass opened.
+    /// [`LoadOp::Load`] and [`LoadOp::Resident`] keep exactly those bytes; a
+    /// [`LoadOp::Clear`] attachment's entry content is the clear colour (not a
+    /// content it held) and a [`LoadOp::DontCare`] attachment's is undefined,
+    /// so a pass that samples either through this arm is refused by name
+    /// instead of being served a copy of bytes the contract never defined.
+    RenderPassEntrySnapshotLoadUnsupported {
+        index: usize,
+        view: ViewId,
+        load: &'static str,
+    },
+    /// A pass-entry snapshot declares a view shape that names no single texel
+    /// grid (`research/docs/23` §118, E-TX15).
+    ///
+    /// One attachment has one pass-entry content, so the declaration has to be
+    /// its plain single-sample 2D view: a layered, 3D or multisampled view
+    /// would make the copy's own subresource set the thing under test rather
+    /// than the attachment's content (`RenderTextureSampleCountUnsupported`
+    /// states the multisample half of the same rule for every arm).
+    RenderPassEntrySnapshotShapeUnsupported {
+        index: usize,
+        view: ViewId,
+        texture_type: TextureType,
+        array_length: u64,
+    },
     // Trace-produced sampled textures (`research/docs/23` §110, E-TX3). The
     // four refusals below are the whole rule the `TextureSource::TraceView`
     // arm states: which pass produces the bytes, when, whether they landed,
@@ -14407,6 +14685,47 @@ impl fmt::Display for ContractError {
             Self::RenderTextureAttachmentConflict { view } => write!(
                 formatter,
                 "render pass samples view {view:?} through a texture binding while writing it as an attachment"
+            ),
+            Self::RenderPassEntrySnapshotUnattached {
+                index,
+                view,
+                allocation,
+            } => write!(
+                formatter,
+                "render texture {index} declares the pass-entry snapshot arm for view {view:?} of \
+                 allocation {allocation:?}, but this pass opens no colour attachment with that \
+                 identity"
+            ),
+            Self::RenderPassEntrySnapshotShapeMismatch {
+                index,
+                view,
+                attachment_format,
+                texture_format,
+                attachment_extent,
+                texture_extent,
+            } => write!(
+                formatter,
+                "render texture {index} declares the pass-entry snapshot arm for view {view:?}, but \
+                 its attachment is {attachment_format:?} at {}x{} while the declaration states \
+                 {texture_format:?} at {}x{}",
+                attachment_extent[0], attachment_extent[1], texture_extent[0], texture_extent[1]
+            ),
+            Self::RenderPassEntrySnapshotLoadUnsupported { index, view, load } => write!(
+                formatter,
+                "render texture {index} declares the pass-entry snapshot arm for view {view:?}, but \
+                 that attachment's load arm is {load}: only load and resident establish the prior \
+                 contents the arm reads"
+            ),
+            Self::RenderPassEntrySnapshotShapeUnsupported {
+                index,
+                view,
+                texture_type,
+                array_length,
+            } => write!(
+                formatter,
+                "render texture {index} declares the pass-entry snapshot arm for view {view:?} as \
+                 {texture_type:?} with {array_length} layers, but one attachment has one \
+                 single-sample 2D pass-entry content"
             ),
             Self::RenderTextureSourceUnwritten {
                 pass_index,
@@ -15998,6 +16317,7 @@ mod tests {
     fn capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             supports_render_kept_frame_landing: false,
+            supports_render_pass_entry_snapshot: false,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
@@ -23558,6 +23878,152 @@ mod tests {
                 maximum: MAX_RENDER_TEXTURES,
             })
         );
+    }
+
+    /// The pass-entry snapshot fixture (`research/docs/23` §118, E-TX15): the
+    /// render-sampler fixture's one sampled declaration rewritten to name the
+    /// pass's *own* attachment through the new arm, restating its format and
+    /// extent.
+    fn pass_entry_snapshot_trace(load: LoadOp, source: TextureSource) -> ComputeTrace {
+        let mut value = render_texture_trace();
+        let attachment = render_entry(&mut value).color_attachments[0];
+        render_entry(&mut value).color_attachments[0].load = load;
+        let mut texture = sampled_texture_view(0);
+        texture.view_id = attachment.view_id;
+        texture.allocation_id = attachment.allocation_id;
+        texture.format = attachment.format.as_texture_format();
+        texture.width = attachment.width;
+        texture.height = attachment.height;
+        texture.source = source;
+        render_entry(&mut value).textures = vec![texture];
+        value
+    }
+
+    /// The pass-entry snapshot arm (`research/docs/23` §118, E-TX15). The
+    /// readings are the four the contract walk states, each with its own
+    /// falsifier: the two load arms that keep prior contents are admitted while
+    /// the two that do not are refused by name; a declaration that names no
+    /// attachment of this pass is refused by name; a declaration that restates
+    /// another shape or another view shape is refused by name; and every other
+    /// source arm on an attachment's own view keeps the conflict refusal it
+    /// always had — the new arm is the only declaration that names the
+    /// same-pass read, and it does not widen the others.
+    #[test]
+    fn the_pass_entry_snapshot_arm_reads_its_own_attachment() {
+        // The two load arms that *keep* prior contents: `Load` uploads the
+        // trace's own bytes and `Resident` keeps the provider image's, and both
+        // are exactly the "bytes the attachment held when the pass opened" the
+        // arm promises.
+        for load in [LoadOp::Load, LoadOp::Resident] {
+            pass_entry_snapshot_trace(load, TextureSource::PassEntrySnapshot)
+                .validate()
+                .expect("a pass-entry snapshot over a loading attachment is admitted");
+        }
+
+        // A clear establishes the clear colour rather than a prior content, and
+        // a discarded attachment establishes nothing at all: both are refusals
+        // by name, because neither is the copy the arm promises.
+        for (load, name) in [
+            (
+                LoadOp::Clear(ClearColor::new([0x40, 0x80, 0xc0, 0xff])),
+                "clear",
+            ),
+            (LoadOp::DontCare, "dont_care"),
+        ] {
+            assert_eq!(
+                pass_entry_snapshot_trace(load, TextureSource::PassEntrySnapshot).validate(),
+                Err(ContractError::RenderPassEntrySnapshotLoadUnsupported {
+                    index: 0,
+                    view: ViewId::new(7),
+                    load: name,
+                })
+            );
+        }
+
+        // A declaration that names a view this pass does not open: the arm has
+        // no entry content to read, and the pair is matched whole.
+        assert_eq!(
+            pass_entry_snapshot_trace(LoadOp::Load, TextureSource::PassEntrySnapshot).validate(),
+            Ok(())
+        );
+        let mut value = render_texture_trace();
+        let mut texture = sampled_texture_view(0);
+        texture.source = TextureSource::PassEntrySnapshot;
+        render_entry(&mut value).textures = vec![texture];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderPassEntrySnapshotUnattached {
+                index: 0,
+                view: ViewId::new(83),
+                allocation: AllocationId::new(53),
+            })
+        );
+
+        // A declaration that restates another extent: the snapshot *is* the
+        // attachment's texel grid.
+        let mut mismatch =
+            pass_entry_snapshot_trace(LoadOp::Load, TextureSource::PassEntrySnapshot);
+        let mut texture = render_entry(&mut mismatch).textures[0].clone();
+        texture.width = 4;
+        texture.height = 4;
+        render_entry(&mut mismatch).textures = vec![texture];
+        assert_eq!(
+            mismatch.validate(),
+            Err(ContractError::RenderPassEntrySnapshotShapeMismatch {
+                index: 0,
+                view: ViewId::new(7),
+                attachment_format: AttachmentFormat::Rgba8Unorm,
+                texture_format: TextureFormat::Rgba8Unorm,
+                attachment_extent: [2, 2],
+                texture_extent: [4, 4],
+            })
+        );
+
+        // A layered declaration names no single grid to copy.
+        let mut layered = pass_entry_snapshot_trace(LoadOp::Load, TextureSource::PassEntrySnapshot);
+        let mut texture = render_entry(&mut layered).textures[0].clone();
+        texture.texture_type = TextureType::D2Array;
+        texture.array_length = 2;
+        render_entry(&mut layered).textures = vec![texture];
+        assert_eq!(
+            layered.validate(),
+            Err(ContractError::RenderPassEntrySnapshotShapeUnsupported {
+                index: 0,
+                view: ViewId::new(7),
+                texture_type: TextureType::D2Array,
+                array_length: 2,
+            })
+        );
+
+        // Every other arm on the attachment's own view stays what it was.
+        assert_eq!(
+            pass_entry_snapshot_trace(LoadOp::Load, TextureSource::OwnedBytes(vec![0; 16]),)
+                .validate(),
+            Err(ContractError::RenderTextureAttachmentConflict {
+                view: ViewId::new(7),
+            })
+        );
+    }
+
+    /// A snapshot that does not declare the pass-entry bit refuses the pass by
+    /// name during admission (`research/docs/23` §118, E-TX15): the arm is a
+    /// device-side copy the rail either states or does not, and a consumer that
+    /// never read the bit must not be handed the shape.
+    #[test]
+    fn a_snapshot_without_the_pass_entry_bit_refuses_the_pass_by_name() {
+        let mut provider = render_texture_capabilities();
+        assert!(!provider.declares_render_pass_entry_snapshot_support());
+        let value = pass_entry_snapshot_trace(LoadOp::Load, TextureSource::PassEntrySnapshot);
+        let refusal = provider
+            .validate_trace(value.clone(), landing_resources())
+            .expect_err("the undeclared arm is refused during admission");
+        assert_eq!(refusal.slug, "render_pass_entry_snapshot_unsupported");
+
+        provider.supports_render_pass_entry_snapshot = true;
+        assert!(provider.declares_render_pass_entry_snapshot_support());
+        provider
+            .validate_trace(value, landing_resources())
+            .expect("the declared arm is admitted");
     }
 
     /// The runtime-sampler face of the render contract (`research/docs/23`
