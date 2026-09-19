@@ -3554,6 +3554,13 @@ fn affine_access_set(accesses: &[AffineAccess]) -> Vec<NormalizedAffineAccess> {
 /// (`research/docs/23` §103, E-VF1), so the normalized formats share their
 /// shape check with their `float32` siblings rather than spelling a second
 /// type name.
+///
+/// The scalar lane is read by the other end of the same rule: a one-component
+/// storage (2026-09-20, census v46's `vertex_format` bucket) pairs with a
+/// scalar member, which the reflection spells `float` (its explicit
+/// `float1`/`half` spellings are the same shape), and a vector member declared
+/// over it is refused exactly as the scalar member declared over a vector
+/// storage is. The arithmetic width is not part of the question here either.
 fn air_type_name_names_vertex_format(type_name: Option<&str>, format: VertexFormat) -> bool {
     match format {
         VertexFormat::Float32x2 | VertexFormat::Unorm8x2 | VertexFormat::Unorm16x2 => {
@@ -3563,6 +3570,7 @@ fn air_type_name_names_vertex_format(type_name: Option<&str>, format: VertexForm
         VertexFormat::Float32x4 | VertexFormat::Unorm8x4 | VertexFormat::Unorm16x4 => {
             matches!(type_name, Some("float4" | "half4"))
         }
+        VertexFormat::Float32x1 => matches!(type_name, Some("float" | "float1" | "half")),
         VertexFormat::Uint32 => matches!(type_name, Some("uint" | "uint1")),
     }
 }
@@ -7382,7 +7390,10 @@ fn indices_format(format: IndexFormat) -> vk::IndexType {
 /// needs no device probe beside it: a driver that failed one of these would not
 /// be a Vulkan implementation. The optional three-channel 8- and 16-bit
 /// formats are exactly the ones this contract does not name
-/// (`research/docs/23` §103).
+/// (`research/docs/23` §103). The scalar lane's `VK_FORMAT_R32_SFLOAT` is
+/// required for the same reason its padded siblings' `R32G32_SFLOAT` and
+/// `R32G32B32A32_SFLOAT` are (2026-09-20, census v46's `vertex_format`
+/// bucket), so the lane needs no probe of its own either.
 fn vertex_vk_format(format: VertexFormat) -> Result<vk::Format, ProviderError> {
     Ok(match format {
         VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
@@ -7393,6 +7404,7 @@ fn vertex_vk_format(format: VertexFormat) -> Result<vk::Format, ProviderError> {
         VertexFormat::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
         VertexFormat::Unorm16x2 => vk::Format::R16G16_UNORM,
         VertexFormat::Unorm16x4 => vk::Format::R16G16B16A16_UNORM,
+        VertexFormat::Float32x1 => vk::Format::R32_SFLOAT,
     })
 }
 
@@ -18566,7 +18578,9 @@ mod tests {
 
     /// Every contract vertex format names a `VkFormat`, and the four normalized
     /// storages name Vulkan's own required vertex input formats — no optional
-    /// three-channel spelling among them (`research/docs/23` §103, E-VF1).
+    /// three-channel spelling among them (`research/docs/23` §103, E-VF1). The
+    /// scalar lane's `R32_SFLOAT` is required beside them (2026-09-20, census
+    /// v46's `vertex_format` bucket), so the table stays probe-free.
     #[test]
     fn every_admitted_vertex_format_names_a_required_vulkan_format() {
         for (format, expected) in [
@@ -18578,6 +18592,7 @@ mod tests {
             (VertexFormat::Unorm8x4, vk::Format::R8G8B8A8_UNORM),
             (VertexFormat::Unorm16x2, vk::Format::R16G16_UNORM),
             (VertexFormat::Unorm16x4, vk::Format::R16G16B16A16_UNORM),
+            (VertexFormat::Float32x1, vk::Format::R32_SFLOAT),
         ] {
             assert_eq!(
                 vertex_vk_format(format).map(vk::Format::as_raw),
@@ -18586,7 +18601,7 @@ mod tests {
             );
             assert!(VertexFormat::ADMITTED.contains(&format), "{format:?}");
         }
-        assert_eq!(VertexFormat::ADMITTED.len(), 8);
+        assert_eq!(VertexFormat::ADMITTED.len(), 9);
     }
 
     /// The AIR type-name rule pairs a storage with the component shape its
@@ -18627,6 +18642,29 @@ mod tests {
         assert!(air_type_name_names_vertex_format(
             Some("uint"),
             VertexFormat::Uint32
+        ));
+        // The scalar lane's own shape (2026-09-20, census v46's `vertex_format`
+        // bucket): a one-component storage is read by a scalar member, and a
+        // vector member declared over it is the same refusal its converse is.
+        for shape in ["float", "float1", "half"] {
+            assert!(
+                air_type_name_names_vertex_format(Some(shape), VertexFormat::Float32x1),
+                "a {shape} member reads the scalar lane"
+            );
+        }
+        for shape in ["float2", "float3", "float4", "half2", "half4", "uint1"] {
+            assert!(
+                !air_type_name_names_vertex_format(Some(shape), VertexFormat::Float32x1),
+                "a {shape} member does not read the scalar lane"
+            );
+        }
+        assert!(!air_type_name_names_vertex_format(
+            Some("float"),
+            VertexFormat::Float32x2
+        ));
+        assert!(!air_type_name_names_vertex_format(
+            Some("float2"),
+            VertexFormat::Float32x3
         ));
     }
 

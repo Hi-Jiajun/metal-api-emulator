@@ -2794,11 +2794,19 @@ pub const MAX_VERTEX_ATTRIBUTES: usize = 8;
 /// Component layout of one vertex attribute.
 ///
 /// The list is closed and contains only formats the reviewed Vulkan and Metal
-/// rails can both build from a vertex buffer. Its first half is the 32-bit
-/// storage the vertex-input increment opened — two, three and four `float32`
-/// components and one `uint32` (`research/docs/23` §3.3, v31); the four `unorm`
-/// values are the normalized 8- and 16-bit storages at the two component
-/// shapes the gate-3 census's refusals sit in (`research/docs/23` §103, E-VF1).
+/// rails can both build from a vertex buffer. Its oldest group is the storage
+/// the vertex-input increment opened — two, three and four `float32` components
+/// and one `uint32` (`research/docs/23` §3.3, v31); the four `unorm` values are
+/// the normalized 8- and 16-bit storages at the two component shapes the
+/// gate-3 census's refusals sit in (`research/docs/23` §103, E-VF1).
+///
+/// The scalar lane is the *one-component* raw `float32` the census's remaining
+/// `vertex_format` records declare (2026-09-20, census v46's bucket): one
+/// component of four bytes, read by a scalar `float` member. It is a raw
+/// `float32` like its padded siblings rather than a normalized storage, so no
+/// conversion sits between the fetched bytes and the member — the
+/// `MTLVertexFormat` that names it is `Float`, and a normalized scalar of the
+/// same width would be a different format this contract does not name.
 ///
 /// The normalized half carries a conversion, which is why it arrived as its own
 /// increment and why its rule is stated here rather than left to each rail: the
@@ -2809,10 +2817,13 @@ pub const MAX_VERTEX_ATTRIBUTES: usize = 8;
 /// comparison. A raw (non-normalized) read of the same bytes is a *different*
 /// format and is not this one.
 ///
-/// The code values are this contract's own (0..=7), because neither Vulkan's
+/// The code values are this contract's own (0..=8), because neither Vulkan's
 /// `VkFormat` nor Metal's `MTLVertexFormat` numbering is a stable wire
 /// vocabulary — the same reasoning [`AttachmentFormat`] records for its reuse
-/// of the texture codes.
+/// of the texture codes. A later arrival is *appended* to the list rather than
+/// inserted, so every code before it keeps its value and every capability list
+/// built from [`VertexFormat::ADMITTED`] keeps the canonical order its own
+/// readers already know.
 ///
 /// Deliberately absent, i.e. the storages this increment does not schedule: the
 /// signed normalized family, the packed `10:10:10:2` and `11:11:10` shapes, the
@@ -2837,18 +2848,27 @@ pub enum VertexFormat {
     Unorm16x2,
     /// `VK_FORMAT_R16G16B16A16_UNORM` / `MTLVertexFormat::UShort4Normalized`.
     Unorm16x4,
+    /// `VK_FORMAT_R32_SFLOAT` / `MTLVertexFormat::Float`.
+    ///
+    /// The scalar raw `float32` lane (2026-09-20, census v46's `vertex_format`
+    /// bucket): four bytes per vertex, read by a scalar `float` member. Its
+    /// code is 8, appended after the eight earlier storages, so the codes E-VF1
+    /// fixed are unchanged.
+    Float32x1,
 }
 
 impl VertexFormat {
-    /// Formats the contract admits. All eight, because each one already has a
+    /// Formats the contract admits. All nine, because each one already has a
     /// reviewed mapping on both rails; the list stays closed so admitting a
-    /// ninth is a deliberate wire-visible change.
+    /// tenth is a deliberate wire-visible change.
     ///
     /// A *rail* may publish a narrower `supported_vertex_formats` — the
     /// capability snapshot is where a rail states the window it has an
     /// observation for — so this list is the vocabulary, not a claim about any
-    /// one device.
-    pub const ADMITTED: [Self; 8] = [
+    /// one device. New arrivals are appended, so a reader that knows the
+    /// canonical order of the earlier lanes reads the same prefix it always
+    /// did.
+    pub const ADMITTED: [Self; 9] = [
         Self::Float32x2,
         Self::Float32x3,
         Self::Float32x4,
@@ -2857,6 +2877,7 @@ impl VertexFormat {
         Self::Unorm8x4,
         Self::Unorm16x2,
         Self::Unorm16x4,
+        Self::Float32x1,
     ];
 
     /// Bytes one attribute of this format occupies in the vertex stream.
@@ -2870,6 +2891,7 @@ impl VertexFormat {
             Self::Unorm8x4 => 4,
             Self::Unorm16x2 => 4,
             Self::Unorm16x4 => 8,
+            Self::Float32x1 => 4,
         }
     }
 
@@ -2885,6 +2907,7 @@ impl VertexFormat {
             Self::Unorm8x4 => 5,
             Self::Unorm16x2 => 6,
             Self::Unorm16x4 => 7,
+            Self::Float32x1 => 8,
         }
     }
 
@@ -2900,6 +2923,7 @@ impl VertexFormat {
             5 => Some(Self::Unorm8x4),
             6 => Some(Self::Unorm16x2),
             7 => Some(Self::Unorm16x4),
+            8 => Some(Self::Float32x1),
             _ => None,
         }
     }
@@ -2918,6 +2942,7 @@ impl VertexFormat {
                 | Self::Unorm8x4
                 | Self::Unorm16x2
                 | Self::Unorm16x4
+                | Self::Float32x1
         )
     }
 }
@@ -21902,6 +21927,10 @@ mod tests {
             (VertexFormat::Unorm8x4, 4),
             (VertexFormat::Unorm16x2, 4),
             (VertexFormat::Unorm16x4, 8),
+            // The scalar lane is one raw 32-bit component, four bytes, with no
+            // normalization between the fetched bytes and the member
+            // (2026-09-20, census v46's `vertex_format` bucket).
+            (VertexFormat::Float32x1, 4),
         ] {
             assert_eq!(format.bytes(), bytes, "{format:?}");
             assert!(VertexFormat::ADMITTED.contains(&format));
@@ -21917,11 +21946,20 @@ mod tests {
             assert_eq!(IndexFormat::from_code(format.code()), Some(format));
             assert!(format.is_admitted());
         }
-        assert_eq!(VertexFormat::ADMITTED.len(), 8);
+        assert_eq!(VertexFormat::ADMITTED.len(), 9);
         // The first code past the closed list, which moved from 4 to 8 when the
-        // normalized storages took 4..=7: an unknown code is still a decoder
-        // error rather than a silent default.
-        assert_eq!(VertexFormat::from_code(8), None);
+        // normalized storages took 4..=7 and to 9 when the scalar lane took 8:
+        // an unknown code is still a decoder error rather than a silent
+        // default, and the earlier codes are unchanged.
+        assert_eq!(VertexFormat::from_code(9), None);
+        assert_eq!(
+            VertexFormat::ADMITTED
+                .iter()
+                .map(|format| format.code())
+                .max(),
+            Some(8),
+            "the appended lane is the last code, not a renumbering"
+        );
         assert_eq!(IndexFormat::from_code(2), None);
     }
 

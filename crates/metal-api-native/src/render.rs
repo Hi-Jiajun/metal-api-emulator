@@ -1369,25 +1369,32 @@ pub(crate) fn vertex_input_capability_bits() -> VertexInputCapabilityBits {
 /// The four 32-bit storages are the window the `--vertex-selftest` observation
 /// behind the vertex-input flip built: the reviewed indexed module over one
 /// `float32x2` stream and a `uint16` index buffer. The contract's four
-/// normalized storages arrived afterwards. Their descriptor mapping is already
+/// normalized storages arrived afterwards, and its scalar `float32` lane after
+/// them. Their descriptor mapping is already
 /// total ([`vertex_format`] and [`metal_vertex_format`]), and the
 /// `MTLVertexFormat` each one names is the reviewed one — but what core
 /// admission reads is this *declaration*, and this rail's discipline is that a
 /// capability follows an Apple-side observation rather than a table (the
 /// `--stage-buffer-selftest` / `--heap-selftest` flips record the same rule).
 ///
-/// Flip condition: an Apple device reading of the normalized shape — the
+/// Flip condition: an Apple device reading of the widened shapes — the
 /// `--vertex-selftest` shape extended to a case whose descriptor declares
-/// `UChar4Normalized` and its siblings, landing the fixture's own bytes on the
-/// macOS runner. This local round cannot produce that reading (no push, no
-/// Apple device), so the four normalized storages stay out of the declaration:
-/// a trace that declares one is refused at admission with
-/// `vertex_format_unsupported` rather than executed on an unobserved path.
+/// `UChar4Normalized` and its siblings, and one that declares `Float` — landing
+/// the fixture's own bytes on the macOS runner. This local round cannot produce
+/// that reading (no push, no Apple device), so the four normalized storages and
+/// the scalar lane stay out of the declaration: a trace that declares one is
+/// refused at admission with `vertex_format_unsupported` rather than executed on
+/// an unobserved path. The scalar lane is refused by *name* rather than by
+/// absence: the reviewed modules this rail's plan selects are the same
+/// `float32x2`/`float32x3`/`float32x4` readers, so nothing here would read a
+/// scalar member even if the descriptor could be built.
 ///
-/// The Vulkan rail declares all eight (`crates/metal-api-vulkan/src/provider.rs`):
-/// these four are Vulkan's *required* vertex input formats, so that rail's
+/// The Vulkan rail declares every value of the contract's list
+/// (`crates/metal-api-vulkan/src/provider.rs`): the normalized four and the
+/// scalar lane are Vulkan's *required* vertex input formats, so that rail's
 /// declaration needs no device answer, and its execution is measured on
-/// Lavapipe by `tests/render_normalized_vertex_e2e.rs`.
+/// Lavapipe by `tests/render_normalized_vertex_e2e.rs` and
+/// `tests/render_scalar_vertex_e2e.rs`.
 pub(crate) const DECLARED_VERTEX_FORMATS: [VertexFormat; 4] = [
     VertexFormat::Float32x2,
     VertexFormat::Float32x3,
@@ -1936,6 +1943,11 @@ pub(crate) enum RenderVertexFormat {
     UShort2Normalized,
     /// `MTLVertexFormat::UShort4Normalized`.
     UShort4Normalized,
+    /// `MTLVertexFormat::Float` — the scalar lane the contract appended on
+    /// 2026-09-20 (census v46's `vertex_format` bucket). Mapped so the
+    /// descriptor translation stays total; not declared, for the reason
+    /// [`DECLARED_VERTEX_FORMATS`] states.
+    Float,
 }
 
 impl RenderVertexFormat {
@@ -1953,6 +1965,7 @@ impl RenderVertexFormat {
             Self::UChar4Normalized => "unorm8x4",
             Self::UShort2Normalized => "unorm16x2",
             Self::UShort4Normalized => "unorm16x4",
+            Self::Float => "float32x1",
         }
     }
 }
@@ -1965,7 +1978,10 @@ impl RenderVertexFormat {
 /// `MTLVertexFormat`s that name them exactly — `UChar2Normalized` and its three
 /// siblings carry the same `c / 255` / `c / 65535` conversion the contract
 /// states, so no arm here has to add or remove a normalization
-/// (`research/docs/23` §103).
+/// (`research/docs/23` §103). The scalar lane maps onto the same
+/// `MTLVertexFormat::Float` its contract name spells, with no conversion
+/// between the fetched bytes and the member (2026-09-20, census v46's
+/// `vertex_format` bucket).
 ///
 /// Being mapped is not being *declared*: which of these the provider publishes
 /// is [`vertex_input_capability_bits`], and that window is where the Apple
@@ -1980,6 +1996,7 @@ pub(crate) const fn vertex_format(format: VertexFormat) -> RenderVertexFormat {
         VertexFormat::Unorm8x4 => RenderVertexFormat::UChar4Normalized,
         VertexFormat::Unorm16x2 => RenderVertexFormat::UShort2Normalized,
         VertexFormat::Unorm16x4 => RenderVertexFormat::UShort4Normalized,
+        VertexFormat::Float32x1 => RenderVertexFormat::Float,
     }
 }
 
@@ -7288,6 +7305,10 @@ const fn metal_vertex_format(format: RenderVertexFormat) -> MTLVertexFormat {
         RenderVertexFormat::UChar4Normalized => MTLVertexFormat::UChar4Normalized,
         RenderVertexFormat::UShort2Normalized => MTLVertexFormat::UShort2Normalized,
         RenderVertexFormat::UShort4Normalized => MTLVertexFormat::UShort4Normalized,
+        // The scalar lane is Metal's own `Float` — one 32-bit component, no
+        // normalization (2026-09-20, census v46's `vertex_format` bucket), the
+        // width `VertexFormat::Float32x1::bytes()` states.
+        RenderVertexFormat::Float => MTLVertexFormat::Float,
     }
 }
 
@@ -12716,9 +12737,10 @@ mod tests {
         // default beside the three fields above.
         assert!(!bits.supports_render_vertex_interface_superset);
         // The declared window is a strict subset of the contract's vocabulary:
-        // the four normalized storages are mapped (see the sibling test) but
-        // not declared, because the Apple-side reading that would declare them
-        // has not been taken (`research/docs/23` §103).
+        // the four normalized storages and the scalar lane are mapped (see the
+        // sibling test) but not declared, because the Apple-side reading that
+        // would declare them has not been taken (`research/docs/23` §103;
+        // 2026-09-20 for the scalar lane).
         assert_eq!(
             bits.supported_vertex_formats.len(),
             DECLARED_VERTEX_FORMATS.len()
@@ -12787,13 +12809,15 @@ mod tests {
         assert_eq!(refused.class, ProviderErrorClass::Capability);
     }
 
-    /// The normalized storages are *mapped* and not *declared*
-    /// (`research/docs/23` §103, E-VF1), and both halves are pinned here: the
-    /// contract's four new formats each translate into the `MTLVertexFormat`
-    /// that names them, while core admission refuses a trace whose layout
-    /// declares one — the fail-closed arm until an Apple device reading lands.
+    /// The storages the reviewed modules do not read are *mapped* and not
+    /// *declared* (`research/docs/23` §103, E-VF1; the scalar lane on
+    /// 2026-09-20, census v46's `vertex_format` bucket), and both halves are
+    /// pinned here: each of the contract's five widened formats translates into
+    /// the `MTLVertexFormat` that names it, while core admission refuses a trace
+    /// whose layout declares one — the fail-closed arm until an Apple device
+    /// reading lands.
     #[test]
-    fn the_normalized_storages_are_mapped_before_they_are_declared() {
+    fn the_storages_the_reviewed_module_does_not_read_are_mapped_before_they_are_declared() {
         for (format, expected, name, bytes) in [
             (
                 VertexFormat::Unorm8x2,
@@ -12818,6 +12842,12 @@ mod tests {
                 RenderVertexFormat::UShort4Normalized,
                 "unorm16x4",
                 8,
+            ),
+            (
+                VertexFormat::Float32x1,
+                RenderVertexFormat::Float,
+                "float32x1",
+                4,
             ),
         ] {
             assert_eq!(vertex_format(format), expected, "{name}");
