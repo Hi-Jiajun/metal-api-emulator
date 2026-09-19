@@ -4,6 +4,8 @@ Experimental source-level Metal compute objects backed by Vulkan, for fast
 host-side iteration without booting a VM. The long-term proposal is to share
 one Metal semantic path between native Metal and a Windows Vulkan provider.
 This repository is an independent prototype; upstream has not adopted it.
+The same path also drives a live macOS guest through a fork of reims-vgpu —
+see [Live VM path](#live-vm-path-windows--whpx--reims-vgpu) below.
 
 The working application path is:
 
@@ -17,6 +19,34 @@ Device -> Library/Function -> ComputePipelineState
 `metal-api-vulkan` translates AIR through the pinned metal2vulkan revision and
 executes the buffer-compute subset. An [optional reims integration](integration/reims/README.md)
 runs the same fixtures against the reims Vulkan engine in a separate workspace.
+
+## Live VM path (Windows + WHPX + reims-vgpu)
+
+The same canonical path also runs against a live macOS guest. On Windows 11,
+QEMU (11.1.x, WHPX acceleration) boots a macOS Ventura image whose GPU work is
+served by a fork of [reims-vgpu](https://github.com/steelbrain/reims-vgpu): the
+guest's Metal render and compute records are carried into this repository's
+provider and executed by the Vulkan engine. A census harness relinks QEMU
+against the provider's static library, boots the guest for a fixed dwell and
+reads the class answers per drain window, so every claim below is a reading
+rather than an impression.
+
+Readings from a 2026-09-19 round (desktop and login scenes):
+
+- About 96% of the guest's draw records are answered by the canonical provider
+  (37,550 of 39,087 records in round `v37`); the remainder are refused by name
+  and stay on the fork's self-contained engine.
+- The largest single host span is `provider.submit`. A per-pass written-rect
+  readback cut host time per draw from 7,886 µs to 6,669 µs, and the bytes read
+  back from the device by about 26%, in a same-binary A/B run.
+- The present-to-present frame profile reports intervals of roughly 1.1 s under
+  the census workload, with the host draw span accounting for about 81% of each
+  interval; the open work is the landing/publishing path and per-pass setup.
+
+Boundaries: this is an independent experiment; the reims-vgpu maintainers have
+not adopted it, and the fork is a local adapter rather than an upstream-approved
+architecture. No guest images or Apple binaries are distributed. QEMU and
+reims-vgpu keep their own license terms; see [NOTICE.md](NOTICE.md).
 
 ## Current status
 
@@ -395,5 +425,6 @@ remain outside this offline test boundary.
 
 ## License
 
-LGPL-3.0-or-later; see [LICENSE](LICENSE), [COPYING](COPYING) and
-[NOTICE.md](NOTICE.md) for the source attribution and license texts.
+LGPL-3.0-or-later, copyright (C) 2026 Jiajun Liang. See [LICENSE](LICENSE),
+[COPYING](COPYING) and [NOTICE.md](NOTICE.md) for the source attribution and
+license texts.

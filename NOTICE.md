@@ -1,5 +1,7 @@
 # Sources and attribution
 
+Copyright (C) 2026 Jiajun Liang <3138947285@qq.com>.
+
 This experimental project uses LGPL-3.0-or-later. See LICENSE for the LGPL
 additional permissions and COPYING for the incorporated GPL version 3 text.
 
