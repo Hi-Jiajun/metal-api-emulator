@@ -5727,6 +5727,101 @@ mod tests {
         assert!(!decoded.supports_render_pass_entry_snapshot);
     }
 
+    /// The layout-free vertex count above the milestone's three travels in the
+    /// escape family's *eleventh* block (2026-09-19, census v45's `vertex_span`
+    /// bucket).
+    ///
+    /// A decoder of the previous increment reads the escape byte followed by a
+    /// family tag it does not know — a typed refusal rather than a snapshot
+    /// silently read as "the widened count was not declared".
+    #[test]
+    fn the_layout_free_vertex_count_block_is_the_tail_familys_eleventh_tag() {
+        let mut capabilities = fake_capabilities();
+        // The frame has to be on the extended payload already, or the new bit
+        // would change the payload's own form rather than only appending its
+        // section: the landing-view bit is the oldest face that does that.
+        capabilities.supports_render_attachment_landing_view = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(without.ends_with(&[0x00, 0x05, 0x01]));
+        assert!(!without.ends_with(&[0x00, 0x0b, 0x01]));
+
+        capabilities.supports_render_vertex_count_above_triangle = true;
+        assert!(capabilities.declares_render_vertex_count_above_triangle());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the layout-free vertex count frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x0b, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the new block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_vertex_count_above_triangle);
+        // A frame that ends before the block reads the bit as the fail-closed
+        // `false`, so a consumer keeps its own refusal by name for the shape.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_vertex_count_above_triangle);
+    }
+
+    /// A declaration whose *only* statement is the widened layout-free count
+    /// still writes the extended payload: the block sits after the heap/ICB half
+    /// the decoder reads by position before the family's escape, so a snapshot
+    /// that never wrote that half would drop the declaration on the wire.
+    #[test]
+    fn an_only_layout_free_vertex_count_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_vertex_count_above_triangle = true;
+        assert!(capabilities.declares_render_vertex_count_above_triangle());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x0b, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_vertex_count_above_triangle);
+        assert!(!decoded.supports_render_vertex_interface_superset);
+        assert!(!decoded.max_render_texture_dimension_1d != 0);
+        assert!(!decoded.supports_render_kept_frame_landing);
+        assert!(!decoded.supports_heaps);
+        assert!(!decoded.supports_indirect_command_buffers);
+    }
+
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
     /// frame's identity and shape and the window's second declaration, in a
     /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -5884,7 +5979,7 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x0b` is the next tag the
+        // The family's tags are a closed set and `0x0c` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
@@ -5892,15 +5987,16 @@ mod tests {
         // until E-TX14 assigned it to the kept-frame landing entry, `0x07` until
         // E-SB2 assigned it to the stage buffer per-stage window, `0x08` until
         // the texel space took it, and `0x09` until E-TX15 assigned it to the
-        // pass-entry snapshot arm, and `0x0a` until the one-dimensional sampled
-        // window took it — exactly the drift the closed set exists to make
-        // visible.)
+        // pass-entry snapshot arm, `0x0a` until the one-dimensional sampled
+        // window took it, and `0x0b` until the layout-free count above the
+        // milestone's three vertices took it — exactly the drift the closed set
+        // exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x0b;
+        unknown_tag[tag_at] = 0x0c;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x0b)
+            CodecError::UnknownCapabilityTail(0x0c)
         ));
     }
 
@@ -7079,6 +7175,7 @@ mod tests {
                     supported_vertex_formats: Vec::new(),
                     supported_index_formats: Vec::new(),
                     supports_render_vertex_interface_superset: false,
+                    supports_render_vertex_count_above_triangle: false,
                     supports_render_instancing: false,
                     max_render_instances: 0,
                     supports_render_multisample: false,
@@ -7468,6 +7565,7 @@ mod tests {
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
+            supports_render_vertex_count_above_triangle: false,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,

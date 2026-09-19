@@ -541,7 +541,7 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # render case and declaring pass `test_suite_v42.py` pins — and v43 the
         # pass-entry snapshot arm (`research/docs/23` §118, E-TX15), whose one
         # translated render case and declaring pass `test_suite_v43.py` pins.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 42)
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 43)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -560,7 +560,7 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v34", "compute-buffer-v35",
                                       "compute-buffer-v36", "compute-buffer-v37",
                                       "compute-buffer-v38", "compute-buffer-v39",
-                                      "compute-buffer-v43",
+                                      "compute-buffer-v43", "compute-buffer-v44",
                                       "compute-buffer-v40", "compute-buffer-v41",
                                       "compute-buffer-v42"):
                     continue

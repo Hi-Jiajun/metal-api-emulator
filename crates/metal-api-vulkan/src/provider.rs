@@ -230,6 +230,18 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // attribute covering it stays refused by name, because the driver would
         // leave that input undefined.
         supports_render_vertex_interface_superset: true,
+        // The layout-free count above the milestone's three vertices is
+        // executed (2026-09-19, census v45's `vertex_span` bucket): the rail
+        // issues the pass's own count (`render.rs`'s draw record), and the
+        // reviewed `vertex_id` module is a total function of the index — its
+        // `isTop` select puts every index above the first two on the triangle's
+        // third corner, so the extra vertices resolve to degenerate triangles
+        // rather than to a position the module does not carry.
+        // `tests/render_vertex_count_e2e.rs` reads both halves back: the
+        // reviewed module's four- and six-vertex draws land the three-vertex
+        // frame byte for byte, and a translated quad module's six-vertex draw
+        // covers the texels its three-vertex draw cannot.
+        supports_render_vertex_count_above_triangle: true,
         // Instancing is executed (`render.rs` builds each binding's input rate
         // from the layout's step and issues `vkCmdDraw*` with the pass's own
         // instance count). Evidence: the reviewed `instanced_pair_4x4` case on

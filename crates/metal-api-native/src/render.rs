@@ -1309,6 +1309,11 @@ pub(crate) struct VertexInputCapabilityBits {
     /// The superset vertex interface's bit (`research/docs/23` §3.3, E-TX11),
     /// declared beside the three vertex-input fields it narrows.
     pub(crate) supports_render_vertex_interface_superset: bool,
+    /// The layout-free count above the milestone's three vertices
+    /// (2026-09-19, census v45's `vertex_span` bucket). Declared beside the
+    /// superset bit for the same reason: both are vertex-input-arm questions
+    /// this rail's reviewed module table answers `false` to.
+    pub(crate) supports_render_vertex_count_above_triangle: bool,
 }
 
 /// The vertex-input bits this provider declares as of the vertex-input flip.
@@ -1346,6 +1351,15 @@ pub(crate) fn vertex_input_capability_bits() -> VertexInputCapabilityBits {
         // Declaring the bit would promise a shape this rail's module table
         // refuses, so it keeps the consumer's fail-closed default.
         supports_render_vertex_interface_superset: false,
+        // The layout-free count above the milestone's three vertices
+        // (2026-09-19, census v45's `vertex_span` bucket) keeps the same
+        // fail-closed default for the same kind of reason: the one
+        // `vertex_id` module this rail's table holds reads a *three-entry*
+        // position table by index (`conformance/shaders/render_offscreen_2x2.metal`),
+        // so a count above three would read a position the module does not
+        // carry. Declaring the bit would promise a shape no reviewed module
+        // here can execute.
+        supports_render_vertex_count_above_triangle: false,
     }
 }
 
@@ -2347,6 +2361,30 @@ fn plan_vertex_input<'a>(
         // A non-indexed draw reads vertices `0..vertices` in order, so every
         // stream has to cover the pass's own count.
         None => {
+            // The layout-free count is this rail's own window (2026-09-19,
+            // census v45's `vertex_span` bucket). `streams` is empty exactly
+            // when the pipeline declares `VertexLayout::None`, and the one
+            // `vertex_id` module this rail's table holds reads a *three-entry*
+            // position table by index
+            // (`conformance/shaders/render_offscreen_2x2.metal`), so a wider
+            // count would read a position it does not carry. Core admission
+            // refuses the shape by name for the snapshot this rail publishes
+            // (`render_vertex_count_window_unsupported`); this second check is
+            // the directly-constructed request's, and it names the rail rather
+            // than the snapshot, the same way the texel-space refusal in
+            // [`plan`] does.
+            if streams.is_empty() && pass.vertices != FULL_SCREEN_TRIANGLE_VERTICES {
+                return Err(capability_refusal("render_vertex_count_window_unsupported")
+                    .with_field("vertices", FieldValue::Unsigned(u64::from(pass.vertices)))
+                    .with_field("rail", FieldValue::Text("native".to_owned()))
+                    .with_detail(
+                        "this rail's reviewed `vertex_id` module reads a three-entry position \
+                         table by index, so a layout-free draw whose count is not the \
+                         milestone's three would read a position the module does not carry; the \
+                         Vulkan rail's reviewed and translated modules are total functions of \
+                         the index, which is where the widened count runs",
+                    ));
+            }
             for (buffer_index, stream) in streams.iter().enumerate() {
                 // The per-vertex arm of the same split: a per-instance stream
                 // covers one record per instance instead of one per vertex.
@@ -10346,6 +10384,19 @@ mod tests {
         pass.vertices = 6;
         let pipeline = milestone_pipeline();
         let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        // The layout-free count above the milestone's three vertices is this
+        // rail's own window (2026-09-19, census v45's `vertex_span` bucket):
+        // the reviewed `vertex_id` module reads a three-entry position table by
+        // index, so the refusal names the window rather than the draw shape.
+        // The slug is the one core admission states for the same shape, and
+        // this rail's snapshot keeps the bit undeclared.
+        assert_eq!(error.slug, "render_vertex_count_window_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        // Below the triangle's three the *contract* refuses first, and that
+        // refusal keeps its own name: this plan check is the widened arm's.
+        let mut short = milestone_pass(LoadOp::Clear(sentinel()));
+        short.vertices = 2;
+        let error = plan_pass(&milestone_request(&short, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "draw_shape_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
     }
@@ -10722,6 +10773,8 @@ mod tests {
             supported_index_formats: vertex.supported_index_formats.clone(),
             supports_render_vertex_interface_superset: vertex
                 .supports_render_vertex_interface_superset,
+            supports_render_vertex_count_above_triangle: vertex
+                .supports_render_vertex_count_above_triangle,
             supports_render_instancing: false,
             max_render_instances: 0,
             // The test snapshot spells the pre-flip shape out for the same

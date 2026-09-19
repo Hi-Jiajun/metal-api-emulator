@@ -2593,8 +2593,19 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // declaring pass as an ordinary compute case.
     case "compute-buffer-v43":
         expectedIDs = ["render_declaring_pass_entry_snapshot"]
+    // The layout-free count above the milestone's three vertices
+    // (2026-09-19, census v45's `vertex_span` bucket): the plain copy kernel
+    // over the 2x2 attachment's own sixteen-byte view, beside the render cases
+    // that name six and five vertices. Those cases run on the Vulkan rails
+    // alone — this oracle compiles the reviewed `vertex_id` module, whose
+    // position table carries exactly three entries, so it has no module for a
+    // wider count and the suite's marker keeps the case off this rail — which
+    // is why this oracle validates and executes the declaring pass as an
+    // ordinary compute case.
+    case "compute-buffer-v44":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v43 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v44 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -3403,6 +3414,22 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     let indexStream: ValidatedIndexStream?
     switch (definition.vertex_layout, definition.vertex_buffers, definition.indices) {
     case (nil, nil, nil):
+        // The layout-free count above the milestone's three vertices
+        // (2026-09-19, census v45's `vertex_span` bucket): the triangle list
+        // bounds the count below and not at three, and the widened arm runs on
+        // the rails whose `vertex_id` module carries the positions. This oracle
+        // compiles the reviewed module, whose position table has exactly three
+        // entries, so it refuses the case by name when a native rail is named
+        // and validates the rest of the case as one it does not serve.
+        if definition.vertices != 3 {
+            try require(!definition.capture_rails.contains("native-metal"),
+                        "\(definition.id): this oracle's reviewed `vertex_id` module reads a "
+                        + "three-entry position table by index and has no position for a wider "
+                        + "count: mark the case for the Vulkan rails")
+            return ValidatedRender(definition: definition, source: "", attachments: [],
+                                   vertexStreams: [], stageBuffers: [], indexStream: nil,
+                                   depth: nil, stencil: nil)
+        }
         try require(definition.vertices == 3,
                     "\(definition.id): expected the full-screen triangle")
         // The base vertex only exists for an indexed draw: both APIs add it to

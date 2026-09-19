@@ -5231,12 +5231,22 @@ impl RenderPassDescriptor {
         if let Some(indices) = &self.indices {
             indices.validate_shape()?;
         }
-        // The `vertex_id`-only shape keeps the milestone's fixed count whether
-        // or not an index buffer selects through it: three indices over three
-        // generated vertices is the same reviewed triangle the v15 indexed
-        // replay uses. A vertex-buffer layout brings its own count, which the
-        // pipeline's layout checks against the bound ranges.
-        if self.vertex_buffers.is_empty() && self.vertices != FULL_SCREEN_TRIANGLE_VERTICES {
+        // The `vertex_id`-only shape names its vertices `0..vertices` and takes
+        // its positions from `vertex_id` alone, so the triangle list it draws
+        // fixes the count's *lower* bound and not its value: three vertices are
+        // the fewest that rasterize anything, and every count above three is
+        // the same shape with more vertices (2026-09-19, census v45's
+        // `vertex_span` bucket). Both rails issue the pass's own count, the
+        // reviewed `vertex_id` module is a total function of the index, and a
+        // translated module runs exactly the vertex stage the trace registered
+        // — so a four-, five- or six-vertex draw is executed where the
+        // milestone's three-vertex triangle was. The upper bound stays the one
+        // the field has always carried (`u32`); the one count this arm refuses
+        // is one below the triangle's three, and it reports the milestone's
+        // three as the count it compared against
+        // (`DrawVertexCountMismatch`), exactly as it did while the whole arm
+        // was one count wide.
+        if self.vertex_buffers.is_empty() && self.vertices < FULL_SCREEN_TRIANGLE_VERTICES {
             return Err(ContractError::DrawVertexCountMismatch {
                 expected: FULL_SCREEN_TRIANGLE_VERTICES,
                 actual: self.vertices,
@@ -9937,6 +9947,34 @@ pub struct ProviderCapabilities {
     /// module by the layout's exact shape and therefore refuses a layout with
     /// attributes no reviewed module reads.
     pub supports_render_vertex_interface_superset: bool,
+    /// Whether this snapshot executes a *layout-free* non-indexed draw whose
+    /// count is above the milestone's three vertices (2026-09-19, census v45's
+    /// `vertex_span` bucket). Defaults to `false`: a pass whose pipeline
+    /// declares [`VertexLayout::None`] and whose `vertices` is not
+    /// [`FULL_SCREEN_TRIANGLE_VERTICES`] is refused by name during admission
+    /// instead of being handed to a rail whose `vertex_id` module carries three
+    /// positions.
+    ///
+    /// The contract itself admits the shape from this increment on — the
+    /// triangle list fixes a lower bound, not a value
+    /// ([`RenderPassDescriptor::vertices`]) — so this bit is what separates
+    /// "the shape is well formed" from "this provider executes it". It is
+    /// limited **by arm**: [`Self::max_vertex_buffers`] and
+    /// [`Self::supported_vertex_formats`] still answer the caller-held stream
+    /// arm, whose count the layout's own bindings bound. It MUST NOT be read as
+    /// "any count is admitted": a count below three stays refused by the
+    /// contract on both arms, and a count above three on a *layout-free* pass is
+    /// exactly the shape this bit names.
+    ///
+    /// Declared `true` by the snapshots whose rail executes that arm: the
+    /// Vulkan rail issues the pass's own count and its reviewed `vertex_id`
+    /// module is a total function of the index, so the extra vertices resolve
+    /// to the degenerate triangles the module's own arithmetic states
+    /// (`tests/render_vertex_count_e2e.rs`). The native rail leaves it at the
+    /// default: its reviewed `vertex_id` module reads a three-entry position
+    /// table by index, so a count above three would read a position the module
+    /// does not carry.
+    pub supports_render_vertex_count_above_triangle: bool,
     /// Whether this snapshot can execute the instanced draw of
     /// `research/docs/23` §3.3 (v31). Defaults to `false`: no provider draws
     /// more than one instance today, so a pass that asks for more is refused
@@ -10367,6 +10405,28 @@ impl ProviderCapabilities {
     /// "refuse a layout the module does not fill" answer.
     pub fn declares_render_vertex_interface_superset_support(&self) -> bool {
         self.supports_render_vertex_interface_superset
+    }
+
+    /// Whether this snapshot executes a layout-free non-indexed draw whose
+    /// count is above the milestone's three vertices (2026-09-19, census v45's
+    /// `vertex_span` bucket).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself: it
+    /// exists so the question is asked in the same place a consumer asks every
+    /// other "did this snapshot declare the shape" question, instead of one
+    /// call site reading the field and another comparing the rest of the
+    /// snapshot against its defaults. The capability frame writes the bit as
+    /// the escape family's next tagged block, so this predicate is also what
+    /// keeps a snapshot that declares *only* this bit from falling back to the
+    /// legacy payload and dropping the declaration on the wire.
+    ///
+    /// Like the superset vertex interface's predicate, this one is deliberately
+    /// *not* part of [`Self::declares_vertex_input_support`]: the three fields
+    /// that predicate reads keep their own readings, and a snapshot that never
+    /// spoke about the widened arm keeps the fail-closed "three vertices only"
+    /// answer.
+    pub fn declares_render_vertex_count_above_triangle(&self) -> bool {
+        self.supports_render_vertex_count_above_triangle
     }
 
     /// Whether any instancing bit differs from its default. Part of the render
@@ -11035,6 +11095,35 @@ impl ProviderCapabilities {
                     .with_field(
                         "maximum",
                         FieldValue::Unsigned(u64::from(self.max_vertex_buffers)),
+                    ));
+            }
+            // The layout-free arm's own count is the next vertex-input
+            // question (2026-09-19, census v45's `vertex_span` bucket). The
+            // contract admits the shape from three vertices up — the triangle
+            // list's own lower bound — so what is left here is the *provider*
+            // question: does this snapshot execute a count above the
+            // milestone's three, or does it keep the "three vertices only"
+            // reading the arm had while it was one count wide? A snapshot that
+            // never spoke about the widening (every frame written before this
+            // increment, and the native rail today) refuses the shape by name
+            // instead of handing its rail a `vertex_id` the module's own table
+            // need not carry.
+            if pass.vertex_buffers.is_empty()
+                && pass.vertices != FULL_SCREEN_TRIANGLE_VERTICES
+                && !self.supports_render_vertex_count_above_triangle
+            {
+                return Err(capability_error("render_vertex_count_window_unsupported")
+                    .with_field("vertices", FieldValue::Unsigned(u64::from(pass.vertices)))
+                    .with_field(
+                        "minimum",
+                        FieldValue::Unsigned(u64::from(FULL_SCREEN_TRIANGLE_VERTICES)),
+                    )
+                    .with_detail(
+                        "a non-indexed draw whose pipeline declares no vertex layout takes its \
+                         positions from `vertex_id`; this snapshot does not declare the count \
+                         above the milestone's three vertices, so the pass is refused instead \
+                         of being executed against a `vertex_id` its module's own position \
+                         table need not carry",
                     ));
             }
             // Instancing is the second pass-level bit this snapshot answers
@@ -16736,6 +16825,7 @@ mod tests {
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
+            supports_render_vertex_count_above_triangle: false,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,
@@ -21709,19 +21799,32 @@ mod tests {
     fn render_pass_refuses_a_draw_that_is_not_the_full_screen_triangle() {
         let mut pass = render_pass();
         pass.vertices = 6;
-        assert_eq!(
-            pass.validate(),
-            Err(ContractError::DrawVertexCountMismatch {
-                expected: FULL_SCREEN_TRIANGLE_VERTICES,
-                actual: 6,
-            })
-        );
+        // The layout-free arm's count is the draw's own from three up
+        // (2026-09-19, census v45's `vertex_span` bucket): a six-vertex draw is
+        // the same shape with more vertices, and the two rails that execute it
+        // issue the count the trace names.
+        assert_eq!(pass.validate(), Ok(()));
+        for count in [4, 5, 7, u32::MAX] {
+            pass.vertices = count;
+            assert_eq!(pass.validate(), Ok(()), "count {count}");
+        }
         pass.vertices = 0;
         assert_eq!(
             pass.validate(),
             Err(ContractError::DrawVertexCountMismatch {
                 expected: FULL_SCREEN_TRIANGLE_VERTICES,
                 actual: 0,
+            })
+        );
+        // Below the triangle's three the arm keeps the refusal it has always
+        // stated, and it still names the milestone's three as the count it
+        // compared against.
+        pass.vertices = FULL_SCREEN_TRIANGLE_VERTICES - 1;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::DrawVertexCountMismatch {
+                expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: FULL_SCREEN_TRIANGLE_VERTICES - 1,
             })
         );
         assert_eq!(
@@ -24970,6 +25073,68 @@ mod tests {
         assert_eq!(
             zero.validate(),
             Err(ContractError::ZeroLength("render instance count"))
+        );
+    }
+
+    #[test]
+    fn the_layout_free_vertex_count_bit_gates_the_count_above_the_triangle() {
+        // The layout-free arm's widened count (2026-09-19, census v45's
+        // `vertex_span` bucket): the contract admits it from three vertices up,
+        // and the snapshot answers whether its rail executes the count.
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        render_entry(&mut value).vertices = 6;
+        value
+            .validate()
+            .expect("the six-vertex layout-free draw is structurally valid");
+
+        // A snapshot that never spoke about the widening keeps the arm's
+        // original reading, and it refuses the shape by name rather than
+        // handing its rail a `vertex_id` the module need not carry.
+        let snapshot = render_capabilities();
+        assert!(!snapshot.declares_render_vertex_count_above_triangle());
+        let refusal = snapshot
+            .admit(&value, &landing_resources())
+            .expect_err("a snapshot that declares no widened count refuses the pass");
+        assert_eq!(refusal.slug, "render_vertex_count_window_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("vertices"),
+            Some(&FieldValue::Unsigned(6))
+        );
+        assert_eq!(
+            refusal.fields.get("minimum"),
+            Some(&FieldValue::Unsigned(u64::from(
+                FULL_SCREEN_TRIANGLE_VERTICES
+            )))
+        );
+
+        // The milestone's own count is admitted by *both* snapshots: the
+        // widening never narrows the shape every earlier increment published.
+        render_entry(&mut value).vertices = FULL_SCREEN_TRIANGLE_VERTICES;
+        snapshot
+            .admit(&value, &landing_resources())
+            .expect("the three-vertex shape keeps admitting without the bit");
+
+        // The bit is the whole gate: a snapshot that declares it admits the
+        // count, and every other render bit keeps its reading.
+        let mut widened = render_capabilities();
+        widened.supports_render_vertex_count_above_triangle = true;
+        assert!(widened.declares_render_vertex_count_above_triangle());
+        render_entry(&mut value).vertices = 6;
+        widened
+            .admit(&value, &landing_resources())
+            .expect("a snapshot that declares the count admits it");
+
+        // A count below the triangle's three stays the contract's own refusal:
+        // it is not a capability question, and neither snapshot answers it.
+        let mut below = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        render_entry(&mut below).vertices = FULL_SCREEN_TRIANGLE_VERTICES - 1;
+        assert_eq!(
+            below.validate(),
+            Err(ContractError::DrawVertexCountMismatch {
+                expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: FULL_SCREEN_TRIANGLE_VERTICES - 1,
+            })
         );
     }
 

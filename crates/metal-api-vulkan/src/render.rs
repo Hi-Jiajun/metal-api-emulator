@@ -5132,7 +5132,24 @@ fn prepare_render_request_with_resident<'a>(
                 }
             }
             if streams.is_empty() {
-                (DrawShape::Milestone, None)
+                // The layout-free arm draws the count the trace named
+                // (2026-09-19, census v45's `vertex_span` bucket). Three
+                // vertices are the milestone's own reviewed triangle, so that
+                // exact count keeps the `Milestone` shape the rail has always
+                // issued; a wider count is the same shape with more vertices —
+                // the module is a total function of the index, so its extra
+                // vertices resolve through the module's own arithmetic instead
+                // of being silently dropped by a three-vertex draw.
+                if pass.vertices == FULL_SCREEN_TRIANGLE_VERTICES {
+                    (DrawShape::Milestone, None)
+                } else {
+                    (
+                        DrawShape::Vertices {
+                            vertex_count: pass.vertices,
+                        },
+                        None,
+                    )
+                }
             } else {
                 (
                     DrawShape::Vertices {
@@ -15342,13 +15359,26 @@ impl<'a> OffscreenObjects<'a> {
                 // vertex-buffer arms do (`research/docs/23` §3.3, v31): the
                 // reviewed triangle is replayed once per instance, so a pass
                 // that asks for more than one keeps its own count here too.
-                self.context.device.cmd_draw(
-                    self.command,
-                    FULL_SCREEN_TRIANGLE_VERTICES,
-                    self.instance_count,
-                    0,
-                    0,
-                );
+                // The vertex count is the trace's own as well (2026-09-19,
+                // census v45's `vertex_span` bucket): `Milestone` states the
+                // three-vertex triangle, and a wider layout-free count arrives
+                // as `Vertices` with the number the trace named, which the
+                // module's `vertex_id` arithmetic resolves vertex by vertex.
+                let vertex_count = match self.draw {
+                    DrawShape::Milestone => FULL_SCREEN_TRIANGLE_VERTICES,
+                    DrawShape::Vertices { vertex_count } => vertex_count,
+                    // A layout-free draw reaches this arm with no index window
+                    // bound, so an indexed shape here is a record the rail
+                    // never prepared.
+                    DrawShape::Indexed { .. } => {
+                        return Err(contract_refusal(
+                            "an indexed draw reached the rail without an index window",
+                        ));
+                    }
+                };
+                self.context
+                    .device
+                    .cmd_draw(self.command, vertex_count, self.instance_count, 0, 0);
             } else {
                 // The indirect replay reads its counts from the buffer the CPU
                 // encoded above; `stride` is the struct size because the first
