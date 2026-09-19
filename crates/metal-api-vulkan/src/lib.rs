@@ -109,15 +109,44 @@ fn failure(message: impl Into<String>) -> ExecutorError {
 /// this policy from the selected device and hands it to both translation entry
 /// points and to the render registration gate. A device without the feature
 /// keeps the fail-closed phase-1 answer, byte for byte.
+///
+/// The 16-bit pair (`Float16` + `Int16`, 2026-09-20) rides the same answer: a
+/// module that narrows a float to `half` and reads the bits back — the shape
+/// census v48's LPF pipeline carries — declares both capabilities, and Vulkan
+/// admits each one exactly when the device enabled the matching feature
+/// (`shaderFloat16`, `shaderInt16`). They are two bits rather than one because
+/// the gate checks each `OpCapability` on its own, exactly as the module
+/// declares them, and one bit could not say "this device has the float but not
+/// the integer".
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SpirvFeaturePolicy {
     float_controls2: bool,
+    float16: bool,
+    int16: bool,
 }
 
 impl SpirvFeaturePolicy {
     /// The phase-1 subset: the capabilities every admitted device enables.
     pub const PHASE1: Self = Self {
         float_controls2: false,
+        float16: false,
+        int16: false,
+    };
+
+    /// The asking side of the gate: every optional capability it can express.
+    ///
+    /// This is *not* a device answer — no device reports what it enables
+    /// through it — and it is not used by any translation a provider
+    /// registers. It is the other half of the pairing a device's own policy
+    /// states: translating under it asks what a module's own words declare,
+    /// which is what a consumer compares against the capability frame's answer
+    /// before it hands a module to a provider
+    /// ([`TranslatedRenderStage::declared_shader_capabilities`], read by the
+    /// reims provider's class gate).
+    pub const ADMITTING: Self = Self {
+        float_controls2: true,
+        float16: true,
+        int16: true,
     };
 
     /// Admit (or keep refusing) `FloatControls2` with `SPV_KHR_float_controls2`.
@@ -126,9 +155,47 @@ impl SpirvFeaturePolicy {
         self
     }
 
+    /// Admit (or keep refusing) `Float16`.
+    ///
+    /// Vulkan's rule is the device's `shaderFloat16`, enabled at creation; the
+    /// capability is what a module declares for every 16-bit floating-point
+    /// type it computes with.
+    pub const fn with_float16(mut self, admitted: bool) -> Self {
+        self.float16 = admitted;
+        self
+    }
+
+    /// Admit (or keep refusing) `Int16`, on the same terms as [`Self::with_float16`]
+    /// and against the core `shaderInt16` feature.
+    pub const fn with_int16(mut self, admitted: bool) -> Self {
+        self.int16 = admitted;
+        self
+    }
+
     /// Whether the gate admits `FloatControls2` + `SPV_KHR_float_controls2`.
     pub const fn float_controls2(self) -> bool {
         self.float_controls2
+    }
+
+    /// Whether the gate admits `OpCapability Float16`.
+    pub const fn float16(self) -> bool {
+        self.float16
+    }
+
+    /// Whether the gate admits `OpCapability Int16`.
+    pub const fn int16(self) -> bool {
+        self.int16
+    }
+
+    /// Whether the gate admits the pair a module that narrows a float to
+    /// `half` and reads its bits back declares.
+    ///
+    /// The conjunction is the *publisher's* reading rather than the gate's: a
+    /// module that declares only one of the two is still admitted by the bit
+    /// that matches, and the capability frame's own one-bit face is this pair
+    /// (`ProviderCapabilities::supports_render_half_capabilities`).
+    pub const fn half(self) -> bool {
+        self.float16 && self.int16
     }
 }
 
@@ -167,6 +234,103 @@ impl FloatControls2Support {
     /// The gate policy this support answers with.
     pub const fn policy(self) -> SpirvFeaturePolicy {
         SpirvFeaturePolicy::PHASE1.with_float_controls2(self.enabled())
+    }
+}
+
+/// What the selected device reported about the two 16-bit shader features the
+/// `Float16`/`Int16` capabilities rest on (2026-09-20, census v48's LPF
+/// pipeline).
+///
+/// `shaderFloat16` is `VkPhysicalDeviceFloat16Int8FeaturesKHR`'s bit (core from
+/// Vulkan 1.2, so it travels in the same `VkPhysicalDeviceVulkan12Features`
+/// chain the mirror-clamp reading uses) and `shaderInt16` is the core
+/// `VkPhysicalDeviceFeatures` bit; both are enabled at device creation exactly
+/// when the device reported them, because asking for a feature a device does not
+/// have is a device-creation error and enabling one whose bit is off would put
+/// the module gate and the device out of step.
+///
+/// The two readings are kept apart for the reason
+/// [`FloatControls2Support`]'s are: they are asked separately and a device can
+/// answer one without the other, which is what the gate's two policy bits and
+/// the capability frame's one conjunction bit are both derived from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HalfShaderSupport {
+    float16: bool,
+    int16: bool,
+}
+
+impl HalfShaderSupport {
+    /// Whether the device reported `shaderFloat16` on.
+    pub const fn float16_reported(self) -> bool {
+        self.float16
+    }
+
+    /// Whether the device reported the core `shaderInt16` feature on.
+    pub const fn int16_reported(self) -> bool {
+        self.int16
+    }
+
+    /// Whether both features were reported and therefore enabled at creation.
+    ///
+    /// This is the one bit the capability frame publishes
+    /// (`ProviderCapabilities::supports_render_half_capabilities`): the pair is
+    /// what the module that needs the face declares, so a device that answers
+    /// one of the two keeps the fail-closed reading.
+    pub const fn enabled(self) -> bool {
+        self.float16 && self.int16
+    }
+
+    /// The gate policy these readings answer with: one bit per capability.
+    pub const fn policy(self) -> SpirvFeaturePolicy {
+        SpirvFeaturePolicy::PHASE1
+            .with_float16(self.float16)
+            .with_int16(self.int16)
+    }
+}
+
+/// Which of the capabilities the device policy answers for one module's own
+/// SPIR-V declares (2026-09-20, the half-capability gate).
+///
+/// It is the module-side half of the pairing [`SpirvFeaturePolicy`] is the
+/// device-side half of: [`TranslatedRenderStage::declared_shader_capabilities`]
+/// produces it by translating a module under
+/// [`SpirvFeaturePolicy::ADMITTING`], and a consumer compares it against the
+/// answer its provider's capability frame carries. The three bits are exactly
+/// the capabilities this gate can express, so a module that declares anything
+/// else does not translate under the admitting policy at all — the walk reports
+/// the refusal instead of a set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeclaredShaderCapabilities {
+    float_controls2: bool,
+    float16: bool,
+    int16: bool,
+}
+
+impl DeclaredShaderCapabilities {
+    /// Whether the module declares `FloatControls2` (and with it
+    /// `SPV_KHR_float_controls2`).
+    pub const fn float_controls2(self) -> bool {
+        self.float_controls2
+    }
+
+    /// Whether the module declares `OpCapability Float16`.
+    pub const fn float16(self) -> bool {
+        self.float16
+    }
+
+    /// Whether the module declares `OpCapability Int16`.
+    pub const fn int16(self) -> bool {
+        self.int16
+    }
+
+    /// Whether the module declares either half of the 16-bit pair.
+    ///
+    /// This is the reading a consumer weighs against the capability frame's one
+    /// half bit (`ProviderCapabilities::supports_render_half_capabilities`):
+    /// the bit answers for **both** capabilities, so a module that declares
+    /// either one is inside the frame's answer exactly when that bit is set.
+    pub const fn declares_half(self) -> bool {
+        self.float16 || self.int16
     }
 }
 
@@ -485,6 +649,19 @@ impl VulkanExecutor {
         self.context.float_controls2_support()
     }
 
+    /// What this device reported about the two 16-bit shader features
+    /// (2026-09-20, census v48's LPF pipeline).
+    ///
+    /// The two readings — `shaderFloat16` and `shaderInt16` — are the pair the
+    /// device was created with, [`Self::spirv_feature_policy`] is the gate
+    /// answer derived from them, and the conjunction is the one bit the
+    /// capability frame publishes
+    /// ([`ProviderCapabilities::supports_render_half_capabilities`]). A device
+    /// that reports neither keeps the phase-1 subset and the fail-closed frame.
+    pub fn half_shader_support(&self) -> HalfShaderSupport {
+        self.context.half_shader_support()
+    }
+
     /// Whether this device was created with `samplerMirrorClampToEdge`
     /// enabled (`research/docs/23` §109).
     ///
@@ -550,6 +727,15 @@ impl VulkanExecutor {
         // that states the arm is refused by name instead.
         capabilities.supports_render_stage_buffer_binding_range =
             self.context.robust_buffer_access();
+        // The 16-bit shader pair is the device's own answer too (2026-09-20,
+        // census v48's LPF pipeline): the rail's registration gate checks every
+        // module's `OpCapability Float16`/`Int16` against the policy derived
+        // from the same two readings (`render.rs::validate_module_capabilities`),
+        // so a device that did not enable both features answers `false` here
+        // and a consumer keeps its own refusal by name for the module instead
+        // of handing the provider a registration the gate would refuse.
+        capabilities.supports_render_half_capabilities =
+            self.context.half_shader_support().enabled();
         capabilities
     }
 
@@ -1059,6 +1245,35 @@ impl TranslatedRenderStage {
         &self.spirv
     }
 
+    /// Which of the optional capabilities one module's own translation
+    /// declares (2026-09-20, the half-capability gate).
+    ///
+    /// This is the *question* half of the capability pairing: a device answers
+    /// what it enabled with its own [`SpirvFeaturePolicy`], and this answers
+    /// what the module needs. A consumer that holds both — the reims provider's
+    /// class gate holds the capability frame's answer — can therefore tell "the
+    /// registration would refuse this module for a capability this provider's
+    /// subset does not contain" apart from "the module does not translate at
+    /// all", which is the distinction a class gate has to make before it hands
+    /// a draw to a provider (`render_provider_out_of_class_module_capability`).
+    ///
+    /// The reading is taken by translating the module under
+    /// [`SpirvFeaturePolicy::ADMITTING`] — the policy that admits every
+    /// optional capability the gate can express — and walking the produced
+    /// module's own `OpCapability` declarations. A module that does not
+    /// translate even there (`Float64`, an unsupported shape, a translator
+    /// refusal) answers `Err`, exactly as [`Self::translate`] answers it: the
+    /// capabilities a module the translator cannot decode would have declared
+    /// are not a question this walk can answer.
+    pub fn declared_shader_capabilities(
+        stage: RenderStage,
+        function: &Function,
+    ) -> Result<DeclaredShaderCapabilities, ExecutorError> {
+        let translated =
+            Self::translate_with_policy(stage, function, SpirvFeaturePolicy::ADMITTING)?;
+        scan_declared_shader_capabilities(translated.spirv())
+    }
+
     /// The reflection of the AIR the module was translated from.
     pub fn reflection(&self) -> &ShaderReflection {
         &self.reflection
@@ -1275,6 +1490,13 @@ pub(crate) struct VulkanContext {
     /// capability gate reads it as [`FloatControls2Support::policy`], so the
     /// snapshot and the gate are the same pair of readings.
     float_controls2: FloatControls2Support,
+    /// What the device reported about the two 16-bit shader features, and
+    /// whether they were enabled at device creation (2026-09-20, census v48's
+    /// LPF pipeline). The SPIR-V capability gate reads them as
+    /// [`HalfShaderSupport::policy`], so the two bits a module's `Float16` /
+    /// `Int16` declarations are checked against and the one bit the capability
+    /// frame publishes are one pair of readings.
+    half_shader: HalfShaderSupport,
     /// Whether the device was created with `samplerMirrorClampToEdge` enabled
     /// (`research/docs/23` §109).
     ///
@@ -1499,11 +1721,28 @@ impl VulkanContext {
             vk::PhysicalDeviceFeatures2::default().push_next(&mut mirror_clamp_features);
         unsafe { instance.get_physical_device_features2(physical, &mut mirror_clamp_query) };
         // The core 1.0 block travels in the same query as the 1.2 chain, so the
-        // reading is taken from the query's own head before the chained struct
-        // is read (`research/docs/23` §3.3, E-SB3).
-        let robust_buffer_access = mirror_clamp_query.features.robust_buffer_access == vk::TRUE;
+        // readings from the query's own head are taken before the chained
+        // struct is read (`research/docs/23` §3.3, E-SB3) — and the head is
+        // copied out in one value, which is also what ends the query's
+        // `push_next` borrow before the chained fields below are read.
+        let core_features = mirror_clamp_query.features;
+        let robust_buffer_access = core_features.robust_buffer_access == vk::TRUE;
         let sampler_mirror_clamp_to_edge =
             mirror_clamp_features.sampler_mirror_clamp_to_edge == vk::TRUE;
+        // The two 16-bit shader features (2026-09-20, census v48's LPF
+        // pipeline) ride the *same* query as the readings above, and cost no
+        // second call for the same reason: `shaderFloat16` is part of the
+        // `VkPhysicalDeviceVulkan12Features` chain the mirror-clamp reading
+        // already asks for, and `shaderInt16` is a bit of the core 1.0 block
+        // the query's own head carries. Both are the device's own answer — a
+        // device that does not report them keeps the fail-closed phase-1
+        // refusal for a module that declares `Float16`/`Int16`
+        // (`validate_spirv_capabilities`), and the capability frame publishes
+        // the conjunction as its own one-bit face.
+        let half_shader = HalfShaderSupport {
+            float16: mirror_clamp_features.shader_float16 == vk::TRUE,
+            int16: core_features.shader_int16 == vk::TRUE,
+        };
         // `robustBufferAccess` is the reading the stage-buffer whole-binding arm
         // rests on (`research/docs/23` §3.3, E-SB3). The arm executes a
         // declaration whose reach the translation could not state by binding the
@@ -1520,9 +1759,11 @@ impl VulkanContext {
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_int8(shader_int8)
+            .shader_float16(half_shader.float16_reported())
             .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge);
         let physical_features = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
+            .shader_int16(half_shader.int16_reported())
             .robust_buffer_access(robust_buffer_access);
         let mut float_controls2_enable =
             vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default()
@@ -1636,6 +1877,7 @@ impl VulkanContext {
             memory,
             device_name,
             float_controls2,
+            half_shader,
             sampler_mirror_clamp_to_edge,
             robust_buffer_access,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
@@ -1726,6 +1968,12 @@ impl VulkanContext {
         self.float_controls2
     }
 
+    /// What this device reported about the 16-bit shader features
+    /// (2026-09-20, census v48's LPF pipeline).
+    pub(crate) const fn half_shader_support(&self) -> HalfShaderSupport {
+        self.half_shader
+    }
+
     /// Whether this device was created with `samplerMirrorClampToEdge` enabled
     /// (`research/docs/23` §109).
     pub(crate) const fn sampler_mirror_clamp_to_edge(&self) -> bool {
@@ -1744,7 +1992,10 @@ impl VulkanContext {
     /// one value, so the module a rail admits and the device that will execute
     /// it cannot drift apart.
     pub(crate) const fn spirv_feature_policy(&self) -> SpirvFeaturePolicy {
-        self.float_controls2.policy()
+        self.float_controls2
+            .policy()
+            .with_float16(self.half_shader.float16_reported())
+            .with_int16(self.half_shader.int16_reported())
     }
 
     /// Admit one new submission against the lifecycle.
@@ -3740,6 +3991,13 @@ fn validate_spirv_capabilities(
             // device's own policy: the translator demands it for a float
             // result that withholds a fast-math permission, and only a device
             // that enabled `VK_KHR_shader_float_controls2` admits it.
+            // `Float16`/`Int16` ride the same device answer (2026-09-20,
+            // census v48's LPF pipeline): the translator declares them for a
+            // module that narrows a float to `half` and reads its bits back,
+            // and Vulkan admits each one exactly when the device enabled
+            // `shaderFloat16` / `shaderInt16` — which is what the policy's two
+            // bits are read from, one `OpCapability` at a time, because a
+            // device may answer for one of the pair and not the other.
             // Everything else stays refused until a capability gate admits a
             // provider feature.
             if !matches!(
@@ -3756,6 +4014,8 @@ fn validate_spirv_capabilities(
                     || value == Capability::SampledBuffer as u32
                     || (policy.float_controls2()
                         && value == Capability::FloatControls2 as u32)
+                    || (policy.float16() && value == Capability::Float16 as u32)
+                    || (policy.int16() && value == Capability::Int16 as u32)
             ) {
                 return Err(failure(format!(
                     "SPIR-V capability {capability} requires a Vulkan feature outside the Phase 1 subset"
@@ -3777,6 +4037,69 @@ fn validate_spirv_capabilities(
         cursor = end;
     }
     Ok(())
+}
+
+/// Which optional capabilities one translated module's own words declare.
+///
+/// The walk is the read side of [`validate_spirv_capabilities`] and structurally
+/// the same one: `OpCapability` is a two-word instruction whose only operand is
+/// the capability number, and it is only legal in the module's declaration
+/// section, so the walk stops at the first `OpFunction` and never reads a
+/// coincidental pair of words out of the instruction stream. It reports the
+/// three capabilities the device policy can admit and ignores every other one:
+/// a module that declares `Shader`, `Int8` or `Int64` (the phase-1 subset) is
+/// described by an all-false answer, which is exactly what a consumer needs to
+/// know — the phase-1 subset is not a question any device answers differently.
+///
+/// The malformed-module refusals are the same sentence [`validate_spirv_capabilities`]
+/// states, because a caller that reads a module this walk cannot decode must not
+/// mistake "the walk found nothing" for "the module declares nothing".
+fn scan_declared_shader_capabilities(
+    spv: &[u8],
+) -> Result<DeclaredShaderCapabilities, ExecutorError> {
+    if !spv.len().is_multiple_of(4) {
+        return Err(failure("translated SPIR-V is not word aligned"));
+    }
+    let words = spv
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+        .collect::<Vec<_>>();
+    if words.len() < 5 || words[0] != 0x0723_0203 {
+        return Err(failure("translated SPIR-V has an invalid header"));
+    }
+    let mut declared = DeclaredShaderCapabilities::default();
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        let end = cursor
+            .checked_add(word_count)
+            .filter(|end| word_count != 0 && *end <= words.len())
+            .ok_or_else(|| {
+                failure(format!(
+                    "translated SPIR-V has a malformed instruction at word {cursor}"
+                ))
+            })?;
+        if opcode == Op::Function as u32 {
+            break;
+        }
+        if opcode == Op::Capability as u32 {
+            if word_count != 2 {
+                return Err(failure("SPIR-V OpCapability has invalid length"));
+            }
+            let capability = words[cursor + 1];
+            if capability == Capability::FloatControls2 as u32 {
+                declared.float_controls2 = true;
+            } else if capability == Capability::Float16 as u32 {
+                declared.float16 = true;
+            } else if capability == Capability::Int16 as u32 {
+                declared.int16 = true;
+            }
+        }
+        cursor = end;
+    }
+    Ok(declared)
 }
 
 /// Create a `VkImage` and bind allocated memory of a requested property class.
@@ -9038,6 +9361,209 @@ mod tests {
         let still_refused =
             validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64]), admitted).unwrap_err();
         assert!(still_refused.message().contains("capability 10"));
+    }
+
+    /// The 16-bit pair rides the device's own answer, one capability at a time
+    /// (2026-09-20, census v48's LPF pipeline).
+    ///
+    /// The census's own probe read
+    /// `SPIR-V capability 9 requires a Vulkan feature outside the Phase 1
+    /// subset` for the module this gate is about, so that sentence is pinned
+    /// here byte for byte — the phase-1 arm must keep it, and a device that did
+    /// not enable the features must answer exactly as it did before the gate
+    /// grew this arm. The two bits are separate because the gate checks each
+    /// `OpCapability` on its own: a device that reported only `shaderFloat16`
+    /// admits `Float16` and still refuses `Int16`, and the pair's own
+    /// conjunction (`SpirvFeaturePolicy::half`) is the publisher's reading
+    /// rather than the gate's.
+    #[test]
+    fn the_16_bit_pair_rides_the_device_policy_one_capability_at_a_time() {
+        let shader = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Shader as u32,
+        ];
+        let float16 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Float16 as u32,
+        ];
+        let int16 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Int16 as u32,
+        ];
+
+        // The numbers the census's own disassembly carries (evidence
+        // `texture-sampler-d94d8da-2026-09-20/12-pipe58-spirv-capabilities.txt`
+        // lists Shader/Int64/Int8/Float16/Int16; only the first refusal is
+        // reached, and it is the one below).
+        assert_eq!(Capability::Float16 as u32, 9);
+        assert_eq!(Capability::Int16 as u32, 22);
+
+        let phase1 = validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &float16]),
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            phase1.message(),
+            "SPIR-V capability 9 requires a Vulkan feature outside the Phase 1 subset",
+            "the phase-1 arm keeps the census's own sentence"
+        );
+        let phase1_int = validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &int16]),
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_err();
+        assert!(phase1_int.message().contains("capability 22"));
+
+        // One feature enabled admits exactly its own capability.
+        let float_only = SpirvFeaturePolicy::PHASE1.with_float16(true);
+        assert!(
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &float16]), float_only).is_ok()
+        );
+        let int_refused =
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &int16]), float_only).unwrap_err();
+        assert!(
+            int_refused.message().contains("capability 22"),
+            "the other bit does not answer for this capability: {}",
+            int_refused.message()
+        );
+        assert!(float_only.float16());
+        assert!(!float_only.int16());
+        assert!(
+            !float_only.half(),
+            "the frame's one bit is the pair this policy does not carry"
+        );
+
+        let both = SpirvFeaturePolicy::PHASE1
+            .with_float16(true)
+            .with_int16(true);
+        assert!(both.half());
+        assert!(
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &float16, &int16]), both).is_ok()
+        );
+
+        // The pair opens those two capabilities and nothing beside them: the
+        // 16-bit *buffer* capability is a different feature and stays refused,
+        // and so does every other capability the gate never answered for.
+        let float16_buffer = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Float16Buffer as u32,
+        ];
+        let buffer_refused =
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &float16_buffer]), both)
+                .unwrap_err();
+        assert!(buffer_refused.message().contains("capability 8"));
+        let float64 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Float64 as u32,
+        ];
+        let float64_refused =
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64]), both).unwrap_err();
+        assert!(float64_refused.message().contains("capability 10"));
+    }
+
+    /// What the device reported is the policy's two bits and the frame's one
+    /// bit (2026-09-20): the readings travel apart because they are asked
+    /// apart, and the one bit a consumer reads is their conjunction, so a
+    /// device that answers for one of the two features keeps the fail-closed
+    /// answer.
+    #[test]
+    fn half_shader_support_answers_only_for_the_pair() {
+        let none = HalfShaderSupport::default();
+        assert!(!none.float16_reported());
+        assert!(!none.int16_reported());
+        assert!(!none.enabled());
+        assert_eq!(none.policy(), SpirvFeaturePolicy::PHASE1);
+
+        let float_only = HalfShaderSupport {
+            float16: true,
+            int16: false,
+        };
+        assert!(float_only.float16_reported());
+        assert!(!float_only.int16_reported());
+        assert!(!float_only.enabled(), "the frame's bit needs both readings");
+        assert_eq!(
+            float_only.policy(),
+            SpirvFeaturePolicy::PHASE1.with_float16(true)
+        );
+        assert!(!float_only.policy().half());
+
+        let int_only = HalfShaderSupport {
+            float16: false,
+            int16: true,
+        };
+        assert!(!int_only.enabled());
+        assert_eq!(
+            int_only.policy(),
+            SpirvFeaturePolicy::PHASE1.with_int16(true)
+        );
+
+        let both = HalfShaderSupport {
+            float16: true,
+            int16: true,
+        };
+        assert!(both.enabled());
+        assert_eq!(
+            both.policy(),
+            SpirvFeaturePolicy::PHASE1
+                .with_float16(true)
+                .with_int16(true)
+        );
+        assert!(both.policy().half());
+    }
+
+    /// The declared-capabilities walk reads the module's own declaration
+    /// section and stops at the first `OpFunction` (2026-09-20).
+    ///
+    /// The pair the gate admits is read out of `OpCapability` words and nothing
+    /// else, so the reading a consumer compares against its provider's answer
+    /// cannot be moved by an instruction stream that happens to carry the same
+    /// numbers — and a module that declares neither answers the all-false set
+    /// rather than a refusal.
+    #[test]
+    fn the_declared_capabilities_walk_stops_at_the_first_function() {
+        let shader = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Shader as u32,
+        ];
+        let float16 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Float16 as u32,
+        ];
+        let int16 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Int16 as u32,
+        ];
+        let float_controls2 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::FloatControls2 as u32,
+        ];
+
+        let none = scan_declared_shader_capabilities(&spirv_bytes(&[&shader])).unwrap();
+        assert_eq!(none, DeclaredShaderCapabilities::default());
+        assert!(!none.declares_half());
+
+        let declared =
+            scan_declared_shader_capabilities(&spirv_bytes(&[&shader, &float16, &int16])).unwrap();
+        assert!(declared.float16());
+        assert!(declared.int16());
+        assert!(declared.declares_half());
+        assert!(!declared.float_controls2());
+
+        let controls =
+            scan_declared_shader_capabilities(&spirv_bytes(&[&shader, &float_controls2])).unwrap();
+        assert!(controls.float_controls2());
+        assert!(!controls.declares_half());
+
+        // A declaration after the module's first function is in the
+        // instruction stream, not the declaration section, so the walk stops
+        // before it: the module below declares only `Shader`.
+        let function = [(5_u32 << 16) | Op::Function as u32, 1, 2, 0, 3];
+        let after = scan_declared_shader_capabilities(&spirv_bytes(&[
+            &shader, &function, &float16, &int16,
+        ]))
+        .unwrap();
+        assert_eq!(after, DeclaredShaderCapabilities::default());
     }
 
     /// The widened family states every field it names on the sampler the rail

@@ -5993,6 +5993,92 @@ mod tests {
         );
     }
 
+    /// The 16-bit shader capability pair travels as the tail's escape family's
+    /// next tag, `0x00 0x10 <bool>` (2026-09-20, census v48's LPF pipeline).
+    ///
+    /// The reading is the one every block in this family is pinned by, read on
+    /// the frame the per-stage window just left: the section appends itself
+    /// after it, changes no earlier byte, and re-encodes byte for byte after a
+    /// decode; a frame that ends before the section reads the bit as the
+    /// fail-closed `false`, which is "this snapshot's SPIR-V subset contains
+    /// neither capability" and therefore the consumer's own by-name refusal for
+    /// a module that declares them; and the legacy payload carries no block at
+    /// all, so it reads the same default rather than a value beside it.
+    #[test]
+    fn the_half_capability_pair_block_is_the_tail_familys_next_tag() {
+        let mut capabilities = fake_capabilities();
+        // The frame has to be on the extended payload already, or the new bit
+        // would change the payload's own form rather than only appending its
+        // section: the landing-view bit is the oldest face that does that.
+        capabilities.supports_render_attachment_landing_view = true;
+        capabilities.max_render_textures_per_stage = MAX_RENDER_TEXTURES as u32;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(without.ends_with(&[
+            0x00,
+            0x0f,
+            0x00,
+            0x00,
+            0x00,
+            u8::try_from(MAX_RENDER_TEXTURES).unwrap(),
+        ]));
+        assert!(!without.ends_with(&[0x00, 0x10, 0x01]));
+        let decoded = match CommandCodec::decode_response(&without).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(
+            !decoded.supports_render_half_capabilities,
+            "a frame that ends before the block reads the pair as the fail-closed default"
+        );
+
+        capabilities.supports_render_half_capabilities = true;
+        assert!(capabilities.declares_render_half_capabilities());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the 16-bit capability pair frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x10, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the new block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_half_capabilities);
+        // The legacy payload cannot carry the block either, so a legacy frame
+        // reads the same fail-closed default rather than a value beside it.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_half_capabilities);
+    }
+
     /// The stage-buffer whole-binding block is the tail's escape family's next
     /// tag, `0x00 0x0c <bool>` (`research/docs/23` §3.3, E-SB3).
     ///
@@ -6139,6 +6225,51 @@ mod tests {
         assert!(!decoded.supports_render_kept_frame_landing);
         assert!(!decoded.supports_heaps);
         assert!(!decoded.supports_indirect_command_buffers);
+    }
+
+    /// A declaration whose *only* statement is the 16-bit shader capability
+    /// pair still writes the extended payload (2026-09-20, census v48's LPF
+    /// pipeline): the block sits after the heap/ICB half the decoder reads by
+    /// position before the family's escape, so a snapshot that never wrote that
+    /// half would drop the declaration on the wire.
+    #[test]
+    fn an_only_half_capability_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_half_capabilities = true;
+        assert!(capabilities.declares_render_half_capabilities());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x10, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_half_capabilities);
+        assert!(!decoded.supports_render_fragment_output_superset);
+        assert!(!decoded.supports_render_vertex_count_above_triangle);
+        assert!(!decoded.supports_heaps);
+
+        // A family tag outside the closed set stays a typed refusal: the walk
+        // must not read a section it does not define as "the pair was not
+        // declared". (`0x7f` rather than the next number: the
+        // three-dimensional window and the per-stage window took `0x0d`/`0x0f`
+        // in the merges beside this one, and a parallel track takes the next
+        // tag again — the walk refuses a tag it does not know, whichever number
+        // that is.)
+        let mut frame_with_unknown = frame.clone();
+        let last = frame_with_unknown.len() - 1;
+        frame_with_unknown[last - 2] = 0x7f;
+        let refused = CommandCodec::decode_response(&frame_with_unknown)
+            .expect_err("an unknown family tag is refused");
+        assert!(
+            format!("{refused:?}").contains("UnknownCapabilityTail"),
+            "the refusal is the tail's own typed arm: {refused:?}"
+        );
     }
 
     /// The three-dimensional sampled window is the family's next tag and
@@ -7535,6 +7666,7 @@ mod tests {
                     supports_render_stage_buffer_namespace_split: false,
                     supports_render_stage_buffer_binding_range: false,
                     supports_render_fragment_output_superset: false,
+                    supports_render_half_capabilities: false,
                     supports_render_pixel_coordinate_sampler: false,
                     max_passes: 2,
                     supports_threads_exact: true,
@@ -7929,6 +8061,7 @@ mod tests {
             supports_render_stage_buffer_namespace_split: false,
             supports_render_stage_buffer_binding_range: false,
             supports_render_fragment_output_superset: false,
+            supports_render_half_capabilities: false,
             supports_render_pixel_coordinate_sampler: false,
             max_passes: 1,
             supports_threads_exact: true,

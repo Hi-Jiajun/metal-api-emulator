@@ -441,6 +441,10 @@ mod tests {
             supports_render_vertex_interface_superset: false,
             supports_render_vertex_count_above_triangle: false,
             supports_render_fragment_output_superset: false,
+            // The ICB snapshot is the same compute face: the 16-bit shader
+            // capability pair (2026-09-20) belongs to the render rail's
+            // reviewed-module answer, which this snapshot does not carry either.
+            supports_render_half_capabilities: false,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,

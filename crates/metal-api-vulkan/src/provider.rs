@@ -334,6 +334,18 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // whose location the module never stores stays refused by name, because
         // it would read back bytes nothing wrote.
         supports_render_fragment_output_superset: true,
+        // The 16-bit shader pair is *not* a limits-derived fact, so this
+        // function keeps it at its fail-closed default and
+        // `VulkanExecutor::provider_capabilities` overlays the device's own
+        // reading (2026-09-20, census v48's LPF pipeline) exactly as it
+        // overlays the depth/stencil resolve masks and the whole-binding arm.
+        // The two readings are one answer: the registration gate checks every
+        // module's `OpCapability Float16`/`Int16` against the policy derived
+        // from the same `shaderFloat16`/`shaderInt16` pair
+        // (`render.rs::validate_module_capabilities`), so a snapshot that
+        // declared this bit for a device that did not enable them would hand
+        // the provider a module it refuses.
+        supports_render_half_capabilities: false,
         // Instancing is executed (`render.rs` builds each binding's input rate
         // from the layout's step and issues `vkCmdDraw*` with the pass's own
         // instance count). Evidence: the reviewed `instanced_pair_4x4` case on
