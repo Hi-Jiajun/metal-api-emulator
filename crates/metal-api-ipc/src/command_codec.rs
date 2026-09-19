@@ -934,6 +934,40 @@ const CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL: u8 = 0x0E;
 /// new consumer reading an old frame keeps the same one.
 const CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL: u8 = 0x0F;
 
+/// Tag, inside the tail's second family, of the three-dimensional sampled
+/// arm's **lane list** (2026-09-20, census v48's volume lane gate).
+///
+/// The section follows the per-stage sampled-texture window and carries one
+/// `u64` count and one byte per format, exactly as the render-sampler block
+/// above carries its own list: the *formats* whose `TYPE_3D` sampled image the
+/// snapshot's device answered it can create
+/// ([`ProviderCapabilities::supported_render_texture_volume_formats`]).
+///
+/// The list is a section of its own rather than a widening of the block above
+/// or of the window beside it, because it answers a third question. The
+/// render-sampler block answers *which lanes a surface may carry*, the window
+/// (`0x0D`) answers *how large a volume the arm admits*, and this one answers
+/// *which lanes a volume may carry at all* — a device question the other two
+/// cannot state: Vulkan promises no three-dimensional format a linear tiling,
+/// and the RTX 5060's refusal of the linear `R32_SFLOAT` volume the
+/// pre-device-copy arm created is the reading that made this a question for the device
+/// rather than a rule for the rail.
+///
+/// The absent section is the older reading, and it is the *pre-increment* rule
+/// rather than the fail-closed one: a frame that ends before it says the arm
+/// carries `r32_float` alone, which is exactly what the arm carried before the
+/// device question existed. Every other lane therefore keeps its refusal by
+/// name on a consumer that reads an older frame, which is both the
+/// fail-closed direction and the reading that keeps an old provider's frames
+/// meaning what they meant.
+///
+/// The tag is `0x11` rather than the family's next number at the time this
+/// increment was written: the sibling landing beside it takes `0x10`, and the
+/// decoder reads the family's sections in strictly ascending tag order, so
+/// each increment keeps its own tag and the order the two of them arrive in is
+/// settled where they merge.
+const CAPABILITY_RENDER_TEXTURE_VOLUME_FORMATS_TAIL: u8 = 0x11;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -1211,6 +1245,13 @@ impl CommandCodec {
                     // shape the provider can hold.
                     || capabilities.declares_render_texture_dimension_1d()
                     || capabilities.declares_render_texture_dimension_3d()
+                    // The volume lane list is a face of its own (2026-09-20,
+                    // census v48's volume lane gate): a snapshot that declares
+                    // only it still has to write the extended payload, or its
+                    // list would be dropped on the wire and every consumer
+                    // would keep the pre-increment `r32_float`-only reading for
+                    // a lane the provider executes.
+                    || capabilities.declares_render_texture_volume_formats()
                     // The per-stage sampled-texture window is a face of its
                     // own (`research/docs/23` §3.3, E-TC1): a snapshot that
                     // declares only it still has to write the extended
@@ -6329,6 +6370,12 @@ fn put_capabilities(
         // (2026-09-20, the `D3` sampled texture arm), and it joins the same
         // guard for the same reason.
         || capabilities.declares_render_texture_dimension_3d()
+        // The volume lane list joins the same guard for the same reason
+        // (2026-09-20, census v48's volume lane gate): a snapshot whose only
+        // statement is this list still has to write the heap/ICB half the
+        // decoder reads by position before the family's escape, or the
+        // declaration would be dropped on the wire.
+        || capabilities.declares_render_texture_volume_formats()
         // The layout-free vertex count above the milestone's three joins the
         // same guard for the same reason (2026-09-19, census v45's
         // `vertex_span` bucket): a snapshot whose only statement is this bit
@@ -6685,6 +6732,30 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL);
             encoder.u32(capabilities.max_render_textures_per_stage);
         }
+        // The volume lane list is the family's next tag and follows the
+        // per-stage sampled-texture window (2026-09-20, census v48's volume
+        // lane gate). It repeats the render-sampler block's shape one question
+        // over — a count and one byte per format — because the question is the
+        // same *kind* of question about a different set of images: a snapshot
+        // that lists no volume lane writes nothing here, and the decoder reads
+        // the missing section as the pre-increment reading, where `r32_float`
+        // was the arm's only lane.
+        if capabilities.declares_render_texture_volume_formats() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_VOLUME_FORMATS_TAIL);
+            if capabilities.supported_render_texture_volume_formats.len()
+                > MAX_SUPPORTED_RENDER_TEXTURE_FORMATS
+            {
+                return Err(CodecError::RenderTextureFormatCount {
+                    count: capabilities.supported_render_texture_volume_formats.len(),
+                    maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+                });
+            }
+            encoder.u64(capabilities.supported_render_texture_volume_formats.len() as u64);
+            for format in &capabilities.supported_render_texture_volume_formats {
+                put_texture_format(encoder, *format);
+            }
+        }
     }
     Ok(())
 }
@@ -6739,6 +6810,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // A frame that ends before the per-stage window's section reads the
         // older reading too (`research/docs/23` §117, E-SB2): the list bound
         // applies to the whole list, which is the stricter rule.
+        //
+        // The volume lane list's absence is the third reading of the same
+        // shape: a frame that ends before it reads an empty list, which every
+        // consumer holds to the pre-increment rule where `r32_float` was the
+        // three-dimensional arm's only lane.
+        supported_render_texture_volume_formats: Vec::new(),
         max_render_stage_buffers_per_stage: 0,
         // A legacy payload cannot have declared the texel space either
         // (2026-09-19, census v43's `texture_state` axis): a consumer of the
@@ -6925,6 +7002,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {}
             CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {}
+            CAPABILITY_RENDER_TEXTURE_VOLUME_FORMATS_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6977,6 +7055,25 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {
                 capabilities.max_render_textures_per_stage = decoder.u32()?;
+            }
+            CAPABILITY_RENDER_TEXTURE_VOLUME_FORMATS_TAIL => {
+                let lane_count = usize::try_from(decoder.u64()?).map_err(|_| {
+                    CodecError::RenderTextureFormatCount {
+                        count: usize::MAX,
+                        maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+                    }
+                })?;
+                if lane_count > MAX_SUPPORTED_RENDER_TEXTURE_FORMATS {
+                    return Err(CodecError::RenderTextureFormatCount {
+                        count: lane_count,
+                        maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+                    });
+                }
+                let mut lanes = Vec::with_capacity(lane_count);
+                for _ in 0..lane_count {
+                    lanes.push(get_texture_format(decoder)?);
+                }
+                capabilities.supported_render_texture_volume_formats = lanes;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

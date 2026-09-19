@@ -550,6 +550,23 @@ impl VulkanExecutor {
         // that states the arm is refused by name instead.
         capabilities.supports_render_stage_buffer_binding_range =
             self.context.robust_buffer_access();
+        // The three-dimensional sampled arm's lane list is the last device
+        // answer the snapshot overlays (2026-09-20, census v48's volume lane
+        // gate), and it is a *measurement* rather than a limits reading: the
+        // probe queries the format/tiling/usage combination the rail creates
+        // and creates one trial image per admitted lane, because the `D3` arm's
+        // own first reading found a device that refuses a volume the query
+        // alone would not have ruled out — and a device that lists no lane
+        // states no window either, so every consumer (including one that
+        // predates this section and reads its lane from the surface list)
+        // refuses the shape by name instead of meeting the driver with an
+        // image it never promised.
+        let (lanes, window) = crate::render::render_texture_volume_lanes(
+            &self.context,
+            capabilities.max_render_texture_dimension_3d,
+        );
+        capabilities.supported_render_texture_volume_formats = lanes;
+        capabilities.max_render_texture_dimension_3d = window;
         capabilities
     }
 

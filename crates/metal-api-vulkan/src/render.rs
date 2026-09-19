@@ -8217,6 +8217,115 @@ pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Form
     })
 }
 
+/// The lanes one device answers for a three-dimensional sampled texture, and
+/// the window those lanes may reach (2026-09-20, census v48's volume lane
+/// gate).
+///
+/// The question is the `D3` arm's own, and it is asked of the *device* because
+/// the arm's first reading answered it the hard way: `vkCreateImage` of a
+/// linear `TYPE_3D` `R32_SFLOAT` image is accepted by Lavapipe and refused by
+/// the RTX 5060, so no rule derived from the two-dimensional window, from the
+/// contract's format list, or from one machine's reading can state which lanes
+/// a volume may travel in. This function therefore measures both halves of the
+/// rail's own creation:
+///
+/// * `vkGetPhysicalDeviceImageFormatProperties` answers whether the combination
+///   the rail creates — `TYPE_3D`, `OPTIMAL` tiling, `SAMPLED |
+///   TRANSFER_DST`, one sample, the create flags the rail passes — is
+///   supported at all, and reports the largest extent that lane may reach;
+/// * `vkCreateImage` of that exact combination at the smallest legal extent
+///   (a `1x1x1` volume) answers whether the device *creates* it, which is the
+///   half a driver may answer "supported" for and still refuse, and the half
+///   the pre-device-copy arm never asked before it handed the first image to
+///   the driver.
+///
+/// The trial image is created at one texel per axis rather than at the window:
+/// the extent question is the query's own `maxExtent`, which is what clamps the
+/// window below, while the creation question is a property of the
+/// format/tiling/usage combination rather than of its size — and a trial at the
+/// window's own extent would allocate gigabytes to answer a boolean.
+///
+/// The returned window is the candidate window clamped by the narrowest
+/// admitted lane, because one number is what the frame states and every listed
+/// lane has to be able to hold a volume of it. A device whose 8-bit lanes reach
+/// the ceiling while its `R32_SFLOAT` volume stops short therefore declares the
+/// narrower number beside a list that carries both lanes, which is exactly the
+/// reading `maxImageDimension3D` states for a *per-format* question.
+///
+/// An empty list returns a window of `0`: a device that can create no volume at
+/// all states no window either, so an *older* consumer — one that reads its
+/// volume lane out of the surface format list, which every rail declares — is
+/// not handed a window it would admit a lane against.
+pub(crate) fn render_texture_volume_lanes(
+    context: &VulkanContext,
+    window: u64,
+) -> (Vec<TextureFormat>, u64) {
+    // The usage the rail's own volume creation states (`create_render_textures`):
+    // sampled as a fragment source, and a transfer destination because a volume
+    // is always filled by `vkCmdCopyBufferToImage`. A lane whose image could be
+    // sampled but never filled is no lane this rail can execute.
+    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+    let mut lanes = Vec::new();
+    let mut lane_window = window;
+    for format in TextureFormat::RENDER_SAMPLED {
+        // Every contract lane the render sampler admits is a candidate: the
+        // question this function answers is which of them a volume may travel
+        // in, not which of them the sampler admits.
+        let Ok(vk_format) = render_texture_vk_format(format) else {
+            continue;
+        };
+        let Ok(properties) = (unsafe {
+            context
+                .instance
+                .get_physical_device_image_format_properties(
+                    context.physical,
+                    vk_format,
+                    vk::ImageType::TYPE_3D,
+                    vk::ImageTiling::OPTIMAL,
+                    usage,
+                    vk::ImageCreateFlags::empty(),
+                )
+        }) else {
+            continue;
+        };
+        let extent = properties.max_extent;
+        let lane_extent = u64::from(extent.width)
+            .min(u64::from(extent.height))
+            .min(u64::from(extent.depth));
+        if lane_extent == 0 {
+            continue;
+        }
+        // The second half of the question, and the one that is not a query:
+        // the image the rail would create, at the smallest extent Vulkan
+        // admits. It is destroyed immediately — nothing but the answer is kept.
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_3D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let Ok(image) = (unsafe { context.device.create_image(&info, None) }) else {
+            continue;
+        };
+        unsafe { context.device.destroy_image(image, None) };
+        lanes.push(format);
+        lane_window = lane_window.min(lane_extent);
+    }
+    if lanes.is_empty() {
+        return (lanes, 0);
+    }
+    (lanes, lane_window)
+}
+
 /// Map a contract [`ClearColor`] onto the `VkClearColorValue` components for an
 /// admitted attachment format.
 ///

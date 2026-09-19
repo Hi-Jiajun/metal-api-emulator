@@ -430,6 +430,12 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // volume's extents declares the narrower number rather than one it
         // would refuse at `vkCreateImage`.
         max_render_texture_dimension_3d: render_texture_dimension_3d(limits),
+        // The volume lane set is not a limits reading: it is the device's own
+        // answer to "which formats can this device create and fill a `TYPE_3D`
+        // sampled image with" (`render.rs`, [`render_texture_volume_lanes`]),
+        // so a snapshot built from limits alone states the pre-increment rule —
+        // an empty list, which every consumer reads as `r32_float` alone.
+        supported_render_texture_volume_formats: Vec::new(),
         // The gathered extent is executed for the arm whose source has host
         // bytes (`research/docs/23` §3.3, §111, E-TX5/E-TX10): a reviewed
         // module's sample coordinate is the fragment's own centre, so

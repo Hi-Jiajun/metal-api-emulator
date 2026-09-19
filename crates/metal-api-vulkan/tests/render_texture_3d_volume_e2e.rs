@@ -104,6 +104,19 @@ const FILL: f32 = 0.000_976_562_5;
 /// The fill value's own bytes, asserted by the construction below.
 const FILL_UNORM: u8 = 0x00;
 
+/// The texel every unsampled position of the **eight-bit** volume carries, in
+/// the lane's own `blue, green, red, alpha` memory order.
+///
+/// A `B8G8R8A8_UNORM` image's *red* channel is the third byte, and the
+/// fixture's samples take `.x` — the red channel — so the byte the frame lands
+/// is that third one: `0x00` here, which is none of the four bytes the four
+/// sampled texels carry. A rail that uploaded the source at another texel width
+/// (one row per four bytes rather than per sixteen, say) lands this fill where
+/// the frame carries a texel, and a rail that named the image `R8G8B8A8_UNORM`
+/// — the other four-byte order — hands the module the *first* byte, `0x11`,
+/// which no lane of the expectation holds either.
+const EIGHT_BIT_FILL: [u8; 4] = [0x11, 0x22, 0x00, 0x33];
+
 /// Which values the volume's two slices carry, and what the attachment lands
 /// for the four texels the fragment stage reaches.
 ///
@@ -167,11 +180,50 @@ impl Pattern {
     /// The volume's tightly packed slice-major bytes at the lane's own texel
     /// width.
     fn bytes(self, format: TextureFormat) -> Vec<u8> {
-        assert_eq!(format, TextureFormat::R32Float, "the fixture's one lane");
-        self.volume()
-            .iter()
-            .flat_map(|value| value.to_bits().to_le_bytes())
-            .collect()
+        match format {
+            TextureFormat::R32Float => self
+                .volume()
+                .iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())
+                .collect(),
+            TextureFormat::Bgra8Unorm => self.eight_bit_volume().to_vec(),
+            other => panic!("the volume fixtures state two lanes, not {other:?}"),
+        }
+    }
+
+    /// The volume's texels in the **eight-bit** lane's own byte order,
+    /// `blue, green, red, alpha` per texel and slice by slice inside it.
+    ///
+    /// The fixture reads each sample's `.x` component, and Vulkan fills that
+    /// from a `B8G8R8A8_UNORM` view's **red** channel — the third byte of the
+    /// lane's own memory order — so each sampled texel carries the byte the
+    /// frame has to land in its `red` position and two decoys (`0x11` in the
+    /// blue byte, `0x22` in the green one) that no lane of the expectation
+    /// holds. `0x11` is exactly what a view of the *other* four-byte order
+    /// would hand the module, which is the mix-up the decoys are there for.
+    fn eight_bit_volume(self) -> [u8; (VOLUME_WIDTH * VOLUME_HEIGHT * VOLUME_DEPTH) as usize * 4] {
+        let mut texels = [EIGHT_BIT_FILL; (VOLUME_WIDTH * VOLUME_HEIGHT * VOLUME_DEPTH) as usize];
+        let position = |slice: u64, row: u64, column: u64| -> usize {
+            (slice * VOLUME_HEIGHT * VOLUME_WIDTH + row * VOLUME_WIDTH + column) as usize
+        };
+        // The same four positions the float lane samples, in the same order:
+        // the two slices are what tells a volume walk from a one-slice upload,
+        // and the four columns and rows are what tell a row pitch from a slice
+        // pitch at the eight-bit lane's own four-byte texel.
+        texels[position(0, 0, 0)][2] = 0x40;
+        texels[position(0, 2, 0)][2] = 0xff;
+        texels[position(1, 0, 2)][2] = 0xbf;
+        texels[position(1, 2, 2)][2] = match self {
+            Self::Primary => 0xdf,
+            Self::Moved => 0x20,
+        };
+        let mut bytes = Vec::with_capacity(texels.len() * 4);
+        for texel in texels {
+            bytes.extend_from_slice(&texel);
+        }
+        bytes
+            .try_into()
+            .expect("the volume's own tightly packed byte extent")
     }
 }
 
@@ -667,6 +719,180 @@ fn the_three_dimensional_volume_executes_and_the_frame_is_its_own_texels() {
         uploaded.len(),
         4 * 4 * 2 * 4,
         "the volume's own byte extent"
+    );
+}
+
+/// Reading 4 (2026-09-20, census v48's volume lane gate): the volume's
+/// **eight-bit** lane — the census's own `B8G8R8A8_UNORM` volumes — executes,
+/// and what admits it is the *device's* own answer rather than the surface
+/// format list beside it.
+///
+/// The reading is the float lane's own frame over the other lane's texels: the
+/// four sampled positions carry the bytes `0x40`, `0xbf`, `0xff` and `0xdf` in
+/// their blue channel (the component a `Bgra8Unorm` view hands the fixture's
+/// `.x` sample), with three distinct decoys beside each one and a fill texel
+/// the frame may not contain. So a rail that walked the source at another texel
+/// width, that uploaded one slice, that read the rows in the wrong order, or
+/// that handed the module a reordered byte lands a frame this expectation does
+/// not have — and the two lanes (trace and objects) still have to land it byte
+/// for byte.
+///
+/// The second half is the compat rule the section states: the same trace
+/// against the same device's snapshot with the lane list cleared is refused by
+/// name, which is exactly what a consumer reading a frame written before the
+/// section does.
+#[test]
+fn the_eight_bit_volume_lane_executes_and_the_empty_list_refuses_it() {
+    let Some((executor, provider)) = executor_and_provider() else {
+        return;
+    };
+    // The device's own answer, archived with the frame: a device that refused
+    // this lane reports it here instead of at the first `vkCreateImage` of the
+    // pass's volume.
+    let capabilities = provider.capabilities();
+    eprintln!(
+        "volume lanes {:?} with window {} (the surface list carries {})",
+        capabilities.supported_render_texture_volume_formats,
+        capabilities.max_render_texture_dimension_3d,
+        match capabilities
+            .supported_render_texture_formats
+            .contains(&TextureFormat::Bgra8Unorm)
+        {
+            true => "bgra8_unorm",
+            false => "no bgra8_unorm",
+        }
+    );
+    assert!(
+        capabilities
+            .supported_render_texture_volume_formats
+            .contains(&TextureFormat::Bgra8Unorm),
+        "the device answers for the census's own volume lane: {:?}",
+        capabilities.supported_render_texture_volume_formats
+    );
+    assert!(
+        capabilities.max_render_texture_dimension_3d >= VOLUME_WIDTH,
+        "the device's volume window covers the fixture's extents: {}",
+        capabilities.max_render_texture_dimension_3d
+    );
+
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let pipeline = register(
+        &provider,
+        &executor,
+        FRAGMENT_AIR,
+        FRAGMENT_ENTRY,
+        TextureFormat::Bgra8Unorm,
+        TextureType::D3,
+        MODULE_SAMPLER,
+    )
+    .expect("the eight-bit volume declaration registers");
+
+    let primary = trace_readback(
+        &provider,
+        &compute,
+        &pipeline,
+        volume_view(TextureFormat::Bgra8Unorm, Pattern::Primary),
+    )
+    .expect("the eight-bit volume executes");
+    let objects_primary = object_readback(
+        &provider,
+        &pipeline,
+        TextureFormat::Bgra8Unorm,
+        Pattern::Primary,
+    );
+    eprintln!(
+        "eight-bit frames: trace {} objects {} (expected {})",
+        hex(&primary),
+        hex(&objects_primary),
+        hex(&Pattern::Primary.expected())
+    );
+    assert_eq!(
+        uniform_texel(&primary),
+        Pattern::Primary.expected(),
+        "trace frame: {}",
+        hex(&primary)
+    );
+    assert_eq!(
+        uniform_texel(&objects_primary),
+        Pattern::Primary.expected(),
+        "object frame: {}",
+        hex(&objects_primary)
+    );
+    assert_eq!(
+        primary, objects_primary,
+        "the two lanes land the eight-bit volume's frame"
+    );
+
+    let moved = trace_readback(
+        &provider,
+        &compute,
+        &pipeline,
+        volume_view(TextureFormat::Bgra8Unorm, Pattern::Moved),
+    )
+    .expect("the moved eight-bit volume executes");
+    eprintln!(
+        "eight-bit moved frame {} (expected {})",
+        hex(&moved),
+        hex(&Pattern::Moved.expected())
+    );
+    assert_eq!(
+        uniform_texel(&moved),
+        Pattern::Moved.expected(),
+        "the moved volume changes the lane the reading watches: {}",
+        hex(&moved)
+    );
+
+    // The lane's own texel width is the arm's whole question at this lane: the
+    // source is thirty-two **four-byte** texels, and the bytes the frame lands
+    // are the third byte of each sampled texel rather than the fill's `0x11`
+    // two bytes to the left of it, which is the byte a view of the other
+    // four-byte order would have handed the module.
+    let uploaded = Pattern::Primary.bytes(TextureFormat::Bgra8Unorm);
+    assert_eq!(uploaded.len(), 4 * 4 * 2 * 4, "the volume's byte extent");
+    for (lane, expected_byte) in Pattern::Primary.expected().iter().enumerate() {
+        assert_ne!(
+            *expected_byte, EIGHT_BIT_FILL[2],
+            "lane {lane}: the frame carries a sampled texel, not the fill"
+        );
+        assert_ne!(
+            *expected_byte, EIGHT_BIT_FILL[0],
+            "lane {lane}: the frame carries the lane's red byte, not the blue one the other \
+             four-byte order would read"
+        );
+    }
+    assert!(
+        !uploaded
+            .chunks_exact(4)
+            .filter(|texel| [texel[0], texel[1], texel[3]]
+                == [EIGHT_BIT_FILL[0], EIGHT_BIT_FILL[1], EIGHT_BIT_FILL[3]])
+            .all(|texel| texel[2] == EIGHT_BIT_FILL[2]),
+        "the source's sampled texels carry a byte the fill does not"
+    );
+
+    // The compat rule, measured on the same device: the lane list is what
+    // admits the shape, and a snapshot that declares the window but no lane
+    // keeps the pre-increment reading, where `r32_float` was the arm's only
+    // lane — the refusal by name a frame written before the section produces.
+    let (trace, resources) = trace_for(
+        &provider,
+        &compute,
+        &pipeline,
+        vec![volume_view(TextureFormat::Bgra8Unorm, Pattern::Primary)],
+    );
+    let mut pre_increment = provider.capabilities();
+    pre_increment
+        .supported_render_texture_volume_formats
+        .clear();
+    assert!(!pre_increment.declares_render_texture_volume_formats());
+    let refusal = match pre_increment.validate_trace(trace, resources) {
+        Ok(_) => panic!("the pre-increment reading refuses the eight-bit lane"),
+        Err(error) => error,
+    };
+    assert_eq!(refusal.slug, "render_texture_volume_format_unsupported");
+    eprintln!(
+        "pre-increment refusal: {} {:?}",
+        refusal.slug,
+        refusal.fields.get("format")
     );
 }
 
