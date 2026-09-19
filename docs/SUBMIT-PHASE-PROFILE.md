@@ -39,7 +39,15 @@ readback_whole_n=... setup_admits_us=... setup_attachments_us=...
 setup_depth_stencil_us=... setup_render_pass_us=... setup_textures_us=...
 setup_stage_buffers_us=... setup_pipeline_us=... setup_readbacks_us=...
 setup_inputs_us=... setup_command_pool_us=... reuse_hit_n=... reuse_miss_n=...
-reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=...
+reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=... texture_backing_us=...
+texture_upload_us=... texture_view_us=... texture_sampler_us=...
+texture_import_us=... texture_descriptor_us=... render_resolve_us=...
+render_present_us=... render_publish_us=... render_landing_us=...
+render_prepare_us=... render_retain_us=... render_land_owner_us=...
+render_teardown_us=... render_residual_us=... texture_named_us=...
+pool_hit_n=... pool_miss_n=... pool_disabled_n=... pool_return_n=...
+pool_drop_n=... import_hit_n=... import_miss_n=... import_disabled_n=...
+import_return_n=... import_drop_n=... render_offscreen_n=... render_present_n=...
 ```
 
 Every µs field is a **sum over that line's own window**, not a mean, with three
@@ -93,6 +101,20 @@ have their own setup and readback).
 | `setup_readbacks` | inside `render_setup`: the readback plan and the stored attachments' destinations |
 | `setup_inputs` | inside `render_setup`: the caller-held streams, the previous-byte buffers and the indirect commands |
 | `setup_command_pool` | inside `render_setup`: the command pool and its command buffer |
+| `texture_backing` | inside `setup_textures`: one sampled declaration's backing (or nothing, when the pool hands one back) |
+| `texture_upload` | inside `setup_textures`: the texels' own trip into that backing |
+| `texture_view` | inside `setup_textures`: the image view a pooled backing did not carry |
+| `texture_sampler` | inside `setup_textures`: the samplers one declaration's slots state |
+| `texture_import` | inside `setup_textures`: the host-pointer import of an owner's no-copy window |
+| `texture_descriptor` | inside `setup_textures`: the sampled set's layout, pool, set and writes |
+| `render_resolve` | inside the render half's residual: the outer loop's per-entry resolution before the rail is called |
+| `render_present` | inside the render half's residual: the present rail's own pass |
+| `render_publish` | inside the render half's residual: the outer loop's per-entry publication after the rail returned |
+| `render_landing` | inside the render half's residual: one landing-only plan entry |
+| `render_prepare` | inside the render half's residual: the offscreen rail entry's admissions and request resolution |
+| `render_retain` | inside the render half's residual: the input retains a pass takes before its first import |
+| `render_land_owner` | inside the render half's residual: the owner-window landing that follows a successful pass |
+| `render_teardown` | inside the render half's residual: the pass objects' destruction once the fence proved the device done |
 
 The ten `setup_*` fields are the one nested split in the line: they divide
 `render_setup` itself, so `sum(setup_*) <= render_setup_us` and the difference is
@@ -102,6 +124,25 @@ part of a pass's assembly a change moved, which is what the render-setup reuse
 increment (`docs/RENDER-SETUP-REUSE.md`) needed and what the bar alone could not
 answer.
 
+Two further nested splits divide what the first ones left unnamed, and neither
+is part of the disjoint sum either:
+
+* the six `texture_*` fields divide `setup_textures` itself:
+  `backing + upload + view + sampler + import + descriptor <= setup_textures`,
+  and the printed `texture_named_us` is their sum. A round that reads them can
+  tell a texture path that builds device objects from one that imports an
+  owner's window or writes descriptors — the reading that selected the second
+  cut (`docs/RENDER-IMPORT-POOL.md`), where `texture_import_us` was 1 117.7 of
+  `setup_textures`'s 1 141.1 µs/submit and the other five came to 5.6 µs.
+* the eight `render_*` residual fields divide what `render_total` cost minus its
+  five children — the outer loop around each pass, a landing-only entry, the
+  present rail, the offscreen rail entry's own admissions, the retains, the
+  owner-window landing and the pass teardown:
+  `sum(render children) + sum(render residual) <= render_total`, with the
+  printed `render_residual_us` as the residual's own sum. The seam that remains
+  is the function-call boundary between them, and the sp4 round read it as
+  32.0 µs/submit out of a 1 769.0 µs/submit residual.
+
 The `reuse_*` fields are counts, not times, and they partition every offscreen
 pass that reached the shape cache: `reuse_hit_n` passes were served the shader
 modules, pipeline layout and pipeline a pass of the same shape built before,
@@ -110,6 +151,17 @@ by the full comparison after a digest collision, `reuse_unkeyed_n` could not
 state an exact key at all (and so were never looked up or cached), and
 `reuse_disabled_n` ran with `METAL_API_VULKAN_RENDER_SETUP_CACHE=0`. A reading
 with `reuse_hit_n=0` is only meaningful beside the other four.
+
+The `pool_*` fields are the same kind of reading for the pooled sampled-texture
+backing (`docs/TEXTURE-BACKING-POOL.md`) and the `import_*` fields for the
+pooled owner-window import (`docs/RENDER-IMPORT-POOL.md`): `hit`/`miss`/
+`disabled` partition a declaration's `take`, `return`/`drop` partition a
+completed pass's hand-back, and the five can be added to the same `n=`.
+`render_offscreen_n` and `render_present_n` count the render passes a window's
+submissions executed, by shape: the five `render_*` children divide the
+offscreen executor, so a reading of them beside a present count would otherwise
+hide that the two shapes are different populations (the sp4 round read
+`render_offscreen_n=1.000` and `render_present_n=0.000` per submission).
 
 `plan_settle` is printed as one field because it is the answer to a question
 about the *rail* rather than about the device: of the CPU time a submission
