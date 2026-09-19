@@ -298,6 +298,35 @@ The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this
 project's current scope.
 
+### Provider increments
+
+Each recent provider increment has its own document, stating the shape it admits,
+the wire statement a consumer reads and the evidence it was accepted on:
+
+- [STAGE-BUFFER-NAMESPACE.md](docs/STAGE-BUFFER-NAMESPACE.md) — two translated
+  stages reading the same `[[buffer(n)]]` index (E-TX9).
+- [NARROW-SAMPLED-FORMATS.md](docs/NARROW-SAMPLED-FORMATS.md) — sampled textures
+  with one or two 8-bit channels (`r8_unorm` / `rg8_unorm`).
+- [GATHERED-TEXTURE-EXTENT.md](docs/GATHERED-TEXTURE-EXTENT.md) — a sampled source
+  whose extent differs from the render area, and the half that stays refused (E-TX10).
+- [GATHERED-EXTENT-NOCOPY.md](docs/GATHERED-EXTENT-NOCOPY.md) — the owner's no-copy
+  window of another extent, read on the device (E-TX12).
+- [VERTEX-INTERFACE-SUPERSET.md](docs/VERTEX-INTERFACE-SUPERSET.md) — a declared
+  vertex layout that covers more than the module reads (E-TX11).
+- [NON-INDEXED-DRAW.md](docs/NON-INDEXED-DRAW.md) — the draw arm without an index
+  buffer, and its reviewed coverage.
+- [ATTACHMENT-LANDING-VIEW.md](docs/ATTACHMENT-LANDING-VIEW.md) — a colour
+  attachment whose load source and landing point are two different view
+  declarations (E-TX13).
+- [KEPT-FRAME-LANDING.md](docs/KEPT-FRAME-LANDING.md) — landing a frame the provider
+  kept, from a later entry (E-TX14).
+- [SUBMIT-PHASE-PROFILE.md](docs/SUBMIT-PHASE-PROFILE.md) — where `submit`'s time
+  goes; [WRITTEN-RECT-READBACK.md](docs/WRITTEN-RECT-READBACK.md) — reading back only
+  the rectangle a pass actually wrote.
+
+These documents are written in Chinese; the contracts and identifiers they quote
+are the English names used in the code.
+
 ## Build and test the standalone workspace
 
 Install Rust, a C linker and Git. The current preparation is tested with Rust
