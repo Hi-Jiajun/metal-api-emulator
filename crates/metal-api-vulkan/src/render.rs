@@ -15983,6 +15983,137 @@ mod tests {
         );
     }
 
+    /// The third addressing axis is folded on the translation's own state too
+    /// (2026-09-19, R44).
+    ///
+    /// The census v38 shape: the two axes a 2D view reads state `clampToZero`
+    /// and the third is the Metal default `clampToEdge`. Every sampled surface
+    /// this rail admits is one single-sample, non-arrayed 2D view, whose
+    /// samples read no third coordinate — so the state is inside the family,
+    /// the request that states the folded policy (the same two axes) is
+    /// admitted, and only the axes that *are* read can move the pair.
+    #[test]
+    fn a_runtime_sampler_state_that_differs_on_the_third_axis_enters_the_family() {
+        use metal2vulkan::passes::{Stage, TransformOptions};
+        use metal2vulkan::reflect::{
+            SamplerAddressMode as AirAddress, SamplerBorderColor, SamplerCompareFunction,
+            SamplerCoordinates, SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+        };
+        use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+        let fixture = include_str!("../tests/fixtures/render_sample_texture_2d_boundary.frag.ll");
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        let state = metal2vulkan::reflect::RuntimeSamplerState {
+            min_filter: AirFilter::Linear,
+            mag_filter: AirFilter::Linear,
+            mip_filter: SamplerMipFilter::None,
+            address_mode_s: AirAddress::ClampToZero,
+            address_mode_t: AirAddress::ClampToZero,
+            address_mode_r: AirAddress::ClampToEdge,
+            coordinates: SamplerCoordinates::Normalized,
+            compare_function: SamplerCompareFunction::Never,
+            max_anisotropy: 1,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            border_color: SamplerBorderColor::TransparentBlack,
+            reduction: SamplerReduction::WeightedAverage,
+            lod_bias: 0.0,
+        };
+        let options = TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .expect("runtime sampler state");
+        let (fragment_spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            fixture,
+            Stage::Fragment,
+            scratch.path(),
+            options,
+        )
+        .expect("the boundary fixture translates");
+        assert_eq!(reflection.runtime_sampler_specializations.len(), 1);
+        eprintln!(
+            "third-axis translation specializations: {:?}",
+            reflection.runtime_sampler_specializations
+        );
+
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d_boundary".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract {
+                    sampler: None,
+                    runtime_sampler: Some(0),
+                    ..TextureBindingContract::sampled(
+                        0,
+                        TextureFormat::Rgba8Unorm,
+                        REVIEWED_SAMPLER_POLICY,
+                    )
+                }],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        stages
+            .validate_stage_pair()
+            .expect("the module's own pairing is executable");
+
+        // The request states the folded policy: the two axes the 2D view reads
+        // state `clampToZero`, and the family spells its own value on the third.
+        let folded = SamplerPolicy {
+            filter: SamplerFilter::Linear,
+            address: SamplerAddressMode::ClampToZero,
+        };
+        let mut pass = sampled_pass(4);
+        pass.samplers = vec![RenderSamplerBinding::new(0, folded)];
+        prepare_render_request(
+            &stages,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the request states the state the translation was given, folded on the third axis");
+
+        // The axes that are read still have to agree: another U/V mode is
+        // refused with both halves by name, exactly as before the fold.
+        let mut moved = sampled_pass(4);
+        moved.samplers = vec![RenderSamplerBinding::new(
+            0,
+            SamplerPolicy {
+                filter: SamplerFilter::Linear,
+                address: SamplerAddressMode::Repeat,
+            },
+        )];
+        let refused = match prepare_render_request(
+            &stages,
+            &moved,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the request names an address mode the translation did not"),
+        };
+        eprintln!("third-axis state disagreement: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_sampler_unsupported");
+        assert_eq!(
+            refused.fields.get("address"),
+            Some(&FieldValue::Text("Repeat".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("module_address"),
+            Some(&FieldValue::Text("ClampToZero".to_owned()))
+        );
+    }
+
     /// A translation given a state the widened family cannot state is refused
     /// by name at the stage gate (`research/docs/23` §109): `clampToBorderColor`
     /// reads a border colour that is a state of its own, so the rail refuses
