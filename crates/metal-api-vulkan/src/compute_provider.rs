@@ -3,9 +3,9 @@
 
 use crate::{
     execute_pool_sequence_with_status, render, Binding, BoundDispatch, FloatControls2Support,
-    LandingTarget, LandingUpdate, PendingExecution, PoolBinding, PoolKey, PoolKind, SequenceTail,
-    SpirvFeaturePolicy, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
-    VulkanPipelineArtifact,
+    LandingTarget, LandingUpdate, PendingExecution, PoolBinding, PoolKey, PoolKind,
+    RenderSetupReuseCounts, SequenceTail, SpirvFeaturePolicy, TranslatedComputePipeline,
+    VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -1011,6 +1011,14 @@ impl VulkanComputeProvider {
             ));
         }
         registrations.remove(&metadata.pipeline_id);
+        // The released registration is part of the contract surface the
+        // shape-decided render objects were built from: a pass that drew
+        // through a retired pipeline registration must not be served by an
+        // entry minted while it was live, so the whole table goes and the next
+        // pass of any shape rebuilds exactly as it did before the cache
+        // existed (`crate::render_setup_reuse`).
+        drop(registrations);
+        self.invalidate_render_setup_reuse();
         Ok(())
     }
 
@@ -2482,6 +2490,52 @@ impl VulkanComputeProvider {
         self.lock_executor()
             .expect("executor lock poisoned")
             .present_counts()
+    }
+
+    /// What the shape-decided render-object reuse has seen
+    /// (`crate::render_setup_reuse`): how many offscreen passes were served
+    /// from the cache, how many built their objects, how many digest
+    /// collisions the full comparison refused, how many passes could state no
+    /// key at all, and how many entries the cap and a released registration
+    /// destroyed.
+    #[doc(hidden)]
+    pub fn render_setup_reuse_counts(&self) -> RenderSetupReuseCounts {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .render_setup_reuse_counts()
+    }
+
+    /// Whether the shape-decided render-object reuse is on for this provider:
+    /// the environment's answer unless a caller stated its own.
+    #[doc(hidden)]
+    pub fn render_setup_reuse_enabled(&self) -> bool {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .render_setup_reuse_enabled()
+    }
+
+    /// Turn the shape-decided render-object reuse on or off for this provider.
+    ///
+    /// The process environment states the default
+    /// (`METAL_API_VULKAN_RENDER_SETUP_CACHE=0` turns it off); this is what a
+    /// test's own arms and a build without the environment state, so both arms
+    /// of a comparison can run against one device in one process. Switching it
+    /// off destroys what it held.
+    #[doc(hidden)]
+    pub fn set_render_setup_reuse(&self, enabled: bool) {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .set_render_setup_reuse(enabled);
+    }
+
+    /// Drop every reusable shape. Called when the contract surface they were
+    /// built from moves under them; the next pass of each shape then builds its
+    /// own objects, exactly as it did before the cache existed.
+    #[doc(hidden)]
+    pub fn invalidate_render_setup_reuse(&self) {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .clear_render_setup_reuse();
     }
 
     fn retire(&self, pending: PendingExecution) {

@@ -8665,6 +8665,10 @@ fn execute_offscreen_render_with_retains(
             // own bookkeeping, in a state a later `LoadOp::Resident` may read
             // (`research/docs/23` §76, R7).
             resident_layouts.publish(true);
+            // The pipeline-shaped objects have retired with the fence, so they
+            // go back to the shape cache before anything else in this pass
+            // reads the frame (`crate::render_setup_reuse`).
+            objects.release_reusable();
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -9373,6 +9377,10 @@ pub(crate) fn execute_present_render<'a>(
             if let Some(retains) = retains.as_mut() {
                 retains.retire();
             }
+            // The present pass's own pipeline objects have retired with the
+            // fence; the shape cache takes them back for the next pass of the
+            // same shape (`crate::render_setup_reuse`).
+            objects.release_reusable();
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -9568,6 +9576,21 @@ struct OffscreenObjects<'a> {
     /// The caller-held index buffer, when the draw is indexed.
     input_index_buffer: vk::Buffer,
     input_index_memory: vk::DeviceMemory,
+    /// The render pass's own descriptions (`crate::render_setup_reuse`), read
+    /// back from the structures handed to `vkCreateRenderPass2`. `None` until
+    /// the render pass exists, and the definition the shape key carries.
+    render_pass_def: Option<crate::render_setup_reuse::RenderPassDef>,
+    /// Every descriptor-set layout this pass created, by the handle it was
+    /// created under: the definition a layout's contents are compared with.
+    layout_defs: Vec<(
+        vk::DescriptorSetLayout,
+        crate::render_setup_reuse::LayoutDef,
+    )>,
+    /// The shape key whose objects this pass holds: the render-setup reuse
+    /// entry taken out of the cache, or the one its own objects will be put
+    /// back under once the pass has retired. `None` for a pass that could not
+    /// state an exact key, or that runs with the mechanism switched off.
+    reusable: Option<crate::render_setup_reuse::PassKey>,
     /// How the draw issues: the milestone triangle, a vertex-buffer draw or an
     /// indexed one. An indirect replay replaces it.
     draw: DrawShape,
@@ -9983,6 +10006,9 @@ impl<'a> OffscreenObjects<'a> {
             index_buffer: vk::Buffer::null(),
             index_memory: vk::DeviceMemory::null(),
             vertex_inputs: Vec::new(),
+            render_pass_def: None,
+            layout_defs: Vec::new(),
+            reusable: None,
             input_index_buffer: vk::Buffer::null(),
             input_index_memory: vk::DeviceMemory::null(),
             draw: DrawShape::Milestone,
@@ -11304,6 +11330,28 @@ impl<'a> OffscreenObjects<'a> {
                 .stencil_resolve_mode(stencil_resolve_mode(stencil_filter))
                 .depth_stencil_resolve_attachment(stencil_resolve_ref);
         }
+        // The chain is read here, before the subpass takes its own mutable
+        // borrow of it, so the shape key carries the resolve the render pass is
+        // built with (`crate::render_setup_reuse`).
+        let resolve_def = (depth_resolve.is_some() || stencil_resolve.is_some()).then(|| {
+            crate::render_setup_reuse::RenderPassDef::resolve_def(
+                depth_stencil_resolve.depth_resolve_mode.as_raw() as i32,
+                depth_stencil_resolve.stencil_resolve_mode.as_raw() as i32,
+                depth_stencil_resolve
+                    .p_depth_stencil_resolve_attachment
+                    .is_null()
+                    .then_some(())
+                    .map_or_else(
+                        || {
+                            let reference = unsafe {
+                                &*depth_stencil_resolve.p_depth_stencil_resolve_attachment
+                            };
+                            Some((reference.attachment, reference.layout.as_raw()))
+                        },
+                        |_| None,
+                    ),
+            )
+        });
         let mut subpass = vk::SubpassDescription2::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs);
@@ -11421,6 +11469,20 @@ impl<'a> OffscreenObjects<'a> {
             .attachments(&attachments)
             .subpasses(&subpasses)
             .dependencies(&dependencies);
+        // The shape key's render-pass half (`crate::render_setup_reuse`): read
+        // back from the descriptions that are about to go to the driver, so
+        // the definition the cache compares is the one the device is handed
+        // rather than a second derivation of it.
+        self.render_pass_def = Some(crate::render_setup_reuse::RenderPassDef::of(
+            &attachments,
+            &color_refs,
+            resolve_refs.as_deref(),
+            depth_ref.as_ref(),
+            resolve_def,
+            &dependencies,
+            vk::PipelineBindPoint::GRAPHICS,
+            subpasses[0].view_mask,
+        ));
         self.render_pass = unsafe { self.context.device.create_render_pass2(&info, None) }
             .map_err(|error| execution_refusal("create render pass", &error.to_string()))?;
         Ok(())
@@ -11847,6 +11909,7 @@ impl<'a> OffscreenObjects<'a> {
             )
         }
         .map_err(|error| execution_refusal("create descriptor set layout", &error.to_string()))?;
+        self.record_layout_def(self.descriptor_set_layout, &bindings);
         let mut pool_sizes = vec![vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(combined_count)];
@@ -12373,6 +12436,7 @@ impl<'a> OffscreenObjects<'a> {
                     &error.to_string(),
                 )
             })?;
+            self.record_layout_def(layout, &[]);
             self.stage_buffer_gap_layouts.push(layout);
             self.stage_buffer_layout_slots.push(layout);
         }
@@ -12389,7 +12453,7 @@ impl<'a> OffscreenObjects<'a> {
     /// and its objects are the ones the pass binds through
     /// [`StageBufferDescriptorSet`].
     fn create_stage_descriptor_set(
-        &self,
+        &mut self,
         set: u32,
         streams: &[&StageBufferStream<'_>],
     ) -> Result<
@@ -12422,6 +12486,7 @@ impl<'a> OffscreenObjects<'a> {
                 &error.to_string(),
             )
         })?;
+        self.record_layout_def(layout, &bindings);
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(bindings.len() as u32)];
@@ -12489,7 +12554,7 @@ impl<'a> OffscreenObjects<'a> {
     /// is the arm a module outside that layout lands in, and building it would
     /// leave one of the two writes landing under the other's declaration.
     fn create_merged_set_zero(
-        &self,
+        &mut self,
         streams: &[&StageBufferStream<'_>],
     ) -> Result<
         (
@@ -12573,6 +12638,7 @@ impl<'a> OffscreenObjects<'a> {
                 &error.to_string(),
             )
         })?;
+        self.record_layout_def(layout, &bindings);
         let pool = unsafe {
             self.context.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -12627,6 +12693,120 @@ impl<'a> OffscreenObjects<'a> {
     /// §3.2), and the sampled pipeline's one extra input is the descriptor set
     /// layout `create_render_textures` installed (`research/docs/23` §3.3,
     /// v70).
+    ///
+    /// The pipeline is built from the pass's *shape*, so a pass whose shape a
+    /// previous pass already built takes that pass's objects instead
+    /// (`crate::render_setup_reuse`): the shape key below is read back from the
+    /// very structures the miss path hands the driver, and a resident entry is
+    /// handed back only when every field of those structures agrees. The
+    /// content-dependent half of the pass — its images, buffers, descriptor
+    /// sets, render pass, framebuffers and command pool — is created either
+    /// way; nothing about what the pass draws changes.
+    fn record_layout_def(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        bindings: &[vk::DescriptorSetLayoutBinding<'_>],
+    ) {
+        self.layout_defs
+            .push((layout, crate::render_setup_reuse::LayoutDef::of(bindings)));
+    }
+
+    /// The definition this pass recorded for one of its descriptor-set
+    /// layouts, or `None` for a handle it did not create (`create_pipeline`
+    /// refuses to key such a pass: an unknown layout's contents cannot be
+    /// compared, and the key is only allowed to lie about nothing).
+    fn layout_def(
+        &self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Option<&crate::render_setup_reuse::LayoutDef> {
+        self.layout_defs
+            .iter()
+            .find(|(handle, _)| *handle == layout)
+            .map(|(_, def)| def)
+    }
+
+    /// The shape key of the pipeline this pass is about to build, or `None`
+    /// when some part of the shape is not in hand (no render pass definition,
+    /// or a descriptor-set layout this pass did not record): a pass without an
+    /// exact key is built and not cached, which is the fail-closed direction.
+    #[allow(clippy::too_many_arguments)]
+    fn reuse_key(
+        &self,
+        vertex_words: &[u32],
+        fragment_words: &[u32],
+        vertex_entry: &CStr,
+        fragment_entry: &CStr,
+        specialization: Option<[u32; 4]>,
+        binding_descriptions: &[vk::VertexInputBindingDescription],
+        attribute_descriptions: &[vk::VertexInputAttributeDescription],
+        vertex_input: &vk::PipelineVertexInputStateCreateInfo<'_>,
+        input_assembly: &vk::PipelineInputAssemblyStateCreateInfo<'_>,
+        viewport_state: &vk::PipelineViewportStateCreateInfo<'_>,
+        rasterization: &vk::PipelineRasterizationStateCreateInfo<'_>,
+        multisample: &vk::PipelineMultisampleStateCreateInfo<'_>,
+        blend: &vk::PipelineColorBlendStateCreateInfo<'_>,
+        blend_attachments: &[vk::PipelineColorBlendAttachmentState],
+        dynamic_states: &[vk::DynamicState],
+        depth_state: Option<&vk::PipelineDepthStencilStateCreateInfo<'_>>,
+        descriptor_set_layouts: &[vk::DescriptorSetLayout],
+    ) -> Option<crate::render_setup_reuse::PassKey> {
+        let render_pass = self.render_pass_def.as_ref()?;
+        let mut set_layouts = Vec::with_capacity(descriptor_set_layouts.len());
+        for layout in descriptor_set_layouts {
+            set_layouts.push(self.layout_def(*layout)?.clone());
+        }
+        let states = crate::render_setup_reuse::PipelineStates {
+            vertex_bindings: binding_descriptions,
+            vertex_attributes: attribute_descriptions,
+            vertex_input,
+            input_assembly,
+            viewport: viewport_state,
+            rasterization,
+            multisample,
+            color_blend: blend,
+            color_blend_attachments: blend_attachments,
+            dynamic_states,
+        };
+        let plan = crate::render_setup_reuse::PipelinePlan::of(
+            vertex_words,
+            fragment_words,
+            vertex_entry,
+            fragment_entry,
+            specialization,
+            // The rail records one subpass and always creates the pipeline for
+            // it (`GraphicsPipelineCreateInfo::subpass` stays at its default).
+            0,
+            &states,
+            depth_state.map(crate::render_setup_reuse::DepthStencilState::of),
+            render_pass,
+            &set_layouts,
+        );
+        Some(crate::render_setup_reuse::PassKey::of(plan))
+    }
+
+    /// Hand the pipeline-shaped objects back to the cache once this pass's work
+    /// has retired on the device.
+    ///
+    /// Called after the fence, so no command buffer is still reading them; the
+    /// pass's own teardown then has nothing to destroy for these fields. A pass
+    /// that never stated a key (or ran with the mechanism off) keeps its
+    /// objects and drops them as it always did.
+    fn release_reusable(&mut self) {
+        let Some(key) = self.reusable.take() else {
+            return;
+        };
+        let objects = crate::render_setup_reuse::ReusablePass {
+            vertex_module: std::mem::replace(&mut self.vertex_module, vk::ShaderModule::null()),
+            fragment_module: std::mem::replace(&mut self.fragment_module, vk::ShaderModule::null()),
+            pipeline_layout: std::mem::replace(
+                &mut self.pipeline_layout,
+                vk::PipelineLayout::null(),
+            ),
+            pipeline: std::mem::replace(&mut self.pipeline, vk::Pipeline::null()),
+        };
+        self.context.lock_render_setup_reuse().insert(key, objects);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_pipeline(
         &mut self,
@@ -12640,21 +12820,6 @@ impl<'a> OffscreenObjects<'a> {
         cull: Option<RenderPassCull>,
         blend: Option<&RenderPassBlend>,
     ) -> Result<(), ProviderError> {
-        self.vertex_module = unsafe {
-            self.context.device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(vertex_words),
-                None,
-            )
-        }
-        .map_err(|error| execution_refusal("create vertex shader module", &error.to_string()))?;
-        self.fragment_module = unsafe {
-            self.context.device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(fragment_words),
-                None,
-            )
-        }
-        .map_err(|error| execution_refusal("create fragment shader module", &error.to_string()))?;
-
         // The gathered sibling's four extents (`research/docs/23` §111, E-TX12):
         // `source_width`, `source_height`, `destination_width` and
         // `destination_height`, in the `SpecId` order the module declares them.
@@ -12701,19 +12866,6 @@ impl<'a> OffscreenObjects<'a> {
             ),
             _ => None,
         };
-        let mut stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(self.vertex_module)
-                .name(vertex_entry),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.fragment_module)
-                .name(fragment_entry),
-        ];
-        if let Some(info) = &gathered_info {
-            stages[1] = stages[1].specialization_info(info);
-        }
         // The vertex input state is derived from the pipeline's own layout, so
         // the state the pipeline is built with and the buffers `record` binds
         // come from one description (`research/docs/23` §3.3). A `vertex_id`
@@ -12872,15 +13024,6 @@ impl<'a> OffscreenObjects<'a> {
                 None => descriptor_set_layouts.push(self.descriptor_set_layout),
             }
         }
-        let pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
-        self.pipeline_layout = unsafe {
-            self.context
-                .device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-        }
-        .map_err(|error| execution_refusal("create pipeline layout", &error.to_string()))?;
-
         // The depth state is built only when the pass carries a depth
         // attachment: Vulkan refuses a depth-stencil state on a subpass with no
         // depth reference, and a pre-v36 pass has none
@@ -12922,6 +13065,83 @@ impl<'a> OffscreenObjects<'a> {
             }
             state
         });
+
+        // The shape key, and the reuse it buys (`crate::render_setup_reuse`):
+        // every field below was just read back from the structures that would
+        // go to the driver, so a resident entry is handed back only when the
+        // driver would be told exactly the same thing twice.
+        let key = self.reuse_key(
+            vertex_words,
+            fragment_words,
+            vertex_entry,
+            fragment_entry,
+            gathered_constants,
+            &binding_descriptions,
+            &attribute_descriptions,
+            &vertex_input,
+            &input_assembly,
+            &viewport_state,
+            &rasterization,
+            &multisample,
+            &blend,
+            &blend_attachments,
+            &dynamic_states,
+            depth_state.as_ref(),
+            &descriptor_set_layouts,
+        );
+        if let Some(key) = &key {
+            let lookup = self.context.lock_render_setup_reuse().lookup(key);
+            crate::phase_profile::note_reuse(lookup.outcome());
+            if let Some(objects) = lookup.take() {
+                // The objects are the shape's own: the pass records with them
+                // and hands them back once its work has retired.
+                self.vertex_module = objects.vertex_module;
+                self.fragment_module = objects.fragment_module;
+                self.pipeline_layout = objects.pipeline_layout;
+                self.pipeline = objects.pipeline;
+                self.reusable = Some(key.clone());
+                return Ok(());
+            }
+        } else {
+            self.context.lock_render_setup_reuse().note_unkeyed();
+            crate::phase_profile::note_reuse(crate::render_setup_reuse::Outcome::Unkeyed);
+        }
+
+        self.vertex_module = unsafe {
+            self.context.device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(vertex_words),
+                None,
+            )
+        }
+        .map_err(|error| execution_refusal("create vertex shader module", &error.to_string()))?;
+        self.fragment_module = unsafe {
+            self.context.device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(fragment_words),
+                None,
+            )
+        }
+        .map_err(|error| execution_refusal("create fragment shader module", &error.to_string()))?;
+        let mut stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.vertex_module)
+                .name(vertex_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(self.fragment_module)
+                .name(fragment_entry),
+        ];
+        if let Some(info) = &gathered_info {
+            stages[1] = stages[1].specialization_info(info);
+        }
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
+        self.pipeline_layout = unsafe {
+            self.context
+                .device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+        }
+        .map_err(|error| execution_refusal("create pipeline layout", &error.to_string()))?;
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
@@ -12951,6 +13171,9 @@ impl<'a> OffscreenObjects<'a> {
         self.pipeline = pipelines.into_iter().next().ok_or_else(|| {
             execution_refusal("create graphics pipeline", "driver returned no pipeline")
         })?;
+        // The pass's own objects are the ones a later pass of the same shape
+        // will be handed; they go back to the cache once this pass retires.
+        self.reusable = key;
         Ok(())
     }
 

@@ -35,7 +35,8 @@
 //!   setup_admits_us=... setup_attachments_us=... setup_depth_stencil_us=...
 //!   setup_render_pass_us=... setup_textures_us=... setup_stage_buffers_us=...
 //!   setup_pipeline_us=... setup_readbacks_us=... setup_inputs_us=...
-//!   setup_command_pool_us=...
+//!   setup_command_pool_us=... reuse_hit_n=... reuse_miss_n=...
+//!   reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=...
 //!   ```
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
@@ -320,6 +321,33 @@ pub(crate) fn note_readback(region: ReadbackRegion) {
     LOCAL.with(|local| local.borrow_mut().readback.note(region));
 }
 
+/// Count one offscreen pass's use of the shape-decided render objects
+/// (`crate::render_setup_reuse`) for the emitting thread's window.
+///
+/// The five outcomes partition every pass that reaches the mechanism: it was
+/// served from the cache, it built its objects and cached them, a digest
+/// collision was refused by the comparison, it could not state a key at all,
+/// or the switch was off. A round that reads `reuse_hit_n=0` can tell which of
+/// the other four it is looking at, which is the whole reason they are counted
+/// apart rather than as one "not a hit".
+#[inline]
+pub(crate) fn note_reuse(outcome: crate::render_setup_reuse::Outcome) {
+    if !enabled() {
+        return;
+    }
+    use crate::render_setup_reuse::Outcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            Outcome::Hit => local.reuse_hit_n += 1,
+            Outcome::Miss => local.reuse_miss_n += 1,
+            Outcome::Mismatch => local.reuse_mismatch_n += 1,
+            Outcome::Unkeyed => local.reuse_unkeyed_n += 1,
+            Outcome::Disabled => local.reuse_disabled_n += 1,
+        }
+    });
+}
+
 /// One thread's window of the profile.
 #[derive(Default)]
 struct Local {
@@ -337,6 +365,12 @@ struct Local {
     window: u64,
     /// The stored attachments this window's submissions read back, by region.
     readback: ReadbackCounts,
+    /// The offscreen passes this window's submissions ran, by reuse outcome.
+    reuse_hit_n: u64,
+    reuse_miss_n: u64,
+    reuse_mismatch_n: u64,
+    reuse_unkeyed_n: u64,
+    reuse_disabled_n: u64,
 }
 
 impl Local {
@@ -412,6 +446,11 @@ impl Local {
         }
         let skipped = std::mem::take(&mut self.fence_skipped_calls);
         let readback = std::mem::take(&mut self.readback);
+        let reuse_hit_n = std::mem::take(&mut self.reuse_hit_n);
+        let reuse_miss_n = std::mem::take(&mut self.reuse_miss_n);
+        let reuse_mismatch_n = std::mem::take(&mut self.reuse_mismatch_n);
+        let reuse_unkeyed_n = std::mem::take(&mut self.reuse_unkeyed_n);
+        let reuse_disabled_n = std::mem::take(&mut self.reuse_disabled_n);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
@@ -420,7 +459,10 @@ impl Local {
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
-             readback_shape_n={} readback_bounds_n={} readback_whole_n={}",
+             readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
+             reuse_hit_n={reuse_hit_n} reuse_miss_n={reuse_miss_n} \
+             reuse_mismatch_n={reuse_mismatch_n} reuse_unkeyed_n={reuse_unkeyed_n} \
+             reuse_disabled_n={reuse_disabled_n}",
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,

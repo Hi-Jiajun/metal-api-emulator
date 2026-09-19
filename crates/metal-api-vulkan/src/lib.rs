@@ -39,6 +39,7 @@ mod phase_profile;
 mod provider;
 mod readback_rect;
 mod render;
+mod render_setup_reuse;
 
 pub use compute_provider::{
     CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
@@ -47,6 +48,7 @@ pub use compute_provider::{
 };
 pub use render::RenderStage;
 pub use render::STAGE_BUFFER_NAMESPACE_SET;
+pub use render_setup_reuse::RenderSetupReuseCounts;
 
 /// The canonical descriptor layout for a folded pair of render stages
 /// (`research/docs/23` §3.3, E-TX9).
@@ -651,6 +653,33 @@ impl VulkanExecutor {
         self.context.readback_regions()
     }
 
+    /// What the shape-decided render-object reuse has seen
+    /// (`crate::render_setup_reuse`).
+    #[doc(hidden)]
+    pub fn render_setup_reuse_counts(&self) -> RenderSetupReuseCounts {
+        self.context.render_setup_reuse_counts()
+    }
+
+    /// Whether the shape-decided render-object reuse is on for this executor.
+    #[doc(hidden)]
+    pub fn render_setup_reuse_enabled(&self) -> bool {
+        self.context.render_setup_reuse_enabled()
+    }
+
+    /// Turn the shape-decided render-object reuse on or off, dropping what it
+    /// held when it goes off.
+    #[doc(hidden)]
+    pub fn set_render_setup_reuse(&self, enabled: bool) {
+        self.context.set_render_setup_reuse(enabled);
+    }
+
+    /// Drop every reusable shape: the contract surface they were built from
+    /// moved.
+    #[doc(hidden)]
+    pub fn clear_render_setup_reuse(&self) {
+        self.context.clear_render_setup_reuse();
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1222,6 +1251,12 @@ pub(crate) struct VulkanContext {
     /// action, so a case with one present reports `1/1`.
     present_acquires: AtomicUsize,
     present_presents: AtomicUsize,
+    /// The shape-decided render objects one offscreen pass may hand the next
+    /// pass of the same shape (`crate::render_setup_reuse`): the shader
+    /// modules, the pipeline layout and the graphics pipeline. On by default,
+    /// off with `METAL_API_VULKAN_RENDER_SETUP_CACHE=0`, and empty for a pass
+    /// whose key cannot be stated exactly.
+    render_setup_reuse: Mutex<render_setup_reuse::RenderSetupReuse>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -1430,6 +1465,9 @@ impl VulkanContext {
         )
         .then(|| device_fault::Device::new(&instance, &device));
 
+        // The shape-decided render objects start empty and read their own
+        // switch. Built before the literal because `device` moves into it.
+        let render_setup_reuse = render_setup_reuse::RenderSetupReuse::new(device.clone());
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
@@ -1459,6 +1497,7 @@ impl VulkanContext {
             readback_whole: AtomicUsize::new(0),
             present_acquires: AtomicUsize::new(0),
             present_presents: AtomicUsize::new(0),
+            render_setup_reuse: Mutex::new(render_setup_reuse),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -1491,6 +1530,38 @@ impl VulkanContext {
         self.lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The shape-decided render objects this device keeps
+    /// (`crate::render_setup_reuse`). A poisoned lock is recovered rather than
+    /// propagated: the cache's own state is a list of device handles, and a
+    /// panic elsewhere must not turn a reusable shape into a refusal.
+    fn lock_render_setup_reuse(&self) -> MutexGuard<'_, render_setup_reuse::RenderSetupReuse> {
+        self.render_setup_reuse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The render-setup reuse counters one reading reports.
+    pub(crate) fn render_setup_reuse_counts(&self) -> render_setup_reuse::RenderSetupReuseCounts {
+        self.lock_render_setup_reuse().counts()
+    }
+
+    /// Whether the render-setup reuse is on for this device.
+    pub(crate) fn render_setup_reuse_enabled(&self) -> bool {
+        self.lock_render_setup_reuse().enabled()
+    }
+
+    /// Turn the render-setup reuse on or off, and drop what it holds when it
+    /// goes off. The environment variable is what a round states; this is what
+    /// an e2e arm and the provider's own test surface state.
+    pub(crate) fn set_render_setup_reuse(&self, enabled: bool) {
+        self.lock_render_setup_reuse().set_enabled(enabled);
+    }
+
+    /// Drop every entry: the contract surface they were built from moved.
+    pub(crate) fn clear_render_setup_reuse(&self) {
+        self.lock_render_setup_reuse().clear();
     }
 
     /// The selected device's own limits, for the render rail's attachment
