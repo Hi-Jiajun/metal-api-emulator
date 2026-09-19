@@ -136,6 +136,15 @@ MAX_READBACK_WINDOW_DIMENSION = 64
 # sampling rule's own fill (zero, and one for alpha), so its expectation is a
 # derivation rather than a copy. The rule form stays the same four-component
 # pair's, because its closed-form expectation is stated over one layout.
+#
+# The rails' window also carries the eight-byte `rgba16_float` lane
+# (2026-09-19, census v44's `texture_bind` bucket). It is deliberately *not* in
+# this fixture table: its texels are four half floats, and the comparator's
+# expectation is the attachment's own 8-bit spelling — turning a half-float
+# sample into those bytes is a quantisation rule this file does not state, so a
+# suite that named the lane is refused here instead of validated against a
+# rule nobody wrote. The rail's own reading of the lane lives in
+# `crates/metal-api-vulkan/tests/render_rgba16f_texture_e2e.rs`.
 SAMPLED_TEXTURE_FORMATS = ("rgba8_unorm", "bgra8_unorm", "r8_unorm", "rg8_unorm")
 # The colour attachment's admitted layouts: the sampled shape renders into the
 # eight-bit four-component surface both rails read back, which is what the
@@ -2855,10 +2864,11 @@ def _render_plan(plan, suite):
                          "the attachment's")
             texture_format = _string(texture.get("format"), f"{texture_where}.format")
             _require(texture_format in SAMPLED_TEXTURE_FORMATS,
-                     f"{texture_where}: the reviewed sampling stage reads one 8-bit "
+                     f"{texture_where}: the reviewed sampling fixtures read one 8-bit "
                      "unorm surface, in either four-component byte order "
                      "(rgba8_unorm/bgra8_unorm) or in the narrow r8_unorm/rg8_unorm "
-                     "lanes")
+                     "lanes — the eight-byte rgba16_float lane the rails execute has "
+                     "no comparator expectation rule")
             attachment_format = _string(attachment.get("format"),
                                         f"{where}.attachment.format")
             _require(attachment_format in COLOUR_ATTACHMENT_FORMATS,

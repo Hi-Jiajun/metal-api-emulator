@@ -258,11 +258,13 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // `sampled_texel_4x4` case on Lavapipe and on the RTX 5060 (the
         // attachment reads back the uploaded texels exactly), and the rail's
         // own `render_e2e` sampling test. The bits name the reviewed window —
-        // the two 8-bit four-component UNORM byte orders
-        // (`TextureFormat::RENDER_SAMPLED`, `research/docs/23` §107: the
-        // census's BGRA8 guest views are the same texel in the other byte
-        // order, and which byte holds which channel is the `VkFormat`'s own
-        // fact, not the module's) and one texture of the render area's own
+        // the `TextureFormat::RENDER_SAMPLED` lanes themselves
+        // (`research/docs/23` §107/§113: the census's BGRA8 guest views are the
+        // same texel in the other byte order, the narrow lanes fill the
+        // channels their format lacks, and the eight-byte half-float lane is
+        // the format the census's remaining binds name, so which byte holds
+        // which channel — or how many bytes a texel is — stays the `VkFormat`'s
+        // own fact, not the module's) and one texture of the render area's own
         // extent — so a wider request is refused by core admission or by the
         // rail's shape gates rather than silently narrowed. The binding count
         // is the contract's own ceiling (`research/docs/23` §3.3, v102): a
@@ -1088,6 +1090,12 @@ mod tests {
         assert_eq!(
             capabilities.supported_render_texture_formats,
             TextureFormat::RENDER_SAMPLED.to_vec()
+        );
+        assert!(
+            capabilities
+                .supported_render_texture_formats
+                .contains(&TextureFormat::Rgba16Float),
+            "the eight-byte half-float lane is part of the window this frame states"
         );
         assert!(capabilities.supports_render_texture_gathered_extent);
         assert!(capabilities.declares_render_texture_gathered_extent_support());

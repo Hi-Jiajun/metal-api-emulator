@@ -641,11 +641,16 @@ pub enum TextureFormat {
     /// The first eight-byte texel the texture list admits
     /// (`research/docs/23` §78): the format table states it so
     /// [`AttachmentFormat::as_texture_format`] stays total and a
-    /// `rgba16_float` attachment can be declared as its own texture view, not
-    /// so the reviewed sampling rail samples it. The render sampler's own
-    /// window is [`TextureFormat::RENDER_SAMPLED`] — the two four-byte 8-bit
-    /// UNORM byte orders — so an unsampled `rgba16_float` binding is refused by
-    /// name rather than sampled with a module no review covered.
+    /// `rgba16_float` attachment can be declared as its own texture view, and
+    /// the render sampler's window admits it too (`research/docs/23` §107,
+    /// census v44's `texture_bind` bucket): the census's 285 records bind a
+    /// `256x1` `R16G16B16A16_SFLOAT` guest view whose every other axis is
+    /// inside the window — one single-sample, non-arrayed, read-only 2D
+    /// surface — so the sampler reads the halves as the four float components
+    /// the format's own name states rather than refusing the width by name.
+    /// A sample of this lane carries the format's extended range: the value a
+    /// fragment stores into an 8-bit attachment is the attachment's own
+    /// float-to-unorm conversion, which is what the lane's fixture pins.
     Rgba16Float,
     /// `VK_FORMAT_R8_UNORM` / `MTLPixelFormat::R8Unorm`.
     ///
@@ -676,7 +681,8 @@ impl TextureFormat {
     /// The formats the render sampler admits as a sampled texture source
     /// (`research/docs/23` §3.3, §107, §113), in the canonical order the rails'
     /// capability lists name them: the two four-byte 8-bit UNORM byte orders,
-    /// then the two narrow-channel formats.
+    /// then the two narrow-channel formats, then the eight-byte half-float
+    /// lane.
     ///
     /// The first two name one texel the fragment stage reads as four normalised
     /// components; which byte holds which channel is the *format's* fact, not
@@ -691,15 +697,25 @@ impl TextureFormat {
     /// `r8_unorm` reads `(r, 0, 0, 1)` and `rg8_unorm` reads `(r, g, 0, 1)`
     /// (`research/docs/23` §113). They join this list because it answers "which
     /// formats may a render pass sample", which is a different question from
-    /// "which formats share the four-component layout". The native rail's
-    /// reviewed table stays narrower because its Apple-side reading is the
-    /// increment that would widen it (`metal-api-native/src/render.rs`,
-    /// `SUPPORTED_RENDER_TEXTURE_FORMATS`).
-    pub const RENDER_SAMPLED: [Self; 4] = [
+    /// "which formats share the four-component layout".
+    ///
+    /// The eight-byte lane is the width the last widening opened
+    /// (`research/docs/23` §107, census v44's `texture_bind` bucket): an
+    /// `rgba16_float` texel is **four half components** rather than a byte
+    /// order of four 8-bit ones, so it is a *format* the sampler reads and not
+    /// another spelling of the 8-bit window. It is appended rather than
+    /// inserted, exactly as the wire codes are, so the four lanes before it
+    /// keep their order in every capability list.
+    ///
+    /// The native rail's reviewed table stays narrower because its Apple-side
+    /// reading is the increment that would widen it
+    /// (`metal-api-native/src/render.rs`, `SUPPORTED_RENDER_TEXTURE_FORMATS`).
+    pub const RENDER_SAMPLED: [Self; 5] = [
         Self::Rgba8Unorm,
         Self::Bgra8Unorm,
         Self::R8Unorm,
         Self::R8G8Unorm,
+        Self::Rgba16Float,
     ];
 
     /// Tightly packed bytes one texel occupies in this format. Sampling and
@@ -9907,14 +9923,16 @@ pub struct ProviderCapabilities {
     /// Texture formats this snapshot admits as render-pass sampling sources.
     /// Empty means none; the render sampler admits
     /// [`TextureFormat::RENDER_SAMPLED`] — the two four-byte 8-bit UNORM byte
-    /// orders and, since the narrow lanes landed, the one- and two-byte
-    /// formats (`research/docs/23` §107/§113) — and a snapshot that executes
-    /// fewer than all of them names only those. The list answers which formats
-    /// a pass may *sample*; the narrow members carry no four-component layout,
-    /// so their samples fill the channels the format lacks by the API's own
-    /// rule rather than by a byte order. Compared by value rather than by wire
-    /// code so the contract's own enum is the single vocabulary, exactly as
-    /// [`Self::supported_color_formats`] is.
+    /// orders, the one- and two-byte narrow formats, and the eight-byte
+    /// half-float lane (`research/docs/23` §107/§113) — and a snapshot that
+    /// executes fewer than all of them names only those. The list answers
+    /// which formats a pass may *sample*; the narrow members carry no
+    /// four-component layout, so their samples fill the channels the format
+    /// lacks by the API's own rule rather than by a byte order, while the
+    /// eight-byte member carries four half-float components of its own.
+    /// Compared by value rather than by wire code so the contract's own enum
+    /// is the single vocabulary, exactly as [`Self::supported_color_formats`]
+    /// is.
     pub supported_render_texture_formats: Vec<TextureFormat>,
     /// Whether this snapshot executes the *gathered* render-sampler shape: one
     /// render pass whose sampled texture has an extent other than the render
@@ -23868,6 +23886,45 @@ mod tests {
             .admit(&narrow, &landing_resources())
             .expect("a snapshot that names the narrow lanes admits the R8 bind");
 
+        // The eight-byte lane (2026-09-19, census v44's `texture_bind`
+        // bucket): the same three bits' question once the snapshot names
+        // `rgba16_float`. The pass's view and the pipeline's declaration agree
+        // on `Rgba16Float` here, so the snapshot's own format list is again
+        // what decides — the pre-increment window refuses the pair by name and
+        // the widened one admits it.
+        let mut wide = render_texture_trace();
+        render_entry(&mut wide).textures[0].format = TextureFormat::Rgba16Float;
+        wide.pipelines[0].render.as_mut().unwrap().textures[0].format = TextureFormat::Rgba16Float;
+        // Eight bytes per texel (`research/docs/23` §107): the source a wide
+        // view states is its own eight-byte extent, which is exactly the
+        // reading `bytes_per_texel` decides the length against.
+        match &mut render_entry(&mut wide).textures[0].source {
+            TextureSource::OwnedBytes(bytes) => bytes.resize(128, 0),
+            other => panic!("the fixture's source is its own bytes, not {other:?}"),
+        }
+        wide.validate()
+            .expect("the RGBA16F pair is structurally valid");
+        let mut four_lane_window = render_texture_capabilities();
+        four_lane_window.supported_render_texture_formats = vec![
+            TextureFormat::Rgba8Unorm,
+            TextureFormat::Bgra8Unorm,
+            TextureFormat::R8Unorm,
+            TextureFormat::R8G8Unorm,
+        ];
+        let refusal = four_lane_window
+            .admit(&wide, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("Rgba16Float".to_owned()))
+        );
+        let mut wide_window = render_texture_capabilities();
+        wide_window.supported_render_texture_formats = TextureFormat::RENDER_SAMPLED.to_vec();
+        wide_window
+            .admit(&wide, &landing_resources())
+            .expect("a snapshot that names the eight-byte lane admits the RGBA16F bind");
+
         // A pass that binds no texture never enters the walk, so every pre-v70
         // trace keeps the admission path it had.
         let plain = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
@@ -23941,6 +23998,7 @@ mod tests {
                 TextureFormat::Bgra8Unorm,
                 TextureFormat::R8Unorm,
                 TextureFormat::R8G8Unorm,
+                TextureFormat::Rgba16Float,
             ]
         );
         // A narrow format is a sampling source only: the colour-attachment
