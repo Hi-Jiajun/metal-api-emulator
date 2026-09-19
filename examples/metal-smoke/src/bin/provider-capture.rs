@@ -20,13 +20,13 @@ use metal_api_core::provider::{
     QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
     RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
     RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
-    SampleCount, SamplerPolicy, SemanticDigest, ShaderSource, StageBufferBinding, StageBufferView,
-    StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter,
-    StencilTest, StorageMode, StoreOp, TextureAccess, TextureBindingContract, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION,
-    RENDER_AFFINE_AXES,
+    SampleCount, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
+    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess,
+    TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_STAGE_BUFFER_INDEX,
+    PROVIDER_SCHEMA_VERSION, RENDER_AFFINE_AXES,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1822,11 +1822,36 @@ fn register_translated_stage_buffer_pipeline(
     // the module's reflection field by field, so a module that reads another
     // binding is refused rather than executed against the wrong bytes.
     let textures = if gathered || snapshot {
-        vec![TextureBindingContract::sampled(
-            0,
-            sampled_case_texture_format(case)?,
-            SamplerPolicy::reviewed_render_sampler(),
-        )]
+        let definition = case
+            .fragment_textures
+            .as_deref()
+            .and_then(|definitions| definitions.first())
+            .ok_or_else(|| format!("{where_}: the translated sampling arm declares one texture"))?;
+        // The state the declaration has to repeat is the *module's*, and the
+        // one case that carries a volume pins E's own `D3` fixture
+        // (`crates/metal-api-vulkan/tests/fixtures/render_sample_texture_3d_volume.frag.ll`),
+        // whose AIR static sampler is linear filtering with clamped addressing —
+        // the state that fixture's own end-to-end test pins as `MODULE_SAMPLER`.
+        // The registration compares the two field by field, so a volume case
+        // whose module carried another state is refused by name rather than
+        // executed with a substituted sampler.
+        let policy = if definition.texture_type()? == TextureType::D3 {
+            SamplerPolicy {
+                filter: SamplerFilter::Linear,
+                address: SamplerAddressMode::ClampToEdge,
+            }
+        } else {
+            SamplerPolicy::reviewed_render_sampler()
+        };
+        let mut sampled =
+            TextureBindingContract::sampled(0, sampled_case_texture_format(case)?, policy);
+        // The declaration restates the bind's own axis (2026-09-20, the `D3`
+        // sampled texture arm): the registration holds it to the module's
+        // reflection field by field, and a `texture3d<T, sample>` argument whose
+        // declaration said `D2` would bind a view the module's own `float3`
+        // sample coordinate is not written against.
+        sampled.texture_type = definition.texture_type()?;
+        vec![sampled]
     } else {
         Vec::new()
     };
@@ -4262,6 +4287,19 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // them), so this table pins the declaring pass, which every rail
         // executes.
         (1, "compute-buffer-v45") => &["render_declaring_copy_word"],
+        // The three-dimensional sampled volume (2026-09-20, the `D3` sampled
+        // texture arm): the plain copy kernel over the 4x4 attachment's own
+        // sixty-four-byte view — the same declaring pass v36's gathered-extent
+        // case pins, because the render case's pass clears that extent — beside
+        // the render case whose translated fragment module samples a
+        // `4 x 4 x 2` volume at four texel centres, two of them in its second
+        // slice. The render case runs on the two Vulkan rails (the two native
+        // faces refuse a `D3` declaration by name — the Apple oracle compiles a
+        // reviewed module selected by the colour format list's exact shape and
+        // has no arm for a volume — and the suite's marker keeps the case off
+        // them), so this table pins the declaring pass, which every rail
+        // executes.
+        (1, "compute-buffer-v46") => &["render_declaring_gathered_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4532,6 +4570,15 @@ struct FragmentTextureDefinition {
     format: String,
     width: u64,
     height: u64,
+    /// The third extent, absent (and `1`) for every surface and above one for a
+    /// **volume** (2026-09-20, the `D3` sampled texture arm). A definition that
+    /// states it declares `TextureType::D3`, carries `width x height x depth`
+    /// texels in slice order, and reaches the object rail through
+    /// `Device::new_volume_texture_with_bytes` rather than the two-dimensional
+    /// constructor — so the view the trace states, the bytes that travel with
+    /// it and the image the provider creates are one shape on all three rails.
+    #[serde(default)]
+    depth: Option<u64>,
     #[serde(default)]
     initial_hex: Option<String>,
     #[serde(default)]
@@ -4549,6 +4596,25 @@ struct FragmentTextureDefinition {
 }
 
 impl FragmentTextureDefinition {
+    /// The bind's third extent: the absent field and the explicit `1` are the
+    /// same two-dimensional arm, and anything above one is the volume the `D3`
+    /// widening admits (2026-09-20).
+    fn depth(&self) -> u64 {
+        self.depth.unwrap_or(1)
+    }
+
+    /// The view type this declaration states, read off the third extent rather
+    /// than from a second spelling of it: a bind with a third extent above one
+    /// is a `D3` view, and every other bind is the `D2` surface the reviewed
+    /// sampling fixtures have always stated.
+    fn texture_type(&self) -> Result<TextureType> {
+        match self.depth() {
+            0 => Err("fragment_textures[0]: a zero third extent".into()),
+            1 => Ok(TextureType::D2),
+            _ => Ok(TextureType::D3),
+        }
+    }
+
     /// The source arm this declaration states (`research/docs/23` §118,
     /// E-TX15). The spelling is closed: an unknown name is a refusal rather
     /// than a silent fall-through to the byte arm.
@@ -4600,12 +4666,21 @@ impl FragmentTextureDefinition {
                 let expected = self
                     .width
                     .checked_mul(self.height)
+                    .and_then(|texels| texels.checked_mul(self.depth()))
                     .and_then(|texels| texels.checked_mul(stride))
                     .ok_or("texture extent overflows")?;
                 if bytes.len() as u64 != expected {
                     return Err("the uploaded texels do not match the extent".into());
                 }
                 Ok(bytes)
+            }
+            // The rule form states one plane's texels as a function of the two
+            // in-plane coordinates (`research/docs/23` §73): a volume's third
+            // extent names a second plane, which no rule here addresses, so the
+            // two are refused together rather than silently reading the first
+            // slice's bytes as the whole volume (`D3`, 2026-09-20).
+            (None, Some(_)) if self.depth() != 1 => {
+                Err("a texel rule addresses one plane; a volume states its texels".into())
             }
             (None, Some(rule)) => rule_bytes(rule, self.width, self.height),
             (Some(_), Some(_)) => Err("a texture carries either initial_hex or texel_rule, \
@@ -6652,13 +6727,25 @@ fn reviewed_gathered_extent_geometry(case: &RenderCase, where_: &str) -> Result<
     if texture.width == 0 || texture.height == 0 {
         return Err(format!("{where_}.fragment_textures[0]: a zero extent").into());
     }
-    if texture.width == attachment.width && texture.height == attachment.height {
+    // The source's own third extent (2026-09-20, the `D3` sampled texture arm):
+    // a volume differs from the render area on the axis the attachment does not
+    // have at all — "the source is another extent" is a statement about the
+    // three axes, and a `4x4x2` volume beside a `4x4` attachment is exactly the
+    // shape the depth axis makes.
+    let texture_depth = texture.depth();
+    if texture.width == attachment.width
+        && texture.height == attachment.height
+        && texture_depth == 1
+    {
         return Err(format!(
             "{where_}.fragment_textures[0]: the gathered-extent arm's source has to differ from \
              the render area in at least one axis, or the case measures the same-extent window"
         )
         .into());
     }
+    // The volume's bytes are its slices (the extent rule above already weighed
+    // the three axes), so the distinctness scans below run over the whole
+    // volume's texels rather than one plane's.
     let texels = texture.texels()?;
     let unique = texels
         .chunks_exact(4)
@@ -11957,11 +12044,15 @@ fn run_render_case(
                         view_id: ViewId::new(definition.view),
                         metal_binding: u32::try_from(binding)?,
                         allocation_id: AllocationId::new(definition.allocation),
-                        texture_type: TextureType::D2,
+                        // The bind's own third extent (2026-09-20, the `D3`
+                        // sampled texture arm): a volume states `D3` and its
+                        // depth here, which is the pair the pass's declaration
+                        // and the provider's window are both read against.
+                        texture_type: definition.texture_type()?,
                         format: definition.format()?,
                         width: definition.width,
                         height: definition.height,
-                        depth: 1,
+                        depth: definition.depth(),
                         array_length: 1,
                         sample_count: 1,
                         access: TextureAccess::Sampled,
@@ -13056,12 +13147,26 @@ fn run_object_render_case(
     let mut object_textures = Vec::new();
     if let Some(definitions) = &case.fragment_textures {
         for (index, definition) in definitions.iter().enumerate() {
-            let texture = device.new_texture_with_bytes(
-                definition.format()?,
-                definition.width,
-                definition.height,
-                definition.texels()?,
-            )?;
+            // The object arm's own statement of the same shape (2026-09-20, the
+            // `D3` sampled texture arm): a volume is declared through
+            // `new_volume_texture_with_bytes`, so the handle's view states
+            // `D3` with this depth and its bytes are one run of slices — the
+            // same pair the trace's declaration states beside it.
+            let texture = match definition.texture_type()? {
+                TextureType::D3 => device.new_volume_texture_with_bytes(
+                    definition.format()?,
+                    definition.width,
+                    definition.height,
+                    definition.depth(),
+                    definition.texels()?,
+                )?,
+                _ => device.new_texture_with_bytes(
+                    definition.format()?,
+                    definition.width,
+                    definition.height,
+                    definition.texels()?,
+                )?,
+            };
             render.set_fragment_texture(u32::try_from(index)?, &texture)?;
             object_textures.push(texture);
         }

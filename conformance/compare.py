@@ -2861,7 +2861,7 @@ def _render_plan(plan, suite):
             texture = textures[0]
             _require(isinstance(texture, dict), f"{texture_where}: expected an object")
             _require(set(texture).issubset({"allocation", "view", "format", "width",
-                                            "height", "initial_hex", "texel_rule",
+                                            "height", "depth", "initial_hex", "texel_rule",
                                             "source"}),
                      f"{texture_where}: unexpected fields")
             _require(_integer(texture.get("allocation"), f"{texture_where}.allocation") > 0
@@ -2879,6 +2879,14 @@ def _render_plan(plan, suite):
                          "pass's own attachment, so its (allocation, view) pair has to be "
                          "the attachment's")
             texture_format = _string(texture.get("format"), f"{texture_where}.format")
+            # The bind's third extent (2026-09-20, the `D3` sampled texture arm):
+            # the absent field and the explicit `1` are the two-dimensional arm
+            # every pre-v46 case states, and anything above one is a **volume** —
+            # the declaration names `D3`, its bytes are `width x height x depth`
+            # texels in slice order, and the third axis is the one the render
+            # area does not have at all.
+            texture_depth = _integer(texture.get("depth", 1),
+                                     f"{texture_where}.depth", 1)
             _require(texture_format in SAMPLED_TEXTURE_FORMATS,
                      f"{texture_where}: the reviewed sampling fixtures read one 8-bit "
                      "unorm surface, in either four-component byte order "
@@ -2894,9 +2902,10 @@ def _render_plan(plan, suite):
                      "(rgba8_unorm/bgra8_unorm)")
             if translated is None or snapshot:
                 _require(texture.get("width") == attachment.get("width")
-                         and texture.get("height") == attachment.get("height"),
+                         and texture.get("height") == attachment.get("height")
+                         and texture_depth == 1,
                          f"{texture_where}: the sampled texture has to share the "
-                         "attachment's extent")
+                         "attachment's extent, which a second slice does not")
             else:
                 # The gathered-extent arm (`research/docs/23` §3.3, §111,
                 # E-TX10): a *translated* fragment module states its own
@@ -2904,8 +2913,13 @@ def _render_plan(plan, suite):
                 # its own extent and the case's whole point is that the two
                 # extents differ. A case whose source shared the render area's
                 # extent would be the window the reviewed pair already measures.
+                # The third axis counts (2026-09-20, the `D3` sampled texture
+                # arm): a `4 x 4 x 2` volume beside a `4 x 4` attachment is
+                # another extent on the axis the attachment does not have, and
+                # the depth alone is enough to say so.
                 _require(texture.get("width") != attachment.get("width")
-                         or texture.get("height") != attachment.get("height"),
+                         or texture.get("height") != attachment.get("height")
+                         or texture_depth != 1,
                          f"{texture_where}: the gathered arm's source has to differ from the "
                          "render area in at least one axis")
             if snapshot:
@@ -3986,6 +4000,21 @@ def _render_plan(plan, suite):
             _require(rails and all(rail == "vulkan" for rail in rails),
                      f"{where}: a pass-entry snapshot case runs on the rail whose texture walk "
                      "resolves the arm, so its capture_rails has to stay inside that list")
+        # The volume arm's marker stays on the rails that translate its stages
+        # (2026-09-20, the `D3` sampled texture arm): the two native faces
+        # compile a reviewed module selected by the colour format list's exact
+        # shape and refuse a three-dimensional declaration by name, so a case
+        # that named them would claim a capture they cannot report.
+        if case.get("fragment_textures") and any(
+            isinstance(texture, dict) and texture.get("depth", 1) != 1
+            for texture in case["fragment_textures"]
+        ):
+            _require(rails and all(rail in (VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL)
+                                   for rail in rails),
+                     f"{where}: a three-dimensional sampled volume runs on the rails that "
+                     "translate its stages ("
+                     + ", ".join((VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL))
+                     + "), so its capture_rails has to stay inside that list")
         # The superset fragment interface's marker stays on the rails that
         # translate its stages and draw through the milestone's entry
         # (2026-09-20, the third door behind census v46's

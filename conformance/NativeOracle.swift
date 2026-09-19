@@ -2616,8 +2616,19 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // case.
     case "compute-buffer-v45":
         expectedIDs = ["render_declaring_copy_word"]
+    // The three-dimensional sampled volume (2026-09-20, the `D3` sampled
+    // texture arm): the plain copy kernel over the 4x4 attachment's own
+    // sixty-four-byte view, beside the render case whose translated fragment
+    // module samples a `4 x 4 x 2` volume at four texel centres. That case runs
+    // on the Vulkan rails alone — this oracle selects a reviewed module by the
+    // colour format list's exact shape and has no arm for a three-dimensional
+    // declaration, and the suite's marker keeps the case off this rail — which
+    // is why this oracle validates and executes the declaring pass as an
+    // ordinary compute case.
+    case "compute-buffer-v46":
+        expectedIDs = ["render_declaring_gathered_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v45 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v46 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

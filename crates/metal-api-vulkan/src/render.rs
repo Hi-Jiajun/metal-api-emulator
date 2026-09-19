@@ -12826,12 +12826,22 @@ impl<'a> OffscreenObjects<'a> {
             self.upload_render_texture(target, texels)?;
             return Ok(None);
         }
-        self.bind_render_input(
+        let staged = self.bind_render_input(
             source,
             vk::BufferUsageFlags::TRANSFER_SRC,
             "render texture volume",
-        )
-        .map(Some)
+        )?;
+        // The staging write is this arm's upload, and it is counted exactly as
+        // the linear lanes' own [`Self::upload_render_texture`] is counted one
+        // arm over: the pass's texture-upload reading is one per byte-bearing
+        // declaration (`research/docs/23` §3.3, v70) and does not depend on the
+        // carrier the bytes travel in — a host-visible image for the lanes that
+        // may be linear, a host-visible staging buffer for a volume, which
+        // Vulkan never promises a linear tiling for. Without this the volume's
+        // own bytes would be the one upload a capture could not see.
+        self.context.record_buffer_upload();
+        self.context.record_buffer_upload_bytes(texels.len());
+        Ok(Some(staged))
     }
 
     /// Upload one pass's sampled textures and build the descriptor the fragment
