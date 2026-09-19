@@ -436,6 +436,7 @@ mod tests {
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
             supports_render_vertex_count_above_triangle: false,
+            supports_render_fragment_output_superset: false,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,

@@ -3977,6 +3977,24 @@ def _render_plan(plan, suite):
             _require(rails and all(rail == "vulkan" for rail in rails),
                      f"{where}: a pass-entry snapshot case runs on the rail whose texture walk "
                      "resolves the arm, so its capture_rails has to stay inside that list")
+        # The superset fragment interface's marker stays on the rails that
+        # translate its stages and draw through the milestone's entry
+        # (2026-09-20, the third door behind census v46's
+        # `stage_buffer_footprint` bucket): the two native faces compile a
+        # reviewed module selected by the colour format list's exact shape, so
+        # a module that stores a location the pass does not attach matches no
+        # arm and is refused by name. A case that named them would claim a
+        # capture they cannot report.
+        if (case.get("translated_stages") is not None
+                and vertex_input is None
+                and not case.get("stage_buffers")
+                and not case.get("fragment_textures")):
+            _require(rails and all(rail in (VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL)
+                                   for rail in rails),
+                     f"{where}: a superset fragment interface case runs on the rails that "
+                     "translate its stages ("
+                     + ", ".join((VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL))
+                     + "), so its capture_rails has to stay inside that list")
         # A stage-buffer case names the rails that bind its slots
         # (`research/docs/23` §3.3, v83-v87), and the two arms name different
         # ones. A *translated* case pins two AIR modules only the Vulkan rails

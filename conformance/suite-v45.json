@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v45",
+  "guard_byte": 169,
+  "cases": [
+    {
+      "id": "render_declaring_copy_word",
+      "entry": "copy_word",
+      "grid": [1, 1, 1],
+      "local": [1, 1, 1],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "fefefefefefefefefefefefefefefefe"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 12,
+          "access": "write",
+          "initial_hex": "ffffffff"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "bytes_hex": "fefefefe"
+        }
+      ]
+    }
+  ],
+  "render_cases": [
+    {
+      "id": "declared_superset_fragment_two_outputs_2x2",
+      "declaring_case": "render_declaring_copy_word",
+      "vertex_entry": "render_fullscreen_triangle",
+      "fragment_entry": "render_two_output_rgba8",
+      "translated_stages": {
+        "vertex": {
+          "path": "../crates/metal-api-vulkan/tests/fixtures/render_offscreen_2x2.vert.ll",
+          "sha256": "be63f8b9efc815f929706fd5ee42e71ec3d12aa9b10d7444e0af8caf67755ddc"
+        },
+        "fragment": {
+          "path": "../crates/metal-api-vulkan/tests/fixtures/render_two_output_rgba8.frag.ll",
+          "sha256": "5e08bfeaf64b6d72682a2f8a2908ac251d385eff8cf946acc1c076ddbc1df64c"
+        }
+      },
+      "vertices": 3,
+      "viewport": [0, 0, 2, 2],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 2,
+        "height": 2,
+        "load": "clear",
+        "store": "store",
+        "clear_hex": "fefefefe"
+      },
+      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff",
+      "capture_rails": ["vulkan", "vulkan-objects"]
+    }
+  ]
+}

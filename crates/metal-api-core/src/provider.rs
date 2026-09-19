@@ -9947,6 +9947,43 @@ pub struct ProviderCapabilities {
     /// module by the layout's exact shape and therefore refuses a layout with
     /// attributes no reviewed module reads.
     pub supports_render_vertex_interface_superset: bool,
+    /// Whether this snapshot executes the *superset* fragment interface: one
+    /// registration whose module declares every colour location the contract's
+    /// format list attaches, plus locations with no attachment beside them
+    /// (2026-09-20, the third door behind census v46's
+    /// `stage_buffer_footprint` bucket). Defaults to `false`: a registration
+    /// whose declared list and reflected list disagree in either direction is
+    /// refused by name instead of being executed against a module one of the
+    /// two sides did not state.
+    ///
+    /// The bit is limited **by direction**, and the direction it admits is the
+    /// mirror image of [`Self::supports_render_vertex_interface_superset`]'s.
+    /// Vulkan defines what a fragment stage does with a colour store that has
+    /// no attachment behind it: the location's write is *discarded* (the value
+    /// reaches no image and no blend state), so the shape that can be executed
+    /// is "the reflection declares more colour locations than the contract
+    /// attaches". Every attached location still has to be declared at its own
+    /// position, with the component shape its format stores — the prefix is
+    /// checked exactly as before and the extra locations are what nothing
+    /// consumes.
+    ///
+    /// It MUST NOT be read as "any difference between the two lists is fine":
+    /// the reverse direction — a colour format whose location the module never
+    /// stores, which would read back bytes nothing wrote — stays refused by
+    /// name whoever declares this bit. Neither does it widen
+    /// [`Self::max_color_attachments`] or [`Self::supported_color_formats`]:
+    /// the number of attachments a pass may declare and the formats it may
+    /// declare them in keep their own readings.
+    ///
+    /// Declared `true` by the snapshots whose rail executes that half: the
+    /// Vulkan rail builds the pipeline from the contract's own
+    /// `color_formats` while the module keeps every store it declares, and the
+    /// stores with no attachment beside them are dropped
+    /// (`tests/render_fragment_output_superset_e2e.rs`). Left at the default
+    /// by the native rail, whose reviewed-module table selects a stage by the
+    /// layout and the colour format list's exact shape and therefore refuses a
+    /// module that stores a location the pass does not attach.
+    pub supports_render_fragment_output_superset: bool,
     /// Whether this snapshot executes a *layout-free* non-indexed draw whose
     /// count is above the milestone's three vertices (2026-09-19, census v45's
     /// `vertex_span` bucket). Defaults to `false`: a pass whose pipeline
@@ -10405,6 +10442,29 @@ impl ProviderCapabilities {
     /// "refuse a layout the module does not fill" answer.
     pub fn declares_render_vertex_interface_superset_support(&self) -> bool {
         self.supports_render_vertex_interface_superset
+    }
+
+    /// Whether this snapshot executes the superset fragment interface
+    /// (2026-09-20, the third door behind census v46's `stage_buffer_footprint`
+    /// bucket).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so the question is asked in the same place a consumer asks
+    /// every other "did this snapshot declare the shape" question, instead of
+    /// one call site reading the field and another comparing the rest of the
+    /// snapshot against its defaults. The capability frame writes the bit as
+    /// the tail's second family's own next block, so this predicate is also
+    /// what keeps a snapshot that declares *only* this bit from falling back to
+    /// the legacy payload and dropping the declaration on the wire.
+    ///
+    /// Like the vertex interface's predicate beside it, this one is
+    /// deliberately *not* part of [`Self::declares_render_support`]: the
+    /// attachment-side fields that predicate reads (`max_color_attachments`,
+    /// `max_attachment_dimension`, `supported_color_formats`) keep their own
+    /// readings, and a snapshot that never spoke about the superset shape keeps
+    /// the default "refuse a list the module does not fill" answer.
+    pub fn declares_render_fragment_output_superset_support(&self) -> bool {
+        self.supports_render_fragment_output_superset
     }
 
     /// Whether this snapshot executes a layout-free non-indexed draw whose
@@ -16825,6 +16885,7 @@ mod tests {
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
+            supports_render_fragment_output_superset: false,
             supports_render_vertex_count_above_triangle: false,
             supports_render_instancing: false,
             max_render_instances: 0,
@@ -22382,6 +22443,49 @@ mod tests {
             declared.declares_vertex_input_support(),
             "the shape bit is the capability frame's own tail block, not one of the three \
              vertex-input fields"
+        );
+    }
+
+    /// The superset fragment interface's bit is a declaration, not a default
+    /// (2026-09-20, the third door behind census v46's `stage_buffer_footprint`
+    /// bucket).
+    ///
+    /// A snapshot that never spoke about the shape must be read as "do not
+    /// register a module that stores colour locations the pass does not
+    /// attach": the bit defaults to `false`, the predicate answers the same
+    /// thing, and setting the bit is the only way to flip either reading. The
+    /// bit is deliberately *not* one of the attachment-side fields — it
+    /// travels in the capability frame's own tagged tail block, beside the
+    /// vertex interface's superset bit — so flipping it has to leave the
+    /// attachment count, the extent window and the format list exactly where
+    /// they were, which is what a consumer reads "how many attachments and
+    /// which formats" from.
+    #[test]
+    fn the_default_snapshot_does_not_declare_the_superset_fragment_interface() {
+        let default = render_capabilities();
+        assert!(!default.supports_render_fragment_output_superset);
+        assert!(!default.declares_render_fragment_output_superset_support());
+
+        let mut declared = default.clone();
+        declared.supports_render_fragment_output_superset = true;
+        assert!(declared.declares_render_fragment_output_superset_support());
+        assert_eq!(
+            declared.max_color_attachments,
+            default.max_color_attachments
+        );
+        assert_eq!(
+            declared.max_attachment_dimension,
+            default.max_attachment_dimension
+        );
+        assert_eq!(
+            declared.supported_color_formats,
+            default.supported_color_formats
+        );
+        assert_eq!(
+            default.declares_render_support(),
+            declared.declares_render_support(),
+            "the shape bit is the capability frame's own tail block, not one of the \
+             attachment-side fields"
         );
     }
 

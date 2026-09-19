@@ -396,6 +396,15 @@ impl NativeMetalProvider {
                 max_color_attachments: render_bits.max_color_attachments,
                 max_attachment_dimension: render_bits.max_attachment_dimension,
                 supported_color_formats: render_bits.supported_color_formats,
+                // The superset fragment interface (2026-09-20, the third door
+                // behind census v46's `stage_buffer_footprint` bucket): this
+                // rail's reviewed-module table selects a stage by the colour
+                // format list's exact shape, so a module that stores a location
+                // the pass does not attach is refused by name rather than
+                // executed. The snapshot therefore declares the same
+                // fail-closed default the contract starts from.
+                supports_render_fragment_output_superset: render_bits
+                    .supports_render_fragment_output_superset,
                 // Vertex input is executed by this rail as of the vertex-input
                 // increment: a pass that binds streams is translated into an
                 // `MTLVertexDescriptor` plus `setVertexBuffer` /

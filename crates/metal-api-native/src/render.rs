@@ -1017,6 +1017,14 @@ pub(crate) struct RenderCapabilityBits {
     pub(crate) max_color_attachments: u32,
     pub(crate) max_attachment_dimension: [u64; 2],
     pub(crate) supported_color_formats: Vec<AttachmentFormat>,
+    /// The superset fragment interface (2026-09-20, the third door behind
+    /// census v46's `stage_buffer_footprint` bucket). Declared beside the three
+    /// attachment-side fields it narrows, and always `false` here: Apple has no
+    /// oracle for a module that stores a colour location the pass does not
+    /// attach, and this rail's reviewed-module table selects a stage by the
+    /// colour format list's *exact* shape (`reviewed_module`), so the shape
+    /// matches no arm and is refused by name.
+    pub(crate) supports_render_fragment_output_superset: bool,
     /// Render-sampler bits, declared next to the render bits for the same
     /// reason: the snapshot and the rail cannot disagree about what this
     /// provider samples (`research/docs/23` §3.3, v70). The three fields come
@@ -1123,6 +1131,15 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         max_color_attachments: MAX_COLOR_ATTACHMENTS,
         max_attachment_dimension: attachment_dimension_window(device_2d_texture_limit),
         supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
+        // The superset fragment interface (2026-09-20, the third door behind
+        // census v46's `stage_buffer_footprint` bucket) is this rail's own
+        // boundary rather than a missing measurement: `reviewed_module` selects
+        // its MSL module by the layout's and the colour format list's *exact*
+        // shape, so a module that stores a location the pass does not attach
+        // matches no arm and the registration is refused by name. Declaring
+        // the bit would promise a shape this rail's module table refuses, so it
+        // keeps the contract's fail-closed default.
+        supports_render_fragment_output_superset: false,
         supports_render_texture_sampling: render_texture.supports_render_texture_sampling,
         max_render_textures: render_texture.max_render_textures,
         supported_render_texture_formats: render_texture.supported_render_texture_formats,
@@ -10768,6 +10785,7 @@ mod tests {
             max_color_attachments: bits.max_color_attachments,
             max_attachment_dimension: bits.max_attachment_dimension,
             supported_color_formats: bits.supported_color_formats.clone(),
+            supports_render_fragment_output_superset: bits.supports_render_fragment_output_superset,
             max_vertex_buffers: vertex.max_vertex_buffers,
             supported_vertex_formats: vertex.supported_vertex_formats.clone(),
             supported_index_formats: vertex.supported_index_formats.clone(),
@@ -11816,6 +11834,15 @@ mod tests {
             bits.supported_color_formats,
             AttachmentFormat::ADMITTED.to_vec()
         );
+        // The superset fragment interface is the attachment face's own
+        // boundary rather than a missing measurement (2026-09-20, the third
+        // door behind census v46's `stage_buffer_footprint` bucket):
+        // `reviewed_module` selects its MSL module by the colour format list's
+        // exact shape, so a module that stores a location the pass does not
+        // attach matches no arm and is refused by name. The declaration stays
+        // at the contract's fail-closed default beside the three fields above.
+        assert!(!bits.supports_render_fragment_output_superset);
+        assert!(!capabilities(&bits).declares_render_fragment_output_superset_support());
 
         let (trace, resources) = milestone_trace(LoadOp::Clear(sentinel()));
         capabilities(&bits)

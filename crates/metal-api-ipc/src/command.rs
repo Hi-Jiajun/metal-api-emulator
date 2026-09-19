@@ -5822,6 +5822,112 @@ mod tests {
         assert!(!decoded.supports_indirect_command_buffers);
     }
 
+    /// The superset fragment interface's block is the tail's second family's
+    /// own last section (2026-09-20), written as `0x00 0x0e <bool>` after the
+    /// layout-free vertex count.
+    ///
+    /// The reading is the same one every block in this family is pinned by:
+    /// adding the declaration appends three bytes and leaves the frame before
+    /// them untouched, a frame that ends before the block reads the bit as the
+    /// fail-closed `false` (so a consumer keeps its own refusal by name for the
+    /// shape), and a decoder that predates the tag refuses the frame rather
+    /// than reading a value out of a family tag it does not know.
+    #[test]
+    fn the_superset_fragment_interface_block_is_the_tail_familys_last_tag() {
+        let mut capabilities = fake_capabilities();
+        // The frame has to be on the extended payload already, or the new bit
+        // would change the payload's own form rather than only appending its
+        // section: the landing-view bit is the oldest face that does that.
+        capabilities.supports_render_attachment_landing_view = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(without.ends_with(&[0x00, 0x05, 0x01]));
+        assert!(!without.ends_with(&[0x00, 0x0e, 0x01]));
+        let decoded = match CommandCodec::decode_response(&without).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(
+            !decoded.supports_render_fragment_output_superset,
+            "a frame that ends before the block reads the bit as the fail-closed default"
+        );
+
+        capabilities.supports_render_fragment_output_superset = true;
+        assert!(capabilities.declares_render_fragment_output_superset_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the superset fragment interface frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x0e, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the new block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_fragment_output_superset);
+        // The legacy payload cannot carry the block either, so a legacy frame
+        // reads the same fail-closed default rather than a value beside it.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_fragment_output_superset);
+    }
+
+    /// A declaration whose *only* statement is the superset fragment interface
+    /// still writes the extended payload: the block sits after the heap/ICB half
+    /// the decoder reads by position before the family's escape, so a snapshot
+    /// that never wrote that half would drop the declaration on the wire.
+    #[test]
+    fn an_only_superset_fragment_interface_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_fragment_output_superset = true;
+        assert!(capabilities.declares_render_fragment_output_superset_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x0e, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_fragment_output_superset);
+        assert!(!decoded.supports_render_vertex_interface_superset);
+        assert!(!decoded.supports_render_vertex_count_above_triangle);
+        assert!(!decoded.supports_render_kept_frame_landing);
+        assert!(!decoded.supports_heaps);
+        assert!(!decoded.supports_indirect_command_buffers);
+    }
+
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
     /// frame's identity and shape and the window's second declaration, in a
     /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -5979,7 +6085,7 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x0c` is the next tag the
+        // The family's tags are a closed set and `0x0f` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
@@ -5989,14 +6095,15 @@ mod tests {
         // the texel space took it, and `0x09` until E-TX15 assigned it to the
         // pass-entry snapshot arm, `0x0a` until the one-dimensional sampled
         // window took it, and `0x0b` until the layout-free count above the
-        // milestone's three vertices took it — exactly the drift the closed set
-        // exists to make visible.)
+        // milestone's three vertices took it, and `0x0e` until the superset
+        // fragment interface took it — exactly the drift the closed set exists
+        // to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x0c;
+        unknown_tag[tag_at] = 0x0f;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x0c)
+            CodecError::UnknownCapabilityTail(0x0f)
         ));
     }
 
@@ -7175,6 +7282,7 @@ mod tests {
                     supported_vertex_formats: Vec::new(),
                     supported_index_formats: Vec::new(),
                     supports_render_vertex_interface_superset: false,
+                    supports_render_fragment_output_superset: false,
                     supports_render_vertex_count_above_triangle: false,
                     supports_render_instancing: false,
                     max_render_instances: 0,
@@ -7565,6 +7673,7 @@ mod tests {
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
+            supports_render_fragment_output_superset: false,
             supports_render_vertex_count_above_triangle: false,
             supports_render_instancing: false,
             max_render_instances: 0,
