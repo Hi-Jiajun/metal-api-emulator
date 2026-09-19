@@ -382,6 +382,10 @@ private struct RenderAttachmentDefinition: Decodable {
     /// (`research/docs/23` §115 之后的增量，E-TX13); absent for every other store
     /// arm, and for every case this oracle compiles.
     let landing_view: LandingViewDefinition?
+    /// The kept-frame landing entry a `"resident"` store's trace carries
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b); absent for every other
+    /// store arm, and for every case this oracle compiles.
+    let kept_frame_landing: KeptFrameLandingDefinition?
     let clear_hex: String?
     let initial_hex: String?
     /// The MRT case's per-attachment expectation; absent for the
@@ -394,6 +398,14 @@ private struct RenderAttachmentDefinition: Decodable {
 private struct LandingViewDefinition: Decodable {
     let allocation: UInt64
     let view: UInt64
+}
+
+/// The kept-frame landing entry (`research/docs/23` §115 之后的增量，E-TX14/R4b):
+/// the identity a pass kept in the provider's own image, and the owner window a
+/// later landing entry delivers it into.
+private struct KeptFrameLandingDefinition: Decodable {
+    let frame: LandingViewDefinition
+    let landing: LandingViewDefinition
 }
 
 /// The depth attachment a render case declares (`research/docs/23` §3.3,
@@ -2535,8 +2547,19 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // route that writes an owner's window).
     case "compute-buffer-v40":
         expectedIDs = ["render_declaring_landing_view"]
+    // The kept-frame landing entry (`research/docs/23` §115 之后的增量，
+    // E-TX14/R4b): the same declaring pass as v40 — the reviewed witness kernel
+    // over the attachment's own sixteen-byte view, the copy landing and the
+    // owner window its third binding declares — beside the render case whose
+    // pass *keeps* its frame (a `"resident"` store publishes nothing) for a later
+    // landing entry to deliver. That render case names the Vulkan rail alone
+    // (this rail keeps no frame and has no route that writes an owner's window),
+    // so this oracle validates and executes the declaring pass as an ordinary
+    // compute case.
+    case "compute-buffer-v41":
+        expectedIDs = ["render_declaring_landing_view"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v40 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v41 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -3271,9 +3294,29 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                                vertexStreams: [], stageBuffers: [], indexStream: nil,
                                depth: nil, stencil: nil)
     }
+    // The kept-frame landing entry (`research/docs/23` §115 之后的增量，
+    // E-TX14/R4b): a pass keeps its frame in the provider's own image (a
+    // `"resident"` store publishes nothing) and a later *entry* delivers that
+    // frame into the owner's registered window. This oracle holds no resident
+    // registry and, exactly as the landing-view arm above states, has no route
+    // that writes an owner's window: a case that names a native capture rail is
+    // a case this oracle cannot serve rather than one it may execute as a plain
+    // store, so it is refused by name here.
+    if definition.kept_frame_landing != nil
+        || landingAttachments.contains(where: { $0.store == "resident" }) {
+        try require(!definition.capture_rails.contains("native-metal"),
+                    "\(definition.id): this oracle keeps no frame in the provider's image "
+                    + "and has no route that delivers one into an owner's window: mark the "
+                    + "case for the Vulkan rail")
+        return ValidatedRender(definition: definition, source: "", attachments: [],
+                               vertexStreams: [], stageBuffers: [], indexStream: nil,
+                               depth: nil, stencil: nil)
+    }
     for attachment in landingAttachments {
         try require(attachment.landing_view == nil,
                     "\(definition.id): only a landing_view store names a landing view")
+        try require(attachment.kept_frame_landing == nil,
+                    "\(definition.id): only a resident store names a kept-frame landing")
     }
     // The stage-buffer shape (`research/docs/23` §3.3, v83-v86) arrives in two
     // arms. A *translated* case pins two AIR modules this oracle compiles no

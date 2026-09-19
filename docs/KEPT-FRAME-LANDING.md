@@ -117,15 +117,23 @@ pub enum TracePass {
   * 只换窗口原字节 ⇒ 帧不动（条目是写方向）；`GuestRuns` 列表臂落进同一窗口。
 * **契约 / wire 单测**：core 的形状规则与 admission 门、ipc 的 tag `0x19` 载荷、能力位
   `0x00 0x06`（含"只声明它仍写扩展载荷"与未知 tag 的闭集读数）、native 的按名拒。
+* **conformance 五路 fixture**：`conformance/suite-v41.json`（见 §7）。render case
+  `kept_frame_landing_quad_2x2` 让这一个 pass 把帧留在 provider 图像里
+  （`store: "resident"`），`kept_frame_landing` 一节同时点出 kept 身份与 owner 窗口，
+  `expected_landing_hex` 是被观察的那份帧。它在 Vulkan trace 轨上跑通：窗口读到
+  `4080c0fffefefefe4080c0fffefefe`（左列片元输出、右列是 pass 的 load 字节），
+  `writebacks`/`allocations` 都是空的，而 `copy_out` 比 v40 的当拍臂少一次发布的
+  回读、多一次条目自己的回读——"pass 没发布"与"条目确实送达"因此是两个可分辨的读数。
 * **门**：`cargo fmt`、`cargo clippy -D warnings`、`tools/gates-local.sh`（`GATES_OK`）、
   `tools/lavapipe-smoke.sh`（suites/captures 计数不减）、`openspec validate --strict`、
   RTX 5060 读数。
 
 ## 6. 边界
 
-1. **conformance 五路 fixture 未随本增量落地**：`conformance/suite-v41.json` 需要的是一格
-   "resident store + landing 条目"的 render case，以及 harness/comparator/native oracle/CI
-   的对应登记；本增量只交付 rail 级读数（上表），五路 fixture 是紧接着的下一增量。
+1. **conformance 五路 fixture 已落地，但只有 Vulkan trace 轨执行它**：见 §7。这条形状
+   的"五路"里，两条 native 轨按名拒（不持帧、也没有写 owner 窗口的路由）、两条对象轨
+   无入口，所以它的 `capture_rails` 只声明 `vulkan`——**这条 fixture 证不了 native /
+   Apple 侧的行为**，它证的是"契约 + wire + Vulkan 执行 + comparator 的期望"这一串。
 2. **对象 API 无入口**：landing 条目是 trace 形状，对象轨没有对应入口（与 E-TX13 §115.5.4
    同一处边界）。
 3. **不做真机 census**：本增量不宣称 `relay_surface` 已收窄；预期读数与 R 侧随动写在交付
@@ -134,3 +142,36 @@ pub enum TracePass {
 5. **native / Apple 无读数**：该轨按名拒，快照位保持 `false`。
 6. **不等于完整 Metal conformance**：一台 Lavapipe 与一次 Windows 真机读数不替代 Apple
    真机，本文件只说明这一条通道在契约、wire、Vulkan 执行上一致且可证伪。
+
+## 7. conformance 五路 fixture：`suite-v41.json`
+
+这条形状在 harness 里需要的是一串互相咬合的登记，本文件记录它们各自钉住了什么：
+
+* **`conformance/suite-v41.json`**：declaring case 复用 v40 的形状（`render_declaring_landing_view`
+  ——同一个 witness kernel、附件自己的 16 字节 view、copy landing，以及它第三绑定声明的
+  owner 窗口 `borrowed_no_copy`），render case 是 `kept_frame_landing_quad_2x2`：
+  `attachment.store = "resident"`（**没有** `expected_hex`）、一节
+  `kept_frame_landing {frame:{900,910}, landing:{940,950}}`、以及唯一的那份期望
+  `expected_landing_hex = 4080c0fffefefefe4080c0fffefefefe`。marker 只声明 `["vulkan"]`。
+* **harness（`examples/metal-smoke/src/bin/provider-capture.rs`）**：`RenderCase` 新增
+  `kept_frame_landing` 一节与校验（kept 身份必须是 resident 附件自己的、窗口仍按
+  `borrowed_no_copy` + 附件 extent 解析）；trace 组装处在 render pass **之后**追加
+  `TracePass::Landing`（窗口声明来自 declaring compute pass，所以条目永不独自出现）；
+  `render_case_landing()` 对两条落地臂统一解析，落地窗口的读回与
+  `expected_landing_hex` 比对整段复用 E-TX13 的实现；expectation 规则仍按 resident 臂
+  用 `expected_landing_hex` 那份字节做逐 texel 校验（"load 混合了 drawn 与 kept texel"
+  一类规则因此原样生效）；写回观测循环跳过 resident store（它不发布 writeback）。
+* **comparator（`conformance/compare.py`）**：resident 臂的 `writes`/`allocations` 为空、
+  `written` 含 kept 帧自己的 allocation（条目送达时的那一次设备回读正是 `copy_out` 的
+  来源），落地窗口规则与 §3.1 共用一段实现；并新增"期望不得等于窗口运行前的字节"这条
+  证伪规则——在没有 writeback 可比对时，它是"条目根本没跑"的唯一落点。
+* **native oracle（`conformance/NativeOracle.swift`）**：`compute-buffer-v41` 登记
+  declaring case 并执行它；render case 因 `kept_frame_landing`/`resident` 按名拒
+  （该轨不持帧、也没有写 owner 窗口的路由），CI 上这一轨因此只报 declaring case。
+* **窄类登记（`conformance/narrow-class.json`）**：这条 case 落在 render 窄类之外，
+  规则 `render-covered-attachment`。
+* **守卫（`conformance/test_suite_v41.py`）**：钉住 suite 身份、源码哈希、declaring
+  pass 形状、render case 的三处关键字段与计划读数，以及一族"改编排必须红"的负例
+  （缺 `kept_frame_landing`、有 section 没有 resident store、resident 臂旁出现
+  `expected_hex`/texel rule、kept 身份不是附件自己、窗口未声明/是拷贝臂/extent 不符、
+  期望等于窗口原字节）。

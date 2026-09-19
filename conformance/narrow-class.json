@@ -83,6 +83,13 @@
       "rule": "render-covered-attachment",
       "why": "the class's one attachment stores through the pool writeback channel; a landing view names a second declaration whose owner window the frame also lands in, and this rail-fact owes its own fixture"
     }
+    ,
+    {
+      "suite": "suite-v41.json",
+      "case": "kept_frame_landing_quad_2x2",
+      "rule": "render-covered-attachment",
+      "why": "the class's one attachment reaches the comparison through a stored writeback; a resident store publishes none and the owner window a later landing entry fills is the whole observation, and this rail-fact owes its own fixture"
+    }
       ]
     }
   ]

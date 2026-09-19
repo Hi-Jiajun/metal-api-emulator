@@ -284,6 +284,37 @@ fragment output while the rest stay the caller's bytes. A rail that resolved the
 load from the landing window would land `11223344` there; a rail that landed
 nothing would leave the window holding its old bytes.
 
+### 3.2 The kept-frame landing entry (E-TX14/R4b)
+
+The *delayed* sibling of §3.1 (`research/docs/23` §115 之后的增量，E-TX14/R4b)
+separates the two halves the landing-view store states together. Its render case
+declares `store: "resident"`: the pass keeps its frame in the provider's own
+image and publishes **nothing** — no writeback, no allocation image, and no
+case-level `expected_hex`, because a frame expectation nothing observes would be
+a claim rather than a reading. A later `TracePass::Landing` entry is what moves
+the frame, and the case spells it as a `kept_frame_landing` section naming two
+identities: the frame the pass kept (which has to be the resident attachment's
+own) and the owner window the entry delivers it into.
+
+The window follows §3.1's rules unchanged — one owner window, a read-only
+`borrowed_no_copy` declaration of the declaring pass covering the attachment's
+own extent — but the observation rules differ, because there is no writeback to
+compare the frame against: the case's `expected_landing_hex` *is* the frame, and
+the comparator refuses an expectation that equals the bytes the window held
+before the entry ran (a provider that delivered nothing would report exactly
+those). The harness reads the window back after the submission and reports it as
+`landing`, as for §3.1.
+
+`suite-v41.json` is that case: its attachment loads the caller's bytes
+(`fefefefe…`) and draws the same quad, the declaring pass is v40's witness kernel
+over the attachment's own view, the copy landing and the owner window (which
+starts as `11223344…`), and the window the entry fills holds
+`4080c0fffefefefe4080c0fffefefefe` — the fragment output on the drawn column and
+the caller's bytes on the other. The kept image is read back exactly once for
+that delivery, so the case's `copy_out` counts the frame's allocation beside the
+declaring pass's own write while the writeback list stays empty: "the pass
+published the frame" and "the entry delivered it" are different observations.
+
 ## 4. Which rails report a render case
 
 The first render increment has five executable rails: the Vulkan trace rail,
@@ -327,6 +358,11 @@ is a *trace* face this increment published — the Vulkan trace rail executes it
 object API has no entry that names a second landing view, and the native rails have
 no route that writes an owner's window — so the arm's capture is the trace rail's
 and every rail it does not name leaves the case out.
+`suite-v41.json` marks `["vulkan"]` alone for the same reason, one increment
+later: the kept-frame landing *entry* is a trace shape (§3.2), the object API has
+no entry that delivers a kept frame at all, and the native rails keep no frame
+and have no route that writes an owner's window (`NativeOracle.swift` refuses the
+arm by name).
 `conformance/test_oracle_coverage.py` checks the marker against `compare.py`'s
 backend vocabulary, refuses a marker that names a rail with no render command
 encoder, and requires every committed suite to be named on every CI rail and in

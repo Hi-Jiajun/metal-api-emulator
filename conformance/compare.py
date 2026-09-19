@@ -2435,44 +2435,146 @@ def _stage_buffer_section(case, declaring_case, declaring_images, where):
     return writes, images, views, written, None
 
 
+def _landing_window_declaration(declaring_buffers, where, path, allocation, view, extent):
+    """The declaring pass's own declaration of a landing arm's owner window
+    (`research/docs/23` §115 之后的增量，E-TX13/E-TX14).
+
+    Both arms resolve their window here and nowhere else, so the two spellings
+    cannot drift into two answers: exactly one buffer of the declaring case
+    carries the identity, it is read-only (a compute write would race the
+    landing), it sits on the `borrowed_no_copy` arm — the window is the owner's
+    registered mapping rather than a copy the provider holds — and its byte
+    range is the attachment's own tightly packed extent.
+
+    Returns the declaring buffer, whose own `initial_hex` is what "the window
+    held before the arm ran" means to a case that has to be falsifiable about
+    it.
+    """
+    declared = [buffer for buffer in declaring_buffers
+                if buffer["allocation"] == allocation and buffer["view"] == view]
+    _require(len(declared) == 1,
+             f"{where}.{path}: the declaring case has to declare exactly the landing view")
+    declared = declared[0]
+    _require(declared.get("storage_mode") == "borrowed_no_copy",
+             f"{where}.{path}: the landing view has to be the declaring pass's "
+             "borrowed_no_copy window")
+    _require(declared["access"] == "read",
+             f"{where}.{path}: the declaring pass reads the landing view")
+    _require(declared["length"] == extent,
+             f"{where}.{path}: the landing view has to be the attachment's own extent")
+    return declared
+
+
+def _kept_frame_landing_section(case, attachment, declaring_buffers, where, expectation):
+    """The kept-frame landing entry's own review surface (`research/docs/23`
+    §115 之后的增量，E-TX14/R4b): the identity a pass kept in the provider's own
+    image, the owner window a later entry delivers it into, and the bytes that
+    window has to hold afterwards.
+
+    The entry is the *deferred* sibling of the landing-view store, so the rules
+    are the same facts stated a second way — one owner window, declared by the
+    declaring pass as a read-only `borrowed_no_copy` view of the attachment's own
+    extent — beside the two facts only the deferred shape has:
+
+    * the kept identity has to be the resident attachment's own, because a pass
+      cannot keep a frame for a surface it did not write;
+    * the case carries no `expected_hex`: the pass publishes no writeback, so a
+      case-level frame expectation would be a claim no observation checks
+      (`research/docs/23` §115.5's boundary). The window is the whole
+      observation, and `expected_landing_hex` is what states it;
+    * that expectation may not equal the bytes the window held before the entry
+      ran — with no writeback to compare against, that is the reading which
+      keeps "the entry never ran" from passing as "the frame landed".
+
+    Returns `(allocation, view, bytes)`.
+    """
+    section = case.get("kept_frame_landing")
+    _require(section is not None,
+             f"{where}: a resident store names the kept_frame_landing entry it delivers "
+             "through")
+    _object(section, ("frame", "landing"), f"{where}.kept_frame_landing")
+    frame = section["frame"]
+    landing = section["landing"]
+    _object(frame, ("allocation", "view"), f"{where}.kept_frame_landing.frame")
+    _object(landing, ("allocation", "view"), f"{where}.kept_frame_landing.landing")
+    frame_allocation = _integer(frame["allocation"],
+                                f"{where}.kept_frame_landing.frame.allocation")
+    frame_view = _integer(frame["view"], f"{where}.kept_frame_landing.frame.view")
+    _require(frame_allocation > 0 and frame_view > 0,
+             f"{where}.kept_frame_landing.frame: zero kept-frame identity")
+    _require((frame_allocation, frame_view)
+             == (attachment["allocation"], attachment["view"]),
+             f"{where}.kept_frame_landing.frame: the kept frame has to be the resident "
+             "attachment's own identity")
+    allocation = _integer(landing["allocation"],
+                          f"{where}.kept_frame_landing.landing.allocation")
+    view = _integer(landing["view"], f"{where}.kept_frame_landing.landing.view")
+    _require(allocation > 0 and view > 0,
+             f"{where}.kept_frame_landing.landing: zero landing identity")
+    extent = attachment["width"] * attachment["height"] * 4
+    window = _landing_window_declaration(declaring_buffers, where,
+                                         "kept_frame_landing.landing", allocation, view,
+                                         extent)
+    landed = _hex(expectation, f"{where}.expected_landing_hex")
+    _require(len(landed) == extent,
+             f"{where}.expected_landing_hex: the landing expectation does not match the "
+             "attachment")
+    held = _hex(window.get("initial_hex"), f"{where}.kept_frame_landing.landing initial "
+                "bytes")
+    _require(landed != held,
+             f"{where}.expected_landing_hex: the window already holds those bytes before "
+             "the entry runs, so a rail that never delivered the kept frame could pass")
+    return allocation, view, landed
+
+
 def _landing_view_section(case, declaring_buffers, parsed, where, single):
-    """The landing-view store's own review surface (`research/docs/23` §115
-    之后的增量，E-TX13): the second view declaration the frame lands in, and the
-    bytes the owner's window has to hold afterwards.
+    """The landing arm's own review surface (`research/docs/23` §115 之后的增量，
+    E-TX13/E-TX14): the second view declaration the frame lands in, and the bytes
+    the owner's window has to hold afterwards.
 
-    The arm separates two facts the borrowed store states as one, so this
-    section pins both of them here, before any rail runs:
+    Two arms state the same reading. A `"landing_view"` store lands the pass's
+    own frame in the window as the pass completes; a `"resident"` store leaves
+    the frame in the provider's image for a later landing *entry* to deliver, and
+    the case then carries the `kept_frame_landing` section instead of the
+    attachment-level one. Either way exactly one attachment may declare the arm —
+    the observation is one owner window under one case-level expectation — and
+    the window is a second declaration of the *declaring* pass rather than the
+    attachment's own identity, which `StoreOp::Borrowed` already states.
 
-    * exactly one attachment may store through it — the observation is one
-      owner window under one case-level expectation;
-    * the view it names has to be a second declaration of the *declaring*
-      pass, read-only and on the `borrowed_no_copy` arm, covering the
-      attachment's own tightly packed extent — the window the rail resolves is
-      that declaration and nothing else;
-    * naming the attachment's own identity is refused: that statement is
-      `StoreOp::Borrowed`'s, and one fact with two spellings would leave the
-      rail two places to resolve one window from;
-    * the declared `expected_landing_hex` has to be the frame the case's own
-      attachment expectation states, because the arm lands exactly the frame
-      the pass read back.
-
-    Returns `(allocation, view, bytes)` for the case that declares the arm, and
+    Returns `(allocation, view, bytes)` for the case that declares an arm, and
     `None` for every case that does not.
     """
     stored = [attachment for attachment, _, _, _ in parsed
               if attachment.get("store", "store") == "landing_view"]
+    kept = [attachment for attachment, _, _, _ in parsed
+            if attachment.get("store", "store") == "resident"]
+    section = case.get("kept_frame_landing")
     expectation = case.get("expected_landing_hex")
-    if not stored:
+    if not stored and not kept:
         _require(expectation is None,
-                 f"{where}: expected_landing_hex needs a landing_view store")
+                 f"{where}: expected_landing_hex needs a landing_view store, or a resident "
+                 "one whose kept_frame_landing entry delivers the frame")
+        _require(section is None,
+                 f"{where}: kept_frame_landing needs a resident store")
         for attachment in parsed:
             _require("landing_view" not in attachment[0],
                      f"{where}: only a landing_view store names a landing view")
         return None
-    _require(len(stored) == 1,
+    _require(not stored or not kept,
+             f"{where}: one case lands one owner window")
+    _require(len(stored) + len(kept) == 1,
              f"{where}: one pass lands one owner window")
     _require(single,
              f"{where}: the landing-view store is the single-attachment shape")
+    if kept:
+        _require("expected_hex" not in case,
+                 f"{where}: a resident store publishes no writeback, so the case carries "
+                 "no expected_hex")
+        _require("expected_rule" not in case and "readback_windows" not in case,
+                 f"{where}: a resident store states its frame as expected_landing_hex, "
+                 "not as a texel rule")
+        return _kept_frame_landing_section(case, kept[0], declaring_buffers, where,
+                                           expectation)
     attachment = stored[0]
     definition = attachment.get("landing_view")
     _object(definition, ("allocation", "view"), f"{where}.attachment.landing_view")
@@ -2484,26 +2586,64 @@ def _landing_view_section(case, declaring_buffers, parsed, where, single):
     _require((allocation, view) != (attachment["allocation"], attachment["view"]),
              f"{where}.attachment.landing_view: the landing view is the attachment's own "
              "identity, which the borrowed store already states")
-    declared = [buffer for buffer in declaring_buffers
-                if buffer["allocation"] == allocation and buffer["view"] == view]
-    _require(len(declared) == 1,
-             f"{where}.attachment.landing_view: the declaring case has to declare exactly "
-             "the landing view")
-    declared = declared[0]
-    _require(declared.get("storage_mode") == "borrowed_no_copy",
-             f"{where}.attachment.landing_view: the landing view has to be the declaring "
-             "pass's borrowed_no_copy window")
-    _require(declared["access"] == "read",
-             f"{where}.attachment.landing_view: the declaring pass reads the landing view")
     extent = attachment["width"] * attachment["height"] * 4
-    _require(declared["length"] == extent,
-             f"{where}.attachment.landing_view: the landing view has to be the "
-             "attachment's own extent")
+    _landing_window_declaration(declaring_buffers, where, "attachment.landing_view",
+                                allocation, view, extent)
     landed = _hex(expectation, f"{where}.expected_landing_hex")
     frame = _hex(case.get("expected_hex"), f"{where}.expected_hex")
     _require(landed == frame,
              f"{where}.expected_landing_hex: the window holds the frame the pass read back")
     return allocation, view, landed
+
+
+def _unpublished_load_shape(attachment, extent, where):
+    """The load shape an attachment that publishes nothing still has to state
+    (`research/docs/23` §3.6, v19).
+
+    Two arms reach this: a `dontcare` store discards the pass's writes, and a
+    `resident` store keeps them in the provider's own image
+    (`research/docs/23` §115 之后的增量，E-TX14/R4b). Neither owes the comparison
+    an attachment image, but the pass still performs its load, so the load's own
+    shape stays pinned: a clear colour is four bytes and travels without initial
+    bytes, a `load` states the previous texels the pass starts from, and a
+    `dontcare` load states neither.
+    """
+    load = attachment.get("load")
+    if load == "clear":
+        clear = _hex(attachment.get("clear_hex"), f"{where}.clear_hex")
+        _require(len(clear) == 4, f"{where}: a clear colour is four bytes")
+        _require("initial_hex" not in attachment,
+                 f"{where}: a cleared attachment carries no initial bytes")
+    elif load == "load":
+        previous = _hex(attachment.get("initial_hex"), f"{where}.initial_hex")
+        _require(len(previous) == extent,
+                 f"{where}: initial texels do not match the attachment")
+        _require("clear_hex" not in attachment,
+                 f"{where}: a loaded attachment carries no clear colour")
+    elif load == "dontcare":
+        _require("clear_hex" not in attachment,
+                 f"{where}: a dontcare load carries no clear colour")
+        _require("initial_hex" not in attachment,
+                 f"{where}: a dontcare load carries no initial bytes")
+    else:
+        raise CaptureError(f"{where}: unknown attachment load op {load!r}")
+
+
+def _kept_frame_attachment(case):
+    """The attachment whose store keeps its frame in the provider's own image
+    (`research/docs/23` §115 之后的增量，E-TX14/R4b), or `None`.
+
+    Reads both attachment spellings — the single `attachment` object and the MRT
+    list — because the two `expected_hex` rules that run before the attachment
+    section is parsed have to see the arm: the resident attachment has no
+    writeback to state an expectation for, so its frame is spelled as
+    `expected_landing_hex` instead.
+    """
+    attachments = [case["attachment"]] if "attachment" in case else case.get("attachments") or []
+    for attachment in attachments:
+        if attachment.get("store", "store") == "resident":
+            return attachment
+    return None
 
 
 def _render_plan(plan, suite):
@@ -2553,7 +2693,7 @@ def _render_plan(plan, suite):
                                "requires_depth_resolve_filter", "stencil_resolve",
                                "requires_stencil_resolve_filter", "requires_sample_count",
                                "metal", "translated_stages", "stage_buffers",
-                               "expected_landing_hex"})
+                               "expected_landing_hex", "kept_frame_landing"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         # A reviewed case pins the MSL module its two stages were written as; a
         # *translated* case pins its two AIR modules instead
@@ -2584,7 +2724,14 @@ def _render_plan(plan, suite):
         _require(single != multiple or no_colour,
                  f"{where}: exactly one of attachment and attachments is required")
         if single:
-            _require("expected_hex" in case or "expected_rule" in case or "depth" in case,
+            # The kept-frame arm (`research/docs/23` §115 之后的增量，E-TX14) is
+            # the one stored shape whose *frame* has no case-level expectation:
+            # the pass publishes no writeback, so the owner window the landing
+            # entry fills is the whole observation and `expected_landing_hex`
+            # states it. `_landing_view_section` holds that spelling to the
+            # arm's own rules rather than reading a missing `expected_hex`.
+            _require("expected_hex" in case or "expected_rule" in case or "depth" in case
+                     or _kept_frame_attachment(case) is not None,
                      f"{where}: missing fields expected_hex")
         elif multiple:
             _require("expected_hex" not in case,
@@ -2797,7 +2944,13 @@ def _render_plan(plan, suite):
         # be stated once that declaration is parsed.
         depth_landing = vertex_input is not None and vertex_input.get("depth_store") is not None
         if single and not depth_landing:
-            _require("expected_hex" in case or "expected_rule" in case,
+            # The kept-frame arm (`research/docs/23` §115 之后的增量，E-TX14/R4b)
+            # is the stored shape whose frame the pass does not publish: its
+            # owner window is the whole observation, and `expected_landing_hex`
+            # is where the case states it. `_landing_view_section` holds that
+            # spelling to the arm's own rules.
+            _require("expected_hex" in case or "expected_rule" in case
+                     or _kept_frame_attachment(case) is not None,
                      f"{where}: missing fields expected_hex")
         if vertex_input is None:
             _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
@@ -3163,10 +3316,26 @@ def _render_plan(plan, suite):
             # The landing-view store (`research/docs/23` §115 之后的增量，
             # E-TX13) is the stored arm plus its own second declaration, so it
             # keeps every rule the stored arm states; the section below pins the
-            # declaration itself.
-            _require(store in ("store", "dontcare", "landing_view"),
+            # declaration itself. The kept-frame arm (E-TX14/R4b) is the stored
+            # arm minus its writeback: the pass keeps its frame in the
+            # provider's own image and the owner window a later landing entry
+            # fills is the whole observation, so the attachment carries no
+            # expectation of its own either.
+            _require(store in ("store", "dontcare", "landing_view", "resident"),
                      f"{attachment_where}: a discarded attachment cannot be compared")
             extent = width * height * 4
+            if store == "resident":
+                # The pass publishes nothing through the writeback channel, so
+                # neither the attachment nor the single-attachment case may
+                # state an expectation: `expected_landing_hex` is the arm's own
+                # spelling of the frame, and `_landing_view_section` holds it
+                # to the window it lands in.
+                _require("expected_hex" not in attachment,
+                         f"{attachment_where}: a resident store publishes no writeback, "
+                         "so the attachment carries no expected_hex")
+                _unpublished_load_shape(attachment, extent, attachment_where)
+                parsed.append((attachment, allocation, view, None))
+                continue
             # A discarded attachment carries no expectation and no observation:
             # the single-attachment form spells its expectation at the case
             # level, so a discard cannot be expressed there, and an expectation
@@ -3183,26 +3352,7 @@ def _render_plan(plan, suite):
                     # absent too, so nothing claims bytes the pass discards.
                     _require("expected_hex" not in case,
                              f"{attachment_where}: a discarded attachment carries no expectation")
-                load = attachment.get("load")
-                if load == "clear":
-                    clear = _hex(attachment.get("clear_hex"), f"{attachment_where}.clear_hex")
-                    _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
-                    _require("initial_hex" not in attachment,
-                             f"{attachment_where}: a cleared attachment carries no initial bytes")
-                elif load == "load":
-                    previous = _hex(attachment.get("initial_hex"),
-                                    f"{attachment_where}.initial_hex")
-                    _require(len(previous) == extent,
-                             f"{attachment_where}: initial texels do not match the attachment")
-                    _require("clear_hex" not in attachment,
-                             f"{attachment_where}: a loaded attachment carries no clear colour")
-                elif load == "dontcare":
-                    _require("clear_hex" not in attachment,
-                             f"{attachment_where}: a dontcare load carries no clear colour")
-                    _require("initial_hex" not in attachment,
-                             f"{attachment_where}: a dontcare load carries no initial bytes")
-                else:
-                    raise CaptureError(f"{attachment_where}: unknown attachment load op {load!r}")
+                _unpublished_load_shape(attachment, extent, attachment_where)
                 parsed.append((attachment, allocation, view, None))
                 continue
             # The stored arm keeps the v13-v18 shape: its expectation is the
@@ -3237,8 +3387,17 @@ def _render_plan(plan, suite):
                 parsed.append((attachment, allocation, view, expected))
                 expected_bytes.append(expected)
                 continue
-            expected = _hex(case["expected_hex"] if single else attachment.get("expected_hex"),
-                            f"{attachment_where}.expected_hex")
+            # A stored attachment's expectation is the whole reason it is
+            # comparable: the MRT form states it on the entry and the
+            # single-attachment form at the case level. A case that states
+            # neither has no observation at all — the kept-frame arm is the one
+            # such shape, and it continued above — so this is a refusal rather
+            # than a lookup that could raise a bare `KeyError`.
+            declared_expectation = (case.get("expected_hex") if single
+                                    else attachment.get("expected_hex"))
+            _require(declared_expectation is not None,
+                     f"{attachment_where}: a stored attachment needs expected_hex")
+            expected = _hex(declared_expectation, f"{attachment_where}.expected_hex")
             _require(len(expected) == extent,
                      f"{attachment_where}: expected texel bytes do not match the attachment")
             texel = expected[:4]
@@ -3596,7 +3755,12 @@ def _render_plan(plan, suite):
         # (`research/docs/23` §3.3, v43/v45): the depth-only shape discards every
         # colour attachment and keeps the depth surface, and the depth texels are
         # then the whole comparison.
-        _require(expected_bytes or depth_landing,
+        # The kept-frame arm's attachment carries no case-level expectation
+        # either, for the reason above: its frame's only landing is the owner
+        # window the landing entry fills.
+        _require(expected_bytes or depth_landing
+                 or any(attachment.get("store", "store") == "resident"
+                        for attachment, _, _, _ in parsed),
                  f"{where}: every colour attachment discards, leaving no observable landing point")
         # The two reviewed MRT locations write two different byte strings, so a
         # dual case whose locations read back the same texels could not show
@@ -3698,6 +3862,15 @@ def _render_plan(plan, suite):
             # never enters the observation surface: no writeback and no
             # allocation image are owed for it (`research/docs/23` §3.6, v19).
             if expected is None:
+                # The kept-frame arm is the one arm that publishes no writeback
+                # and still moves bytes: the landing entry reads the provider's
+                # kept image back exactly once to deliver it into the owner's
+                # window, so the frame's own allocation does leave the device
+                # even though the pass that kept it reported nothing
+                # (`research/docs/23` §115 之后的增量，E-TX14/R4b). The
+                # copy-out count below is where that transfer is observable.
+                if attachment.get("store", "store") == "resident":
+                    written.add(allocation)
                 continue
 
             # The allocation image is the declaring case's own image with the

@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v41",
+  "guard_byte": 168,
+  "cases": [
+    {
+      "id": "render_declaring_landing_view",
+      "entry": "copy_word_with_witness",
+      "grid": [1, 1, 1],
+      "local": [1, 1, 1],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word_with_witness.ll",
+        "sha256": "f24e33124da1c228bf4766d32496d8d7ede4fc29d8e6c582c889a36343dfc18e"
+      },
+      "metal": {
+        "path": "shaders/copy_word_with_witness.metal",
+        "sha256": "c116fec300f1369069fbcf19d5fbb95e8c5ad07475757c19930075a19ad4367a"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "fefefefefefefefefefefefefefefefe"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 12,
+          "access": "write",
+          "initial_hex": "ffffffff"
+        },
+        {
+          "binding": 2,
+          "allocation": 940,
+          "view": 950,
+          "offset": 16384,
+          "length": 16,
+          "allocation_size": 32768,
+          "access": "read",
+          "initial_hex": "11223344112233441122334411223344",
+          "storage_mode": "borrowed_no_copy"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "bytes_hex": "11223344"
+        }
+      ],
+      "capture_rails": [
+        "vulkan",
+        "native-metal",
+        "native-metal-provider"
+      ]
+    }
+  ],
+  "render_cases": [
+    {
+      "id": "kept_frame_landing_quad_2x2",
+      "declaring_case": "render_declaring_landing_view",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2.metal",
+        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 960,
+          "view": 970,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000080bf00000000000080bf000080bf0000803f000000000000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 980,
+        "view": 990,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [0, 0, 2, 2],
+      "coverage": "partial",
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 2,
+        "height": 2,
+        "load": "load",
+        "store": "resident",
+        "initial_hex": "fefefefefefefefefefefefefefefefe"
+      },
+      "kept_frame_landing": {
+        "frame": {
+          "allocation": 900,
+          "view": 910
+        },
+        "landing": {
+          "allocation": 940,
+          "view": 950
+        }
+      },
+      "expected_landing_hex": "4080c0fffefefefe4080c0fffefefefe",
+      "capture_rails": ["vulkan"]
+    }
+  ]
+}

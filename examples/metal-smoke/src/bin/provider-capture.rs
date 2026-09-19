@@ -13,19 +13,19 @@ use metal_api_core::provider::{
     Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
     HeapPlacement, HeapResource, HostRegion, IndexBufferBinding, IndexFormat,
     IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
-    LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve,
-    NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
-    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
-    RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment,
-    RenderStencilIdentity, ResourceTableSnapshot, SampleCount, SamplerPolicy, SemanticDigest,
-    ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
-    StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp,
-    TextureAccess, TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView,
-    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    Winding, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION,
-    RENDER_AFFINE_AXES,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, KeptFrame, KeptFrameLanding,
+    LeaseId, LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
+    MultisampleStencilResolve, NoCopyLeaseImporter, OperationId, PipelineCompileRequest,
+    PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, QueuePriority,
+    QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
+    SampleCount, SamplerPolicy, SemanticDigest, ShaderSource, StageBufferBinding, StageBufferView,
+    StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter,
+    StencilTest, StorageMode, StoreOp, TextureAccess, TextureBindingContract, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS,
+    MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION, RENDER_AFFINE_AXES,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1981,6 +1981,18 @@ struct RenderCase {
     /// reported only the writeback would leave it unobserved.
     #[serde(default)]
     expected_landing_hex: Option<String>,
+    /// The kept-frame landing entry a `"resident"` store's trace carries
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b): the identity the pass left
+    /// in the provider's own image, and the owner window a *later* landing entry
+    /// delivers it into.
+    ///
+    /// It is the deferred sibling of [`RenderAttachmentDefinition::landing_view`]:
+    /// there the pass lands its own frame in the window in the same completion,
+    /// here the frame stays where the pass kept it and the entry moves it — so the
+    /// case's expectation is the same bytes under the name the entry's own
+    /// observation has (`expected_landing_hex`), and the attachment carries none.
+    #[serde(default)]
+    kept_frame_landing: Option<KeptFrameLandingDefinition>,
     /// The rule the single attachment's own bytes follow, when the case cannot
     /// spell them (R5a, `research/docs/23` §73). It is the reviewed sampling
     /// shape's identity rule restated: the fragment stage copies the bound
@@ -2699,6 +2711,20 @@ struct RenderAttachmentDefinition {
 struct LandingViewDefinition {
     allocation: u64,
     view: u64,
+}
+
+/// The kept-frame landing entry a `"resident"` store's trace carries
+/// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
+///
+/// Two identities and no third field: the frame the pass kept in the provider's
+/// own image, and the owner window the entry delivers it into. Both halves are
+/// the same `(allocation, view)` pair shape the landing-view store names, so the
+/// declaring pass's own declaration resolves either one through one code path.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeptFrameLandingDefinition {
+    frame: LandingViewDefinition,
+    landing: LandingViewDefinition,
 }
 
 fn default_attachment_store() -> String {
@@ -4124,6 +4150,15 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // render case runs on the Vulkan track rail alone, so this table pins the
         // declaring pass, which every rail executes.
         (1, "compute-buffer-v40") => &["render_declaring_landing_view"],
+        // The kept-frame landing entry (`research/docs/23` §115 之后的增量，
+        // E-TX14/R4b): the same declaring pass as v40 — the reviewed witness
+        // kernel over the attachment's own sixteen-byte view, the copy landing
+        // and the owner window its third binding declares — beside the render
+        // case whose pass *keeps* its frame (resident store) for a later
+        // landing entry to deliver. The render case runs on the Vulkan trace
+        // rail alone, so this table pins the declaring pass, which every rail
+        // executes.
+        (1, "compute-buffer-v41") => &["render_declaring_landing_view"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4447,44 +4482,142 @@ fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition
     case.attachment.iter().collect()
 }
 
-/// The one attachment that stores through the landing view
-/// (`research/docs/23` §115 之后的增量，E-TX13), with the second view
-/// declaration it names.
+/// The one attachment that lands its frame through a landing arm
+/// (`research/docs/23` §115 之后的增量，E-TX13/E-TX14), with the owner window
+/// that arm names.
 ///
-/// A case may declare at most one such attachment: the arm's reading is one
-/// owner window, and two landing views in one pass would need two windows
-/// reported under one case-level expectation.
+/// Two arms state the same reading. A `"landing_view"` store lands the pass's
+/// *own* frame in the window as the pass completes, and names that window in its
+/// own `landing_view` section. A `"resident"` store leaves the frame in the
+/// provider's own image and publishes nothing, and the case-level
+/// `kept_frame_landing` section names both the kept identity and the window the
+/// later landing entry delivers it into. Either way the observation is one owner
+/// window under one case-level `expected_landing_hex`, so a case may declare at
+/// most one such attachment: two landing views in one pass would need two windows
+/// reported under one expectation.
 fn render_case_landing(
     case: &RenderCase,
 ) -> Result<Option<(&RenderAttachmentDefinition, &LandingViewDefinition)>> {
     let mut found = None;
     for attachment in render_case_attachments(case) {
-        if attachment.store != "landing_view" {
-            if attachment.landing_view.is_some() {
-                return Err(format!(
-                    "render case {}: only a landing_view store names a landing view",
-                    case.id
-                )
-                .into());
+        let definition = match attachment.store.as_str() {
+            "landing_view" => {
+                attachment
+                    .landing_view
+                    .as_ref()
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        format!(
+                            "render case {}: a landing_view store needs the landing_view section",
+                            case.id
+                        )
+                        .into()
+                    })?
             }
-            continue;
-        }
-        let definition = attachment
-            .landing_view
-            .as_ref()
-            .ok_or_else(|| -> Box<dyn Error> {
-                format!(
-                    "render case {}: a landing_view store needs the landing_view section",
-                    case.id
-                )
-                .into()
-            })?;
+            "resident" => {
+                if attachment.landing_view.is_some() {
+                    return Err(format!(
+                        "render case {}: a resident store names its window in the \
+                         kept_frame_landing section, not in a landing_view section",
+                        case.id
+                    )
+                    .into());
+                }
+                &case
+                    .kept_frame_landing
+                    .as_ref()
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        format!(
+                            "render case {}: a resident store needs the kept_frame_landing \
+                             section",
+                            case.id
+                        )
+                        .into()
+                    })?
+                    .landing
+            }
+            _ => {
+                if attachment.landing_view.is_some() {
+                    return Err(format!(
+                        "render case {}: only a landing_view store names a landing view",
+                        case.id
+                    )
+                    .into());
+                }
+                continue;
+            }
+        };
         if found.is_some() {
             return Err(format!("render case {}: one pass lands one owner window", case.id).into());
         }
         found = Some((attachment, definition));
     }
+    // A kept-frame section on a case whose attachments all discard or store
+    // keeps a frame nothing would ever deliver: the entry it describes has no
+    // identity to consume.
+    if found.is_none() && case.kept_frame_landing.is_some() {
+        return Err(format!(
+            "render case {}: kept_frame_landing needs a resident store",
+            case.id
+        )
+        .into());
+    }
     Ok(found)
+}
+
+/// The declaring pass's own declaration of a landing arm's owner window
+/// (`research/docs/23` §115 之后的增量，E-TX13/E-TX14).
+///
+/// Both arms resolve their window here and nowhere else, so the two spellings
+/// cannot drift into two answers: exactly one buffer of the declaring case
+/// carries the identity, the declaring pass only *reads* it (a compute write
+/// would race the landing), the declaration sits on the `borrowed_no_copy` arm —
+/// the window is the owner's registered mapping, not a copy the provider
+/// holds — and its byte range is the attachment's own tightly packed extent.
+fn landing_window_declaration(
+    suite: &Suite,
+    case: &RenderCase,
+    where_: &str,
+    definition: &LandingViewDefinition,
+    extent: usize,
+) -> Result<()> {
+    let declaring = suite
+        .cases
+        .iter()
+        .find(|declared| declared.id == case.declaring_case)
+        .ok_or(format!(
+            "{where_}: the declaring case {} is not in this suite",
+            case.declaring_case
+        ))?;
+    let declared = declaring
+        .buffers
+        .iter()
+        .filter(|buffer| {
+            buffer.allocation == definition.allocation && buffer.view == definition.view
+        })
+        .collect::<Vec<_>>();
+    if declared.len() != 1 {
+        return Err(format!(
+            "{where_}: the declaring case has to declare exactly the landing view"
+        )
+        .into());
+    }
+    let declared = declared[0];
+    if declared.access != "read" {
+        return Err(format!("{where_}: the declaring pass reads the landing view").into());
+    }
+    if declared.storage_mode.as_deref() != Some("borrowed_no_copy") {
+        return Err(format!(
+            "{where_}: a landing view has to be the declaring pass's \
+             borrowed_no_copy window"
+        )
+        .into());
+    }
+    if declared.length != u64::try_from(extent)? {
+        return Err(
+            format!("{where_}: the landing view has to be the attachment's own extent").into(),
+        );
+    }
+    Ok(())
 }
 
 /// The identity a render case's stored depth attachment lands in
@@ -7295,12 +7428,15 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             format!("{where_}: a rule expectation is the reviewed sampling shape's").into(),
         );
     }
-    // The landing expectation belongs to the landing-view store and nowhere
-    // else (`research/docs/23` §115 之后的增量，E-TX13): a case that states the
+    // The landing expectation belongs to a landing arm and nowhere else
+    // (`research/docs/23` §115 之后的增量，E-TX13/E-TX14): a case that states the
     // bytes an owner window should hold without naming the arm that lands them
     // would be claiming an observation no pass performs.
     if case.expected_landing_hex.is_some() && render_case_landing(case)?.is_none() {
-        return Err(format!("{where_}: expected_landing_hex needs a landing_view store").into());
+        return Err(format!(
+            "{where_}: expected_landing_hex needs a landing_view or resident store"
+        )
+        .into());
     }
     let shapes = render_attachment_shapes(case)?;
     if multiple && !(2..=metal_api_core::provider::MAX_COLOR_ATTACHMENTS).contains(&shapes.len()) {
@@ -8254,71 +8390,111 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .ok_or("attachment extent overflows")?,
         )?;
         match attachment.store.as_str() {
-            // The landing-view store (`research/docs/23` §115 之后的增量，
-            // E-TX13) is the stored arm *plus* its second declaration: every
-            // expectation rule the stored arm states — the whole attachment is
-            // covered, the frame is falsifiable against the load's own bytes,
-            // the load shape is pinned — applies unchanged, and the landing
-            // view's own rules are checked at the end of this arm.
-            "store" | "landing_view" => {
-                if attachment.store == "landing_view" {
-                    let (_, definition) = render_case_landing(case)?.ok_or(format!(
-                        "{where_}: a landing_view store names the second view declaration it \
-                         lands in"
-                    ))?;
-                    let landed = unhex(case.expected_landing_hex.as_deref().ok_or(format!(
-                        "{where_}: a landing_view store needs expected_landing_hex"
-                    ))?)?;
-                    if landed.len() != extent {
-                        return Err(format!(
-                            "{where_}: the landing expectation does not match the attachment"
-                        )
-                        .into());
-                    }
-                    let declared = suite
-                        .cases
-                        .iter()
-                        .find(|declared| declared.id == case.declaring_case)
-                        .and_then(|declared| {
-                            declared.buffers.iter().find(|buffer| {
-                                buffer.allocation == definition.allocation
-                                    && buffer.view == definition.view
-                            })
-                        })
-                        .ok_or(format!(
-                            "{where_}: the declaring pass does not declare the landing view"
+            // The three stored arms (`research/docs/23` §115 之后的增量，
+            // E-TX13/E-TX14) are the stored arm *plus* where the frame goes:
+            // every expectation rule the stored arm states — the whole
+            // attachment is covered, the frame is falsifiable against the
+            // load's own bytes, the load shape is pinned — applies unchanged,
+            // and each arm's own window rules are checked here.
+            "store" | "landing_view" | "resident" => {
+                match attachment.store.as_str() {
+                    // E-TX13: the pass's *own* frame lands in the owner window
+                    // a second view declaration names, in the same completion.
+                    "landing_view" => {
+                        let (_, definition) = render_case_landing(case)?.ok_or(format!(
+                            "{where_}: a landing_view store names the second view declaration it \
+                             lands in"
                         ))?;
-                    if declared.storage_mode.as_deref() != Some("borrowed_no_copy") {
-                        return Err(format!(
-                            "{where_}: a landing view has to be the declaring pass's \
-                             borrowed_no_copy window"
-                        )
-                        .into());
+                        let landed = unhex(case.expected_landing_hex.as_deref().ok_or(
+                            format!("{where_}: a landing_view store needs expected_landing_hex"),
+                        )?)?;
+                        if landed.len() != extent {
+                            return Err(format!(
+                                "{where_}: the landing expectation does not match the attachment"
+                            )
+                            .into());
+                        }
+                        landing_window_declaration(suite, case, &where_, definition, extent)?;
                     }
-                    if declared.length != u64::try_from(extent)? {
-                        return Err(format!(
-                            "{where_}: the landing view has to be the attachment's own extent"
-                        )
-                        .into());
+                    // E-TX14: the pass keeps its frame in the provider's own
+                    // image and publishes nothing, and a later landing *entry*
+                    // delivers that frame into the owner window. The identity
+                    // the entry consumes is this attachment's own — a pass
+                    // cannot keep a frame for a surface it did not write — and
+                    // the window is the declaring pass's borrowed declaration,
+                    // exactly as the landing-view arm's is.
+                    "resident" => {
+                        if expected_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a resident store publishes no writeback, so the \
+                                 attachment carries no expected_hex"
+                            )
+                            .into());
+                        }
+                        if case.expected_rule.is_some() {
+                            return Err(format!(
+                                "{where_}: a resident store states its frame as \
+                                 expected_landing_hex, not as a texel rule"
+                            )
+                            .into());
+                        }
+                        let section = case.kept_frame_landing.as_ref().ok_or(format!(
+                            "{where_}: a resident store needs the kept_frame_landing section"
+                        ))?;
+                        if (section.frame.allocation, section.frame.view)
+                            != (attachment.allocation, attachment.view)
+                        {
+                            return Err(format!(
+                                "{where_}: the kept frame has to be the resident attachment's own \
+                                 identity"
+                            )
+                            .into());
+                        }
+                        let landed = unhex(case.expected_landing_hex.as_deref().ok_or(
+                            format!("{where_}: a resident store needs expected_landing_hex"),
+                        )?)?;
+                        if landed.len() != extent {
+                            return Err(format!(
+                                "{where_}: the landing expectation does not match the attachment"
+                            )
+                            .into());
+                        }
+                        landing_window_declaration(suite, case, &where_, &section.landing, extent)?;
                     }
-                } else if attachment.landing_view.is_some() {
-                    return Err(format!(
-                        "{where_}: only a landing_view store names a landing view"
-                    )
-                    .into());
+                    _ => {
+                        if attachment.landing_view.is_some() {
+                            return Err(format!(
+                                "{where_}: only a landing_view store names a landing view"
+                            )
+                            .into());
+                        }
+                    }
                 }
+                // The frame's bytes, spelled by the arm that observes them. A
+                // stored arm publishes the frame through the writeback channel
+                // and states it as `expected_hex`; the resident arm's frame has
+                // no writeback at all — the owner window a later landing entry
+                // fills is its only observation, and the case states those
+                // bytes as `expected_landing_hex`. Every expectation rule below
+                // reads whichever spelling this arm owes, so the resident arm's
+                // window is held to the same per-texel rules the stored arms'
+                // writebacks are.
+                //
                 // R5a (`research/docs/23` §73): a rule-expected attachment
                 // states its expectation as the reviewed per-texel rule instead
                 // of a hex string. The rule's own plane is computed here, so
                 // every expectation check below reads exactly the texels the
                 // capture's digest and windows cover.
+                let frame_hex = match attachment.store.as_str() {
+                    "resident" => case.expected_landing_hex.as_deref(),
+                    _ => expected_hex.as_deref(),
+                };
                 let texels = match case.expected_rule.as_deref() {
                     Some(rule) => rule_bytes(rule, attachment.width, attachment.height)?,
                     None => {
-                        let expected_hex = expected_hex
-                            .as_deref()
+                        let frame_hex = frame_hex
                             .ok_or(format!("{where_}: a stored attachment needs expected_hex"))?;
-                        unhex(expected_hex)?
+                        unhex(frame_hex)?
                     }
                 };
                 if texels.len() != extent {
@@ -10950,6 +11126,12 @@ fn run_render_case(
                         view_id: ViewId::new(landing.view),
                     })
                 }
+                // The kept-frame arm (`research/docs/23` §115 之后的增量，
+                // E-TX14/R4b): the pass keeps its frame in the provider's own
+                // image and publishes nothing, and the landing entry pushed
+                // below delivers that same frame into the owner's window. The
+                // store decision is the *pass*'s; the entry carries none.
+                "resident" => StoreOp::Resident,
                 other => {
                     return Err(
                         format!("render case {}: unsupported store op {other:?}", case.id).into(),
@@ -11090,6 +11272,36 @@ fn run_render_case(
         samplers: Vec::new(),
         present,
     }));
+    // The kept-frame landing entry (`research/docs/23` §115 之后的增量，
+    // E-TX14/R4b) rides *after* the pass that keeps the frame: the entry
+    // carries no pipeline, no draw and no load source, so "this submission
+    // delivers a frame a previous entry kept" is a fact of the pass list rather
+    // than a convention. The window it names is a view the declaring compute
+    // pass declares (`serial_resources()` only collects compute-pass views and
+    // attachment identities), which is why the entry can never stand alone.
+    if let Some(section) = &case.kept_frame_landing {
+        let frame = attachments
+            .iter()
+            .map(|(attachment, _)| *attachment)
+            .find(|attachment| {
+                attachment.allocation == section.frame.allocation
+                    && attachment.view == section.frame.view
+            })
+            .ok_or("the kept frame has to be the resident attachment's own identity")?;
+        trace.passes.push(TracePass::Landing(KeptFrameLanding {
+            frame: KeptFrame {
+                allocation_id: AllocationId::new(section.frame.allocation),
+                view_id: ViewId::new(section.frame.view),
+                format: attachment_format(&frame.format)?,
+                width: frame.width,
+                height: frame.height,
+            },
+            landing: metal_api_core::provider::AttachmentLandingView {
+                allocation_id: AllocationId::new(section.landing.allocation),
+                view_id: ViewId::new(section.landing.view),
+            },
+        }));
+    }
 
     let admitted = provider
         .capabilities()
@@ -11176,10 +11388,15 @@ fn run_render_case(
     let mut writebacks = Vec::new();
     let mut images = Vec::new();
     for (attachment, _) in &attachments {
-        // Both stored arms publish their frame through the writeback channel
-        // (`research/docs/23` §115 及其后的增量): the landing-view arm adds the
-        // owner's window as a *second* destination, so the attachment's own
-        // observation stays the one every other stored case reports.
+        // Both *publishing* stored arms report their frame through the
+        // writeback channel (`research/docs/23` §115 及其后的增量): the
+        // landing-view arm adds the owner's window as a *second* destination,
+        // so the attachment's own observation stays the one every other stored
+        // case reports. The resident arm is deliberately absent from this list:
+        // the frame stays in the provider's own image and the pass publishes
+        // nothing, so the case owes neither a writeback nor an allocation image
+        // for it — the owner window the landing entry fills is its whole
+        // observation (E-TX14/R4b).
         if !matches!(attachment.store.as_str(), "store" | "landing_view") {
             continue;
         }
@@ -11444,7 +11661,7 @@ fn run_render_case(
         None => {
             if case.expected_landing_hex.is_some() {
                 return Err(format!(
-                    "render case {}: expected_landing_hex needs a landing_view store",
+                    "render case {}: expected_landing_hex needs a landing_view or resident store",
                     case.id
                 )
                 .into());

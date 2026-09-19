@@ -534,8 +534,10 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # declaring pass `test_suite_v39.py` pins, so it joins the list as well —
         # and v40 the colour attachment's landing view (`research/docs/23` §115
         # 之后的增量，E-TX13), whose one render case and declaring pass
-        # `test_suite_v40.py` pins.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 39)
+        # `test_suite_v40.py` pins — and v41 the kept-frame landing entry
+        # (`research/docs/23` §115 之后的增量，E-TX14/R4b), whose one render case
+        # and declaring pass `test_suite_v41.py` pins.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 40)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -554,7 +556,7 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v34", "compute-buffer-v35",
                                       "compute-buffer-v36", "compute-buffer-v37",
                                       "compute-buffer-v38", "compute-buffer-v39",
-                                      "compute-buffer-v40"):
+                                      "compute-buffer-v40", "compute-buffer-v41"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

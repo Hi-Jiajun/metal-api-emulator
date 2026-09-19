@@ -21,7 +21,15 @@ written up in [../docs/NON-INDEXED-DRAW.md](../docs/NON-INDEXED-DRAW.md);
 while its frame lands in the owner window a *second* view declaration names —
 the declaring pass's `borrowed_no_copy` binding — with the window's bytes
 reported beside the attachment's and written up in
-[../docs/ATTACHMENT-LANDING-VIEW.md](../docs/ATTACHMENT-LANDING-VIEW.md). The render and present observation rules live in
+[../docs/ATTACHMENT-LANDING-VIEW.md](../docs/ATTACHMENT-LANDING-VIEW.md);
+`suite-v41.json` is the *delayed* sibling of that arm (`research/docs/23` §115
+之后的增量，E-TX14/R4b): the render pass keeps its frame in the provider's own
+image (`store: "resident"`, which publishes no writeback at all) and a
+`kept_frame_landing` section names both the kept identity and the owner window
+the landing *entry* delivers it into, so the window is the case's whole
+observation and `expected_landing_hex` is where the frame is stated — written up
+in [../docs/KEPT-FRAME-LANDING.md](../docs/KEPT-FRAME-LANDING.md). The render and
+present observation rules live in
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10, the
 store/dontcare rules in §11 and the undefined-load rules in §12; the per-suite
 rules are exercised by
