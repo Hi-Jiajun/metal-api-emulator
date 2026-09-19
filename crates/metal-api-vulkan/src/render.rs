@@ -1827,7 +1827,12 @@ impl RenderStages {
     /// translated module described by its reflection.
     fn validate_vertex_half(&self) -> Result<(), ProviderError> {
         match &self.vertex_translation {
-            Some(reflection) => validate_translated_stage(self, RenderStage::Vertex, reflection),
+            Some(reflection) => validate_translated_stage(
+                self,
+                RenderStage::Vertex,
+                reflection,
+                EXECUTES_FRAGMENT_OUTPUT_SUPERSET,
+            ),
             None => {
                 if reviewed_vertex_module(&self.contract.vertex_entry, &self.vertex_spirv) {
                     Ok(())
@@ -1845,7 +1850,12 @@ impl RenderStages {
     /// list, or a translated module described by its reflection.
     fn validate_fragment_half(&self) -> Result<(), ProviderError> {
         match &self.fragment_translation {
-            Some(reflection) => validate_translated_stage(self, RenderStage::Fragment, reflection),
+            Some(reflection) => validate_translated_stage(
+                self,
+                RenderStage::Fragment,
+                reflection,
+                EXECUTES_FRAGMENT_OUTPUT_SUPERSET,
+            ),
             None => {
                 if fragment_stage_is_reviewed(self) {
                     Ok(())
@@ -1992,6 +2002,7 @@ fn validate_translated_stage(
     stages: &RenderStages,
     stage: RenderStage,
     reflection: &ShaderReflection,
+    fragment_output_superset: bool,
 ) -> Result<(), ProviderError> {
     let (entry, module) = match stage {
         RenderStage::Vertex => (
@@ -2051,7 +2062,9 @@ fn validate_translated_stage(
     validate_translated_stage_textures(stages, stage, entry, reflection)?;
     match stage {
         RenderStage::Vertex => validate_translated_vertex(stages, entry, reflection),
-        RenderStage::Fragment => validate_translated_fragment(stages, entry, reflection),
+        RenderStage::Fragment => {
+            validate_translated_fragment(stages, entry, reflection, fragment_output_superset)
+        }
     }
 }
 
@@ -2271,16 +2284,45 @@ fn validate_translated_vertex_attributes(
     Ok(())
 }
 
+/// Whether this rail executes the **superset fragment interface**
+/// ([`ProviderCapabilities::supports_render_fragment_output_superset`]).
+///
+/// The rail's own answer, and the reason the bit is not merely a declaration
+/// written beside the behaviour: [`validate_translated_fragment`] branches on
+/// it, so the strict count rule below and the widened one are two arms of one
+/// function rather than two spellings of one rule. Vulkan defines what the
+/// widened arm executes — a store to a colour location with no attachment
+/// behind it is *discarded*, so the frame is exactly the attached locations'
+/// stores — and the pipeline itself is built from the contract's own
+/// `color_formats`, which is why no device feature is asked for here. The
+/// capability snapshot in `provider.rs` declares the same answer, and
+/// `provider.rs`'s own test reads this constant against that snapshot so the
+/// declaration cannot drift from the gate.
+pub(crate) const EXECUTES_FRAGMENT_OUTPUT_SUPERSET: bool = true;
+
 /// The fragment half's own agreement with the contract.
 ///
 /// One render target per declared colour format, in location order: the count,
 /// the locations and each target's component shape. A fragment stage reads no
 /// vertex attribute and uses no vertex builtin, so either of those in the
 /// reflection is the wrong stage's interface.
+///
+/// The count rule is the one place the superset arm widens the agreement, and
+/// it widens it **by direction**: a module may declare *more* colour locations
+/// than the contract attaches when `fragment_output_superset` is the rail's
+/// own answer ([`EXECUTES_FRAGMENT_OUTPUT_SUPERSET`]), because the extra
+/// locations' stores are the ones Vulkan discards. The prefix the contract does
+/// attach is walked exactly as it always was — position by position, each with
+/// the component shape its format stores — and the reverse direction (a
+/// declared format whose location the module never stores) keeps today's
+/// refusal, sentence and fields, in both arms: a stage that skips a location it
+/// is registered with would leave the attachment reading back bytes nothing
+/// wrote.
 fn validate_translated_fragment(
     stages: &RenderStages,
     entry: &str,
     reflection: &ShaderReflection,
+    fragment_output_superset: bool,
 ) -> Result<(), ProviderError> {
     let mismatch = |field: &str| {
         reflection_mismatch_refusal(RenderStage::Fragment, entry)
@@ -2298,7 +2340,18 @@ fn validate_translated_fragment(
         );
     }
     let declared = &stages.contract.color_formats;
-    if declared.len() != reflection.render_targets.len() {
+    let reflected = &reflection.render_targets;
+    // The widened arm admits one direction only, and it is the direction that
+    // needs the rail's own answer: `reflected > declared` is "the module
+    // declares locations the pass does not attach", which Vulkan executes by
+    // discarding those stores. `declared > reflected` is not that statement —
+    // it is an attachment the module never writes — so it keeps the refusal
+    // below with the sentence and the fields it has always had, whichever arm
+    // is in force, and so does the whole count rule on a rail that has not
+    // declared the shape.
+    if declared.len() != reflected.len()
+        && !(fragment_output_superset && reflected.len() > declared.len())
+    {
         return Err(mismatch("render_targets")
             .with_field(
                 "declared_targets",
@@ -2314,8 +2367,11 @@ fn validate_translated_fragment(
                  skips one it has) is a different interface",
             ));
     }
-    for (location, (format, target)) in declared.iter().zip(&reflection.render_targets).enumerate()
-    {
+    // The walk covers the contract's own list: on the widened arm the extra
+    // reflected locations past it are the ones nothing consumes, so no rule
+    // here reads them — reading them would be inventing a second interface the
+    // contract never stated.
+    for (location, (format, target)) in declared.iter().zip(reflected).enumerate() {
         let location = location as u32;
         if target.location != location {
             return Err(mismatch("render_targets")
@@ -18296,6 +18352,154 @@ mod tests {
         assert_eq!(
             refused.fields.get("module_address"),
             Some(&FieldValue::Text("ClampToZero".to_owned()))
+        );
+    }
+
+    /// The fragment count rule has two arms, and the rail's own answer is what
+    /// selects between them (2026-09-20, the third door behind census v46's
+    /// `stage_buffer_footprint` bucket).
+    ///
+    /// The module under test is the census's own shape — one whose fragment
+    /// stage stores two locations — so the three readings below are the three
+    /// statements the increment is made of: the strict arm keeps today's count
+    /// rule *and today's sentence*, the rail's own arm admits the extra store
+    /// to be discarded, and the reverse direction keeps its refusal in both
+    /// arms.
+    #[test]
+    fn the_fragment_count_rule_widens_one_direction_on_the_rails_own_answer() {
+        use metal2vulkan::passes::{Stage, TransformOptions};
+
+        let scratch = crate::ScratchDir::new().expect("scratch directory");
+        let translate = |source: &str| {
+            metal2vulkan::translate_sanitized_native_reflected(
+                source,
+                Stage::Fragment,
+                scratch.path(),
+                TransformOptions::default(),
+            )
+            .expect("the fixture translates")
+        };
+        let (two_output_spirv, two_output) = translate(include_str!(
+            "../tests/fixtures/render_two_output_rgba8.frag.ll"
+        ));
+        let (_single_spirv, single) = translate(include_str!(
+            "../tests/fixtures/render_offscreen_2x2.frag.ll"
+        ));
+        assert_eq!(
+            two_output
+                .render_targets
+                .iter()
+                .map(|target| target.location)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the fixture really declares two locations"
+        );
+        assert_eq!(single.render_targets.len(), 1);
+
+        let stages = |formats: Vec<AttachmentFormat>,
+                      fragment_spirv: &[u8],
+                      reflection: &ShaderReflection,
+                      entry: &str| RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: entry.to_owned(),
+                color_formats: formats,
+                vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: fragment_spirv.to_vec(),
+            vertex_translation: None,
+            fragment_translation: Some(reflection.clone()),
+            fragment_pixel_spirv: None,
+        };
+
+        let one_attachment = stages(
+            vec![AttachmentFormat::Rgba8Unorm],
+            &two_output_spirv,
+            &two_output,
+            "render_two_output_rgba8",
+        );
+        let refused = validate_translated_fragment(
+            &one_attachment,
+            "render_two_output_rgba8",
+            &two_output,
+            false,
+        )
+        .expect_err("a rail that has not declared the shape keeps the count rule");
+        eprintln!("strict arm refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("field"),
+            Some(&FieldValue::Text("render_targets".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("declared_targets"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_targets"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            refused.detail.as_deref(),
+            Some(
+                "the contract's colour format list and the reflection have to name the same \
+                 render targets; a stage that stores a location with no attachment beside it (or \
+                 skips one it has) is a different interface"
+            ),
+            "the strict arm keeps today's sentence byte for byte"
+        );
+
+        validate_translated_fragment(
+            &one_attachment,
+            "render_two_output_rgba8",
+            &two_output,
+            EXECUTES_FRAGMENT_OUTPUT_SUPERSET,
+        )
+        .expect("the rail's own answer admits the extra store to be discarded");
+
+        // The reverse direction — an attachment whose location the module never
+        // stores — is refused by both arms, with the same fields.
+        let reverse = stages(
+            vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+            &_single_spirv,
+            &single,
+            "render_solid_rgba8",
+        );
+        for superset in [false, EXECUTES_FRAGMENT_OUTPUT_SUPERSET] {
+            let refused =
+                validate_translated_fragment(&reverse, "render_solid_rgba8", &single, superset)
+                    .expect_err("a location the module never stores cannot describe the contract");
+            assert_eq!(
+                refused.fields.get("declared_targets"),
+                Some(&FieldValue::Unsigned(2))
+            );
+            assert_eq!(
+                refused.fields.get("reflected_targets"),
+                Some(&FieldValue::Unsigned(1))
+            );
+        }
+
+        // The attached positions keep the shape rule they always had: the
+        // widened count does not widen the component shape.
+        let wrong_shape = stages(
+            vec![AttachmentFormat::R32Float],
+            &two_output_spirv,
+            &two_output,
+            "render_two_output_rgba8",
+        );
+        let refused = validate_translated_fragment(
+            &wrong_shape,
+            "render_two_output_rgba8",
+            &two_output,
+            EXECUTES_FRAGMENT_OUTPUT_SUPERSET,
+        )
+        .expect_err("a float4 store is not the component shape an R32Float attachment reads");
+        assert_eq!(
+            refused.fields.get("type_name"),
+            Some(&FieldValue::Text("float4".to_owned()))
         );
     }
 

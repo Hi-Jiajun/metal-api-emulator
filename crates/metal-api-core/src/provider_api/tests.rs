@@ -325,6 +325,10 @@ impl ComputeProvider for FakeProvider {
             // through neither entry point.
             supports_render_vertex_interface_superset: false,
             supports_render_vertex_count_above_triangle: false,
+            // The fixture provider attaches exactly the locations its modules
+            // store, so the superset fragment interface is not one of the shapes
+            // either object rail reaches through this entry point (2026-09-20).
+            supports_render_fragment_output_superset: false,
             // The object rails execute the direct vertex-input shape, so the
             // fixture provider declares the same two instancing bits; the
             // instanced draw call itself is the next increment's encoder work

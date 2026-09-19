@@ -887,6 +887,31 @@ const CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL: u8 = 0x08;
 /// block's, and why a snapshot that does not declare the bit writes nothing.
 const CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL: u8 = 0x0C;
 
+/// Tag, inside the tail's second family, of the superset fragment interface's
+/// block (2026-09-20, the third door behind census v46's
+/// `stage_buffer_footprint` bucket).
+///
+/// The section follows the layout-free vertex count and carries one bool:
+/// whether the snapshot executes a registration whose fragment module declares
+/// every colour location the contract's format list attaches *plus* locations
+/// with no attachment beside them
+/// ([`ProviderCapabilities::supports_render_fragment_output_superset`]). The
+/// contract admits that direction from this increment on — a Vulkan fragment
+/// store to a location with no attachment behind it is discarded, not an
+/// error — so a consumer that gates a draw on the face has to be able to tell
+/// "the provider I am talking to executes the module's extra stores, dropped"
+/// from "it registers only a module whose stores and attachments are the same
+/// list".
+///
+/// The absent section is the older reading, and it is the fail-closed one: a
+/// frame that ends before it means the consumer keeps its own refusal by name
+/// for the shape instead of handing the provider a pipeline registration that
+/// comes back a refusal no rail answered — the census red line
+/// (`draws_skipped_after_engine_refusal`). That is why the section is the
+/// family's next tag rather than a widening of the colour format block's
+/// payload, and why a snapshot that does not declare the bit writes nothing.
+const CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL: u8 = 0x0E;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -1164,6 +1189,13 @@ impl CommandCodec {
                     // shape the provider can hold.
                     || capabilities.declares_render_texture_dimension_1d()
                     || capabilities.declares_render_texture_dimension_3d()
+                    // The superset fragment interface is a face of its own
+                    // (2026-09-20, the third door behind census v46's
+                    // `stage_buffer_footprint` bucket): a snapshot that
+                    // declares only it still has to write the extended
+                    // payload, or its declaration would be dropped on the wire
+                    // and every consumer would keep refusing the shape by name.
+                    || capabilities.declares_render_fragment_output_superset_support()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -6234,6 +6266,13 @@ fn put_capabilities(
         // before the family's escape, or the declaration would be dropped on
         // the wire.
         || capabilities.declares_render_vertex_count_above_triangle()
+        // The superset fragment interface joins the same guard for the same
+        // reason (2026-09-20, the third door behind census v46's
+        // `stage_buffer_footprint` bucket): a snapshot whose only statement is
+        // this bit still has to write the heap/ICB half the decoder reads by
+        // position before the family's escape, or the declaration would be
+        // dropped on the wire.
+        || capabilities.declares_render_fragment_output_superset_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6540,6 +6579,22 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL);
             encoder.u64(capabilities.max_render_texture_dimension_3d);
         }
+        // The superset fragment interface is the family's next tag and follows
+        // the layout-free vertex count (2026-09-20, the third door behind
+        // census v46's `stage_buffer_footprint` bucket). It carries one bool
+        // rather than a count for the same reason the vertex interface's
+        // superset bit does: the question is "does this snapshot execute a
+        // module that declares colour locations the pass does not attach",
+        // and the attachment list itself stays where it always was. A snapshot
+        // that does not declare it writes nothing here, and the decoder reads
+        // the missing section as `false` — the "keep the shape refused by
+        // name" default every consumer of the bit keeps its fail-closed
+        // direction with.
+        if capabilities.declares_render_fragment_output_superset_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL);
+            encoder.bool(capabilities.supports_render_fragment_output_superset);
+        }
     }
     Ok(())
 }
@@ -6642,6 +6697,13 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // than executed against a vertex input state one side did not state.
         supports_render_vertex_interface_superset: false,
         supports_render_vertex_count_above_triangle: false,
+        // The superset fragment interface (2026-09-20, the third door behind
+        // census v46's `stage_buffer_footprint` bucket) is the family's next
+        // block: a legacy payload cannot carry it either, so it reads the same
+        // fail-closed default — a registration whose declared attachment list
+        // and reflected colour locations disagree would be refused by name
+        // rather than executed against a module one side did not state.
+        supports_render_fragment_output_superset: false,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,
@@ -6766,6 +6828,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL => {}
             CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {}
+            CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6812,6 +6875,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {
                 capabilities.max_render_texture_dimension_3d = decoder.u64()?;
+            }
+            CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL => {
+                capabilities.supports_render_fragment_output_superset = decoder.bool()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

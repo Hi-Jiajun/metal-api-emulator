@@ -268,6 +268,28 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // frame byte for byte, and a translated quad module's six-vertex draw
         // covers the texels its three-vertex draw cannot.
         supports_render_vertex_count_above_triangle: true,
+        // The superset fragment interface is executed (2026-09-20, the third
+        // door behind census v46's `stage_buffer_footprint` bucket):
+        // `render.rs` builds the pipeline from the *contract's* own
+        // `color_formats` — one attachment per attached location — while the
+        // fragment module keeps every `Location` store its reflection declares.
+        // Vulkan defines what happens to the stores with no attachment behind
+        // them: they are discarded, so the frame is the attached locations'
+        // stores and nothing else. The registration gate is what this bit's
+        // declaration follows: it walks the attached positions exactly as it
+        // always did — each one at its own location with the component shape
+        // its format stores — and admits the extra reflected locations as the
+        // dropped half (`render::EXECUTES_FRAGMENT_OUTPUT_SUPERSET`, whose test
+        // below reads this snapshot against it so the two cannot drift).
+        // `tests/render_fragment_output_superset_e2e.rs` measures it: the
+        // module that stores `Location 0` and `Location 1` under a
+        // one-attachment contract lands `40 80 c0 ff` per texel, its twin with
+        // a different `Location 1` texel lands the same four bytes, and the
+        // same module under a two-attachment contract really does store the
+        // second texel. The bit names exactly that direction: an attachment
+        // whose location the module never stores stays refused by name, because
+        // it would read back bytes nothing wrote.
+        supports_render_fragment_output_superset: true,
         // Instancing is executed (`render.rs` builds each binding's input rate
         // from the layout's step and issues `vkCmdDraw*` with the pass's own
         // instance count). Evidence: the reviewed `instanced_pair_4x4` case on
@@ -1216,6 +1238,19 @@ mod tests {
         );
         assert!(capabilities.supports_render_vertex_interface_superset);
         assert!(capabilities.declares_render_vertex_interface_superset_support());
+
+        // The superset fragment interface (2026-09-20, the third door behind
+        // census v46's `stage_buffer_footprint` bucket): the attachment-side
+        // readings above are unchanged by the new bit, and the declaration is
+        // the very answer the registration gate branches on, so this test reads
+        // the snapshot against the gate's own constant instead of restating it.
+        assert!(capabilities.supports_render_fragment_output_superset);
+        assert!(capabilities.declares_render_fragment_output_superset_support());
+        assert_eq!(
+            capabilities.supports_render_fragment_output_superset,
+            crate::render::EXECUTES_FRAGMENT_OUTPUT_SUPERSET,
+            "the snapshot's declaration and the gate's own arm are one fact"
+        );
     }
 
     #[test]

@@ -1449,6 +1449,7 @@ fn register_render_pipeline(
         RenderGeometry::GatheredExtent
             | RenderGeometry::SupersetVertexInput
             | RenderGeometry::PassEntrySnapshot
+            | RenderGeometry::SupersetFragmentOutput
     ) {
         return Err(format!(
             "render case {}: the translated arm registers its translated stages",
@@ -1612,6 +1613,9 @@ fn register_render_pipeline(
         // Unreachable for the same reason: the pass-entry snapshot arm's stages
         // are the translator's too (`research/docs/23` §118, E-TX15).
         RenderGeometry::PassEntrySnapshot => unreachable!(),
+        // Unreachable for the same reason: the superset fragment interface's
+        // stages are the translator's too (2026-09-20).
+        RenderGeometry::SupersetFragmentOutput => unreachable!(),
     };
     // The sampled case's declaration (`research/docs/23` §3.3, v100): the
     // fragment stage reads the pass's one texture at binding 0, and the state
@@ -1758,13 +1762,18 @@ fn register_translated_stage_buffer_pipeline(
     // `render_texture_extent_e2e` reading measured.
     let gathered = geometry == RenderGeometry::GatheredExtent;
     let snapshot = geometry == RenderGeometry::PassEntrySnapshot;
+    // The superset fragment interface reads no `[[buffer(N)]]` argument either
+    // (2026-09-20): its fragment stage stores two colour locations and reads
+    // nothing else, so it takes the translator's default layout — every Metal
+    // resource in set 0 — exactly as the gathered-extent pair does.
+    let fragment_superset = geometry == RenderGeometry::SupersetFragmentOutput;
     // The declared-superset pair reads no `[[buffer(N)]]` argument either
     // (`research/docs/23` §3.3, E-TX11): its vertex module's inputs are the
     // vertex attributes the contract declares, so it takes the translator's
     // default layout — every Metal resource in set 0 — exactly as the
     // gathered-extent pair does.
     let superset = geometry == RenderGeometry::SupersetVertexInput;
-    let (vertex_set, fragment_set) = if gathered || superset || snapshot {
+    let (vertex_set, fragment_set) = if gathered || superset || snapshot || fragment_superset {
         (GATHERED_EXTENT_SET, GATHERED_EXTENT_SET)
     } else {
         (STAGE_BUFFER_VERTEX_SET, STAGE_BUFFER_FRAGMENT_SET)
@@ -4241,6 +4250,18 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // a wider count, and the suite's marker keeps the cases off them), so
         // this table pins the declaring pass, which every rail executes.
         (1, "compute-buffer-v44") => &["render_declaring_copy_word"],
+        // The superset fragment interface (2026-09-20, the third door behind
+        // census v46's `stage_buffer_footprint` bucket): the plain copy kernel
+        // over the 2x2 attachment's own sixteen-byte view — the bytes the
+        // render case's pass loads before it draws — beside the render case
+        // whose translated fragment module stores two colour locations while
+        // the pass attaches one. The render case runs on the two Vulkan rails
+        // (the native rails select a reviewed module by the colour format
+        // list's exact shape and have none for a module that stores a location
+        // the pass does not attach, and the suite's marker keeps the case off
+        // them), so this table pins the declaring pass, which every rail
+        // executes.
+        (1, "compute-buffer-v45") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4488,6 +4509,14 @@ enum RenderGeometry {
     /// its marker stays inside the Vulkan trace rail and no MSL sibling exists
     /// to pin.
     PassEntrySnapshot,
+    /// The superset fragment interface (2026-09-20, the third door behind
+    /// census v46's `stage_buffer_footprint` bucket): two translated AIR stages
+    /// whose *fragment* stage stores more colour locations than the pass
+    /// attaches. Vulkan discards the extra locations' stores, so the frame is
+    /// the attached location's texel and nothing else; the arm is the
+    /// translating rails', so its marker stays inside the two Vulkan rails and
+    /// no MSL sibling exists to pin.
+    SupersetFragmentOutput,
 }
 
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
@@ -6954,6 +6983,170 @@ fn translated_superset_geometry(case: &RenderCase, where_: &str) -> Result<Rende
     Ok(RenderGeometry::SupersetVertexInput)
 }
 
+/// Classify the superset fragment interface (2026-09-20, the third door behind
+/// census v46's `stage_buffer_footprint` bucket).
+///
+/// The arm is the census's: a translated fragment module that stores more
+/// colour locations than the pass has attachments for. Vulkan defines what the
+/// rail does with those stores — a fragment output whose location has no
+/// attachment behind it is discarded — so the frame is the *attached* location's
+/// texel, and the fixture's `expected_hex` is that texel in every covered pixel.
+/// The fixture states the shape and nothing else: the `vertex_id` triangle's
+/// three vertices, no stream and no index buffer, one 2x2 clearing `rgba8_unorm`
+/// attachment, and no state section of any kind. What keeps the reading
+/// falsifiable is the module's own second store: the rail's e2e twin changes the
+/// dropped location's texel and lands the same frame, so a rail that folded it
+/// in, or bound it to the attached location, cannot pass this case.
+///
+/// The module's own count is not readable here — this runner pins the module's
+/// bytes by digest, not by parsing — so `conformance/test_suite_v45.py` is what
+/// reads the pinned AIR and holds it to the arm's declaration: exactly two
+/// `air.render_target` entries, at locations 0 and 1. The census's LPF stage
+/// stores three; the fixture keeps the smallest shape that states the arm.
+fn translated_fragment_output_superset_geometry(
+    case: &RenderCase,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    let translated = case.translated_stages.as_ref().ok_or_else(|| {
+        format!("{where_}: the superset fragment interface registers two translated AIR stages")
+    })?;
+    if case.vertex_layout.is_some() || !case.vertex_buffers.is_empty() || case.indices.is_some() {
+        return Err(format!(
+            "{where_}: the superset fragment interface binds no vertex stream and no index \
+             buffer, so the draw is the vertex_id milestone's own triangle"
+        )
+        .into());
+    }
+    if !case.stage_buffers.is_empty() || case.fragment_textures.is_some() {
+        return Err(format!(
+            "{where_}: the superset fragment interface binds no stage buffer and samples no \
+             texture"
+        )
+        .into());
+    }
+    if case.attachments.is_some() {
+        return Err(format!(
+            "{where_}: the superset fragment interface attaches one colour location"
+        )
+        .into());
+    }
+    if case.depth.is_some()
+        || case.stencil.is_some()
+        || case.cull.is_some()
+        || case.blend.is_some()
+        || case.multisample.is_some()
+        || case.depth_resolve.is_some()
+        || case.stencil_resolve.is_some()
+        || case.present.is_some()
+        || case.icb.is_some()
+        || case.expected_rule.is_some()
+        || case.readback_windows.is_some()
+        || case.scissor.is_some()
+    {
+        return Err(format!(
+            "{where_}: a superset-fragment-interface case carries no depth, stencil, cull, \
+             blend, multisample, resolve, present, indirect, rule, readback window or scissor \
+             section"
+        )
+        .into());
+    }
+    if case.metal.is_some() {
+        return Err(format!(
+            "{where_}: a translated case has no MSL sibling to pin, so it carries no metal source"
+        )
+        .into());
+    }
+    if translated.vertex.path == translated.fragment.path {
+        return Err(
+            format!("{where_}: the two translated stages name their own AIR modules").into(),
+        );
+    }
+    let allowed = ["vulkan", "vulkan-objects"];
+    if case.capture_rails.is_empty()
+        || case
+            .capture_rails
+            .iter()
+            .any(|rail| !allowed.contains(&rail.as_str()))
+    {
+        return Err(format!(
+            "{where_}: a superset-fragment-interface case runs on the rails that translate its \
+             stages ({}), so its capture_rails has to stay inside that list",
+            allowed.join(", ")
+        )
+        .into());
+    }
+    if case.vertices != SUPERSET_VERTEX_VERTICES {
+        return Err(format!(
+            "{where_}: the superset fragment interface draws the vertex_id triangle's \
+             {SUPERSET_VERTEX_VERTICES} vertices"
+        )
+        .into());
+    }
+    if case.instance_count != 1 || case.base_vertex != 0 {
+        return Err(format!(
+            "{where_}: the superset fragment interface draws one instance with no vertex offset"
+        )
+        .into());
+    }
+    let attachment = case.attachment.as_ref().ok_or_else(|| {
+        format!("{where_}: the superset fragment interface stores one attachment")
+    })?;
+    let attachment_layout = attachment_format(&attachment.format)?;
+    if !matches!(
+        attachment_layout,
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+    ) || attachment.store != "store"
+    {
+        return Err(format!(
+            "{where_}: the superset fragment interface stores one 8-bit four-component unorm \
+             attachment, in either byte order"
+        )
+        .into());
+    }
+    if attachment.width != 2 || attachment.height != 2 {
+        return Err(format!(
+            "{where_}: the superset fragment interface draws the fixture's 2x2 attachment"
+        )
+        .into());
+    }
+    let clear = unhex(attachment.clear_hex.as_deref().unwrap_or_default())?;
+    if attachment.load != "clear" || clear.len() != 4 {
+        return Err(format!(
+            "{where_}.attachment: the superset fragment interface clears its attachment, so a \
+             rail that ignored the draw is observable"
+        )
+        .into());
+    }
+    let expected = unhex(case.expected_hex.as_deref().ok_or_else(|| {
+        format!("{where_}: the superset fragment interface states the frame it lands")
+    })?)?;
+    if expected.len() != 16 {
+        return Err(format!("{where_}: the superset fragment expectation is the 2x2 frame").into());
+    }
+    if expected[..4] == clear[..] {
+        return Err(format!(
+            "{where_}: the superset fragment frame's first texel is the fragment output, or a \
+             rail that ignored the draw could pass"
+        )
+        .into());
+    }
+    // The frame is one texel four times: the fixture's triangle covers every
+    // pixel centre of the 2x2 attachment, so a case whose expectation varies
+    // across texels is not this fixture's frame.
+    let texel = expected[..4].to_vec();
+    if expected
+        .chunks_exact(4)
+        .any(|chunk| chunk != texel.as_slice())
+    {
+        return Err(format!(
+            "{where_}.expected_hex: the superset fragment interface's triangle covers the whole \
+             attachment, so every texel is the attached location's own texel"
+        )
+        .into());
+    }
+    Ok(RenderGeometry::SupersetFragmentOutput)
+}
+
 /// Classify a stage-buffer case and pin the declarations the reviewed arms
 /// admit (`research/docs/23` §3.3, v83-v86).
 ///
@@ -7642,6 +7835,15 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     if case.translated_stages.is_some() && case.vertex_layout.is_some() {
         return translated_superset_geometry(case, where_);
     }
+    // The superset fragment interface (2026-09-20, the third door behind
+    // census v46's `stage_buffer_footprint` bucket) is the translated arm's
+    // third shape: two AIR stages whose fragment stage stores more colour
+    // locations than the pass attaches, with no vertex layout, no sampled
+    // declaration and no slot. It is classified before the stage-buffer shape
+    // for the same reason the vertex superset is.
+    if case.translated_stages.is_some() && case.stage_buffers.is_empty() {
+        return translated_fragment_output_superset_geometry(case, where_);
+    }
     // The stage-buffer shape is classified first (`research/docs/23` §3.3,
     // v83-v86): its stages read their bytes from `[[buffer(N)]]` arguments
     // rather than from a vertex layout or the vertex index, so a case that
@@ -8105,6 +8307,21 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             // landing of its own, and the case states no present or indirect
             // action.
         }
+        RenderGeometry::SupersetFragmentOutput => {
+            // The superset fragment interface's own claims were pinned by
+            // `translated_fragment_output_superset_geometry` above — the
+            // translated pair, the layout-free draw, the one clearing
+            // attachment and the Vulkan-only marker — so what is left here is
+            // the pass's own half. The pass names no landing of its own and the
+            // case states no present or indirect action.
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a superset-fragment-interface case carries neither a present \
+                     action nor an ICB"
+                )
+                .into());
+            }
+        }
         RenderGeometry::StageBuffers => {
             // The stage-buffer geometry and its declarations were pinned by
             // `reviewed_stage_buffer_geometry` above; what is left here is the
@@ -8256,6 +8473,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // translator's, and the shape module above pinned that it carries no
         // MSL pin.
         RenderGeometry::PassEntrySnapshot => {
+            (case.vertex_entry.as_str(), case.fragment_entry.as_str())
+        }
+        // The superset fragment interface names its own two AIR entries for the
+        // same reason (2026-09-20): its stages are the translator's, and the
+        // shape module above pinned that it carries no MSL pin.
+        RenderGeometry::SupersetFragmentOutput => {
             (case.vertex_entry.as_str(), case.fragment_entry.as_str())
         }
         // A translated stage-buffer case names its own two AIR entries rather
