@@ -3,9 +3,12 @@
 Experimental source-level Metal compute objects backed by Vulkan, for fast
 host-side iteration without booting a VM. The long-term proposal is to share
 one Metal semantic path between native Metal and a Windows Vulkan provider.
-This repository is an independent prototype; upstream has not adopted it.
-The same path also drives a live macOS guest through a fork of reims-vgpu —
-see [Live VM path](#live-vm-path-windows--whpx--reims-vgpu) below.
+This repository is an independent project: the provider and contract design
+here live outside both upstream repositories and nothing in this repository
+has been merged into them. (The fork's Windows/WHPX host port is a separate
+contribution that *was* merged upstream — reims-vgpu PR #57.) The same path
+also drives a live macOS guest through a fork of reims-vgpu — see
+[Live VM path](#live-vm-path-windows--whpx--reims-vgpu) below.
 
 The working application path is:
 
@@ -43,10 +46,12 @@ Readings from a 2026-09-19 round (desktop and login scenes):
   the census workload, with the host draw span accounting for about 81% of each
   interval; the open work is the landing/publishing path and per-pass setup.
 
-Boundaries: this is an independent experiment; the reims-vgpu maintainers have
-not adopted it, and the fork is a local adapter rather than an upstream-approved
-architecture. No guest images or Apple binaries are distributed. QEMU and
-reims-vgpu keep their own license terms; see [NOTICE.md](NOTICE.md).
+Boundaries: this is an independent experiment. The provider and contract design
+here are not part of either upstream repository; the fork is a local adapter on
+top of the upstream Windows host port (reims-vgpu PR #57), and the census path
+is not an upstream-approved architecture. No guest images or Apple binaries are
+distributed. QEMU and reims-vgpu keep their own license terms; see
+[NOTICE.md](NOTICE.md).
 
 ## Current status
 

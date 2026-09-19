@@ -1,5 +1,13 @@
 # Proposal: offline Metal API provider prototype and first parity case
 
+> **Status note (2026-09-19).** This is the original discussion draft and is
+> kept for context; it is not a current statement of the project. Since it was
+> written the provider described below has been implemented (`ComputeProvider`
+> is no longer an interface without a backend), the Windows host port of the
+> fork was merged upstream as reims-vgpu PR #57, and the render half grew
+> alongside the compute half. The design still lives in this repository, not
+> in either upstream.
+
 Hello! Following steel-brain's Discord suggestion to use a shared Metal
 semantic path with a Windows Metal API emulator, I have been prototyping an
 independent host-side compute workspace:
