@@ -3045,9 +3045,24 @@ fn descriptor_type_for_binding(
 /// `{nearest, linear}` minification/magnification, each with the mip filter
 /// `{not-mipmapped, nearest, linear}` — crossed with five address modes
 /// (`clamp-to-edge`, `repeat`, `mirror-clamp-to-edge`, `mirror-repeat`,
-/// `clamp-to-zero`), under normalized coordinates, equal address on all three
-/// axes, no comparison function, no reduction mode and no anisotropy.
+/// `clamp-to-zero`), under normalized coordinates, one address mode on the two
+/// axes a 2D view reads, no comparison function, no reduction mode and no
+/// anisotropy.
 /// `research/docs/23` §109 widened the two first-increment names to this list.
+///
+/// The **third** addressing axis (`r` in AIR, `addressModeW` in Vulkan) is read
+/// on no view this family samples (2026-09-19, R44): every sampled surface the
+/// render family admits is one single-sample, non-arrayed 2D view
+/// (`render_texture_shape_unsupported` refuses every other reflected shape, and
+/// the request side's bind gate refuses every other view), and a 2D sample
+/// carries no third coordinate — Vulkan applies `addressModeW` to the r
+/// coordinate of a 3D view, while an array's third coordinate *selects* a layer
+/// rather than being addressed. A state whose two addressing axes agree is
+/// therefore inside the family whatever its `r` says, and the rail spells its
+/// own fixed value for that axis on the create-info (the same mode, see
+/// [`sampler_create_info`]) instead of carrying a field no sample can reach.
+/// The request side folds the same axis under the same proof (R44's
+/// `..._state_address_w_folded`, counted rather than dropped silently).
 /// Anything else is refused here rather than approximated, because a
 /// substituted sampler changes which texels a sample returns without changing
 /// the module the state came from.
@@ -3114,10 +3129,13 @@ pub(crate) fn static_sampler_policy(
             state.min_filter, state.mag_filter
         )));
     }
-    if state.address_mode_s != state.address_mode_t || state.address_mode_s != state.address_mode_r
-    {
+    // The two axes a 2D view reads state one mode; the third is not read at
+    // all (see the note above `sampler_create_info` for the proof and for the
+    // fold's own reading on the request side, R44).
+    if state.address_mode_s != state.address_mode_t {
         return Err(failure(format!(
-            "an AIR sampler whose axes address differently (s {:?}, t {:?}, r {:?}) is outside the reviewed family",
+            "an AIR sampler whose two addressing axes disagree (s {:?}, t {:?}; r {:?} is not \
+             read by any view this family samples) is outside the reviewed family",
             state.address_mode_s, state.address_mode_t, state.address_mode_r
         )));
     }
@@ -3173,6 +3191,15 @@ pub(crate) fn static_sampler_policy(
 /// canonical view carries one mip level, so level zero is the only reachable
 /// level and a mip filter can only name the mode it is selected under), no
 /// comparison, `unnormalizedCoordinates` false and no anisotropy.
+///
+/// `addressModeW` is the family's own copy of the mode `addressMode{U,V}`
+/// carries: the render family samples one single-sample, non-arrayed 2D view
+/// per binding, and a 2D sample reads no third coordinate for a `W` mode to
+/// address ([`static_sampler_policy`] carries the whole proof). The create-info
+/// still spells the field — a `VkSamplerCreateInfo` with three modes and one
+/// value cannot leave one of them to a default — and spelling it with the U/V
+/// mode is what makes the folded state the request side admits (R44) execute
+/// the same sample program the equal-axes state always did.
 pub(crate) fn sampler_create_info(
     policy: metal_api_core::provider::SamplerPolicy,
 ) -> vk::SamplerCreateInfo<'static> {
@@ -8897,6 +8924,34 @@ mod tests {
         .expect("clamp-to-zero is inside the family");
         assert_eq!(zero.filter, SamplerFilter::NearestMipNearest);
         assert_eq!(zero.address, SamplerAddressMode::ClampToZero);
+
+        // The third addressing axis is not read by any view this family samples
+        // (2026-09-19, R44): `s` and `t` agree, `r` is the Metal default, and
+        // the state is admitted as the mode the two read axes state.
+        let mut third_axis = state(
+            AirFilter::Nearest,
+            SamplerMipFilter::None,
+            AirAddress::ClampToZero,
+        );
+        third_axis.address_mode_r = AirAddress::ClampToEdge;
+        let folded = static_sampler_policy(&third_axis)
+            .expect("the third addressing axis is not read by a 2D sample");
+        eprintln!("third-axis state folds onto {folded:?}");
+        assert_eq!(folded.filter, SamplerFilter::Nearest);
+        assert_eq!(folded.address, SamplerAddressMode::ClampToZero);
+
+        // The two axes a 2D view *does* read still have to agree, and the
+        // refusal names the rule rather than the third axis.
+        let mut split = state(
+            AirFilter::Nearest,
+            SamplerMipFilter::None,
+            AirAddress::ClampToZero,
+        );
+        split.address_mode_t = AirAddress::Repeat;
+        let split = static_sampler_policy(&split)
+            .expect_err("the two axes a 2D view reads have to state one mode");
+        eprintln!("axes that address disagree: {}", split.message());
+        assert!(split.message().contains("two addressing axes disagree"));
 
         let border = static_sampler_policy(&state(
             AirFilter::Linear,

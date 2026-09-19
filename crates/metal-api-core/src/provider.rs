@@ -931,6 +931,14 @@ pub enum SamplerAddressMode {
 /// `clampToBorderColor`, which the family refuses by name. The rail states its
 /// own fixed values for those fields (LOD range `0..=0`, bias `0`,
 /// transparent-black border) rather than letting a provider default decide.
+///
+/// The addressing half is one mode for the **two** axes a 2D view reads
+/// (2026-09-19, R44): every view this family samples is a single-sample,
+/// non-arrayed 2D surface, and a 2D sample carries no third coordinate for a
+/// third mode to address — so a state whose third axis (`addressModeW`)
+/// differs states no sample this family can reach, and the rails fold that axis
+/// into the mode the other two agree on instead of refusing it. The request
+/// side counts the fold (`render_provider_texture_state_address_w_folded`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SamplerPolicy {
     pub filter: SamplerFilter,
