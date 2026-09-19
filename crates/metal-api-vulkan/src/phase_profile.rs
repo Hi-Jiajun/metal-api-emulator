@@ -36,11 +36,23 @@
 //!   setup_render_pass_us=... setup_textures_us=... setup_stage_buffers_us=...
 //!   setup_pipeline_us=... setup_readbacks_us=... setup_inputs_us=...
 //!   setup_command_pool_us=... texture_backing_us=... texture_upload_us=...
+//!   texture_view_us=... texture_sampler_us=... texture_import_us=...
+//!   texture_descriptor_us=...
 //!   reuse_hit_n=... reuse_miss_n=...
 //!   reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=...
 //!   pool_hit_n=... pool_miss_n=... pool_disabled_n=... pool_return_n=...
 //!   pool_drop_n=...
+//!   import_hit_n=... import_miss_n=... import_disabled_n=... import_return_n=...
+//!   import_drop_n=...
+//!   render_offscreen_n=... render_present_n=...
 //!   ```
+//!
+//! and, beside the disjoint fields, the aggregate readings the nested splits
+//! imply: `render_us` (the five `render_*` children), `render_residual_us`
+//! (their eight siblings that divide what those five leave unnamed) and
+//! `texture_named_us` (the six nested regions inside `setup_textures`). The
+//! aggregates are printed beside the fields they aggregate rather than added to
+//! them, exactly as `plan_settle_us` already was.
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
 //! so a reader can add lines together and divide by the summed `n` without
@@ -54,6 +66,26 @@
 //! stays their enclosing bar, so `sum(setup_*) <= render_setup_us` and the
 //! difference is the seam between those regions — the plan of the whole setup,
 //! charged to the bar that encloses them rather than to one of them.
+//!
+//! Two further nested splits answer the two questions the first split left
+//! open, and neither is part of the disjoint sum:
+//!
+//! * `texture_view_us`, `texture_sampler_us`, `texture_import_us` and
+//!   `texture_descriptor_us` divide what `setup_textures` spent *beside*
+//!   `texture_backing_us` and `texture_upload_us` — the image view a pooled
+//!   backing did not carry, the samplers, the per-declaration host-pointer
+//!   imports of owner windows, and the sampled set's layout, pool, set and
+//!   writes. `backing + upload + view + sampler + import + descriptor <=
+//!   setup_textures_us`.
+//! * `render_resolve_us`, `render_present_us`, `render_publish_us`,
+//!   `render_landing_us`, `render_prepare_us`, `render_retain_us`,
+//!   `render_land_owner_us` and `render_teardown_us` divide the render half's
+//!   residual — what `render_total` cost minus its five children: the outer
+//!   loop's resolution and publication around each pass, a landing-only plan
+//!   entry, the present rail's own pass, the offscreen rail entry's admissions
+//!   and affine index resolution, the input retains, the owner-window landing
+//!   that follows a pass, and the pass objects' teardown. `sum(render children)
+//!   + sum(render residual) <= render_total_us`.
 //!
 //! The `readback_*` fields are the one exception in *unit*, not in window: they
 //! count the stored attachments this window's submissions published — how many
@@ -199,9 +231,64 @@ pub(crate) enum Phase {
     /// pass-entry-snapshot arms write nothing here, because their bytes never
     /// exist on the host.
     TextureUpload,
+    /// Inside `setup_textures`: the sampled declaration's own image view, when
+    /// the backing pool did not hand one over (`vkCreateImageView`).
+    TextureView,
+    /// Inside `setup_textures`: the sampler one declaration's slot states
+    /// (`vkCreateSampler`). A texel-fetch slot creates none and charges nothing.
+    TextureSampler,
+    /// Inside `setup_textures`: the import of an owner's window as a
+    /// host-pointer buffer (`docs/23` §75, R5c) — the no-copy arm's staging
+    /// buffer and memory, allocated and bound per declaration per pass.
+    TextureImport,
+    /// Inside `setup_textures`: the sampled set's own layout, pool, set and
+    /// descriptor writes — the state the fragment module reads the textures
+    /// through, rebuilt for every pass.
+    TextureDescriptor,
+    /// Inside the render half's residual (`render_total` minus the five
+    /// `render_*` children): the outer loop's per-entry resolution before the
+    /// rail is called — the attachment/landing/resident declarations looked up
+    /// against the trace's view list, the present target, the executor lock and
+    /// the produced-bytes context.
+    ///
+    /// This bar and the six below it divide what the render half's own split
+    /// did not name, so they are *nested* inside [`Phase::RenderTotal`] beside
+    /// its five children: `sum(render children) + sum(render residual) <=
+    /// render_total_us`, and the difference is the seam that remains.
+    RenderResolve,
+    /// Inside the render half's residual: the present rail's own pass
+    /// (`execute_present_render`) — its request, its objects, its recording,
+    /// its readback and its teardown. Present has its own setup and readback
+    /// shape rather than the offscreen one the five children were placed for.
+    RenderPresent,
+    /// Inside the render half's residual: the outer loop's per-entry
+    /// publication after the rail returned — the writeback pushes, the resident
+    /// and re-kept identities, and the stage-buffer landings.
+    RenderPublish,
+    /// Inside the render half's residual: one landing-only plan entry
+    /// (`land_kept_frame_entry`), which runs in the plan's order instead of a
+    /// pass.
+    RenderLanding,
+    /// Inside the render half's residual: the offscreen rail entry's own work
+    /// before the pass executor — the extent/contract admissions the rail
+    /// re-runs on the request, the stage-pair validation and the affine index
+    /// resolution (which may read an owner's window through the lease channel).
+    RenderPrepare,
+    /// Inside the render half's residual: the input retains an offscreen pass
+    /// takes before its first import (`RenderInputRetains::retain`).
+    RenderRetain,
+    /// Inside the render half's residual: the owner-window landing that follows
+    /// a successful offscreen pass (`land_owner_windows`) — the pass's texels
+    /// copied into the guest pages the store named.
+    RenderLandOwner,
+    /// Inside the render half's residual: the pass objects' teardown
+    /// (`OffscreenObjects::drop`) once the fence has proven the device done
+    /// with them — the images, views, samplers, descriptor pools, framebuffers,
+    /// render passes, readback buffers, fences and command pools one pass held.
+    RenderTeardown,
 }
 
-const PHASE_COUNT: usize = Phase::TextureUpload as usize + 1;
+const PHASE_COUNT: usize = Phase::RenderTeardown as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -234,6 +321,18 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "setup_command_pool",
     "texture_backing",
     "texture_upload",
+    "texture_view",
+    "texture_sampler",
+    "texture_import",
+    "texture_descriptor",
+    "render_resolve",
+    "render_present",
+    "render_publish",
+    "render_landing",
+    "render_prepare",
+    "render_retain",
+    "render_land_owner",
+    "render_teardown",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -254,6 +353,35 @@ const RENDER_SLOTS: [usize; 5] = [
     Phase::RenderSubmit as usize,
     Phase::RenderWait as usize,
     Phase::RenderReadback as usize,
+];
+
+/// The slots that divide what [`RENDER_SLOTS`] leaves unnamed — the render
+/// half's residual. Like the `setup_*` fields they are a nested split rather
+/// than a second disjoint set: `sum(RENDER_SLOTS) + sum(RENDER_RESIDUAL_SLOTS)
+/// <= render_total`, and the difference is the seam between the bars.
+///
+/// The list is a reading aid rather than a printed field; a tool that checks
+/// the identity reads it from here.
+const RENDER_RESIDUAL_SLOTS: [usize; 8] = [
+    Phase::RenderResolve as usize,
+    Phase::RenderPresent as usize,
+    Phase::RenderPublish as usize,
+    Phase::RenderLanding as usize,
+    Phase::RenderPrepare as usize,
+    Phase::RenderRetain as usize,
+    Phase::RenderLandOwner as usize,
+    Phase::RenderTeardown as usize,
+];
+
+/// The nested split of `setup_textures`, beside the two upload/backing bars it
+/// already had: `sum(setup_textures children) <= setup_textures_us`.
+const TEXTURE_SLOTS: [usize; 6] = [
+    Phase::TextureBacking as usize,
+    Phase::TextureUpload as usize,
+    Phase::TextureView as usize,
+    Phase::TextureSampler as usize,
+    Phase::TextureImport as usize,
+    Phase::TextureDescriptor as usize,
 ];
 
 /// The bars that are a fence wait, and therefore carry the idle/blocked split.
@@ -394,8 +522,60 @@ pub(crate) fn note_texture_pool(outcome: crate::render_texture_pool::PoolOutcome
     });
 }
 
+/// Count one sampled declaration's use of the pooled owner-window import
+/// (`crate::render_import_pool`) for the emitting thread's window.
+///
+/// The five outcomes partition every declaration that reaches the mechanism:
+/// the pool held this window's import and handed it over, it held none and the
+/// declaration imported the range itself, the switch was off, or a completed
+/// pass handed an import back and the pool kept it (or destroyed it instead).
+#[inline]
+pub(crate) fn note_import_pool(outcome: crate::render_import_pool::ImportOutcome) {
+    if !enabled() {
+        return;
+    }
+    use crate::render_import_pool::ImportOutcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            ImportOutcome::Hit => local.import_hit_n += 1,
+            ImportOutcome::Miss => local.import_miss_n += 1,
+            ImportOutcome::Disabled => local.import_disabled_n += 1,
+            ImportOutcome::Returned => local.import_return_n += 1,
+            ImportOutcome::Dropped => local.import_drop_n += 1,
+        }
+    });
+}
+
+/// Which shape one executed render pass had: the offscreen rail the five
+/// `render_*` children were placed for, or the present rail, whose own setup,
+/// recording and readback are the residual's [`Phase::RenderPresent`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RenderShape {
+    Offscreen,
+    Present,
+}
+
+/// Count one executed render pass for the emitting thread's window, by shape.
+///
+/// A round needs this beside the bars: the two shapes are not one population,
+/// so "what does a pass cost" is only readable when the reader can see how many
+/// of each the window carried.
+#[inline]
+pub(crate) fn note_render_shape(shape: RenderShape) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match shape {
+            RenderShape::Offscreen => local.render_offscreen_n += 1,
+            RenderShape::Present => local.render_present_n += 1,
+        }
+    });
+}
+
 /// One thread's window of the profile.
-#[derive(Default)]
 struct Local {
     ns: [u64; PHASE_COUNT],
     calls: [u64; PHASE_COUNT],
@@ -424,6 +604,55 @@ struct Local {
     pool_disabled_n: u64,
     pool_return_n: u64,
     pool_drop_n: u64,
+    /// The sampled declarations this window's passes made, by what
+    /// `crate::render_import_pool` answered.
+    import_hit_n: u64,
+    import_miss_n: u64,
+    import_disabled_n: u64,
+    import_return_n: u64,
+    import_drop_n: u64,
+    /// The render passes this window's submissions executed, by shape. The two
+    /// do not share a cost shape, so a bar reading has to name its population.
+    render_offscreen_n: u64,
+    render_present_n: u64,
+}
+
+/// An empty window, spelled out because the slot tables are longer than the
+/// largest array `Default` is derived over (32): every table is zeroed here on
+/// purpose, so a phase whose reading must not be inherited has a slot to be
+/// zero in.
+impl Default for Local {
+    fn default() -> Self {
+        Self {
+            ns: [0; PHASE_COUNT],
+            calls: [0; PHASE_COUNT],
+            wait_idle_ns: [0; PHASE_COUNT],
+            wait_idle_calls: [0; PHASE_COUNT],
+            wait_blocked_ns: [0; PHASE_COUNT],
+            wait_blocked_calls: [0; PHASE_COUNT],
+            wait_timeout_calls: [0; PHASE_COUNT],
+            fence_skipped_calls: 0,
+            window: 0,
+            readback: ReadbackCounts::default(),
+            reuse_hit_n: 0,
+            reuse_miss_n: 0,
+            reuse_mismatch_n: 0,
+            reuse_unkeyed_n: 0,
+            reuse_disabled_n: 0,
+            pool_hit_n: 0,
+            pool_miss_n: 0,
+            pool_disabled_n: 0,
+            pool_return_n: 0,
+            pool_drop_n: 0,
+            import_hit_n: 0,
+            import_miss_n: 0,
+            import_disabled_n: 0,
+            import_return_n: 0,
+            import_drop_n: 0,
+            render_offscreen_n: 0,
+            render_present_n: 0,
+        }
+    }
 }
 
 impl Local {
@@ -472,6 +701,8 @@ impl Local {
         let mut fields = String::with_capacity(600);
         let mut plan_settle_ns = 0u64;
         let mut render_ns = 0u64;
+        let mut render_residual_ns = 0u64;
+        let mut texture_named_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
             self.calls[slot] = 0;
@@ -480,6 +711,12 @@ impl Local {
             }
             if RENDER_SLOTS.contains(&slot) {
                 render_ns += ns;
+            }
+            if RENDER_RESIDUAL_SLOTS.contains(&slot) {
+                render_residual_ns += ns;
+            }
+            if TEXTURE_SLOTS.contains(&slot) {
+                texture_named_ns += ns;
             }
             if WAIT_SLOTS.contains(&slot) {
                 let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
@@ -509,12 +746,23 @@ impl Local {
         let pool_disabled_n = std::mem::take(&mut self.pool_disabled_n);
         let pool_return_n = std::mem::take(&mut self.pool_return_n);
         let pool_drop_n = std::mem::take(&mut self.pool_drop_n);
+        let import_hit_n = std::mem::take(&mut self.import_hit_n);
+        let import_miss_n = std::mem::take(&mut self.import_miss_n);
+        let import_disabled_n = std::mem::take(&mut self.import_disabled_n);
+        let import_return_n = std::mem::take(&mut self.import_return_n);
+        let import_drop_n = std::mem::take(&mut self.import_drop_n);
+        let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
+        let render_present_n = std::mem::take(&mut self.render_present_n);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
+        let render_residual_us = micros(render_residual_ns);
+        let texture_named_us = micros(texture_named_ns);
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
+             render_residual_us={render_residual_us:.3} \
+             texture_named_us={texture_named_us:.3} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
@@ -522,7 +770,12 @@ impl Local {
              reuse_mismatch_n={reuse_mismatch_n} reuse_unkeyed_n={reuse_unkeyed_n} \
              reuse_disabled_n={reuse_disabled_n} pool_hit_n={pool_hit_n} \
              pool_miss_n={pool_miss_n} pool_disabled_n={pool_disabled_n} \
-             pool_return_n={pool_return_n} pool_drop_n={pool_drop_n}",
+             pool_return_n={pool_return_n} pool_drop_n={pool_drop_n} \
+             import_hit_n={import_hit_n} import_miss_n={import_miss_n} \
+             import_disabled_n={import_disabled_n} import_return_n={import_return_n} \
+             import_drop_n={import_drop_n} \
+             render_offscreen_n={render_offscreen_n} \
+             render_present_n={render_present_n}",
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
@@ -704,6 +957,36 @@ mod tests {
             );
         }
         assert!(PLAN_SETTLE_SLOTS.iter().all(|slot| *slot < PHASE_COUNT));
+    }
+
+    /// The two nested splits name regions their enclosing bar states, and no
+    /// slot of either is the enclosing bar or a sibling of it: a slip here
+    /// would make the identity a reader checks (`children + residual <=
+    /// render_total`, `texture children <= setup_textures`) untrue without
+    /// saying so.
+    #[test]
+    fn the_nested_splits_stay_inside_their_enclosing_bar() {
+        assert_eq!(PHASE_NAMES[Phase::RenderResolve as usize], "render_resolve");
+        assert_eq!(
+            PHASE_NAMES[Phase::RenderTeardown as usize],
+            "render_teardown"
+        );
+        assert_eq!(
+            PHASE_NAMES[Phase::TextureDescriptor as usize],
+            "texture_descriptor"
+        );
+        for slot in RENDER_RESIDUAL_SLOTS {
+            assert_ne!(slot, Phase::RenderTotal as usize);
+            assert!(!RENDER_SLOTS.contains(&slot));
+        }
+        for slot in TEXTURE_SLOTS {
+            assert_ne!(slot, Phase::SetupTextures as usize);
+        }
+        // Both splits are named apart from each other as well: a slot in both
+        // would be charged to two regions that a reader would then add.
+        for slot in RENDER_RESIDUAL_SLOTS {
+            assert!(!TEXTURE_SLOTS.contains(&slot));
+        }
     }
 
     /// Off by default: a process without the variable must not read a clock or

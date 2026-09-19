@@ -39,6 +39,7 @@ mod phase_profile;
 mod provider;
 mod readback_rect;
 mod render;
+mod render_import_pool;
 mod render_setup_reuse;
 mod render_texture_pool;
 
@@ -49,6 +50,7 @@ pub use compute_provider::{
 };
 pub use render::RenderStage;
 pub use render::STAGE_BUFFER_NAMESPACE_SET;
+pub use render_import_pool::RenderImportPoolCounts;
 pub use render_setup_reuse::RenderSetupReuseCounts;
 pub use render_texture_pool::RenderTexturePoolCounts;
 
@@ -945,6 +947,35 @@ impl VulkanExecutor {
         self.context.clear_render_texture_pool();
     }
 
+    /// What the pooled owner-window imports have seen
+    /// (`crate::render_import_pool`): how many sampled declarations the pool
+    /// served, how many imported their own window, how many were asked while
+    /// the switch was off, and how many imports were kept, evicted or dropped.
+    #[doc(hidden)]
+    pub fn render_import_pool_counts(&self) -> RenderImportPoolCounts {
+        self.context.render_import_pool_counts()
+    }
+
+    /// Whether the pooled owner-window import is on for this executor.
+    #[doc(hidden)]
+    pub fn render_import_pool_enabled(&self) -> bool {
+        self.context.render_import_pool_enabled()
+    }
+
+    /// Turn the pooled owner-window import on or off, dropping what it held
+    /// when it goes off.
+    #[doc(hidden)]
+    pub fn set_render_import_pool(&self, enabled: bool) {
+        self.context.set_render_import_pool(enabled);
+    }
+
+    /// Drop every pooled import: the contract surface they were built from
+    /// moved.
+    #[doc(hidden)]
+    pub fn clear_render_import_pool(&self) {
+        self.context.clear_render_import_pool();
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1639,6 +1670,12 @@ pub(crate) struct VulkanContext {
     /// its memory and its view. On by default, off with
     /// `METAL_API_VULKAN_TEXTURE_BACKING_POOL=0`.
     render_texture_pool: Mutex<render_texture_pool::RenderTexturePool>,
+    /// The owner-window import one offscreen pass may hand the next
+    /// declaration of the same range (`crate::render_import_pool`): the buffer
+    /// over the owner's pages, its imported memory and the requirement the
+    /// import was checked against. On by default, off with
+    /// `METAL_API_VULKAN_RENDER_IMPORT_POOL=0`.
+    render_import_pool: Mutex<render_import_pool::RenderImportPool>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -1891,6 +1928,9 @@ impl VulkanContext {
         // The pooled sampled-texture backing reads the same way: its own
         // switch, its own empty table, built before the literal takes `device`.
         let render_texture_pool = render_texture_pool::RenderTexturePool::new(device.clone());
+        // The pooled owner-window import reads the same way: its own switch and
+        // its own empty table, built before the literal takes `device`.
+        let render_import_pool = render_import_pool::RenderImportPool::new(device.clone());
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
@@ -1924,6 +1964,7 @@ impl VulkanContext {
             present_presents: AtomicUsize::new(0),
             render_setup_reuse: Mutex::new(render_setup_reuse),
             render_texture_pool: Mutex::new(render_texture_pool),
+            render_import_pool: Mutex::new(render_import_pool),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -2047,6 +2088,61 @@ impl VulkanContext {
     /// moved.
     pub(crate) fn clear_render_texture_pool(&self) {
         self.lock_render_texture_pool().clear();
+    }
+
+    /// The owner-window import this device keeps
+    /// (`crate::render_import_pool`). A poisoned lock is recovered for the same
+    /// reason the sampled-backing pool's is: the pool's state is a list of
+    /// device handles, and a panic elsewhere must not turn a reusable window
+    /// into a refusal.
+    fn lock_render_import_pool(&self) -> MutexGuard<'_, render_import_pool::RenderImportPool> {
+        self.render_import_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The import this owner window may already have, and what the pool
+    /// answered.
+    pub(crate) fn take_render_import(
+        &self,
+        key: render_import_pool::ImportKey,
+    ) -> (
+        Option<render_import_pool::Imported>,
+        render_import_pool::ImportOutcome,
+    ) {
+        self.lock_render_import_pool().take(key)
+    }
+
+    /// Hand a completed declaration's import back, or destroy it when the
+    /// mechanism is off.
+    pub(crate) fn give_render_import_back(
+        &self,
+        key: render_import_pool::ImportKey,
+        imported: render_import_pool::Imported,
+    ) -> render_import_pool::ImportOutcome {
+        self.lock_render_import_pool().give(key, imported)
+    }
+
+    /// The owner-window import pool counters one reading reports.
+    pub(crate) fn render_import_pool_counts(&self) -> render_import_pool::RenderImportPoolCounts {
+        self.lock_render_import_pool().counts()
+    }
+
+    /// Whether the owner-window import pool is on for this device.
+    pub(crate) fn render_import_pool_enabled(&self) -> bool {
+        self.lock_render_import_pool().enabled()
+    }
+
+    /// Turn the owner-window import pool on or off, and drop what it holds when
+    /// it goes off.
+    pub(crate) fn set_render_import_pool(&self, enabled: bool) {
+        self.lock_render_import_pool().set_enabled(enabled);
+    }
+
+    /// Drop every pooled import: the contract surface they were built from
+    /// moved.
+    pub(crate) fn clear_render_import_pool(&self) {
+        self.lock_render_import_pool().clear();
     }
 
     /// The selected device's own limits, for the render rail's attachment
