@@ -45,6 +45,12 @@
 //!   import_hit_n=... import_miss_n=... import_disabled_n=... import_return_n=...
 //!   import_drop_n=...
 //!   render_offscreen_n=... render_present_n=...
+//!   readback_rect_us=... readback_full_us=... readback_seed_us=...
+//!   readback_surfaces_us=... readback_shape_us=... readback_named_us=...
+//!   landing_lookup_us=... landing_windows_us=... landing_stage_us=...
+//!   landing_record_us=... landing_wait_us=... landing_fetch_us=...
+//!   landing_write_us=... landing_release_us=... landing_named_us=...
+//!   landing_n=... landing_bytes=...
 //!   ```
 //!
 //! and, beside the disjoint fields, the aggregate readings the nested splits
@@ -100,6 +106,25 @@
 //! `readback_whole_n` for a rectangle that covered the whole attachment anyway).
 //! They are window sums like every other field, so the same add-and-divide rule
 //! answers "bytes read back per submission" (`docs/WRITTEN-RECT-READBACK.md`).
+//!
+//! Two more nested splits answer the two bars the first three rounds selected
+//! as the next cut, and neither is part of the disjoint sum:
+//!
+//! * `readback_rect_us`, `readback_full_us` and `readback_surfaces_us` divide
+//!   `render_readback` itself — the trimmed arm, the whole-extent arm and the
+//!   depth/stencil/stage-buffer copy-outs — with `readback_seed_us` nested
+//!   inside the trimmed arm (the rebuild that arm pays and the whole-extent arm
+//!   does not). `readback_shape_us` is the decision `plan_readback_regions`
+//!   takes, which happens inside `setup_readbacks` rather than inside the
+//!   readback bar: the arm is chosen before any device object exists.
+//! * `landing_lookup_us`, `landing_windows_us`, `landing_stage_us`,
+//!   `landing_record_us`, `landing_wait_us`, `landing_fetch_us`,
+//!   `landing_write_us` and `landing_release_us` divide `render_landing` — one
+//!   landing-only entry's identity bookkeeping, its window resolution, its
+//!   staging objects, the copy's recording and submission, its fence wait, the
+//!   host fetch of the copied frame, the write into the owner's pages and the
+//!   release of those objects. The printed `landing_named_us` is their sum, and
+//!   `landing_n` / `landing_bytes` count what they were spent on.
 //!
 //! The accumulator is **thread-local**, and a line is emitted by the thread that
 //! filled its own window. That is what makes each line self-consistent: with one
@@ -286,9 +311,60 @@ pub(crate) enum Phase {
     /// with them — the images, views, samplers, descriptor pools, framebuffers,
     /// render passes, readback buffers, fences and command pools one pass held.
     RenderTeardown,
+    /// Inside `render_readback`: one stored attachment's *trimmed* frame — the
+    /// mapped rectangle copied to the host and the seed rebuilt around it. The
+    /// arm the written-rectangle increment exists for
+    /// (`docs/WRITTEN-RECT-READBACK.md`).
+    ReadbackRect,
+    /// Inside `render_readback`: one stored attachment's *whole* extent copied
+    /// out of its mapping, the pre-increment shape of the readback
+    /// (`docs/WRITTEN-RECT-READBACK.md` §1).
+    ReadbackFull,
+    /// Inside `readback_rect`: the rebuild itself (`rebuild_frame`) — the seed
+    /// the uncovered texels come from (a clear's repeated payload, or the bytes
+    /// a `Load` resolved to) and the patch that pins the copied rectangle back
+    /// into it.
+    ReadbackSeed,
+    /// Inside `render_readback`: the depth, stencil and writable stage-buffer
+    /// copy-outs, which follow the colour attachments through the same
+    /// channel (`research/docs/23` §3.3).
+    ReadbackSurfaces,
+    /// The readback *decision* itself (`plan_readback_regions`): which shapes
+    /// keep the written-rectangle arm and which fall back to the whole
+    /// attachment. This one is nested inside `setup_readbacks`, not inside
+    /// `render_readback`, because the decision is taken before any device
+    /// object exists (`docs/WRITTEN-RECT-READBACK.md` §2).
+    ReadbackShape,
+    /// Inside `render_landing`: the identity bookkeeping before the copy — the
+    /// kept frame's target looked up in the resident registry and the landing
+    /// view's declaration found in the trace's own view list.
+    LandingLookup,
+    /// Inside `render_landing`: the owner windows the frame will be written
+    /// into, resolved against the lease channel (the single borrowed window or
+    /// the ordered guest-run list, and the extent check both arms take).
+    LandingWindows,
+    /// Inside `render_landing`: the landing's own staging objects — the
+    /// host-visible `TRANSFER_DST` buffer and its memory, the mapping, the
+    /// command pool, the command buffer and the completion fence.
+    LandingStage,
+    /// Inside `render_landing`: recording the image→buffer copy (its barrier,
+    /// its region and the availability barrier behind it) and submitting it.
+    LandingRecord,
+    /// Inside `render_landing`: `vkWaitForFences` for the landing copy.
+    LandingWait,
+    /// Inside `render_landing`: the host fetch of the copied frame — the
+    /// mapping read into the `Vec` the owner's windows are written from. This
+    /// is the part a landing shares with the readback channel.
+    LandingFetch,
+    /// Inside `render_landing`: the write into the owner's live pages
+    /// (`AttachmentLanding::land`), which is what the copy exists for.
+    LandingWrite,
+    /// Inside `render_landing`: releasing the staging objects — the fence, the
+    /// command pool, the mapping, the buffer and its memory.
+    LandingRelease,
 }
 
-const PHASE_COUNT: usize = Phase::RenderTeardown as usize + 1;
+const PHASE_COUNT: usize = Phase::LandingRelease as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -333,6 +409,19 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "render_retain",
     "render_land_owner",
     "render_teardown",
+    "readback_rect",
+    "readback_full",
+    "readback_seed",
+    "readback_surfaces",
+    "readback_shape",
+    "landing_lookup",
+    "landing_windows",
+    "landing_stage",
+    "landing_record",
+    "landing_wait",
+    "landing_fetch",
+    "landing_write",
+    "landing_release",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -382,6 +471,35 @@ const TEXTURE_SLOTS: [usize; 6] = [
     Phase::TextureSampler as usize,
     Phase::TextureImport as usize,
     Phase::TextureDescriptor as usize,
+];
+
+/// The slots inside `render_readback` that divide the frames it publishes: the
+/// trimmed arm, the whole-extent arm and the depth/stencil/stage-buffer
+/// copy-outs. `readback_seed` is deliberately not a member — it is nested
+/// inside the trimmed arm, so adding it would count the same microseconds
+/// twice. The printed `readback_named_us` is this set's sum.
+const READBACK_ARM_SLOTS: [usize; 3] = [
+    Phase::ReadbackRect as usize,
+    Phase::ReadbackFull as usize,
+    Phase::ReadbackSurfaces as usize,
+];
+
+/// The slots inside `render_landing` that divide one landing-only entry: the
+/// identity bookkeeping, the window resolution, the staging objects, the
+/// recording and submission, the fence wait, the host fetch, the write into the
+/// owner's pages and the release of the staging objects. Every slot is a region
+/// of its own — none encloses another — so the set's sum, printed as
+/// `landing_named_us`, is bounded by `render_landing_us` and the difference is
+/// the seam between them.
+const LANDING_SLOTS: [usize; 8] = [
+    Phase::LandingLookup as usize,
+    Phase::LandingWindows as usize,
+    Phase::LandingStage as usize,
+    Phase::LandingRecord as usize,
+    Phase::LandingWait as usize,
+    Phase::LandingFetch as usize,
+    Phase::LandingWrite as usize,
+    Phase::LandingRelease as usize,
 ];
 
 /// The bars that are a fence wait, and therefore carry the idle/blocked split.
@@ -466,6 +584,25 @@ pub(crate) fn note_readback(region: ReadbackRegion) {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().readback.note(region));
+}
+
+/// Count one landed kept frame for the emitting thread's window, by the bytes
+/// the owner's pages received.
+///
+/// The landing's bars are a per-entry reading; a round that wants "what does
+/// one landing cost" and "how big is one landing" divides them by this count
+/// and this byte sum, exactly as the `readback_*` counters do for a stored
+/// attachment.
+#[inline]
+pub(crate) fn note_landing(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.landing_n += 1;
+        local.landing_bytes += bytes;
+    });
 }
 
 /// Count one offscreen pass's use of the shape-decided render objects
@@ -615,6 +752,10 @@ struct Local {
     /// do not share a cost shape, so a bar reading has to name its population.
     render_offscreen_n: u64,
     render_present_n: u64,
+    /// The kept frames this window's landing-only entries delivered, and the
+    /// bytes the owner's pages received.
+    landing_n: u64,
+    landing_bytes: u64,
 }
 
 /// An empty window, spelled out because the slot tables are longer than the
@@ -651,6 +792,8 @@ impl Default for Local {
             import_drop_n: 0,
             render_offscreen_n: 0,
             render_present_n: 0,
+            landing_n: 0,
+            landing_bytes: 0,
         }
     }
 }
@@ -703,6 +846,8 @@ impl Local {
         let mut render_ns = 0u64;
         let mut render_residual_ns = 0u64;
         let mut texture_named_ns = 0u64;
+        let mut readback_named_ns = 0u64;
+        let mut landing_named_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
             self.calls[slot] = 0;
@@ -717,6 +862,12 @@ impl Local {
             }
             if TEXTURE_SLOTS.contains(&slot) {
                 texture_named_ns += ns;
+            }
+            if READBACK_ARM_SLOTS.contains(&slot) {
+                readback_named_ns += ns;
+            }
+            if LANDING_SLOTS.contains(&slot) {
+                landing_named_ns += ns;
             }
             if WAIT_SLOTS.contains(&slot) {
                 let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
@@ -753,16 +904,22 @@ impl Local {
         let import_drop_n = std::mem::take(&mut self.import_drop_n);
         let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
         let render_present_n = std::mem::take(&mut self.render_present_n);
+        let landing_n = std::mem::take(&mut self.landing_n);
+        let landing_bytes = std::mem::take(&mut self.landing_bytes);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
         let render_residual_us = micros(render_residual_ns);
         let texture_named_us = micros(texture_named_ns);
+        let readback_named_us = micros(readback_named_ns);
+        let landing_named_us = micros(landing_named_ns);
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
              render_residual_us={render_residual_us:.3} \
              texture_named_us={texture_named_us:.3} \
+             readback_named_us={readback_named_us:.3} \
+             landing_named_us={landing_named_us:.3} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
@@ -775,7 +932,8 @@ impl Local {
              import_disabled_n={import_disabled_n} import_return_n={import_return_n} \
              import_drop_n={import_drop_n} \
              render_offscreen_n={render_offscreen_n} \
-             render_present_n={render_present_n}",
+             render_present_n={render_present_n} \
+             landing_n={landing_n} landing_bytes={landing_bytes}",
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
@@ -987,6 +1145,31 @@ mod tests {
         for slot in RENDER_RESIDUAL_SLOTS {
             assert!(!TEXTURE_SLOTS.contains(&slot));
         }
+        // The readback and landing splits (the sp7 round) follow the same two
+        // rules, and the trimmed arm's seed rebuild is deliberately *not* a
+        // member of the arm set: it runs inside the trimmed arm, so adding it
+        // there would count those microseconds twice.
+        for slot in READBACK_ARM_SLOTS {
+            assert_ne!(slot, Phase::RenderReadback as usize);
+            assert_ne!(slot, Phase::ReadbackSeed as usize);
+            assert!(!RENDER_SLOTS.contains(&slot));
+        }
+        for slot in LANDING_SLOTS {
+            assert_ne!(slot, Phase::RenderLanding as usize);
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!READBACK_ARM_SLOTS.contains(&slot));
+        }
+        assert_eq!(
+            PHASE_NAMES[Phase::LandingLookup as usize],
+            "landing_lookup",
+            "the landing split's first slot is the entry's own lookup"
+        );
+        assert_eq!(
+            PHASE_NAMES[Phase::ReadbackRect as usize],
+            "readback_rect",
+            "the readback split's first slot is the trimmed arm"
+        );
     }
 
     /// Off by default: a process without the variable must not read a clock or

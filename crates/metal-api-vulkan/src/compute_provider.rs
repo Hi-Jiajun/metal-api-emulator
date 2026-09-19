@@ -2296,39 +2296,57 @@ impl VulkanComputeProvider {
         pool: &[BufferView],
         leases: &render::RenderLeaseContext<'_>,
     ) -> Result<(), ProviderError> {
-        let identity = landing.identity();
-        let image = self.kept_frame_target(&landing.frame)?;
-        let view = pool
-            .iter()
-            .find(|view| {
-                view.view_id == landing.landing.view_id
-                    && view.allocation_id == landing.landing.allocation_id
-            })
-            .ok_or_else(|| {
+        // The entry's identities are the first region of its residual
+        // (`crate::phase_profile::Phase::LandingLookup`): the kept frame's own
+        // target in the resident registry, and the landing view's declaration in
+        // the trace's view list. Both are value-level questions, so both are
+        // asked before any device object exists.
+        let (identity, image, view) = {
+            let _landing_lookup =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingLookup);
+            let identity = landing.identity();
+            let image = self.kept_frame_target(&landing.frame)?;
+            let view = pool
+                .iter()
+                .find(|view| {
+                    view.view_id == landing.landing.view_id
+                        && view.allocation_id == landing.landing.allocation_id
+                })
+                .ok_or_else(|| {
+                    refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "kept_frame_landing_undeclared",
+                    )
+                    .with_field("view", FieldValue::Unsigned(landing.landing.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(landing.landing.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "a landing-only entry writes the owner's registered window a second view \
+                         declaration names, and this trace declares no view covering that identity",
+                    )
+                })?;
+            (identity, image, view)
+        };
+        // Resolving those declarations into the owner's live windows is the
+        // entry's second region (`crate::phase_profile::Phase::LandingWindows`):
+        // the borrow arm's pointer, the run list's pointers, and the extent both
+        // arms have to match the kept frame exactly.
+        let windows = {
+            let _landing_windows =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingWindows);
+            let expected_bytes = landing.frame.expected_bytes().map_err(|error| {
                 refusal(
                     ProviderPhase::Resolve,
-                    ProviderErrorClass::Capability,
-                    "kept_frame_landing_undeclared",
+                    ProviderErrorClass::Args,
+                    "trace_contract_invalid",
                 )
-                .with_field("view", FieldValue::Unsigned(landing.landing.view_id.get()))
-                .with_field(
-                    "allocation",
-                    FieldValue::Unsigned(landing.landing.allocation_id.get()),
-                )
-                .with_detail(
-                    "a landing-only entry writes the owner's registered window a second view \
-                     declaration names, and this trace declares no view covering that identity",
-                )
+                .with_detail(error.to_string())
             })?;
-        let expected_bytes = landing.frame.expected_bytes().map_err(|error| {
-            refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Args,
-                "trace_contract_invalid",
-            )
-            .with_detail(error.to_string())
-        })?;
-        let windows = render::resolve_kept_frame_landing(view, Some(leases), expected_bytes)?;
+            render::resolve_kept_frame_landing(view, Some(leases), expected_bytes)?
+        };
         // The registry held this identity's shape equal to the entry's own, and
         // the image it answered with was created from a narrowed extent, so the
         // copy's 32-bit region cannot disagree with either.

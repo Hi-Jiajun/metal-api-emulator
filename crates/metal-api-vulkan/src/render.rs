@@ -6986,22 +6986,37 @@ pub(crate) fn land_kept_frame(
     // through the guard before it drops (`research/docs/23` §76, R7).
     let mut layout = target.begin_target_pass();
     let source_layout = *layout;
-    let (readback, mapping) = allocate_host_readback(context, byte_length)?;
-    let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(family);
-    let pool = unsafe { context.device.create_command_pool(&pool_info, None) }
-        .map_err(|error| execution_refusal("create landing command pool", &error.to_string()))?;
+    // The landing's staging objects are one region of the entry's residual
+    // (`crate::phase_profile::Phase::LandingStage`): the host-visible copy
+    // destination, its memory and mapping, and the command pool the copy is
+    // recorded in.
+    let (readback, mapping, pool) = {
+        let _landing_stage =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingStage);
+        let (readback, mapping) = allocate_host_readback(context, byte_length)?;
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(family);
+        let pool =
+            unsafe { context.device.create_command_pool(&pool_info, None) }.map_err(|error| {
+                execution_refusal("create landing command pool", &error.to_string())
+            })?;
+        (readback, mapping, pool)
+    };
     let result = (|| -> Result<(), ProviderError> {
-        let command = unsafe {
-            context.device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|error| {
-            execution_refusal("allocate landing command buffer", &error.to_string())
-        })?[0];
+        let command = {
+            let _landing_stage =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingStage);
+            unsafe {
+                context.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            }
+            .map_err(|error| {
+                execution_refusal("allocate landing command buffer", &error.to_string())
+            })?[0]
+        };
         let subresource = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -7011,125 +7026,152 @@ pub(crate) fn land_kept_frame(
         };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            context
-                .device
-                .begin_command_buffer(command, &begin)
-                .map_err(|error| {
-                    execution_refusal("begin landing command buffer", &error.to_string())
-                })?;
-            // A published layout is `TRANSFER_SRC_OPTIMAL` for a frame a
-            // completed pass kept; the barrier is only needed when the image
-            // sits somewhere else (a sentinel-preset target, or a layout an
-            // earlier round trip published as `UNDEFINED`). Declaring the
-            // registry's own value as the old layout is what keeps the copy
-            // legal in either case.
-            if source_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                let release = vk::ImageMemoryBarrier::default()
-                    .old_layout(source_layout)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_access_mask(
-                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                            | vk::AccessFlags::TRANSFER_WRITE
-                            | vk::AccessFlags::SHADER_WRITE,
-                    )
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        // The copy's own recording is another region of the entry's residual
+        // (`crate::phase_profile::Phase::LandingRecord`), submitted in the same
+        // bar below.
+        {
+            let _landing_record =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingRecord);
+            unsafe {
+                context
+                    .device
+                    .begin_command_buffer(command, &begin)
+                    .map_err(|error| {
+                        execution_refusal("begin landing command buffer", &error.to_string())
+                    })?;
+                // A published layout is `TRANSFER_SRC_OPTIMAL` for a frame a
+                // completed pass kept; the barrier is only needed when the image
+                // sits somewhere else (a sentinel-preset target, or a layout an
+                // earlier round trip published as `UNDEFINED`). Declaring the
+                // registry's own value as the old layout is what keeps the copy
+                // legal in either case.
+                if source_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+                    let release = vk::ImageMemoryBarrier::default()
+                        .old_layout(source_layout)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_access_mask(
+                            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                | vk::AccessFlags::TRANSFER_WRITE
+                                | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(target.image())
+                        .subresource_range(subresource);
+                    context.device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[release],
+                    );
+                }
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                context.device.cmd_copy_image_to_buffer(
+                    command,
+                    target.image(),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    readback.buffer,
+                    &[region],
+                );
+                let available = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(target.image())
-                    .subresource_range(subresource);
+                    .buffer(readback.buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
                 context.device.cmd_pipeline_barrier(
                     command,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
                     vk::DependencyFlags::empty(),
                     &[],
+                    &[available],
                     &[],
-                    &[release],
                 );
+                context
+                    .device
+                    .end_command_buffer(command)
+                    .map_err(|error| {
+                        execution_refusal("end landing command buffer", &error.to_string())
+                    })?;
             }
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-            context.device.cmd_copy_image_to_buffer(
-                command,
-                target.image(),
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                readback.buffer,
-                &[region],
-            );
-            let available = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(readback.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-            context.device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[available],
-                &[],
-            );
-            context
-                .device
-                .end_command_buffer(command)
-                .map_err(|error| {
-                    execution_refusal("end landing command buffer", &error.to_string())
-                })?;
         }
         context.notify_enqueue(queue_index);
-        let fence = unsafe {
-            context
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
+        let fence = {
+            let _landing_stage =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingStage);
+            unsafe {
+                context
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+            }
         }
         .map_err(|error| execution_refusal("create landing fence", &error.to_string()))?;
         let commands = [command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        let submitted = context
-            .submit_commands(queue_index, &submits, fence)
-            .map_err(|result| {
-                driver_refusal(
-                    context,
-                    ProviderPhase::Submit,
-                    "submit kept-frame landing",
-                    result,
-                )
-            });
+        let submitted = {
+            let _landing_record =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingRecord);
+            context.submit_commands(queue_index, &submits, fence)
+        }
+        .map_err(|result| {
+            driver_refusal(
+                context,
+                ProviderPhase::Submit,
+                "submit kept-frame landing",
+                result,
+            )
+        });
         if let Err(error) = submitted {
-            unsafe { context.device.destroy_fence(fence, None) };
+            {
+                let _landing_release =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingRelease);
+                unsafe { context.device.destroy_fence(fence, None) };
+            }
             return Err(error);
         }
         context.record_queue_submission(queue_index);
-        let waited = context
-            .wait_for_fence(fence, crate::FENCE_TIMEOUT_NS)
-            .map_err(|result| {
-                driver_refusal(
-                    context,
-                    ProviderPhase::Wait,
-                    "wait for kept-frame landing",
-                    result,
-                )
-            });
-        unsafe { context.device.destroy_fence(fence, None) };
+        let waited = {
+            // The wait is the landing's own region: it is where the copy's
+            // device time (and the queue's latency) is paid.
+            let _landing_wait =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingWait);
+            context.wait_for_fence(fence, crate::FENCE_TIMEOUT_NS)
+        }
+        .map_err(|result| {
+            driver_refusal(
+                context,
+                ProviderPhase::Wait,
+                "wait for kept-frame landing",
+                result,
+            )
+        });
+        {
+            let _landing_release =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingRelease);
+            unsafe { context.device.destroy_fence(fence, None) };
+        }
         if let Err(error) = waited {
             // The copy reached the queue and its fence never signalled, so the
             // image's layout is unknown: `UNDEFINED` is the one old layout that
@@ -7142,20 +7184,38 @@ pub(crate) fn land_kept_frame(
         context.record_queue_retirement(queue_index);
         Ok(())
     })();
-    unsafe { context.device.destroy_command_pool(pool, None) };
+    {
+        let _landing_release =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingRelease);
+        unsafe { context.device.destroy_command_pool(pool, None) };
+    }
     result?;
-    let bytes =
-        unsafe { std::slice::from_raw_parts(mapping as *const u8, landing.byte_len()).to_vec() };
-    unsafe {
-        context.device.unmap_memory(readback.memory);
-        context.device.destroy_buffer(readback.buffer, None);
-        context.device.free_memory(readback.memory, None);
+    // The host fetch of the copied frame — the part a landing shares with the
+    // readback channel (`crate::phase_profile::Phase::LandingFetch`).
+    let bytes = {
+        let _landing_fetch =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingFetch);
+        unsafe { std::slice::from_raw_parts(mapping as *const u8, landing.byte_len()).to_vec() }
+    };
+    {
+        let _landing_release =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingRelease);
+        unsafe {
+            context.device.unmap_memory(readback.memory);
+            context.device.destroy_buffer(readback.buffer, None);
+            context.device.free_memory(readback.memory, None);
+        }
     }
     context.record_buffer_readback();
     // The owner's pages receive the frame only after the copy has landed and
     // the window has been written in full; a refused write leaves the identity
     // unconsumed and the image where the copy found it.
-    landing.land(registry, &bytes)?;
+    {
+        let _landing_write =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingWrite);
+        landing.land(registry, &bytes)?;
+    }
+    crate::phase_profile::note_landing(byte_length);
     *layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
     Ok(())
 }
@@ -9092,10 +9152,18 @@ fn read_back_offscreen(
             continue;
         };
         let mapping = mappings.next().expect("one readback per stored attachment");
+        // Charged to no arm below: this is a shape check both arms take, and it
+        // refuses before either of them runs.
         let texel_bytes = usize::try_from(attachment.format.bytes_per_texel())
             .map_err(|_| contract_refusal("render attachment texel width overflows usize"))?;
         let frame = match region.rect {
             Some(rect) => {
+                // The trimmed arm is its own region of the readback bar, and
+                // the seed rebuild it alone pays is a region inside *it*
+                // (`crate::phase_profile`): the whole-extent arm below hands
+                // its bytes back without rebuilding anything.
+                let _readback_rect =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackRect);
                 // The copy region leaves the rectangle's own tightly packed rows
                 // at the mapping's start (`VkBufferImageCopy` with no row
                 // stride), so this is one contiguous read — and the read this
@@ -9106,7 +9174,11 @@ fn read_back_offscreen(
                     .ok_or_else(|| contract_refusal("render readback rectangle overflows usize"))?;
                 let rect_bytes =
                     unsafe { std::slice::from_raw_parts(mapping as *const u8, copied).to_vec() };
-                let frame = rebuild_frame(region, request.extent, rect, texel_bytes, &rect_bytes)?;
+                let frame = {
+                    let _readback_seed =
+                        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackSeed);
+                    rebuild_frame(region, request.extent, rect, texel_bytes, &rect_bytes)?
+                };
                 context.record_buffer_readback();
                 context.record_buffer_readback_bytes(rect_bytes.len());
                 let extent_bytes = usize::try_from(region.extent_bytes).unwrap_or(usize::MAX);
@@ -9118,6 +9190,10 @@ fn read_back_offscreen(
                 frame
             }
             None => {
+                // The whole-extent arm: the pre-increment readback shape, and
+                // its own region of the bar (`crate::phase_profile`).
+                let _readback_full =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackFull);
                 let bytes = usize::try_from(region.extent_bytes)
                     .map_err(|_| contract_refusal("render attachment bytes overflow usize"))?;
                 let texels =
@@ -9133,15 +9209,23 @@ fn read_back_offscreen(
         };
         results.push(Some(frame));
     }
-    let depth = objects.depth_readback_bytes(depth_byte_length as usize, context)?;
-    // The stored stencil surface follows the depth one through the same
-    // copy-out channel; its byte extent is one per texel, not the colour
-    // attachments' four (`research/docs/23` §3.3, v49).
-    let stencil = objects.stencil_readback_bytes(stencil_byte_length as usize, context)?;
-    // The writable stage buffers come last, after the attachments' own
-    // landings (`research/docs/23` §3.3, v86): their bytes are the pass's other
-    // observable output, read beside the texels that same submission wrote.
-    let stage_buffers = objects.stage_buffer_readback_bytes(context)?;
+    let (depth, stencil, stage_buffers) = {
+        // The pass's other observable surfaces: its depth and stencil
+        // copy-outs and its writable stage buffers, in one region of the
+        // readback bar (`crate::phase_profile`).
+        let _readback_surfaces =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackSurfaces);
+        let depth = objects.depth_readback_bytes(depth_byte_length as usize, context)?;
+        // The stored stencil surface follows the depth one through the same
+        // copy-out channel; its byte extent is one per texel, not the colour
+        // attachments' four (`research/docs/23` §3.3, v49).
+        let stencil = objects.stencil_readback_bytes(stencil_byte_length as usize, context)?;
+        // The writable stage buffers come last, after the attachments' own
+        // landings (`research/docs/23` §3.3, v86): their bytes are the pass's other
+        // observable output, read beside the texels that same submission wrote.
+        let stage_buffers = objects.stage_buffer_readback_bytes(context)?;
+        (depth, stencil, stage_buffers)
+    };
     Ok(OffscreenReadback {
         attachments: results,
         depth,
@@ -9947,7 +10031,15 @@ fn execute_offscreen_render_with_retains(
     // sized for it (`docs/WRITTEN-RECT-READBACK.md`).
     let setup_readbacks =
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupReadbacks);
-    let regions = plan_readback_regions(context, request)?;
+    // The readback *decision*, named inside the setup bar rather than inside
+    // `render_readback`: it is taken here, before any device object exists, so
+    // a round can tell "the shapes did not qualify" from "the copy was slow"
+    // (`crate::phase_profile::Phase::ReadbackShape`).
+    let regions = {
+        let _readback_shape =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackShape);
+        plan_readback_regions(context, request)?
+    };
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
     for (attachment, region) in request.attachments.iter().zip(&regions) {
         let Some(region) = region else {
