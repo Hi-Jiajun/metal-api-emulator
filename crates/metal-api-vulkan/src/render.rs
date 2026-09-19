@@ -2386,8 +2386,12 @@ fn translated_texture_pairs(
     // The module's own statement of how it reads each descriptor image
     // (`research/docs/23` §3.3, v105): the reflection says a texture argument
     // exists, this says whether the module's instructions sample it or
-    // texel-fetch it, which is the half the declaration has to repeat.
-    let descriptor_uses = descriptor_image_uses(&stages.fragment_spirv);
+    // texel-fetch it, which is the half the declaration has to repeat. The
+    // same walk answers the sampler half beside it (E-RS5/v118): which
+    // decorated slots an `OpSampledImage` names as its sampler operand, and
+    // therefore which AIR static samplers the module's instructions read
+    // through at all.
+    let descriptor_reads = descriptor_reads(&stages.fragment_spirv);
     // The AIR-embedded constexpr samplers first: one sampled texture is read
     // through one of them, exactly as the compute face's narrow class states
     // it, so the two lists pair by position below.
@@ -2410,6 +2414,30 @@ fn translated_texture_pairs(
                 "the reflected AIR static sampler consumes no Vulkan descriptor".to_owned(),
             ));
         };
+        // Whether the module reads through this slot at all (E-RS5/v118). The
+        // AIR state is the module's *declaration*; the module's own
+        // `OpSampledImage` sampler operands are the *use*, and only the use can
+        // tell a sampler the pass really binds from the state a lowered sample
+        // leaves behind — a `coord::pixel` sampler is emulated with shader-side
+        // fetches, so the finished module carries no `OpSampledImage` for it and
+        // nothing can read the filter, address or anisotropy the state names.
+        // Such a state is bypassed rather than weighed: it cannot change what
+        // the pass executes.
+        //
+        // Every arm that cannot decide keeps today's behaviour and weighs the
+        // sampler by name: a module whose reads the walk cannot answer
+        // (`None`), and one the walk could not attach some `OpSampledImage`'s
+        // sampler operand to any decorated slot all take that path, as does a
+        // binding whose own descriptor the reflection never located (the
+        // refusal above).
+        let slot = (sampler_descriptor.set, sampler_descriptor.binding);
+        let slot_is_read = descriptor_reads
+            .as_ref()
+            .and_then(|reads| reads.samplers.as_ref())
+            .map(|samplers| samplers.contains(&slot));
+        if slot_is_read == Some(false) {
+            continue;
+        }
         if sampler_descriptor.count != 1 || sampler_descriptor.set != 0 {
             return Err(capability_refusal("render_texture_layout_unsupported")
                 .with_field(
@@ -2590,9 +2618,14 @@ fn translated_texture_pairs(
         // the module reads directly, writes, or never touches — is refused by
         // name with both halves in hand rather than executed with a descriptor
         // nothing reads through.
-        let module_use = descriptor_uses
-            .get(&(descriptor.set, descriptor.binding))
-            .copied()
+        let module_use = descriptor_reads
+            .as_ref()
+            .and_then(|reads| {
+                reads
+                    .images
+                    .get(&(descriptor.set, descriptor.binding))
+                    .copied()
+            })
             .unwrap_or(DescriptorImageUse::Unused);
         match (declared.access, module_use) {
             (TextureAccess::Fetched, DescriptorImageUse::Fetched) => {
@@ -3423,7 +3456,7 @@ impl DescriptorImageUse {
     }
 }
 
-/// The fixpoint step of [`descriptor_image_uses`]: every descriptor variable
+/// The fixpoint step of [`descriptor_reads`]: every descriptor variable
 /// `from` descends from becomes one `target` descends from too. Answers whether
 /// `target`'s set grew, which is what makes the surrounding loop terminate.
 fn union_sources(
@@ -3440,28 +3473,46 @@ fn union_sources(
     entry.len() != before
 }
 
-/// The use each decorated descriptor slot's image gets in one module
-/// (`research/docs/23` §3.3, v105).
+/// What one module's own instructions state about the decorated descriptors it
+/// reads (`research/docs/23` §3.3, v105; E-RS5/v118).
+struct DescriptorReads {
+    /// The use each decorated descriptor slot's *image* gets, exactly as
+    /// [`DescriptorImageUse`] classifies it.
+    images: BTreeMap<(u32, u32), DescriptorImageUse>,
+    /// The decorated slots some `OpSampledImage` names as its *sampler*
+    /// operand, or `None` when the walk cannot answer for the whole module —
+    /// an `OpSampledImage` whose sampler operand it cannot attach to a
+    /// decorated slot (including one whose operand list is too short to carry
+    /// a sampler at all). `None` is the fail-closed answer: the caller weighs
+    /// every AIR static sampler by name rather than bypassing one the module
+    /// might read through.
+    samplers: Option<std::collections::BTreeSet<(u32, u32)>>,
+}
+
+/// The use each decorated descriptor slot's image gets in one module, and the
+/// slots some `OpSampledImage` reads a sampler from
+/// (`research/docs/23` §3.3, v105; E-RS5/v118).
 ///
-/// The walk resolves every classified instruction's image operand back to the
+/// The walk resolves every classified instruction's operands back to the
 /// `UniformConstant` variable its own `DescriptorSet`/`Binding` decorations
 /// name, through the copies the translator emits — `OpLoad`, `OpCopyObject`,
 /// `OpSelect`, `OpPhi`, access chains, and the function parameters a call feeds
-/// — and answers one classification per decorated slot. Nothing else is read:
-/// a slot the module never decorates has no answer here, and the pairing above
-/// reads that absence as [`DescriptorImageUse::Unused`], which is a refusal by
-/// name rather than a silently bound descriptor.
+/// — and answers one classification per decorated slot. The image half is the
+/// read the declaration has to repeat; the sampler half is what tells a
+/// sampler the module samples through from a state a lowered sample leaves
+/// behind. Nothing else is read: a slot the module never decorates has no
+/// answer here, and the pairing above reads that absence as
+/// [`DescriptorImageUse::Unused`], which is a refusal by name rather than a
+/// silently bound descriptor.
 ///
 /// A module that does not parse into a whole number of instructions answers
-/// with an empty map. That is not a hole: [`RenderStages::validate`] refuses
-/// such a module by name at registration, before a trace can select it, and
-/// this walk runs only on modules registration has already accepted.
-fn descriptor_image_uses(module: &[u8]) -> BTreeMap<(u32, u32), DescriptorImageUse> {
-    let Some(words) = spirv_words(module) else {
-        return BTreeMap::new();
-    };
+/// `None`. That is not a hole: [`RenderStages::validate`] refuses such a module
+/// by name at registration, before a trace can select it, and this walk runs
+/// only on modules registration has already accepted.
+fn descriptor_reads(module: &[u8]) -> Option<DescriptorReads> {
+    let words = spirv_words(module)?;
     if words.len() < 5 {
-        return BTreeMap::new();
+        return None;
     }
     // Instructions as (opcode, operands) in module order, where `operands` are
     // the instruction's words after its own header word.
@@ -3471,12 +3522,9 @@ fn descriptor_image_uses(module: &[u8]) -> BTreeMap<(u32, u32), DescriptorImageU
         let header = words[cursor];
         let word_count = (header >> 16) as usize;
         let opcode = header & 0xffff;
-        let Some(end) = cursor
+        let end = cursor
             .checked_add(word_count)
-            .filter(|end| word_count != 0 && *end <= words.len())
-        else {
-            return BTreeMap::new();
-        };
+            .filter(|end| word_count != 0 && *end <= words.len())?;
         instructions.push((opcode, &words[cursor + 1..end]));
         cursor = end;
     }
@@ -3558,7 +3606,28 @@ fn descriptor_image_uses(module: &[u8]) -> BTreeMap<(u32, u32), DescriptorImageU
     for (slot, variable) in &slots {
         variable_slots.entry(*variable).or_default().push(*slot);
     }
+    // The sampler half: which decorated slot each `OpSampledImage` reads its
+    // sampler from (`research/docs/23` §3.3, E-RS5). A sampler the module never
+    // names here is one no instruction samples through, whatever AIR metadata
+    // still declares beside it; an operand this walk cannot attribute keeps the
+    // whole answer `None`, so the caller falls back to weighing every sampler
+    // by name.
+    let mut sampler_reads = std::collections::BTreeSet::<(u32, u32)>::new();
+    let mut samplers_decidable = true;
     for (opcode, operands) in &instructions {
+        if *opcode == spirv::Op::SampledImage as u32 {
+            let mut attributed = false;
+            if let Some(readers) = operands.get(3).and_then(|sampler| sources.get(sampler)) {
+                for variable in readers {
+                    let Some(slot_of_variable) = variable_slots.get(variable) else {
+                        continue;
+                    };
+                    sampler_reads.extend(slot_of_variable.iter().copied());
+                    attributed = true;
+                }
+            }
+            samplers_decidable &= attributed;
+        }
         let (image, use_) = if *opcode == spirv::Op::SampledImage as u32 && operands.len() >= 3 {
             (operands[2], DescriptorImageUse::Sampled)
         } else if *opcode == spirv::Op::ImageFetch as u32 && operands.len() >= 3 {
@@ -3586,7 +3655,10 @@ fn descriptor_image_uses(module: &[u8]) -> BTreeMap<(u32, u32), DescriptorImageU
             }
         }
     }
-    uses
+    Some(DescriptorReads {
+        images: uses,
+        samplers: samplers_decidable.then_some(sampler_reads),
+    })
 }
 
 /// The stage name a reflection reports, spelled as this module spells stages.
@@ -15650,6 +15722,163 @@ mod tests {
         assert_eq!(request.textures[0].extent, [6, 4]);
         assert!(request.textures[0].gathered.is_none());
         assert_eq!(request.textures[0].source.len(), 6 * 4 * 4);
+    }
+
+    /// How many `OpSampledImage` instructions one module carries
+    /// (`research/docs/23` §3.3, E-RS5/v118): the instruction that combines an
+    /// image with a sampler, and therefore the only place a sampler operand can
+    /// name a slot the rail binds.
+    fn sampled_image_instructions(module: &[u8]) -> usize {
+        let Some(words) = spirv_words(module) else {
+            return 0;
+        };
+        let mut cursor = 5_usize;
+        let mut count = 0_usize;
+        while cursor < words.len() {
+            let header = words[cursor];
+            let word_count = (header >> 16) as usize;
+            if header & 0xffff == spirv::Op::SampledImage as u32 {
+                count += 1;
+            }
+            cursor += word_count.max(1);
+        }
+        count
+    }
+
+    /// The AIR sampler a lowered pixel-coordinate sample leaves behind is not
+    /// weighed, and the same axis on a sampler the module really reads through
+    /// still is (`research/docs/23` §3.3, E-RS5/v118).
+    ///
+    /// The two fixtures are one body: both carry one AIR `constexpr sampler`
+    /// and sample two texels of one texture. The first states `coord::pixel`,
+    /// which the pinned translator emulates with shader-side fetches, so the
+    /// finished module names no sampler operand anywhere and the state cannot
+    /// change what the pass executes; the second states `normalized`
+    /// coordinates with `Nearest` minification and `Linear` magnification, so
+    /// its sample lowers to a genuine `OpSampledImage` whose filter the rail
+    /// would have to substitute to execute. The first registers under the
+    /// declaration that repeats the module's fetch; the second is refused by
+    /// name, with the axis in the detail.
+    #[test]
+    fn a_static_sampler_the_modules_instructions_never_read_is_not_weighed() {
+        let fixture =
+            include_str!("../tests/fixtures/render_sample_texture_2d_pixel_sampler.frag.ll");
+        let (fragment_spirv, reflection) =
+            translate_fixture_with_layout(fixture, Stage::Fragment, DescriptorLayout::default());
+        let reads = descriptor_reads(&fragment_spirv).expect("the module parses");
+        eprintln!(
+            "pixel-coordinate fixture: image reads {:?}, sampler reads {:?}",
+            reads.images, reads.samplers
+        );
+        assert_eq!(
+            reads.images.get(&(0, 32)),
+            Some(&DescriptorImageUse::Fetched),
+            "the lowered sample reads the image with a fetch and no sampler"
+        );
+        assert_eq!(
+            reads.samplers,
+            Some(std::collections::BTreeSet::new()),
+            "no `OpSampledImage` names a sampler operand anywhere in the module"
+        );
+        assert_eq!(
+            sampled_image_instructions(&fragment_spirv),
+            0,
+            "the translation emulates the pixel-coordinate state with fetches, so the module \
+             carries no `OpSampledImage` at all"
+        );
+        // The reflection still declares the state — the *module* is what
+        // stopped reading it — so the admission below is a decision about the
+        // state, not about a binding a translator dropped.
+        assert!(reflection.bindings.iter().any(|binding| {
+            binding.kind == ResourceKind::StaticSampler
+                && binding
+                    .descriptor
+                    .map(|descriptor| (descriptor.set, descriptor.binding))
+                    == Some((0, 160))
+        }));
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d_pixel_sampler".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract::fetched(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                )],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        stages
+            .validate_stage_pair()
+            .expect("a sampler no instruction reads through is not weighed");
+    }
+
+    /// The control beside it: a sampler the module *does* read through is
+    /// weighed by its own state and refused by name (`research/docs/23` §3.3,
+    /// E-RS5/v118). Same body, same declaration shape, one axis moved — the
+    /// pixel-coordinate fixture's coordinates are normalized here and its
+    /// magnification filter is `Linear`, so the state is outside the family on
+    /// the axis the census's own shapes never carry.
+    #[test]
+    fn a_static_sampler_the_module_reads_through_is_still_weighed_by_its_state() {
+        let fixture =
+            include_str!("../tests/fixtures/render_sample_texture_2d_mixed_filters.frag.ll");
+        let (fragment_spirv, reflection) =
+            translate_fixture_with_layout(fixture, Stage::Fragment, DescriptorLayout::default());
+        let reads = descriptor_reads(&fragment_spirv).expect("the module parses");
+        assert_eq!(
+            reads.images.get(&(0, 32)),
+            Some(&DescriptorImageUse::Sampled),
+            "the normalized sample is a real `OpSampledImage`"
+        );
+        assert_eq!(
+            reads.samplers,
+            Some(std::collections::BTreeSet::from([(0, 160)])),
+            "the module reads its own AIR sampler at the reflection's slot"
+        );
+        assert_eq!(
+            sampled_image_instructions(&fragment_spirv),
+            2,
+            "both sample sites combine the image with the sampler the module names"
+        );
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: SAMPLED_QUAD_VERTEX_ENTRY.to_owned(),
+                fragment_entry: "render_sample_texture_2d_mixed_filters".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract::sampled(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                    REVIEWED_SAMPLER_POLICY,
+                )],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: Some(reflection),
+        };
+        let refused = stages
+            .validate_stage_pair()
+            .expect_err("a bound state outside the family is refused by name");
+        eprintln!("bound mixed-filter sampler: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_unsupported_interface");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.fields.get("index"), Some(&FieldValue::Unsigned(0)));
+        assert!(
+            refused.detail.as_deref().unwrap_or_default().contains(
+                "an AIR sampler whose min (Nearest) and mag (Linear) filters differ is \
+                     outside the reviewed family"
+            ),
+            "the refusal names the axis: {:?}",
+            refused.detail
+        );
     }
 
     /// The reviewed pair's window in the runtime-sampler increment and the
