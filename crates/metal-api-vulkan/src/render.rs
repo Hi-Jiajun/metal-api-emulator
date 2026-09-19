@@ -44,7 +44,7 @@ use metal_api_core::provider::{
     StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp,
     TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout,
     VertexFormat, VertexStep, ViewId, Winding, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_TEXTURES,
+    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -6351,8 +6351,12 @@ fn resolve_stage_buffers<'a>(
 ) -> Result<Vec<StageBufferStream<'a>>, ProviderError> {
     // The rail's own cap restatement, for a directly-constructed request that
     // skipped core admission — the same reason `resolve_render_textures`
-    // re-checks its own ceiling.
-    if pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+    // re-checks its own ceiling. The count rule is the contract's own
+    // (`research/docs/23` §117, E-SB2): the *stage's* list is bounded by
+    // [`MAX_RENDER_STAGE_BUFFERS`] and the pass's list by the pair's sum. The
+    // device's window is a second, narrower question the objects answered
+    // before they built anything (`create_stage_buffers`).
+    if pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(capability_refusal("render_stage_buffer_limit")
             .with_field(
                 "requested",
@@ -6360,8 +6364,28 @@ fn resolve_stage_buffers<'a>(
             )
             .with_field(
                 "maximum",
-                FieldValue::Unsigned(MAX_RENDER_STAGE_BUFFERS as u64),
+                FieldValue::Unsigned(MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u64),
             ));
+    }
+    for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
+        let count = pass
+            .stage_buffers
+            .iter()
+            .filter(|bound| bound.stage == stage)
+            .count();
+        if count > MAX_RENDER_STAGE_BUFFERS {
+            return Err(capability_refusal("render_stage_buffer_limit")
+                .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+                .with_field("requested", FieldValue::Unsigned(count as u64))
+                .with_field(
+                    "maximum",
+                    FieldValue::Unsigned(MAX_RENDER_STAGE_BUFFERS as u64),
+                )
+                .with_detail(
+                    "one stage's own list of stage buffer bindings is bounded by the contract's \
+                     per-stage ceiling",
+                ));
+        }
     }
     let mut streams = Vec::with_capacity(pass.stage_buffers.len());
     for stage in &pass.stage_buffers {
@@ -12014,6 +12038,46 @@ impl<'a> OffscreenObjects<'a> {
                     ));
             }
             by_set.entry(set).or_default().push(stream);
+        }
+        // The device's window is the second, narrower bound on the same shape
+        // (`research/docs/23` §117, E-SB2). The contract's per-stage ceiling is
+        // a review bound, while the descriptor counts a pipeline layout may
+        // carry are the device's own answers: a stage may hold at most
+        // `maxPerStageDescriptorStorageBuffers` storage buffers and one set at
+        // most `maxDescriptorSetStorageBuffers` of them. The reviewed
+        // arrangement gives each stage its own set, so a stage's list only has
+        // to fit the per-set window; a translated pair whose slots share one
+        // set (the translator's default layout, or a merged set 0) has to fit
+        // *both* lists in that set, which is why the check is per set and not
+        // per stage alone.
+        let window = crate::provider::stage_buffer_window(self.context.physical_device_limits());
+        for (set, set_streams) in &by_set {
+            if set_streams.len() as u32 > window.per_set {
+                return Err(capability_refusal("render_stage_buffer_limit")
+                    .with_field("set", FieldValue::Unsigned(u64::from(*set)))
+                    .with_field("requested", FieldValue::Unsigned(set_streams.len() as u64))
+                    .with_field("maximum", FieldValue::Unsigned(u64::from(window.per_set)))
+                    .with_detail(
+                        "one descriptor set of this pass carries more stage buffer bindings \
+                         than the device states storage buffers in a set",
+                    ));
+            }
+        }
+        for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
+            let count = streams
+                .iter()
+                .filter(|stream| stream.stage == stage)
+                .count();
+            if count as u32 > window.per_stage {
+                return Err(capability_refusal("render_stage_buffer_limit")
+                    .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+                    .with_field("requested", FieldValue::Unsigned(count as u64))
+                    .with_field("maximum", FieldValue::Unsigned(u64::from(window.per_stage)))
+                    .with_detail(
+                        "one stage carries more stage buffer bindings than the device states \
+                         storage buffers for a stage",
+                    ));
+            }
         }
         for streams in by_set.values() {
             for (position, stream) in streams.iter().enumerate() {

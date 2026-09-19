@@ -3900,9 +3900,19 @@ impl RenderCommandEncoder {
             }
             .into());
         }
-        if self.stage_buffers.len() >= MAX_RENDER_STAGE_BUFFERS {
+        // The count is the *stage's* own (`research/docs/23` §117, E-SB2): the
+        // encoder holds one slot per `(stage, index)` pair, and a stage's
+        // namespace is bounded by [`MAX_RENDER_STAGE_BUFFERS`] — the other
+        // stage's bindings are a second list, not more of this one.
+        let stage_count = self
+            .stage_buffers
+            .keys()
+            .filter(|(code, _)| *code == stage.code())
+            .count();
+        if stage_count >= MAX_RENDER_STAGE_BUFFERS {
             return Err(ContractError::RenderStageBufferLimitExceeded {
-                requested: self.stage_buffers.len() + 1,
+                stage: Some(stage),
+                requested: stage_count + 1,
                 maximum: MAX_RENDER_STAGE_BUFFERS,
             }
             .into());

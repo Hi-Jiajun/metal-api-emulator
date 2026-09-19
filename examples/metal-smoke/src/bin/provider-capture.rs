@@ -25,7 +25,8 @@ use metal_api_core::provider::{
     StencilTest, StorageMode, StoreOp, TextureAccess, TextureBindingContract, TextureFormat,
     TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
     VertexFormat, VertexLayout, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION, RENDER_AFFINE_AXES,
+    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION,
+    RENDER_AFFINE_AXES,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -4159,6 +4160,14 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // rail alone, so this table pins the declaring pass, which every rail
         // executes.
         (1, "compute-buffer-v41") => &["render_declaring_landing_view"],
+        // The per-stage stage-buffer ceiling (`research/docs/23` §117,
+        // E-SB2): the same declaring pass as v34 — the plain copy kernel over
+        // the 2x2 attachment's own sixteen-byte view — beside the render case
+        // whose two stages declare thirteen slots between them, seven on the
+        // vertex stage and six on the fragment stage. The render case runs on
+        // the two Vulkan rails, so this table pins the declaring pass, which
+        // every rail executes.
+        (1, "compute-buffer-v42") => &["render_declaring_stage_buffer_per_stage"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -6577,11 +6586,29 @@ fn reviewed_stage_buffer_geometry(case: &RenderCase, where_: &str) -> Result<Ren
         )
         .into());
     }
-    if case.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+    // The count rule is the stage's own (`research/docs/23` §117, E-SB2): the
+    // list bound is the pair's sum and each stage's own share is the contract's
+    // per-stage ceiling.
+    if case.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(format!(
-            "{where_}: the reviewed stage-buffer ceiling is {MAX_RENDER_STAGE_BUFFERS} slots"
+            "{where_}: the reviewed stage-buffer list bound is \
+             {MAX_RENDER_STAGE_BUFFER_DECLARATIONS} slots"
         )
         .into());
+    }
+    for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
+        let stage_slots = case
+            .stage_buffers
+            .iter()
+            .filter(|binding| binding.stage == stage.name())
+            .count();
+        if stage_slots > MAX_RENDER_STAGE_BUFFERS {
+            return Err(format!(
+                "{where_}: the reviewed stage-buffer ceiling is \
+                 {MAX_RENDER_STAGE_BUFFERS} slots per stage"
+            )
+            .into());
+        }
     }
     // A stage-buffer case names the rails that bind its slots, and the two arms
     // name different ones (`research/docs/23` §3.3, v83-v87). A *translated*
@@ -9724,6 +9751,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         // 2x2 attachment's own sixteen-byte view beside the copy landing
         // (`research/docs/23` §3.3).
         "render_declaring_stage_buffer_namespace" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4)][..],
+        ),
+        // E-SB2: the per-stage ceiling's declaring pass is the same plain copy
+        // kernel over the 2x2 attachment's own sixteen-byte view
+        // (`research/docs/23` §117).
+        "render_declaring_stage_buffer_per_stage" => (
             "copy_word",
             [1, 1, 1],
             [1, 1, 1],

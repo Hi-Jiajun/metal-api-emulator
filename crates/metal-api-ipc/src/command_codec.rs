@@ -33,8 +33,8 @@ use metal_api_core::provider::{
     TextureAccess, TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource,
     TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
     VertexLayout, VertexStep, ViewId, Winding, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES,
-    MAX_VERTEX_BUFFERS,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+    MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -713,6 +713,28 @@ const CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL: u8 = 0x05;
 /// position rule every section before it follows.
 const CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL: u8 = 0x06;
 
+/// Tag, inside the tail's second family, of the stage-buffer per-stage
+/// window's block (`research/docs/23` §3.3, §117 E-SB2).
+///
+/// The section follows the kept-frame-landing block and carries one `u32`
+/// (big-endian): the number of stage buffer bindings **one stage** of a render
+/// pass may declare
+/// ([`ProviderCapabilities::max_render_stage_buffers_per_stage`]). It is a
+/// number rather than a bool because the window is the device's own answer —
+/// the contract's ceiling clamped by `maxPerStageDescriptorStorageBuffers` —
+/// and a consumer that gates a draw on this face has to know which stage
+/// window the provider it is talking to states.
+///
+/// The absent section is the older reading, and it is the *stricter* one: a
+/// frame that ends before it says the list bound applies to a pass's whole
+/// stage-buffer list, exactly what every pre-E-SB2 snapshot meant by
+/// [`ProviderCapabilities::max_render_stage_buffers`]. That is why the section
+/// is the family's next tag rather than a widening of an existing block's
+/// payload, and why a snapshot with the default `0` writes nothing: an old
+/// consumer reading a new frame keeps a rule its provider still honours, and a
+/// new consumer reading an old frame keeps the same one.
+const CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL: u8 = 0x07;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -958,6 +980,13 @@ impl CommandCodec {
                     // extended payload, or its declaration would be dropped on
                     // the wire.
                     || capabilities.declares_render_kept_frame_landing_support()
+                    // The per-stage stage-buffer window is a face of its own
+                    // (`research/docs/23` §117, E-SB2): a snapshot that
+                    // declares only it still has to write the extended
+                    // payload, or its window would be dropped on the wire and
+                    // every consumer would keep reading the stricter list
+                    // bound as the whole rule.
+                    || capabilities.declares_render_stage_buffer_per_stage_ceiling()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -1908,10 +1937,11 @@ fn put_pipeline_tagged(
 /// partial entry.
 fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecError> {
     let format_count = bounded_color_format_count(contract.color_formats.len() as u64)?;
-    if contract.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+    if contract.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(CodecError::RenderStageBufferCount {
+            stage: None,
             count: contract.stage_buffers.len(),
-            maximum: MAX_RENDER_STAGE_BUFFERS,
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
         });
     }
     if contract.textures.len() > MAX_RENDER_TEXTURES {
@@ -1988,15 +2018,26 @@ fn put_render_pipeline_contract(
 /// tuples, in the canonical order the contract's own rules state.
 ///
 /// The list is bound the way every other length prefix is: a count above
-/// [`MAX_RENDER_STAGE_BUFFERS`] is refused before a single tuple is written,
-/// so a refused registration never emits a partial block.
+/// [`MAX_RENDER_STAGE_BUFFER_DECLARATIONS`] — or a list whose *stage* carries
+/// more than [`MAX_RENDER_STAGE_BUFFERS`], the count rule's own axis
+/// (`research/docs/23` §117, E-SB2) — is refused before a single tuple is
+/// written, so a refused registration never emits a partial block.
 fn put_stage_buffer_declarations(
     encoder: &mut Encoder,
     bindings: &[StageBufferBinding],
 ) -> Result<(), CodecError> {
-    if bindings.len() > MAX_RENDER_STAGE_BUFFERS {
+    if bindings.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(CodecError::RenderStageBufferCount {
+            stage: None,
             count: bindings.len(),
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+        });
+    }
+    if let Some((stage, count)) = stage_buffer_stage_over_ceiling(bindings, |binding| binding.stage)
+    {
+        return Err(CodecError::RenderStageBufferCount {
+            stage: Some(stage),
+            count,
             maximum: MAX_RENDER_STAGE_BUFFERS,
         });
     }
@@ -2014,15 +2055,20 @@ fn put_stage_buffer_declarations(
 ///
 /// The count is read as one byte and refused above the contract's own cap
 /// before a single tuple — or a `Vec` of that length — is produced, so a
-/// corrupt count cannot drive the decoder.
+/// corrupt count cannot drive the decoder. The stage's own bound is asked
+/// after the list is read, because which stage a tuple names is inside the
+/// block (`research/docs/23` §117, E-SB2); a list that crosses it is refused
+/// with the stage named rather than handed to a caller that would have to
+/// re-state the rule.
 fn get_stage_buffer_declarations(
     decoder: &mut Decoder<'_>,
 ) -> Result<Vec<StageBufferBinding>, CodecError> {
     let count = usize::from(decoder.u8()?);
-    if count > MAX_RENDER_STAGE_BUFFERS {
+    if count > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(CodecError::RenderStageBufferCount {
+            stage: None,
             count,
-            maximum: MAX_RENDER_STAGE_BUFFERS,
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
         });
     }
     let mut bindings = Vec::with_capacity(count);
@@ -2034,7 +2080,38 @@ fn get_stage_buffer_declarations(
             footprint: get_footprint(decoder)?,
         });
     }
+    if let Some((stage, count)) =
+        stage_buffer_stage_over_ceiling(&bindings, |binding| binding.stage)
+    {
+        return Err(CodecError::RenderStageBufferCount {
+            stage: Some(stage),
+            count,
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
     Ok(bindings)
+}
+
+/// The stage whose own list crosses [`MAX_RENDER_STAGE_BUFFERS`], if any
+/// (`research/docs/23` §117, E-SB2).
+///
+/// The count rule is the *stage's* own, so both the encoder and the two
+/// decoders ask it here rather than each spelling the loop: a list is refused
+/// when either stage names more than the contract's per-stage ceiling, and the
+/// refusal carries that stage's own count.
+fn stage_buffer_stage_over_ceiling<T>(
+    bindings: &[T],
+    stage_of: impl Fn(&T) -> RenderPipelineStage,
+) -> Option<(RenderPipelineStage, usize)> {
+    [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment]
+        .into_iter()
+        .find_map(|stage| {
+            let count = bindings
+                .iter()
+                .filter(|bound| stage_of(bound) == stage)
+                .count();
+            (count > MAX_RENDER_STAGE_BUFFERS).then_some((stage, count))
+        })
 }
 
 /// The sampler form byte of one render texture declaration
@@ -3153,10 +3230,13 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // the tag of its own and every pre-v83 frame keeps its exact
                 // bytes.
                 let has_stage_buffers = !pass.stage_buffers.is_empty();
-                if has_stage_buffers && pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+                if has_stage_buffers
+                    && pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS
+                {
                     return Err(CodecError::RenderStageBufferCount {
+                        stage: None,
                         count: pass.stage_buffers.len(),
-                        maximum: MAX_RENDER_STAGE_BUFFERS,
+                        maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
                     });
                 }
                 // The runtime sampler block follows the same rule one more
@@ -3515,14 +3595,24 @@ fn put_render_texture_block(
 /// `[[buffer(N)]]` argument reads have to travel with the trace that binds
 /// them, and the view's own `metal_binding` is the index inside its stage.
 /// The count is bound before a single entry is written, exactly as the
-/// decoder bounds it.
+/// decoder bounds it: the list bound is the pair's sum, and each stage's own
+/// share is bounded by [`MAX_RENDER_STAGE_BUFFERS`] (`research/docs/23` §117,
+/// E-SB2).
 fn put_stage_buffer_block(
     encoder: &mut Encoder,
     views: &[StageBufferView],
 ) -> Result<(), CodecError> {
-    if views.len() > MAX_RENDER_STAGE_BUFFERS {
+    if views.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(CodecError::RenderStageBufferCount {
+            stage: None,
             count: views.len(),
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+        });
+    }
+    if let Some((stage, count)) = stage_buffer_stage_over_ceiling(views, |view| view.stage) {
+        return Err(CodecError::RenderStageBufferCount {
+            stage: Some(stage),
+            count,
             maximum: MAX_RENDER_STAGE_BUFFERS,
         });
     }
@@ -4292,13 +4382,15 @@ fn get_render_texture_block(decoder: &mut Decoder<'_>) -> Result<Vec<TextureView
 /// The count is refused above the contract's own cap before a single entry is
 /// read, and each entry's stage byte goes through the named-stage decoder, so
 /// a corrupt block is refused by name rather than read as the pass's own
-/// fields.
+/// fields. The stage's own bound is the second half of the same rule
+/// (`research/docs/23` §117, E-SB2).
 fn get_stage_buffer_block(decoder: &mut Decoder<'_>) -> Result<Vec<StageBufferView>, CodecError> {
     let count = usize::from(decoder.u8()?);
-    if count > MAX_RENDER_STAGE_BUFFERS {
+    if count > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(CodecError::RenderStageBufferCount {
+            stage: None,
             count,
-            maximum: MAX_RENDER_STAGE_BUFFERS,
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
         });
     }
     let mut views = Vec::with_capacity(count);
@@ -4306,6 +4398,13 @@ fn get_stage_buffer_block(decoder: &mut Decoder<'_>) -> Result<Vec<StageBufferVi
         views.push(StageBufferView {
             stage: get_render_pipeline_stage(decoder)?,
             view: get_view(decoder)?,
+        });
+    }
+    if let Some((stage, count)) = stage_buffer_stage_over_ceiling(&views, |view| view.stage) {
+        return Err(CodecError::RenderStageBufferCount {
+            stage: Some(stage),
+            count,
+            maximum: MAX_RENDER_STAGE_BUFFERS,
         });
     }
     Ok(views)
@@ -5814,6 +5913,11 @@ fn put_capabilities(
         // reads by position before the family's escape, or its declaration
         // would be dropped on the wire.
         || capabilities.declares_render_kept_frame_landing_support()
+        // The per-stage stage-buffer window joins the same guard for the same
+        // reason (`research/docs/23` §117, E-SB2): a snapshot that declares
+        // only it still has to write the heap/ICB half the decoder reads by
+        // position before the family's escape.
+        || capabilities.declares_render_stage_buffer_per_stage_ceiling()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6029,6 +6133,18 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL);
             encoder.bool(capabilities.supports_render_kept_frame_landing);
         }
+        // The per-stage stage-buffer window is the family's seventh tag and
+        // follows the kept-frame landing block (`research/docs/23` §117,
+        // E-SB2). A snapshot whose window stays at its default writes nothing
+        // here, and the decoder reads the missing section as `0` — the reading
+        // every pre-E-SB2 frame has, where the list bound is the whole rule and
+        // a pair this rail cannot execute is refused by name instead of being
+        // half-admitted.
+        if capabilities.declares_render_stage_buffer_per_stage_ceiling() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL);
+            encoder.u32(capabilities.max_render_stage_buffers_per_stage);
+        }
     }
     Ok(())
 }
@@ -6080,6 +6196,10 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
     Ok(ProviderCapabilities {
         supports_render_stage_buffers: false,
         max_render_stage_buffers: 0,
+        // A frame that ends before the per-stage window's section reads the
+        // older reading too (`research/docs/23` §117, E-SB2): the list bound
+        // applies to the whole list, which is the stricter rule.
+        max_render_stage_buffers_per_stage: 0,
         // A legacy payload cannot have declared the folded shape either
         // (`research/docs/23` §3.3, E-TX9): the section arrived after the
         // compute-texture block, so a frame that ends earlier reads the
@@ -6224,7 +6344,8 @@ fn decode_capability_extended_tail(
             | CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL
             | CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL
-            | CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL => {}
+            | CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL
+            | CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6250,6 +6371,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL => {
                 capabilities.supports_render_attachment_landing_view = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL => {
+                capabilities.max_render_stage_buffers_per_stage = decoder.u32()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;
@@ -6598,4 +6722,43 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
     Ok(capabilities)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decoder's own half of the count rule (`research/docs/23` §117,
+    /// E-SB2).
+    ///
+    /// The wire's list bound is the *pair's* sum, so a block whose count is
+    /// inside that bound is one the encoder can frame but the contract cannot
+    /// state: nine declarations on one stage. The encoder refuses to write such
+    /// a block, so the frame is spelled here by hand — the point is that a
+    /// decoder handed one refuses it with the stage named instead of passing a
+    /// shape on that every consumer would have to re-check.
+    #[test]
+    fn a_declaration_block_whose_stage_crosses_the_ceiling_is_refused_by_stage() {
+        let mut encoder = Encoder::new();
+        let over = MAX_RENDER_STAGE_BUFFERS + 1;
+        encoder.u8(u8::try_from(over).expect("nine fits one byte"));
+        for index in 0..over as u32 {
+            encoder.u8(RenderPipelineStage::Fragment.code());
+            encoder.u32(index);
+            put_access(&mut encoder, BufferAccess::Read);
+            put_footprint(&mut encoder, &FootprintProof::Static { max_bytes: 16 });
+        }
+        let bytes = encoder.bytes.clone();
+        let refusal = get_stage_buffer_declarations(&mut Decoder::new(&bytes))
+            .expect_err("nine declarations on one stage cross the per-stage ceiling");
+        eprintln!("declaration block stage refusal: {refusal}");
+        assert!(matches!(
+            refusal,
+            CodecError::RenderStageBufferCount {
+                stage: Some(RenderPipelineStage::Fragment),
+                count,
+                maximum,
+            } if count == over && maximum == MAX_RENDER_STAGE_BUFFERS
+        ));
+    }
 }

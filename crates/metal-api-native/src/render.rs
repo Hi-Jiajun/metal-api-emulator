@@ -958,6 +958,12 @@ pub(crate) const APPLE_2D_TEXTURE_CEILING: u64 = 16_384;
 pub(crate) struct StageBufferCapabilityBits {
     pub(crate) supports_render_stage_buffers: bool,
     pub(crate) max_render_stage_buffers: u32,
+    /// The per-stage window this rail states, or `0` for the list-bound-only
+    /// reading (`research/docs/23` §117, E-SB2). The reviewed modules bind one
+    /// slot per stage, so this rail declares none: a pair that spreads thirteen
+    /// declarations over its stages is refused by name by core admission rather
+    /// than executed against slots no Apple reading measured.
+    pub(crate) max_render_stage_buffers_per_stage: u32,
     /// Whether this rail executes a pair whose two stages each read a
     /// `[[buffer(n)]]` argument of the same Metal index (`research/docs/23`
     /// §3.3, E-TX9). Declared beside the pair above because it is the same
@@ -977,6 +983,7 @@ pub(crate) fn stage_buffer_capability_bits() -> StageBufferCapabilityBits {
     StageBufferCapabilityBits {
         supports_render_stage_buffers: true,
         max_render_stage_buffers: MAX_RENDER_STAGE_BUFFERS,
+        max_render_stage_buffers_per_stage: 0,
         // The reviewed pair binds the two stages at different slots, so the
         // folded shape is the arrangement this rail already executes. No new
         // native implementation arrives with the bit: the declaration names
@@ -10484,6 +10491,10 @@ mod tests {
         ProviderCapabilities {
             supports_render_stage_buffers: stage_buffers.supports_render_stage_buffers,
             max_render_stage_buffers: stage_buffers.max_render_stage_buffers,
+            // The native rail's reviewed pair binds one slot per stage
+            // (`research/docs/23` §83), so the snapshot declares no per-stage
+            // window and keeps the list bound as the whole rule (§117 E-SB2).
+            max_render_stage_buffers_per_stage: stage_buffers.max_render_stage_buffers_per_stage,
             supports_render_stage_buffer_namespace_split: stage_buffers
                 .supports_render_stage_buffer_namespace_split,
             max_passes: 8,
@@ -11636,6 +11647,14 @@ mod tests {
         let bits = stage_buffer_capability_bits();
         assert!(bits.supports_render_stage_buffers);
         assert_eq!(bits.max_render_stage_buffers, MAX_RENDER_STAGE_BUFFERS);
+        // The per-stage window stays undeclared (`research/docs/23` §117,
+        // E-SB2): this rail's reviewed modules bind one slot per stage, so the
+        // list bound is the whole rule and a pair that declares thirteen slots
+        // between its stages is refused by name by core admission instead of
+        // being executed against slots no Apple reading sized.
+        assert_eq!(bits.max_render_stage_buffers_per_stage, 0);
+        assert!(!capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+            .declares_render_stage_buffer_per_stage_ceiling());
         // The folded shape's bit is part of the same spelling (`research/docs/23`
         // §3.3, E-TX9): the reviewed pair's two stages are bound at set 1 and
         // set 2, so the shape that needs those two namespaces declared here.
