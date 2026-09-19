@@ -40,6 +40,7 @@ mod provider;
 mod readback_rect;
 mod render;
 mod render_setup_reuse;
+mod render_texture_pool;
 
 pub use compute_provider::{
     CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
@@ -49,6 +50,7 @@ pub use compute_provider::{
 pub use render::RenderStage;
 pub use render::STAGE_BUFFER_NAMESPACE_SET;
 pub use render_setup_reuse::RenderSetupReuseCounts;
+pub use render_texture_pool::RenderTexturePoolCounts;
 
 /// The canonical descriptor layout for a folded pair of render stages
 /// (`research/docs/23` §3.3, E-TX9).
@@ -914,6 +916,35 @@ impl VulkanExecutor {
         self.context.clear_render_setup_reuse();
     }
 
+    /// What the pooled sampled-texture backing has seen
+    /// (`crate::render_texture_pool`): how many sampled declarations the pool
+    /// served, how many built their own backing, how many were asked while the
+    /// switch was off, and how many backings were kept, evicted or dropped.
+    #[doc(hidden)]
+    pub fn render_texture_pool_counts(&self) -> RenderTexturePoolCounts {
+        self.context.render_texture_pool_counts()
+    }
+
+    /// Whether the pooled sampled-texture backing is on for this executor.
+    #[doc(hidden)]
+    pub fn render_texture_pool_enabled(&self) -> bool {
+        self.context.render_texture_pool_enabled()
+    }
+
+    /// Turn the pooled sampled-texture backing on or off, dropping what it held
+    /// when it goes off.
+    #[doc(hidden)]
+    pub fn set_render_texture_pool(&self, enabled: bool) {
+        self.context.set_render_texture_pool(enabled);
+    }
+
+    /// Drop every pooled backing: the contract surface they were built from
+    /// moved.
+    #[doc(hidden)]
+    pub fn clear_render_texture_pool(&self) {
+        self.context.clear_render_texture_pool();
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1603,6 +1634,11 @@ pub(crate) struct VulkanContext {
     /// off with `METAL_API_VULKAN_RENDER_SETUP_CACHE=0`, and empty for a pass
     /// whose key cannot be stated exactly.
     render_setup_reuse: Mutex<render_setup_reuse::RenderSetupReuse>,
+    /// The sampled-texture backing one offscreen pass may hand the next
+    /// declaration of the same shape (`crate::render_texture_pool`): the image,
+    /// its memory and its view. On by default, off with
+    /// `METAL_API_VULKAN_TEXTURE_BACKING_POOL=0`.
+    render_texture_pool: Mutex<render_texture_pool::RenderTexturePool>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -1852,6 +1888,9 @@ impl VulkanContext {
         // The shape-decided render objects start empty and read their own
         // switch. Built before the literal because `device` moves into it.
         let render_setup_reuse = render_setup_reuse::RenderSetupReuse::new(device.clone());
+        // The pooled sampled-texture backing reads the same way: its own
+        // switch, its own empty table, built before the literal takes `device`.
+        let render_texture_pool = render_texture_pool::RenderTexturePool::new(device.clone());
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
@@ -1884,6 +1923,7 @@ impl VulkanContext {
             present_acquires: AtomicUsize::new(0),
             present_presents: AtomicUsize::new(0),
             render_setup_reuse: Mutex::new(render_setup_reuse),
+            render_texture_pool: Mutex::new(render_texture_pool),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -1950,6 +1990,63 @@ impl VulkanContext {
     /// Drop every entry: the contract surface they were built from moved.
     pub(crate) fn clear_render_setup_reuse(&self) {
         self.lock_render_setup_reuse().clear();
+    }
+
+    /// The sampled-texture backing this device keeps
+    /// (`crate::render_texture_pool`). A poisoned lock is recovered rather than
+    /// propagated, for the same reason the render-setup cache recovers: the
+    /// pool's state is a list of device handles, and a panic elsewhere must not
+    /// turn a reusable shape into a refusal.
+    fn lock_render_texture_pool(&self) -> MutexGuard<'_, render_texture_pool::RenderTexturePool> {
+        self.render_texture_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The backing a sampled declaration of this shape may take, and what the
+    /// pool answered.
+    pub(crate) fn take_render_texture_backing(
+        &self,
+        key: render_texture_pool::BackingKey,
+    ) -> (
+        Option<render_texture_pool::Backing>,
+        render_texture_pool::PoolOutcome,
+    ) {
+        self.lock_render_texture_pool().take(key)
+    }
+
+    /// Hand a completed declaration's backing back, or destroy it when the
+    /// mechanism is off.
+    pub(crate) fn give_render_texture_backing(
+        &self,
+        key: render_texture_pool::BackingKey,
+        backing: render_texture_pool::Backing,
+    ) -> render_texture_pool::PoolOutcome {
+        self.lock_render_texture_pool().give(key, backing)
+    }
+
+    /// The sampled-texture pool counters one reading reports.
+    pub(crate) fn render_texture_pool_counts(
+        &self,
+    ) -> render_texture_pool::RenderTexturePoolCounts {
+        self.lock_render_texture_pool().counts()
+    }
+
+    /// Whether the sampled-texture pool is on for this device.
+    pub(crate) fn render_texture_pool_enabled(&self) -> bool {
+        self.lock_render_texture_pool().enabled()
+    }
+
+    /// Turn the sampled-texture pool on or off, and drop what it holds when it
+    /// goes off.
+    pub(crate) fn set_render_texture_pool(&self, enabled: bool) {
+        self.lock_render_texture_pool().set_enabled(enabled);
+    }
+
+    /// Drop every pooled backing: the contract surface they were built from
+    /// moved.
+    pub(crate) fn clear_render_texture_pool(&self) {
+        self.lock_render_texture_pool().clear();
     }
 
     /// The selected device's own limits, for the render rail's attachment

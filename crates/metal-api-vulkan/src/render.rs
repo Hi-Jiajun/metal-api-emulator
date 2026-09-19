@@ -10032,6 +10032,9 @@ fn execute_offscreen_render_with_retains(
             // go back to the shape cache before anything else in this pass
             // reads the frame (`crate::render_setup_reuse`).
             objects.release_reusable();
+            // The sampled textures' pooled backing retires with the same
+            // fence (`crate::render_texture_pool`).
+            objects.release_pooled_textures();
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -10744,6 +10747,10 @@ pub(crate) fn execute_present_render<'a>(
             // fence; the shape cache takes them back for the next pass of the
             // same shape (`crate::render_setup_reuse`).
             objects.release_reusable();
+            // And the present pass's sampled textures hand their pooled
+            // backing back through the same fence
+            // (`crate::render_texture_pool`).
+            objects.release_pooled_textures();
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -11027,6 +11034,26 @@ struct SampledTextureObjects {
     /// The descriptor slot (or pair of slots) this texture is bound to
     /// (`research/docs/23` §3.3, v100).
     slot: RenderTextureSlot,
+    /// The pooled backing this texture holds, keyed by its own shape
+    /// (`crate::render_texture_pool`), or `None` for a declaration whose
+    /// backing the switch kept out of the pool. `Some` means the image, its
+    /// memory and its view are given back to the pool when the pass is
+    /// destroyed instead of being released, which is what makes the next
+    /// declaration of the same shape pay no `vkCreateImage`, no
+    /// `vkAllocateMemory` and no `vkCreateImageView`.
+    pooled: Option<crate::render_texture_pool::BackingKey>,
+    /// The layout this texture's image is in when `record` runs
+    /// (`docs/TEXTURE-BACKING-POOL.md`): what a fresh image of this arm starts
+    /// in (`PREINITIALIZED` for the host-written arms, `UNDEFINED` for the
+    /// device-copied ones), or `GENERAL` for a backing the pool handed back —
+    /// the layout every arm publishes before the descriptor binds it. The
+    /// barriers `record` states use this as their old layout, so a pooled image
+    /// is never transitioned out of a layout it is not in.
+    entry_layout: vk::ImageLayout,
+    /// The image's own memory requirements, which is what the host upload maps
+    /// and what the pool's byte cap counts when the backing is handed back
+    /// (`crate::render_texture_pool`).
+    requirements: vk::MemoryRequirements,
 }
 
 /// The Vulkan objects the rail-owned depth attachment owns
@@ -13111,6 +13138,12 @@ impl<'a> OffscreenObjects<'a> {
         texels: &[u8],
         volume: bool,
     ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, ProviderError> {
+        // The texels' own trip into the backing (`crate::phase_profile`): the
+        // host write for the linear lanes, the staging write a volume takes
+        // before its device copy. It is a *nested* bar inside
+        // `setup_textures`, so a reading must not add it to that bar
+        // (`docs/TEXTURE-BACKING-POOL.md`).
+        let _upload = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TextureUpload);
         if !volume {
             self.upload_render_texture(target, texels)?;
             return Ok(None);
@@ -13257,17 +13290,71 @@ impl<'a> OffscreenObjects<'a> {
                 } else {
                     vk::ImageLayout::PREINITIALIZED
                 });
-            let (image, memory, requirements) = crate::allocate_image_backing(
-                self.context,
-                &info,
-                if device_copy {
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL
-                } else {
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
-                },
-                "render texture",
-            )
-            .map_err(|error| execution_refusal("create render texture image", &error.detail))?;
+            // The backing — image, memory and view — is the one part of this
+            // declaration that its own *shape* decides, so the pass asks the
+            // pool for it first (`crate::render_texture_pool`): a guest that
+            // samples the same shapes draw after draw pays `vkCreateImage`,
+            // `vkAllocateMemory`, `vkBindImageMemory` and `vkCreateImageView`
+            // again for every one of them. A miss is the fresh path exactly as
+            // it was, and a pass that reaches its readback hands the backing
+            // back through [`OffscreenObjects::drop`].
+            let backing_key = crate::render_texture_pool::BackingKey::new(
+                texture.image_type,
+                format,
+                [width, height, depth],
+                texture.view_type,
+                device_copy,
+            );
+            let (pooled, outcome) = self.context.take_render_texture_backing(backing_key);
+            crate::phase_profile::note_texture_pool(outcome);
+            let pooled_backing = pooled.is_some();
+            // A declaration that was built while the switch was off has no
+            // backing the pool may keep, so it is destroyed with the pass
+            // exactly as it always was.
+            let pooled_key = match outcome {
+                crate::render_texture_pool::PoolOutcome::Disabled => None,
+                _ => Some(backing_key),
+            };
+            let (image, memory, requirements, pooled_view) = match pooled {
+                Some(backing) => (
+                    backing.image,
+                    backing.memory,
+                    backing.requirements,
+                    Some(backing.view),
+                ),
+                None => {
+                    let _backing = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::TextureBacking,
+                    );
+                    let (image, memory, requirements) = crate::allocate_image_backing(
+                        self.context,
+                        &info,
+                        if device_copy {
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        } else {
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT
+                        },
+                        "render texture",
+                    )
+                    .map_err(|error| {
+                        execution_refusal("create render texture image", &error.detail)
+                    })?;
+                    (image, memory, requirements, None)
+                }
+            };
+            // A pooled image is handed back in `GENERAL` — the layout every arm
+            // below publishes before the descriptor binds it — so the pass that
+            // takes one states that as the entry layout of its own barriers
+            // instead of the `UNDEFINED`/`PREINITIALIZED` a fresh image starts
+            // in (`docs/TEXTURE-BACKING-POOL.md`).
+            let entry_layout = if pooled_backing {
+                vk::ImageLayout::GENERAL
+            } else if device_copy {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::PREINITIALIZED
+            };
             let target = RenderTextureImage {
                 image,
                 memory,
@@ -13325,24 +13412,30 @@ impl<'a> OffscreenObjects<'a> {
                 // so nothing is written here and no buffer is imported.
                 RenderInputSource::AttachmentSnapshot { .. } => None,
             };
-            let view = crate::create_sampled_image_view(
-                self.context,
-                image,
-                format,
-                texture.view_type,
-                "render texture",
-            )
-            .map_err(|error| {
-                unsafe {
-                    if let Some((buffer, buffer_memory)) = copy_source {
-                        self.context.device.destroy_buffer(buffer, None);
-                        self.context.device.free_memory(buffer_memory, None);
+            // The view belongs to the pooled family beside the image: a backing
+            // that came from the pool carries its own view, and one this
+            // declaration built gets the view this rail always built for it.
+            let view = match pooled_view {
+                Some(view) => view,
+                None => crate::create_sampled_image_view(
+                    self.context,
+                    image,
+                    format,
+                    texture.view_type,
+                    "render texture",
+                )
+                .map_err(|error| {
+                    unsafe {
+                        if let Some((buffer, buffer_memory)) = copy_source {
+                            self.context.device.destroy_buffer(buffer, None);
+                            self.context.device.free_memory(buffer_memory, None);
+                        }
+                        self.context.device.destroy_image(image, None);
+                        self.context.device.free_memory(memory, None);
                     }
-                    self.context.device.destroy_image(image, None);
-                    self.context.device.free_memory(memory, None);
-                }
-                execution_refusal("create render texture view", &error.detail)
-            })?;
+                    execution_refusal("create render texture view", &error.detail)
+                })?,
+            };
             // The state the sampler is created with is the *declaration's*
             // (`research/docs/23` §3.3, v100): on this rail the fragment
             // module's samples take their filtering and addressing from the
@@ -13413,6 +13506,9 @@ impl<'a> OffscreenObjects<'a> {
                 copy_source,
                 snapshot_from,
                 slot: texture.slot,
+                pooled: pooled_key,
+                entry_layout,
+                requirements,
             });
         }
         // The descriptor set layout is the sampled pipeline's own: one
@@ -14397,6 +14493,33 @@ impl<'a> OffscreenObjects<'a> {
             pipeline: std::mem::replace(&mut self.pipeline, vk::Pipeline::null()),
         };
         self.context.lock_render_setup_reuse().insert(key, objects);
+    }
+
+    /// Hand the sampled textures' pooled backing back once this pass's work has
+    /// retired on the device.
+    ///
+    /// Called after the fence, beside [`Self::release_reusable`] and for the
+    /// same reason: no command buffer is still reading the images, so the next
+    /// declaration of a shape may take one and upload its own texels into it.
+    /// The pass's own teardown then has nothing to destroy for these fields —
+    /// each handle is left null behind the backing — while a declaration the
+    /// pool did not serve (the switch was off, or a shape the cap cannot hold)
+    /// keeps its objects and drops them exactly as it always did
+    /// (`crate::render_texture_pool`).
+    fn release_pooled_textures(&mut self) {
+        for texture in &mut self.textures {
+            let Some(key) = texture.pooled.take() else {
+                continue;
+            };
+            let backing = crate::render_texture_pool::Backing {
+                image: std::mem::replace(&mut texture.image, vk::Image::null()),
+                memory: std::mem::replace(&mut texture.memory, vk::DeviceMemory::null()),
+                requirements: texture.requirements,
+                view: std::mem::replace(&mut texture.view, vk::ImageView::null()),
+            };
+            let outcome = self.context.give_render_texture_backing(key, backing);
+            crate::phase_profile::note_texture_pool(outcome);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15734,7 +15857,11 @@ impl<'a> OffscreenObjects<'a> {
             };
             unsafe {
                 // The sampled image starts `UNDEFINED`: every texel it will
-                // hold comes from the copy below.
+                // hold comes from the copy below. A pooled backing starts in
+                // `GENERAL` instead — it is handed back in the layout the
+                // previous declaration published — so the entry barrier states
+                // the layout the image is actually in
+                // (`docs/TEXTURE-BACKING-POOL.md`).
                 self.context.device.cmd_pipeline_barrier(
                     self.command,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -15743,7 +15870,7 @@ impl<'a> OffscreenObjects<'a> {
                     &[],
                     &[],
                     &[vk::ImageMemoryBarrier::default()
-                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .old_layout(texture.entry_layout)
                         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -15901,7 +16028,7 @@ impl<'a> OffscreenObjects<'a> {
                         &[],
                         &[],
                         &[vk::ImageMemoryBarrier::default()
-                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .old_layout(texture.entry_layout)
                             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -15952,7 +16079,7 @@ impl<'a> OffscreenObjects<'a> {
                 continue;
             }
             let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .old_layout(texture.entry_layout)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
