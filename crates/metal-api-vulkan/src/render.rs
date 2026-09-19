@@ -12623,6 +12623,46 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// Put one sampled texture's host bytes into its image, by the carrier the
+    /// image's own type states (2026-09-20, the `D3` sampled texture arm).
+    ///
+    /// The two- and one-dimensional lanes take [`Self::upload_render_texture`]:
+    /// their images are host-visible `LINEAR` ones the rail writes directly,
+    /// and Vulkan requires that tiling for the formats those arms upload.
+    ///
+    /// A volume takes neither half of that. Vulkan does not require any
+    /// three-dimensional format to support `LINEAR` tiling — the RTX 5060
+    /// refuses `R32_SFLOAT` volumes created that way, which is the reading that
+    /// made this arm device-copied — so the image is an `OPTIMAL`,
+    /// device-local `TRANSFER_DST` one and the texels reach it through a
+    /// host-visible staging buffer: this function returns that buffer, and
+    /// [`Self::record`] issues the one `vkCmdCopyBufferToImage` that fills the
+    /// image with `imageExtent`'s three extents and the tightly packed rows and
+    /// slices `bufferRowLength = bufferImageHeight = 0` states.
+    ///
+    /// `source` is the arm the bytes came from, exactly as
+    /// [`Self::bind_render_input`] reads it: a volume is never gathered on the
+    /// host (`resolve_render_textures` refuses that combination by name), so
+    /// the source's own bytes are the texels and the two never disagree.
+    fn upload_render_texture_into(
+        &self,
+        source: &RenderInputSource<'_>,
+        target: &RenderTextureImage,
+        texels: &[u8],
+        volume: bool,
+    ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, ProviderError> {
+        if !volume {
+            self.upload_render_texture(target, texels)?;
+            return Ok(None);
+        }
+        self.bind_render_input(
+            source,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            "render texture volume",
+        )
+        .map(Some)
+    }
+
     /// Upload one pass's sampled textures and build the descriptor the fragment
     /// stage reads them through (`research/docs/23` §3.3, v70).
     ///
@@ -12692,8 +12732,22 @@ impl<'a> OffscreenObjects<'a> {
             // them, so they live in device-local `OPTIMAL` memory and start
             // undefined.
             let borrowing = matches!(texture.source, RenderInputSource::Borrowed { .. });
-            let device_copy =
-                borrowing || matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. });
+            // A **volume** is the third device-copied arm (2026-09-20, the
+            // `D3` sampled texture arm), and it is one unconditionally: Vulkan
+            // does not require any three-dimensional format to support
+            // `LINEAR` tiling, and the RTX 5060 refuses `R32_SFLOAT` volumes
+            // created that way outright (`vkCreateImage`: "Requested format is
+            // not supported on this device", the reading that made this arm
+            // device-copied). The bytes therefore reach an `OPTIMAL`,
+            // device-local image through a host-visible staging buffer and one
+            // `vkCmdCopyBufferToImage` in [`Self::record`] — the same two-step
+            // shape an attachment's previous bytes take, and one every
+            // conformant device supports for a sampled three-dimensional
+            // format.
+            let volume = texture.image_type == vk::ImageType::TYPE_3D;
+            let device_copy = borrowing
+                || matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. })
+                || volume;
             let info = vk::ImageCreateInfo::default()
                 // The view's own type (2026-09-19, census b10's
                 // `texture_shape` bucket, and 2026-09-20's `D3` arm beside it):
@@ -12774,13 +12828,11 @@ impl<'a> OffscreenObjects<'a> {
                 }
                 RenderInputSource::TraceBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(&target, texels)?;
-                    None
+                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
                 RenderInputSource::StagedBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(&target, texels)?;
-                    None
+                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
                 // The trace's own production uploads exactly as the two
                 // trace-carried arms do (`research/docs/23` §110, E-TX3):
@@ -12788,16 +12840,14 @@ impl<'a> OffscreenObjects<'a> {
                 // how the rail gets them into the sampled image.
                 RenderInputSource::ProducedBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(&target, texels)?;
-                    None
+                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
                 // A gathered guest-runs window is the provider's own copy
                 // (`research/docs/23` §74, E-TX6), so it uploads through the
                 // same host-visible path as the staged arm.
                 RenderInputSource::GatheredBytes { bytes, .. } => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture(&target, texels)?;
-                    None
+                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
                 // The pass-entry snapshot arm has no host bytes to upload
                 // (`research/docs/23` §118, E-TX15): the image is a
