@@ -4869,7 +4869,13 @@ fn resolve_render_textures<'a>(
                     FieldValue::Text(format!("{:?}", view.texture_type)),
                 )
                 .with_field("sample_count", FieldValue::Unsigned(view.sample_count))
-                .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
+                .with_detail(
+                    "the reviewed sampling module reads a single-sample 2D surface: the Metal 1D \
+                     and 3D equivalences the widened arms beside it would need are shapes this \
+                     rail has no Apple-side reading for, so a `D1`/`D1Array` LUT and a `D3` \
+                     volume keep this refusal by name while the snapshot declares no window for \
+                     either of them",
+                ));
         }
         let source = resolve_render_texture_source(
             view,
@@ -8953,6 +8959,45 @@ mod tests {
                 "D1Array".to_owned()
             ))
         );
+
+        // The three-dimensional arm (2026-09-20, the `D3` sampled texture arm)
+        // is the same table's third axis: a volume's `float3` coordinate has no
+        // reviewed MSL sibling here either, so a `D3` view bound beside the
+        // reviewed module keeps the shape's own refusal by name — and the
+        // snapshot declares no three-dimensional window at all, which is the
+        // fail-closed direction every consumer of the field reads.
+        assert_eq!(
+            capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+                .max_render_texture_dimension_3d,
+            0,
+            "the native snapshot declares no three-dimensional sampled window"
+        );
+        let mut pass = sampled_pass(4);
+        let mut view = sampled_texture_view(4);
+        view.texture_type = TextureType::D3;
+        view.depth = 2;
+        view.source = TextureSource::OwnedBytes(vec![0x5a; 4 * 4 * 2 * 4]);
+        pass.textures = vec![view];
+        // The declaration restates the view's type, the pairing the contract
+        // holds the two to — so what answers the shape is the rail's own gate
+        // rather than the structural rule that would catch a declaration naming
+        // another type.
+        let mut volume = sampled.clone();
+        volume.textures[0].texture_type = TextureType::D3;
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &volume,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        eprintln!("D3 refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_shape_unsupported");
+        assert_eq!(
+            error.fields.get("texture_type"),
+            Some(&metal_api_core::provider::FieldValue::Text("D3".to_owned()))
+        );
     }
 
     /// The declaration repeats the state the reviewed module's own `constexpr
@@ -10737,6 +10782,7 @@ mod tests {
             // so the shape keeps its refusal by name and the field stays at the
             // arm's fail-closed default.
             max_render_texture_dimension_1d: 0,
+            max_render_texture_dimension_3d: 0,
             supports_render_stage_buffer_namespace_split: stage_buffers
                 .supports_render_stage_buffer_namespace_split,
             // The native rail's reviewed MSL modules spell one `constexpr

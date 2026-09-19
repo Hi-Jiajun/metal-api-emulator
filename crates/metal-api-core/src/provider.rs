@@ -796,6 +796,20 @@ impl TextureType {
         matches!(self, Self::D1 | Self::D1Array)
     }
 
+    /// Whether this type has three spatial axes (2026-09-20, the `D3` sampled
+    /// texture arm).
+    ///
+    /// A three-dimensional image is a *volume*: `width x height x depth` texels
+    /// and no slice axis at all, which is why the enum has no `D3Array` sibling
+    /// and why the structural rules below already hold every non-arrayed type to
+    /// `array_length == 1`. Its `depth` is the axis a three-dimensional sample
+    /// coordinate's *third* component names — `coord.xyz`, not an array layer —
+    /// so a rail that read the pair as a two-dimensional grid plus layers would
+    /// sample the wrong texels rather than refuse them.
+    pub const fn is_three_dim(self) -> bool {
+        matches!(self, Self::D3)
+    }
+
     pub const fn is_multisample(self) -> bool {
         matches!(self, Self::D2Multisample | Self::D2MultisampleArray)
     }
@@ -2625,6 +2639,24 @@ pub const MAX_RENDER_TEXTURES: usize = 8;
 /// cannot hold the widest reviewed LUT declares a narrower window instead of
 /// one it would have to refuse at `vkCreateImage`.
 pub const MAX_RENDER_TEXTURE_DIMENSION_1D: u64 = 16_384;
+
+/// The widest three-dimensional sampled texture the render sampler's
+/// *reviewed* window states, per axis (2026-09-20, the `D3` sampled texture
+/// arm).
+///
+/// The number is a *review* ceiling rather than a device fact, exactly as
+/// [`MAX_RENDER_TEXTURE_DIMENSION_1D`] and [`MAX_RENDER_TEXTURES`] are: it caps
+/// every one of a volume's three axes, not one axis' texel count, because
+/// Vulkan's `maxImageDimension3D` bounds the width, height **and** depth of a
+/// `vk::ImageType::TYPE_3D` image — a device answers one number for all three.
+/// Apple's own `maxImageDimension3D` is 2048, and the census's own volumes are
+/// the desktop-sized low-pass-filter sources the wallpaper and layer passes
+/// sample, so 2048 is the value the review states and a provider's own answer
+/// is the smaller of it and the device's `maxImageDimension3D`
+/// (`ProviderCapabilities::max_render_texture_dimension_3d`). A device whose
+/// volume window is narrower declares its own number instead of one it would
+/// have to refuse at `vkCreateImage`.
+pub const MAX_RENDER_TEXTURE_DIMENSION_3D: u64 = 2_048;
 
 /// The highest texture index a render texture declaration or pass binding may
 /// carry (`research/docs/23` §3.3, v104).
@@ -10085,6 +10117,42 @@ pub struct ProviderCapabilities {
     /// absent section reads `0`, the fail-closed direction, and a consumer
     /// keeps its own refusal by name for the shape.
     pub max_render_texture_dimension_1d: u64,
+    /// The widest three-dimensional sampled texture this snapshot admits, in
+    /// texels **per axis** (2026-09-20, the `D3` sampled texture arm). `0` —
+    /// the field's own default — means the snapshot admits **no**
+    /// three-dimensional sampled texture at all.
+    ///
+    /// The field is the sibling of [`Self::max_render_texture_dimension_1d`]
+    /// two axes over, and it names a different axis from every field above it
+    /// for the same reason: those answer "does this snapshot sample a render
+    /// pass's texture", "how many bindings", "which formats"; this one answers
+    /// "how large may the three-dimensional arm's own volume be". A volume
+    /// states three extents and Vulkan's `maxImageDimension3D` bounds each of
+    /// them, so the window is one number the volume's width, height and depth
+    /// are each held to — a device may hold a wide two-dimensional attachment
+    /// and a small volume in the same snapshot, and the two limits are not
+    /// interchangeable.
+    ///
+    /// The value is `min(`[`MAX_RENDER_TEXTURE_DIMENSION_3D`]`, the device's own
+    /// `maxImageDimension3D`)` — the review ceiling clamped by what the device
+    /// says — exactly as the one-dimensional window beside it is the review
+    /// ceiling clamped by `maxImageDimension1D`.
+    ///
+    /// Declared non-zero by the snapshots whose rail executes the arm: the
+    /// Vulkan rail uploads a `vk::ImageType::TYPE_3D` volume slice by slice
+    /// through the driver's own `depthPitch` and samples it through a
+    /// `TYPE_3D` view (`tests/render_texture_3d_volume_e2e.rs`), and the native
+    /// rail leaves it at the default because no Apple-side reading states a
+    /// Metal 3D equivalence this generation accepts.
+    ///
+    /// The wire is a presence-tagged section of the capability tail (the
+    /// escape family's tag `0x0D`, the section its `0x0B`/`0x0C` siblings
+    /// precede): a frame written before the arm existed does not carry it, and
+    /// a decoder that met the tag in an older frame would have refused it as an
+    /// unknown tail tag rather than read a zero — so the absent section reads
+    /// `0`, the fail-closed direction, and a consumer keeps its own refusal by
+    /// name for the shape.
+    pub max_render_texture_dimension_3d: u64,
     /// Whether this snapshot executes the *gathered* render-sampler shape: one
     /// render pass whose sampled texture has an extent other than the render
     /// area's, with that source's bytes readable on the host
@@ -10587,6 +10655,19 @@ impl ProviderCapabilities {
     /// wire.
     pub fn declares_render_texture_dimension_1d(&self) -> bool {
         self.max_render_texture_dimension_1d != 0
+    }
+
+    /// Whether this snapshot admits a three-dimensional sampled texture at all
+    /// (2026-09-20, the `D3` sampled texture arm).
+    ///
+    /// [`Self::declares_render_texture_dimension_1d`]'s sibling two axes over,
+    /// and the predicate has the same two reasons: the field *is* the window,
+    /// so `0` is the fail-closed reading a snapshot that never spoke about the
+    /// arm states, and the capability frame's payload guard asks this predicate
+    /// so a snapshot whose *only* statement is this window still writes the
+    /// extended payload instead of dropping the declaration on the wire.
+    pub fn declares_render_texture_dimension_3d(&self) -> bool {
+        self.max_render_texture_dimension_3d != 0
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -11412,6 +11493,57 @@ impl ProviderCapabilities {
                                 "maximum",
                                 FieldValue::Unsigned(self.max_render_texture_dimension_1d),
                             ));
+                    }
+                }
+                // The three-dimensional window is the face's seventh question
+                // (2026-09-20, the `D3` sampled texture arm): the same shape
+                // one axis further out. A volume states three extents and the
+                // device's own `maxImageDimension3D` bounds each of them, so
+                // the window is one number all three axes are held to — and
+                // `0` is again the fail-closed default a frame written before
+                // the window existed reads, which keeps a snapshot that never
+                // spoke about the arm refusing the shape by name rather than
+                // being handed a volume its device was never asked about.
+                if texture.texture_type.is_three_dim() {
+                    if self.max_render_texture_dimension_3d == 0 {
+                        return Err(capability_error("render_texture_dimension_3d_unsupported")
+                            .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                            .with_field(
+                                "binding",
+                                FieldValue::Unsigned(u64::from(texture.metal_binding)),
+                            )
+                            .with_field(
+                                "texture_type",
+                                FieldValue::Text(format!("{:?}", texture.texture_type)),
+                            )
+                            .with_detail(
+                                "a three-dimensional sampled texture is a volume whose three \
+                                     extents the provider's device bounds by \
+                                     `maxImageDimension3D` rather than by the 2D window; this \
+                                     snapshot declares no such window, so the pass is refused \
+                                     instead of being executed against a volume its device was \
+                                     never asked about",
+                            ));
+                    }
+                    for (axis, extent) in [
+                        ("width", texture.width),
+                        ("height", texture.height),
+                        ("depth", texture.depth),
+                    ] {
+                        if extent > self.max_render_texture_dimension_3d {
+                            return Err(capability_error("render_texture_dimension_3d_limit")
+                                .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                                .with_field(
+                                    "binding",
+                                    FieldValue::Unsigned(u64::from(texture.metal_binding)),
+                                )
+                                .with_field("axis", FieldValue::Text(axis.to_owned()))
+                                .with_field("extent", FieldValue::Unsigned(extent))
+                                .with_field(
+                                    "maximum",
+                                    FieldValue::Unsigned(self.max_render_texture_dimension_3d),
+                                ));
+                        }
                     }
                 }
             }
@@ -16794,6 +16926,7 @@ mod tests {
             supports_render_kept_frame_landing: false,
             supports_render_pass_entry_snapshot: false,
             max_render_texture_dimension_1d: 0,
+            max_render_texture_dimension_3d: 0,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,

@@ -44,7 +44,7 @@ use metal_api_core::provider::{
     StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp,
     TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout,
     VertexFormat, VertexStep, ViewId, Winding, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES,
+    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_DIMENSION_3D,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -1272,6 +1272,14 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// when the pair's gathered sibling states it (`research/docs/23` §111,
     /// E-TX12), and refused by name when the sampling sibling does.
     pub extent: [u32; 2],
+    /// Slices of the image [`Self::extent`] describes (2026-09-20, the `D3`
+    /// sampled texture arm): `1` for every two-dimensional and one-dimensional
+    /// lane — both of those keep `depth == 1` by the contract's own structural
+    /// rules — and the volume's own `depth` for the three-dimensional arm. The
+    /// image this rail creates is `extent[0] x extent[1] x depth` texels and
+    /// the upload walks it slice by slice, so the number is the arm's one
+    /// addition to the shape the two-dimensional upload already carries.
+    pub depth: u32,
     /// The `VkFormat` the view's own `TextureFormat` names (`research/docs/23`
     /// §3.3, §107): the image this rail uploads the bytes into and the view the
     /// descriptor reads. Which byte holds which channel is decided here and
@@ -1281,12 +1289,14 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// guest's own channel order is what the fragment stage reads.
     pub format: vk::Format,
     /// The `VkImageType` this rail creates for the view (2026-09-19, census
-    /// b10's `texture_shape` bucket): `TYPE_2D` for every lane the window
-    /// carried before the one-dimensional arm, and `TYPE_1D` for the
-    /// single-row LUT whose own type has one spatial axis. The image's
-    /// `extent.height` is `1` for both, so the two differ in the type alone —
-    /// and in what the descriptor's own image type must be for the module's
-    /// `OpTypeImage` (`Dim 1D` against `Dim 2D`) to be a legal read.
+    /// b10's `texture_shape` bucket, and 2026-09-20's `D3` arm beside it):
+    /// `TYPE_2D` for every lane the window carried before the one-dimensional
+    /// arm, `TYPE_1D` for the single-row LUT whose own type has one spatial
+    /// axis, and `TYPE_3D` for the volume whose three axes the module's own
+    /// `Dim 3D` image names. The image's `extent.height` is `1` for the first
+    /// two, so those differ in the type alone — and in what the descriptor's
+    /// own image type must be for the module's `OpTypeImage` to be a legal
+    /// read; the volume differs in its `depth` as well.
     pub image_type: vk::ImageType,
     /// The `VkImageViewType` the descriptor's image view is created with
     /// (2026-09-19, census b10's `texture_shape` bucket): the declaration's own
@@ -1298,11 +1308,12 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     pub view_type: vk::ImageViewType,
     /// Tightly packed bytes one texel of those bytes occupies
     /// (`research/docs/23` §113/§107): four for the two four-component byte
-    /// orders, one and two for the narrow lanes, eight for the half-float
-    /// lane. The upload derives its row pitch from this, because a surface
-    /// whose texel is not four bytes wide is not `width * 4` bytes a row apart
-    /// and the pre-v113 spelling would land every row after the first inside
-    /// the previous one.
+    /// orders, one and two for the narrow lanes, four for the single-component
+    /// `r32_float` lane, two for `r16_float`, eight for the half-float lane.
+    /// The upload derives its row pitch from this, because a surface whose
+    /// texel is not four bytes wide is not `width * 4` bytes a row apart and
+    /// the pre-v113 spelling would land every row after the first inside the
+    /// previous one.
     pub texel_bytes: u64,
     /// The descriptor slot the fragment stage reads this texture from, and the
     /// sampler state it samples it with (`research/docs/23` §3.3, v100). The
@@ -1324,6 +1335,14 @@ struct RenderTextureImage {
     requirements: vk::MemoryRequirements,
     width: u32,
     height: u32,
+    /// Depth in texels of the image those two extents belong to
+    /// (2026-09-20, the `D3` sampled texture arm): `1` for every
+    /// two-dimensional and one-dimensional lane the window carried before the
+    /// volume arm, and the declaration's own `depth` for a
+    /// [`TextureType::D3`] view. The upload reads it as the *slice count* of a
+    /// `TYPE_3D` image, whose rows are further apart than one row pitch when
+    /// the driver's linear layout says so.
+    depth: u32,
     /// Tightly packed bytes one texel occupies: four for the two
     /// four-component byte orders, one and two for the narrow lanes, eight for
     /// the half-float lane.
@@ -2698,7 +2717,26 @@ fn translated_texture_pairs(
             && !shape.array_ref
             && !shape.writable
             && shape.array_length.is_none();
+        // The three-dimensional arm (2026-09-20, the `D3` sampled texture arm)
+        // is the one-dimensional arm's sibling one axis further out: the module
+        // declares `texture3d<float, sample>`, so its own `OpTypeImage` names
+        // `Dim 3D` and its sample coordinate is a `float3` whose *third*
+        // component is the volume's depth — not an array layer. The rail can
+        // execute that shape: the image is a `TYPE_3D` volume in the lane's own
+        // format, the view is `TYPE_3D`, and the upload walks the volume slice
+        // by slice. Everything else about the shape is the 2D window's rule
+        // unchanged: single-sample, read-only, not a descriptor array, and not
+        // a volume that is also arrayed (`TextureType` has no `D3Array`, and
+        // the structural rule already refuses a non-arrayed type stating an
+        // array length above one).
+        let volume = shape.dimension == TextureDimension::D3
+            && !shape.arrayed
+            && !shape.multisampled
+            && !shape.array_ref
+            && !shape.writable
+            && shape.array_length.is_none();
         if !one_dim
+            && !volume
             && (shape.dimension != TextureDimension::D2
                 || shape.arrayed
                 || shape.multisampled
@@ -2715,8 +2753,10 @@ fn translated_texture_pairs(
                 .with_field("multisampled", FieldValue::Bool(shape.multisampled))
                 .with_field("writable", FieldValue::Bool(shape.writable))
                 .with_detail(
-                    "the render sampler reads either a single-sample non-arrayed 2D surface or \
-                     the one-dimensional single-row LUT its own frame's window admits",
+                    "the render sampler reads either a single-sample non-arrayed 2D surface, the \
+                     one-dimensional single-row LUT its own frame's window admits, or a \
+                     single-sample non-arrayed three-dimensional volume whose axis the module's \
+                     own coordinate names",
                 ));
         }
         if shape.component != TextureComponent::Float {
@@ -2758,15 +2798,18 @@ fn translated_texture_pairs(
                 "the module reads a sampled texture the contract does not declare",
             ));
         };
-        // The one-dimensional arm's own field-by-field agreement: the
-        // declaration has to restate which of the two one-dimensional shapes
+        // The one-dimensional and three-dimensional arms' own field-by-field
+        // agreement: the declaration has to restate which of the widened shapes
         // the module declared, and every other reflected fact about it is the
         // `Sampled`/`Fetched` pairing below. A plain declaration for an arrayed
-        // module (or the reverse) is refused by name with both halves in hand,
-        // because the view the rail creates has to be the view the module's own
-        // sample coordinate is written against.
-        if one_dim {
-            let expected = if shape.arrayed {
+        // module (or the reverse, or a 2D/3D declaration for the other's
+        // module) is refused by name with both halves in hand, because the view
+        // the rail creates has to be the view the module's own sample
+        // coordinate is written against.
+        if one_dim || volume {
+            let expected = if volume {
+                TextureType::D3
+            } else if shape.arrayed {
                 TextureType::D1Array
             } else {
                 TextureType::D1
@@ -2780,13 +2823,46 @@ fn translated_texture_pairs(
                     )
                     .with_field("arrayed", FieldValue::Bool(shape.arrayed))
                     .with_detail(
-                        "the module samples a one-dimensional surface, and the declaration has \
-                         to restate whether that surface is arrayed: the view the rail creates \
-                         is the module's own array axis (`TYPE_1D` or `TYPE_1D_ARRAY`), and a \
-                         declaration naming the other one would bind a view the module's own \
-                         sample coordinate is not written against",
+                        "the module samples a surface of more than two spatial axes, and the \
+                         declaration has to restate its own axis: the view the rail creates is \
+                         the module's own shape (`TYPE_1D` or `TYPE_1D_ARRAY` for a \
+                         one-dimensional surface, `TYPE_3D` for a volume), and a declaration \
+                         naming another one would bind a view the module's own sample \
+                         coordinate is not written against",
                     ));
             }
+        } else if matches!(
+            declared.texture_type,
+            TextureType::D1 | TextureType::D1Array | TextureType::D3
+        ) {
+            // The same agreement the other direction (`research/docs/23` §3.3,
+            // v100's pairing and the two widened arms beside it): the module
+            // here is the two-dimensional one, so a declaration naming one of
+            // the *axis-widened* types would bind a view whose
+            // `VkImageViewType` is not the module's own `OpTypeImage` — a
+            // descriptor pairing Vulkan validation refuses, and one a rail
+            // that skipped validation would execute as an undefined read.
+            //
+            // The two-dimensional *arrayed* and *multisampled* types are
+            // deliberately not answered here: both name `TYPE_2D` views whose
+            // shape the sampled view gate refuses by name with the array
+            // length and sample count it reads
+            // (`tests/render_bgra_texture_e2e.rs`), and a registration gate
+            // that refused them earlier would move a refusal the pre-widening
+            // rail already published at execution.
+            return Err(capability_refusal("render_texture_shape_unsupported")
+                .with_field("binding", index)
+                .with_field(
+                    "texture_type",
+                    FieldValue::Text(format!("{:?}", declared.texture_type)),
+                )
+                .with_field("arrayed", FieldValue::Bool(shape.arrayed))
+                .with_detail(
+                    "the module samples a two-dimensional surface, and the declaration has to \
+                     restate that shape: the view the rail creates is `TYPE_2D`, and a \
+                     declaration naming the one-dimensional or three-dimensional arm would bind \
+                     a view the module's own image type is not written against",
+                ));
         }
         if !TextureFormat::RENDER_SAMPLED.contains(&declared.format) {
             return Err(capability_refusal("render_texture_format_unsupported")
@@ -5471,21 +5547,28 @@ fn resolve_render_textures<'a>(
                      components rather than four 8-bit bytes",
                 ));
         }
-        // The one-dimensional arm (2026-09-19, census b10's `texture_shape`
-        // bucket) is the same single-sample, single-slice, single-descriptor
-        // statement one spatial axis over: the image this rail creates for it
-        // is a single-row `TYPE_1D` one, and the view's type is the
-        // declaration's own array axis (`TYPE_1D` or `TYPE_1D_ARRAY`), which is
-        // what makes the module's `float`/`float2` sample coordinate legal. Its
-        // height is one by definition, and the structural contract rule has
-        // already refused any declaration that said otherwise
-        // (`ContractError::TextureDimensionMismatch`); the check below repeats
-        // it because a directly-constructed request can reach this rail without
-        // passing through the contract's own validation.
-        if !view.texture_type.is_one_dim() && view.texture_type != TextureType::D2
+        // The widened arms (2026-09-19, census b10's `texture_shape` bucket,
+        // and 2026-09-20's `D3` arm beside it) are the same single-sample,
+        // single-layer, single-descriptor statement on their own axes: the
+        // one-dimensional image this rail creates is a single-row `TYPE_1D`
+        // one and its view type is the declaration's own array axis
+        // (`TYPE_1D` or `TYPE_1D_ARRAY`), which is what makes the module's
+        // `float`/`float2` sample coordinate legal; the volume is a `TYPE_3D`
+        // image whose `depth` is the declaration's own and whose view is
+        // `TYPE_3D`, which is what makes the module's `float3` coordinate
+        // legal. The one-dimensional type's height is one by definition and the
+        // structural contract rule has already refused any declaration that
+        // said otherwise (`ContractError::TextureDimensionMismatch`); the check
+        // below repeats it because a directly-constructed request can reach
+        // this rail without passing through the contract's own validation — and
+        // states the volume's own repetition of the sample-count, array-length
+        // and depth rules for the same reason.
+        if !view.texture_type.is_one_dim()
+            && view.texture_type != TextureType::D2
+            && !view.texture_type.is_three_dim()
             || view.sample_count != 1
-            || view.depth != 1
             || view.array_length != 1
+            || (view.depth != 1 && !view.texture_type.is_three_dim())
         {
             return Err(capability_refusal("render_texture_shape_unsupported")
                 .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
@@ -5499,12 +5582,15 @@ fn resolve_render_textures<'a>(
                 .with_detail(
                     "the reviewed sampling module reads a single-sample 2D surface, and the \
                      one-dimensional arm beside it reads a single-row `D1`/`D1Array` surface \
-                     with one slice",
+                     with one slice; the volume arm reads a single-sample `D3` surface whose \
+                     own depth may exceed one, which is the axis a `float3` sample \
+                     coordinate's third component names",
                 ));
         }
         let width = narrow_dimension(view.width)?;
         let height = narrow_dimension(view.height)?;
-        if width == 0 || height == 0 {
+        let depth = narrow_dimension(view.depth)?;
+        if width == 0 || height == 0 || depth == 0 {
             return Err(contract_refusal("render texture has a zero dimension"));
         }
         if view.texture_type.is_one_dim() && height != 1 {
@@ -5520,6 +5606,28 @@ fn resolve_render_textures<'a>(
                      image's height at one, so a declaration stating more names a surface the \
                      rail would have to read as a grid of rows it never declared",
                 ));
+        }
+        // The volume's own review ceiling (2026-09-20, the `D3` sampled texture
+        // arm): core admission holds the declaration to the window its own
+        // capability frame published — the device's `maxImageDimension3D`
+        // clamped by the contract's ceiling — and this gate states the *review*
+        // half of the same rule again, so a directly-constructed request that
+        // never passed admission cannot hand `vkCreateImage` a volume the
+        // reviewed window has never stated. Vulkan bounds all three axes by the
+        // one device limit, so all three are held to the one number.
+        if view.texture_type.is_three_dim() {
+            for (axis, extent) in [("width", width), ("height", height), ("depth", depth)] {
+                if u64::from(extent) > MAX_RENDER_TEXTURE_DIMENSION_3D {
+                    return Err(capability_refusal("render_texture_dimension_3d_limit")
+                        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+                        .with_field("axis", FieldValue::Text(axis.to_owned()))
+                        .with_field("extent", FieldValue::Unsigned(u64::from(extent)))
+                        .with_field(
+                            "maximum",
+                            FieldValue::Unsigned(MAX_RENDER_TEXTURE_DIMENSION_3D),
+                        ));
+                }
+            }
         }
         // The widened window (`research/docs/23` §111, E-TX5). The reviewed
         // pair leaves its sample coordinate implicit — the fragment's own
@@ -5586,14 +5694,20 @@ fn resolve_render_textures<'a>(
         // The byte arms are sized against the declaration; the snapshot arm
         // has no host bytes at all — its extent *is* the attachment's, which
         // the resolver above held the declaration to — so the rule is theirs.
+        // A volume's declaration is *three* extents (2026-09-20, the `D3`
+        // sampled arm), so the expectation is `width x height x depth` texels
+        // exactly as the contract's own `TextureView::expected_bytes` counts
+        // them: a volume's source is one tightly packed run of slices, which is
+        // the shape the guest's own mapping has and the shape the upload walks.
         if !matches!(source, RenderInputSource::AttachmentSnapshot { .. }) {
             let expected = u64::from(width)
                 .checked_mul(u64::from(height))
+                .and_then(|texels| texels.checked_mul(u64::from(depth)))
                 .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
                 .ok_or_else(|| contract_refusal("render texture bytes overflow u64"))?;
             if u64::try_from(source.len()).unwrap_or(u64::MAX) != expected {
                 return Err(contract_refusal(&format!(
-                    "render texture binding {binding} resolves {} bytes for a {width}x{height} surface",
+                    "render texture binding {binding} resolves {} bytes for a {width}x{height}x{depth} surface",
                     source.len()
                 )));
             }
@@ -5607,6 +5721,28 @@ fn resolve_render_textures<'a>(
         let fetched = gathered_extent
             && gathered_fetch
             && matches!(view.source, TextureSource::BorrowedNoCopy(_));
+        // The host gather is a *two-dimensional* index rule
+        // (`gather_render_texture` walks rows and columns), so a volume of
+        // another extent keeps its own name for the shape rather than being
+        // gathered by an arithmetic that states no slice axis: the arm's
+        // reviewed fixtures are the two-dimensional ones, and a volume's own
+        // sample coordinates are the module's when the module is translated.
+        if gathered_extent && view.texture_type.is_three_dim() {
+            return Err(capability_refusal("render_texture_shape_unsupported")
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+                .with_field(
+                    "texture_type",
+                    FieldValue::Text(format!("{:?}", view.texture_type)),
+                )
+                .with_field("depth", FieldValue::Unsigned(view.depth))
+                .with_detail(
+                    "the reviewed pair's sample coordinate is the fragment's own centre, so a \
+                     source of another extent is gathered into the render area's integer grid — \
+                     an index rule that walks rows and columns and states no slice axis. A \
+                     volume of another extent therefore keeps this refusal instead of being \
+                     gathered into a grid its own third axis has no place in",
+                ));
+        }
         let (gathered, upload_extent) = if gathered_extent && !fetched {
             let bytes = source.host_bytes().expect(
                 "the sampled window is the one source without host bytes, and the \
@@ -5629,20 +5765,25 @@ fn resolve_render_textures<'a>(
             gathered,
             gathered_fetch: fetched,
             extent: upload_extent,
+            depth,
             format: render_texture_vk_format(view.format)?,
             // The declaration's own spatial axis decides the object type: a
             // one-dimensional view is a single-row `TYPE_1D` image (Vulkan
             // fixes its `height`/`depth` at one, which is the shape the LUT
-            // has), and every other admitted lane is the `TYPE_2D` window the
+            // has), a volume is the `TYPE_3D` image its own `depth` slices
+            // name, and every other admitted lane is the `TYPE_2D` window the
             // rail has always created.
             image_type: if view.texture_type.is_one_dim() {
                 vk::ImageType::TYPE_1D
+            } else if view.texture_type.is_three_dim() {
+                vk::ImageType::TYPE_3D
             } else {
                 vk::ImageType::TYPE_2D
             },
             view_type: match view.texture_type {
                 TextureType::D1Array => vk::ImageViewType::TYPE_1D_ARRAY,
                 TextureType::D1 => vk::ImageViewType::TYPE_1D,
+                TextureType::D3 => vk::ImageViewType::TYPE_3D,
                 _ => vk::ImageViewType::TYPE_2D,
             },
             texel_bytes: view.format.bytes_per_texel(),
@@ -10396,6 +10537,13 @@ struct SampledTextureObjects {
     /// no-copy arm's `vkCmdCopyBufferToImage` covers (`research/docs/23` §75,
     /// R5c).
     extent: [u32; 2],
+    /// The slices that extent carries (2026-09-20, the `D3` sampled texture
+    /// arm): `1` on every two-dimensional and one-dimensional lane, and the
+    /// volume's own `depth` for the three-dimensional arm. [`Self::extent`]
+    /// plus this number are the whole region the no-copy arm's
+    /// `vkCmdCopyBufferToImage` covers — `imageExtent.depth` is the volume's
+    /// third *spatial* axis, not an array layer.
+    depth: u32,
     /// The view's texel size in bytes (`research/docs/23` §107): the unit the
     /// upload's row pitch and the pass-entry snapshot's own byte accounting
     /// are stated in.
@@ -12344,6 +12492,26 @@ impl<'a> OffscreenObjects<'a> {
     /// or a half of the four-byte row the pre-v113 rail assumed. Deriving it
     /// from the format is what keeps an upload of a narrow texture from landing
     /// its second row where the first row's last texels are.
+    ///
+    /// A volume walks the same rows one axis further out (2026-09-20, the `D3`
+    /// sampled arm). The accounting is a histogram of the bytes the source
+    /// carries, read one dimension at a time:
+    ///
+    /// ```text
+    /// one tightly packed row   = width * texel_bytes
+    /// one tightly packed slice = height * (width * texel_bytes)   rows
+    /// the whole source         = depth  * (height * width * texel_bytes)
+    /// ```
+    ///
+    /// — so the source's `n`-th row is `slice = n / height`, `row = n %
+    /// height`, and its destination is `base + slice * depth_pitch + row *
+    /// row_pitch`. A two- or one-dimensional image is the same walk with
+    /// `depth == 1` (the rail's own value for both of those lanes), where the
+    /// slice term is zero and the arithmetic collapses to the single-pitch form
+    /// the pre-volume rail wrote. The two pitches come from the driver's own
+    /// `VkSubresourceLayout` because a *linear* image's rows are only at least
+    /// the tightly packed width apart and its slices are only at least the
+    /// tightly packed slice apart.
     fn upload_render_texture(
         &self,
         target: &RenderTextureImage,
@@ -12355,6 +12523,7 @@ impl<'a> OffscreenObjects<'a> {
             requirements,
             width,
             height,
+            depth,
             texel_bytes,
         } = *target;
         let mapped = match unsafe {
@@ -12388,8 +12557,14 @@ impl<'a> OffscreenObjects<'a> {
                 }
                 contract_refusal("render texture row pitch overflows usize")
             })?;
-        let (base_offset, row_pitch) = if height == 1 {
-            (0, tight_row_bytes)
+        // The one-row shorthands: a one-dimensional image and a two-dimensional
+        // one row high are both a single row at the mapping's start. A volume
+        // whose `height` happens to be one is *not* one of them — its slices
+        // are a row each, and the driver's own `depthPitch` is what separates
+        // them — so the layout is read whenever the image carries more than one
+        // row in total.
+        let (base_offset, row_pitch, depth_pitch) = if height == 1 && depth == 1 {
+            (0, tight_row_bytes, 0)
         } else {
             let layout = unsafe {
                 self.context.device.get_image_subresource_layout(
@@ -12406,10 +12581,26 @@ impl<'a> OffscreenObjects<'a> {
                     .map_err(|_| contract_refusal("render texture row offset overflows"))?,
                 usize::try_from(layout.row_pitch)
                     .map_err(|_| contract_refusal("render texture row pitch overflows"))?,
+                usize::try_from(layout.depth_pitch)
+                    .map_err(|_| contract_refusal("render texture slice pitch overflows"))?,
             )
         };
+        // `row` counts tightly packed rows, so a volume's rows are read slice
+        // by slice: `height` of them belong to each `depth` slice (the
+        // histogram above). Both pitches are the driver's own, and a
+        // two-dimensional image's `depth` is one, which makes the slice term
+        // zero on every lane that existed before the volume arm. A slice
+        // always holds at least one row — the view gate refuses a zero extent
+        // before any image exists, and Vulkan fixes a `TYPE_1D` image's height
+        // at one — so the walk below never divides by zero.
+        let rows_per_slice = usize::try_from(height)
+            .ok()
+            .filter(|rows| *rows != 0)
+            .expect("a sampled image has at least one row in every slice");
         for (row, chunk) in texels.chunks(tight_row_bytes).enumerate() {
-            let destination = base_offset + row * row_pitch;
+            let slice = row / rows_per_slice;
+            let row_in_slice = row % rows_per_slice;
+            let destination = base_offset + slice * depth_pitch + row_in_slice * row_pitch;
             if destination + chunk.len() > usize::try_from(requirements.size).unwrap_or(0) {
                 unsafe {
                     self.context.device.unmap_memory(memory);
@@ -12493,6 +12684,7 @@ impl<'a> OffscreenObjects<'a> {
         }
         for texture in textures {
             let [width, height] = texture.extent;
+            let depth = texture.depth;
             let format = texture.format;
             // The two device-copied arms — the owner's no-copy window and the
             // pass's own attachment (`research/docs/23` §118, E-TX15) — are
@@ -12504,17 +12696,20 @@ impl<'a> OffscreenObjects<'a> {
                 borrowing || matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. });
             let info = vk::ImageCreateInfo::default()
                 // The view's own type (2026-09-19, census b10's
-                // `texture_shape` bucket): `TYPE_2D` for every lane the window
-                // carried before the one-dimensional arm and `TYPE_1D` for the
-                // single-row LUT beside them, whose height is already `1` by
-                // construction — which is exactly what Vulkan requires of a
-                // `TYPE_1D` image.
+                // `texture_shape` bucket, and 2026-09-20's `D3` arm beside it):
+                // `TYPE_2D` for every lane the window carried before the
+                // one-dimensional arm, `TYPE_1D` for the single-row LUT beside
+                // it, whose height is already `1` by construction — which is
+                // exactly what Vulkan requires of a `TYPE_1D` image — and
+                // `TYPE_3D` for the volume, whose three extents are the
+                // declaration's own and whose `arrayLayers` stays `1`, the one
+                // value Vulkan admits for a three-dimensional image.
                 .image_type(texture.image_type)
                 .format(format)
                 .extent(vk::Extent3D {
                     width,
                     height,
-                    depth: 1,
+                    depth,
                 })
                 .mip_levels(1)
                 .array_layers(1)
@@ -12555,6 +12750,7 @@ impl<'a> OffscreenObjects<'a> {
                 requirements,
                 width,
                 height,
+                depth,
                 texel_bytes: texture.texel_bytes,
             };
             // The imported buffer's lifetime is the pass's: the copy reads it
@@ -12691,6 +12887,7 @@ impl<'a> OffscreenObjects<'a> {
                 view,
                 sampler,
                 extent: [width, height],
+                depth: texture.depth,
                 texel_bytes: u32::try_from(texture.texel_bytes).unwrap_or(u32::MAX),
                 gathered_fetch: texture.gathered_fetch,
                 copy_source,
@@ -15128,6 +15325,18 @@ impl<'a> OffscreenObjects<'a> {
             }
             if let Some((buffer, _)) = texture.copy_source {
                 let [width, height] = texture.extent;
+                // The device-copied arm's own volume statement (2026-09-20,
+                // the `D3` sampled arm): a three-dimensional declaration's
+                // copy is `width x height x depth` texels of one
+                // `imageSubresourceLayers`, whose Vulkan spelling is
+                // `layerCount = 1` plus an `imageExtent.depth` — the third
+                // *spatial* axis of the destination image, not an array layer.
+                // `bufferRowLength`/`bufferImageHeight` stay zero, which the
+                // spec reads as "the source is tightly packed at the image's
+                // own extent": a row is `width` texels, a slice is `height`
+                // rows, and the volume is `depth` slices — exactly the bytes
+                // the contract's `expected_bytes` holds the window to.
+                let depth = texture.depth;
                 unsafe {
                     self.context.device.cmd_pipeline_barrier(
                         self.command,
@@ -15158,7 +15367,7 @@ impl<'a> OffscreenObjects<'a> {
                         .image_extent(vk::Extent3D {
                             width,
                             height,
-                            depth: 1,
+                            depth,
                         });
                     self.context.device.cmd_copy_buffer_to_image(
                         self.command,

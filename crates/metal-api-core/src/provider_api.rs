@@ -618,6 +618,33 @@ impl Device {
         )
     }
 
+    /// Declare one sampled **volume** with its initial contents (2026-09-20,
+    /// the `D3` sampled texture arm).
+    ///
+    /// The three-extent sibling of [`Self::new_texture_with_bytes`]: the handle
+    /// is a `texture3d<T, sample>` argument, so every view it declares states
+    /// [`contract::TextureType::D3`] with this depth, and its bytes are one
+    /// tightly packed run of slices — `width x height` texels each, `depth` of
+    /// them, in slice order. The bounds are the two-dimensional constructor's
+    /// one axis further out: a zero extent is refused, and the byte length has
+    /// to be exactly the extent's own count.
+    pub fn new_volume_texture_with_bytes(
+        &self,
+        format: contract::TextureFormat,
+        width: u64,
+        height: u64,
+        depth: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Texture, Error> {
+        self.new_texture_of_shape(
+            contract::TextureAccess::Sampled,
+            format,
+            contract::TextureType::D3,
+            [width, height, depth],
+            bytes,
+        )
+    }
+
     /// Declare one sampled texture whose texels are the trace's own GPU
     /// output (`research/docs/23` §110, E-TX3).
     ///
@@ -667,9 +694,11 @@ impl Device {
                 owner: Arc::clone(&self.state),
                 allocation_id: view.allocation_id(),
                 view_id: view.view_id(),
+                texture_type: contract::TextureType::D2,
                 format,
                 width,
                 height,
+                depth: 1,
                 length: view.length,
                 access: contract::TextureAccess::Sampled,
                 origin: TextureOrigin::TraceView,
@@ -688,7 +717,34 @@ impl Device {
         height: u64,
         bytes: Vec<u8>,
     ) -> Result<Texture, Error> {
-        if width == 0 || height == 0 {
+        self.new_texture_of_shape(
+            access,
+            format,
+            contract::TextureType::D2,
+            [width, height, 1],
+            bytes,
+        )
+    }
+
+    /// Declare one handle of an explicit shape: [`Self::new_texture`]'s
+    /// three-extent sibling (2026-09-20, the `D3` sampled texture arm).
+    ///
+    /// The type travels with the extents rather than being derived from them,
+    /// because a volume of one slice is still a volume: the module's own
+    /// `OpTypeImage` names `Dim 3D`, so the view this handle declares has to
+    /// state `D3` however many slices it carries. The byte expectation is the
+    /// contract's own `width x height x depth x texel` count, exactly as
+    /// [`contract::TextureView::expected_bytes`] states it.
+    fn new_texture_of_shape(
+        &self,
+        access: contract::TextureAccess,
+        format: contract::TextureFormat,
+        texture_type: contract::TextureType,
+        extent: [u64; 3],
+        bytes: Vec<u8>,
+    ) -> Result<Texture, Error> {
+        let [width, height, depth] = extent;
+        if width == 0 || height == 0 || depth == 0 {
             return Err(ApiError::ZeroSize.into());
         }
         if bytes.is_empty() {
@@ -696,6 +752,7 @@ impl Device {
         }
         let expected = width
             .checked_mul(height)
+            .and_then(|extent| extent.checked_mul(depth))
             .and_then(|extent| extent.checked_mul(format.bytes_per_texel()))
             .ok_or(ContractError::ArithmeticOverflow("texture extent"))?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
@@ -711,9 +768,11 @@ impl Device {
                 owner: Arc::clone(&self.state),
                 allocation_id: AllocationId::new(next_id()?),
                 view_id: ViewId::new(next_id()?),
+                texture_type,
                 format,
                 width,
                 height,
+                depth,
                 length: bytes.len(),
                 access,
                 origin: TextureOrigin::DeclaredBytes,
@@ -1584,9 +1643,20 @@ struct TextureInner {
     owner: Arc<DeviceState>,
     allocation_id: AllocationId,
     view_id: ViewId,
+    /// The shape every view of this handle states (2026-09-20, the `D3`
+    /// sampled texture arm): [`contract::TextureType::D2`] for each of the
+    /// constructors that carry two extents, and
+    /// [`contract::TextureType::D3`] for the volume constructor. It is stored
+    /// rather than derived from [`Self::depth`] because a volume of *one*
+    /// slice is still a volume: the module's own `OpTypeImage` names `Dim 3D`
+    /// and a rail that bound a 2D view for it would refuse the pairing.
+    texture_type: contract::TextureType,
     format: contract::TextureFormat,
     width: u64,
     height: u64,
+    /// Slices of the extent above: `1` for every two-dimensional handle, and
+    /// the constructor's own depth for a volume.
+    depth: u64,
     length: usize,
     access: contract::TextureAccess,
     /// Where every view this handle declares takes its texels from
@@ -1741,11 +1811,11 @@ impl Texture {
             view_id: self.inner.view_id,
             metal_binding,
             allocation_id: self.inner.allocation_id,
-            texture_type: contract::TextureType::D2,
+            texture_type: self.inner.texture_type,
             format: self.inner.format,
             width: self.inner.width,
             height: self.inner.height,
-            depth: 1,
+            depth: self.inner.depth,
             array_length: 1,
             sample_count: 1,
             access: self.inner.access,

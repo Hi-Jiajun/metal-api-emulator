@@ -5822,6 +5822,67 @@ mod tests {
         assert!(!decoded.supports_indirect_command_buffers);
     }
 
+    /// The three-dimensional sampled window is the family's next tag and
+    /// states an extent rather than a bit (2026-09-20, the `D3` sampled
+    /// texture arm): a snapshot whose *only* statement is this window still
+    /// writes the extended payload, the section is `0x00 0x0d` plus one
+    /// big-endian `u64` — the one-dimensional window's own frame shape, for the
+    /// reason `command_codec`'s constant states — and a snapshot that never
+    /// spoke about the arm decodes as `0`, the fail-closed reading a consumer's
+    /// own refusal by name is written against.
+    #[test]
+    fn an_only_three_dimensional_window_still_writes_the_extended_payload() {
+        use metal_api_core::provider::MAX_RENDER_TEXTURE_DIMENSION_3D;
+
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        assert!(!capabilities.declares_render_texture_dimension_3d());
+        capabilities.max_render_texture_dimension_3d = MAX_RENDER_TEXTURE_DIMENSION_3D;
+        assert!(capabilities.declares_render_texture_dimension_3d());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        let mut section = vec![0x00, 0x0d];
+        section.extend_from_slice(&MAX_RENDER_TEXTURE_DIMENSION_3D.to_be_bytes());
+        assert_eq!(
+            frame.windows(2).position(|pair| pair == [0x00, 0x0d]),
+            Some(frame.len() - section.len()),
+            "the window's section is the family's last one in this frame"
+        );
+        assert_eq!(
+            &frame[frame.len() - section.len()..],
+            &section[..],
+            "the window is one presence tag, one family tag and one u64"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(
+            decoded.max_render_texture_dimension_3d,
+            MAX_RENDER_TEXTURE_DIMENSION_3D
+        );
+
+        // The absent section reads zero: the same snapshot with the window back
+        // at its default writes a shorter frame, and the decoder's answer for
+        // the missing block is the fail-closed one.
+        let mut bare = fake_capabilities();
+        bare.supports_render_vertex_count_above_triangle = true;
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: bare,
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(decoded.max_render_texture_dimension_3d, 0);
+    }
+
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
     /// frame's identity and shape and the window's second declaration, in a
     /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -7144,6 +7205,7 @@ mod tests {
                     supports_render_kept_frame_landing: false,
                     supports_render_pass_entry_snapshot: false,
                     max_render_texture_dimension_1d: 0,
+                    max_render_texture_dimension_3d: 0,
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
@@ -7534,6 +7596,7 @@ mod tests {
             supports_render_kept_frame_landing: false,
             supports_render_pass_entry_snapshot: false,
             max_render_texture_dimension_1d: 0,
+            max_render_texture_dimension_3d: 0,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,

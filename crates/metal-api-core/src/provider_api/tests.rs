@@ -234,6 +234,7 @@ impl ComputeProvider for FakeProvider {
             // (2026-09-19, census b10's `texture_shape` bucket), so it declares
             // no one-dimensional sampled window.
             max_render_texture_dimension_1d: 0,
+            max_render_texture_dimension_3d: 0,
             max_render_stage_buffers: if self.stage_buffers {
                 MAX_RENDER_STAGE_BUFFERS as u32
             } else {
