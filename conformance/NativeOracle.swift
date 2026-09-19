@@ -2627,8 +2627,18 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // ordinary compute case.
     case "compute-buffer-v46":
         expectedIDs = ["render_declaring_gathered_extent"]
+    // The volume lane the device answers for (2026-09-20, census v48's volume
+    // lane gate): the same declaring pass, beside the render case whose volume
+    // travels in the eight-bit `bgra8_unorm` lane. That case runs on the Vulkan
+    // rails alone for the reason v46's does — this oracle selects a reviewed
+    // module by the colour format list's exact shape and has no arm for a
+    // three-dimensional declaration, and the suite's marker keeps the case off
+    // this rail — which is why this oracle validates and executes the declaring
+    // pass as an ordinary compute case.
+    case "compute-buffer-v47":
+        expectedIDs = ["render_declaring_gathered_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v46 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v47 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
