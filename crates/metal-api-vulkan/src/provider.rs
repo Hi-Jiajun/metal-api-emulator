@@ -15,7 +15,7 @@ use metal_api_core::provider::{
     PresentMode, ProviderCapabilities, SemanticDigest, StencilResolveFilter, StorageMode,
     TextureBindingContract, TextureFormat, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
     MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
-    MAX_RENDER_TEXTURE_DIMENSION_1D,
+    MAX_RENDER_TEXTURE_DIMENSION_1D, MAX_RENDER_TEXTURE_DIMENSION_3D,
 };
 use metal_api_core::ExecutorError;
 
@@ -71,6 +71,27 @@ pub(crate) fn attachment_dimension_window(limits: &vk::PhysicalDeviceLimits) -> 
 /// gate (`render.rs`, the sampled view gate's one-dimensional arm).
 pub(crate) fn render_texture_dimension_1d(limits: &vk::PhysicalDeviceLimits) -> u64 {
     u64::from(limits.max_image_dimension1_d).min(MAX_RENDER_TEXTURE_DIMENSION_1D)
+}
+
+/// The three-dimensional sampled window a device with these limits declares
+/// (2026-09-20, the `D3` sampled texture arm).
+///
+/// [`render_texture_dimension_1d`]'s sibling two axes over, with the one
+/// difference the device's own limit states: `maxImageDimension3D` bounds a
+/// `TYPE_3D` image's width, height **and** depth, so the contract's review
+/// ceiling ([`MAX_RENDER_TEXTURE_DIMENSION_3D`]) caps every one of the volume's
+/// three extents rather than one row's texel count. The snapshot publishes the
+/// smaller of the two, so a device whose volume window is narrower than the
+/// reviewed ceiling declares its own number instead of one every
+/// `vkCreateImage` of the rail's three-dimensional arm would refuse.
+///
+/// The rail's own view gate states the *review* half of the same rule
+/// (`render.rs`, the sampled view gate's volume arm): a directly-constructed
+/// request that never passed core admission is still held to
+/// [`MAX_RENDER_TEXTURE_DIMENSION_3D`] per axis, and the device's own answer
+/// arrives through this window for every request that did.
+pub(crate) fn render_texture_dimension_3d(limits: &vk::PhysicalDeviceLimits) -> u64 {
+    u64::from(limits.max_image_dimension3_d).min(MAX_RENDER_TEXTURE_DIMENSION_3D)
 }
 
 /// The stage-buffer window one device states (`research/docs/23` §3.3, §117
@@ -326,6 +347,18 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // the narrower width rather than one it would refuse at
         // `vkCreateImage`.
         max_render_texture_dimension_1d: render_texture_dimension_1d(limits),
+        // The three-dimensional sampled window is executed by the same rail
+        // (2026-09-20, the `D3` sampled texture arm): `render.rs` creates a
+        // `vk::ImageType::TYPE_3D` volume in the view's own format, uploads it
+        // slice by slice through the driver's own `depthPitch`, and samples it
+        // through a `TYPE_3D` view. `tests/render_texture_3d_volume_e2e.rs`
+        // reads the volume's own texels back through both rails on Lavapipe,
+        // and the census's own boot reads them on the RTX 5060. The window is
+        // the device's own `maxImageDimension3D` clamped by the contract's
+        // review ceiling, and a device whose answer is below the reviewed
+        // volume's extents declares the narrower number rather than one it
+        // would refuse at `vkCreateImage`.
+        max_render_texture_dimension_3d: render_texture_dimension_3d(limits),
         // The gathered extent is executed for the arm whose source has host
         // bytes (`research/docs/23` §3.3, §111, E-TX5/E-TX10): a reviewed
         // module's sample coordinate is the fragment's own centre, so

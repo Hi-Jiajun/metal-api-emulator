@@ -811,6 +811,42 @@ const CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL: u8 = 0x07;
 /// snapshot that does not declare the bit writes nothing.
 const CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL: u8 = 0x0B;
 
+/// Tag, inside the tail's second family, of the three-dimensional sampled
+/// window's block (2026-09-20, the `D3` sampled texture arm).
+///
+/// The section follows the layout-free vertex count's block and carries one
+/// `u64` (big-endian): the widest three-dimensional sampled texture the
+/// snapshot admits, **per axis**
+/// ([`ProviderCapabilities::max_render_texture_dimension_3d`]). The value is
+/// the *device's* own answer clamped by the contract's review ceiling, so a
+/// consumer that gates a volume bind on this face has to be able to read which
+/// window the provider it is talking to states.
+///
+/// The frame shape is the one-dimensional window's `u64` rather than the
+/// per-stage stage-buffer window's `u32`, and for the same reason that section
+/// states it: the number is an *extent* the declaration's own `u64` extents are
+/// held to (`TextureView::width`/`height`/`depth` are `u64`), so a `u32` here
+/// would be a narrowing the consumer would have to undo before it could compare
+/// the two — and a device is free to answer a value above `u32::MAX` in a
+/// future limit, which the review ceiling's own `u64` type already permits.
+/// The wire width follows the values it is compared against rather than the
+/// byte count this generation's devices happen to fit.
+///
+/// The absent section is the older reading, and it is the fail-closed one: a
+/// frame that ends before it reads `0`, which says the snapshot admits no
+/// three-dimensional sampled texture at all, so a consumer keeps its own
+/// refusal by name for the shape instead of handing the provider a volume whose
+/// extents its device never promised. That is why the section is the family's
+/// next tag rather than a widening of the one-dimensional window's payload, and
+/// why a snapshot whose window stays at the default `0` writes nothing.
+///
+/// The tag is `0x0D` rather than `0x0C`: the two increments landing beside this
+/// one take the family's `0x0C` (the stage-buffer `BindingRange`) and `0x0E`
+/// (the fragment-output superset) tags, and the decoder reads the family's
+/// sections in strictly ascending tag order, so each increment keeps its own
+/// tag and the order the three of them arrive in is settled where they merge.
+const CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL: u8 = 0x0D;
+
 /// Tag, inside the tail's second family, of the pixel-coordinate sampler block
 /// (2026-09-19, census v43's `texture_state` axis).
 ///
@@ -1119,6 +1155,15 @@ impl CommandCodec {
                     // wire and every consumer would keep reading the stricter
                     // "no pass-entry snapshot" default.
                     || capabilities.declares_render_pass_entry_snapshot_support()
+                    // The sampled-texture windows are faces of their own
+                    // (2026-09-19, census b10's `texture_shape` bucket, and
+                    // 2026-09-20's `D3` arm beside it): a snapshot that
+                    // declares only one of them still has to write the extended
+                    // payload, or its window would be dropped on the wire and
+                    // every consumer would keep its own refusal by name for a
+                    // shape the provider can hold.
+                    || capabilities.declares_render_texture_dimension_1d()
+                    || capabilities.declares_render_texture_dimension_3d()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -6178,6 +6223,10 @@ fn put_capabilities(
         // half the decoder reads by position before the family's escape, or the
         // declaration would be dropped on the wire.
         || capabilities.declares_render_texture_dimension_1d()
+        // The three-dimensional sampled window is the sibling face beside it
+        // (2026-09-20, the `D3` sampled texture arm), and it joins the same
+        // guard for the same reason.
+        || capabilities.declares_render_texture_dimension_3d()
         // The layout-free vertex count above the milestone's three joins the
         // same guard for the same reason (2026-09-19, census v45's
         // `vertex_span` bucket): a snapshot whose only statement is this bit
@@ -6478,6 +6527,19 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL);
             encoder.bool(capabilities.supports_render_stage_buffer_binding_range);
         }
+        // The three-dimensional sampled window is the family's next tag and
+        // follows the layout-free vertex count (2026-09-20, the `D3` sampled
+        // texture arm). It carries a `u64` per axis for the reasons the
+        // constant above states — the values the consumer compares it against
+        // are `u64` extents — and a snapshot whose window stays at its default
+        // `0` writes nothing here, so the decoder reads the missing section as
+        // `0`, the "keep the shape refused by name" default every consumer of
+        // the window keeps its fail-closed direction with.
+        if capabilities.declares_render_texture_dimension_3d() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL);
+            encoder.u64(capabilities.max_render_texture_dimension_3d);
+        }
     }
     Ok(())
 }
@@ -6572,6 +6634,7 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // admissible, and a consumer keeps its own refusal by name for the
         // shape.
         max_render_texture_dimension_1d: 0,
+        max_render_texture_dimension_3d: 0,
         // The superset vertex interface's bit (`research/docs/23` §3.3,
         // E-TX11) is the family's third block: a legacy payload cannot carry
         // it either, so it reads the same fail-closed default — a registration
@@ -6702,6 +6765,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL => {}
             CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL => {}
             CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL => {}
+            CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6745,6 +6809,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL => {
                 capabilities.supports_render_stage_buffer_binding_range = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {
+                capabilities.max_render_texture_dimension_3d = decoder.u64()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

@@ -339,6 +339,7 @@ impl NativeMetalProvider {
                 // arm's fail-closed default and the shape stays refused by
                 // name.
                 max_render_texture_dimension_1d: 0,
+                max_render_texture_dimension_3d: 0,
                 // The folded shape's bit (`research/docs/23` §3.3, E-TX9):
                 // the reviewed pair binds its two stages at set 1 and set 2,
                 // so this snapshot declares the arrangement the pair's Apple

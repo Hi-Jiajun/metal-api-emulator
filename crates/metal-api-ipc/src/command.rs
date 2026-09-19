@@ -5899,9 +5899,12 @@ mod tests {
 
         // A family tag outside the closed set stays a typed refusal: the walk
         // must not read a section it does not define as "no declaration".
+        // (0x7f rather than 0x0d: the three-dimensional window took 0x0d in the
+        // same merge this test landed with, and the walk refuses a tag it does
+        // not know, whichever number that is.)
         let mut frame_with_unknown = frame.clone();
         let last = frame_with_unknown.len() - 1;
-        frame_with_unknown[last - 2] = 0x0d;
+        frame_with_unknown[last - 2] = 0x7f;
         let refused = CommandCodec::decode_response(&frame_with_unknown)
             .expect_err("an unknown family tag is refused");
         assert!(
@@ -5936,6 +5939,67 @@ mod tests {
         assert!(!decoded.supports_render_stage_buffers);
         assert!(!decoded.supports_render_vertex_count_above_triangle);
         assert!(!decoded.supports_heaps);
+    }
+
+    /// The three-dimensional sampled window is the family's next tag and
+    /// states an extent rather than a bit (2026-09-20, the `D3` sampled
+    /// texture arm): a snapshot whose *only* statement is this window still
+    /// writes the extended payload, the section is `0x00 0x0d` plus one
+    /// big-endian `u64` — the one-dimensional window's own frame shape, for the
+    /// reason `command_codec`'s constant states — and a snapshot that never
+    /// spoke about the arm decodes as `0`, the fail-closed reading a consumer's
+    /// own refusal by name is written against.
+    #[test]
+    fn an_only_three_dimensional_window_still_writes_the_extended_payload() {
+        use metal_api_core::provider::MAX_RENDER_TEXTURE_DIMENSION_3D;
+
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        assert!(!capabilities.declares_render_texture_dimension_3d());
+        capabilities.max_render_texture_dimension_3d = MAX_RENDER_TEXTURE_DIMENSION_3D;
+        assert!(capabilities.declares_render_texture_dimension_3d());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        let mut section = vec![0x00, 0x0d];
+        section.extend_from_slice(&MAX_RENDER_TEXTURE_DIMENSION_3D.to_be_bytes());
+        assert_eq!(
+            frame.windows(2).position(|pair| pair == [0x00, 0x0d]),
+            Some(frame.len() - section.len()),
+            "the window's section is the family's last one in this frame"
+        );
+        assert_eq!(
+            &frame[frame.len() - section.len()..],
+            &section[..],
+            "the window is one presence tag, one family tag and one u64"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(
+            decoded.max_render_texture_dimension_3d,
+            MAX_RENDER_TEXTURE_DIMENSION_3D
+        );
+
+        // The absent section reads zero: the same snapshot with the window back
+        // at its default writes a shorter frame, and the decoder's answer for
+        // the missing block is the fail-closed one.
+        let mut bare = fake_capabilities();
+        bare.supports_render_vertex_count_above_triangle = true;
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: bare,
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(decoded.max_render_texture_dimension_3d, 0);
     }
 
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
@@ -6095,8 +6159,8 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x0d` is the next tag the
-        // family has not assigned: a byte no version of the walk may read as a
+        // The family's tags are a closed set and `0x7f` is a tag no version of
+        // the walk has assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
         // until E-TX13 assigned it to the attachment landing view, `0x06`
@@ -6105,15 +6169,18 @@ mod tests {
         // the texel space took it, `0x09` until E-TX15 assigned it to the
         // pass-entry snapshot arm, `0x0a` until the one-dimensional sampled
         // window took it, `0x0b` until the layout-free count above the
-        // milestone's three vertices took it, and `0x0c` until E-SB3 assigned it
-        // to the stage-buffer whole-binding arm — exactly the drift the closed
-        // set exists to make visible.)
+        // milestone's three vertices took it, `0x0c` until E-SB3 assigned it to
+        // the stage-buffer whole-binding arm, and `0x0d` until the
+        // three-dimensional sampled window took it — exactly the drift the
+        // closed set exists to make visible. The probe now names a number the
+        // family's sequence will not reach, so the next assignment does not
+        // have to move it again.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x0d;
+        unknown_tag[tag_at] = 0x7f;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x0d)
+            CodecError::UnknownCapabilityTail(0x7f)
         ));
     }
 
@@ -7261,6 +7328,7 @@ mod tests {
                     supports_render_kept_frame_landing: false,
                     supports_render_pass_entry_snapshot: false,
                     max_render_texture_dimension_1d: 0,
+                    max_render_texture_dimension_3d: 0,
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
@@ -7652,6 +7720,7 @@ mod tests {
             supports_render_kept_frame_landing: false,
             supports_render_pass_entry_snapshot: false,
             max_render_texture_dimension_1d: 0,
+            max_render_texture_dimension_3d: 0,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
