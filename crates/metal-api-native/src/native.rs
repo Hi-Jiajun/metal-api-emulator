@@ -493,6 +493,11 @@ impl NativeMetalProvider {
                 // cleared sampling result the trace did not ask for.
                 supports_render_texture_sampling: render_bits.supports_render_texture_sampling,
                 max_render_textures: render_bits.max_render_textures,
+                // The per-stage window travels beside the list bound for the
+                // reason the pair is a pair (`research/docs/23` §3.3, E-TC1):
+                // this rail declares none, and the field is read from the bits
+                // so the snapshot and the rail's own walk cannot drift.
+                max_render_textures_per_stage: render_bits.max_render_textures_per_stage,
                 supported_render_texture_formats: render_bits
                     .supported_render_texture_formats
                     .clone(),

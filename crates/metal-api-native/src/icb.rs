@@ -451,6 +451,7 @@ mod tests {
             stencil_resolve_modes: 0,
             supports_render_texture_sampling: false,
             max_render_textures: 0,
+            max_render_textures_per_stage: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,

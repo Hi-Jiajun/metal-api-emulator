@@ -3883,16 +3883,21 @@ mod tests {
             .position(|window| window == [0x12, 0x20, 0x01, 0x01])
             .expect("the sampled fixture carries its own tag");
         let mut patched = frame.clone();
-        // One above the contract's own ceiling (`research/docs/23` §3.3,
-        // v102): the count byte is refused before a single texture is read, so
-        // the patched frame needs no matching block behind it.
+        // One above *one stage's* own ceiling (`research/docs/23` §3.3, v102;
+        // E-TC1): the list bound is the pair's sum and this count is inside
+        // it, so the refusal is the stage's own — and the count byte is refused
+        // before a single texture is read, so the patched frame needs no
+        // matching block behind it.
         patched[position + 3] = u8::try_from(MAX_RENDER_TEXTURES + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched),
             Err(CodecError::RenderTextureCount {
+                stage,
                 count,
                 maximum,
-            }) if count == MAX_RENDER_TEXTURES + 1 && maximum == MAX_RENDER_TEXTURES
+            }) if stage == Some(RenderPipelineStage::Fragment)
+                && count == MAX_RENDER_TEXTURES + 1
+                && maximum == MAX_RENDER_TEXTURES
         ));
     }
 
@@ -5899,6 +5904,95 @@ mod tests {
         assert!(!decoded.supports_render_fragment_output_superset);
     }
 
+    /// The per-stage sampled-texture window travels as the tail's escape
+    /// family's next tag, `0x00 0x0f <u32 BE>` (`research/docs/23` §3.3,
+    /// E-TC1).
+    ///
+    /// One escape byte, the family's tag and one big-endian `u32` — the same
+    /// shape the per-stage stage-buffer window states, because both carry a
+    /// *count* of bindings — and the section appends itself to a frame that was
+    /// already on the extended payload without moving a byte before it. The
+    /// frame that ends before the section is the older reading: the window
+    /// stays `0`, which is the "the list bound applies to the whole list" arm,
+    /// so the absent-section direction is fail-closed and the frames keep their
+    /// bytes everywhere before it.
+    #[test]
+    fn the_per_stage_texture_window_travels_in_its_own_extended_block() {
+        let mut capabilities = fake_capabilities();
+        // The frame has to be on the extended payload already, or the new
+        // window would change the payload's own form rather than only
+        // appending its section: the landing-view bit is the oldest face that
+        // does that.
+        capabilities.supports_render_attachment_landing_view = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(without.ends_with(&[0x00, 0x05, 0x01]));
+
+        capabilities.max_render_textures_per_stage = MAX_RENDER_TEXTURES as u32;
+        assert!(capabilities.declares_render_texture_per_stage_ceiling());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // One escape byte, the family's next tag and one big-endian `u32`.
+        let block = [
+            0x00,
+            0x0f,
+            0x00,
+            0x00,
+            0x00,
+            u8::try_from(MAX_RENDER_TEXTURES).unwrap(),
+        ];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the per-stage window's block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        // The frame without the section is the pre-E-TC1 reading: the window
+        // stays `0`, which is the "the list bound is the whole rule" arm, and
+        // the value is what the section's payload carries rather than a second
+        // presence flag.
+        let decoded = match CommandCodec::decode_response(&without).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(decoded.max_render_textures_per_stage, 0);
+        assert!(!decoded.declares_render_texture_per_stage_ceiling());
+        // The legacy payload cannot carry the block either, so a legacy frame
+        // reads the same older reading rather than a value beside it.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(decoded.max_render_textures_per_stage, 0);
+        eprintln!(
+            "per-stage texture window frame: len={} without={} block={block:02x?}",
+            frame.len(),
+            without.len()
+        );
+    }
+
     /// The stage-buffer whole-binding block is the tail's escape family's next
     /// tag, `0x00 0x0c <bool>` (`research/docs/23` §3.3, E-SB3).
     ///
@@ -7479,6 +7573,7 @@ mod tests {
                     stencil_resolve_modes: 0,
                     supports_render_texture_sampling: false,
                     max_render_textures: 0,
+                    max_render_textures_per_stage: 0,
                     supported_render_texture_formats: Vec::new(),
                     supports_render_texture_gathered_extent: false,
                     supports_render_texture_gathered_extent_no_copy: false,
@@ -7872,6 +7967,7 @@ mod tests {
             stencil_resolve_modes: 0,
             supports_render_texture_sampling: false,
             max_render_textures: 0,
+            max_render_textures_per_stage: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
@@ -9474,13 +9570,20 @@ mod tests {
             .position(|window| window == RENDER_TEXTURE_DECLARATION_BLOCK)
             .expect("the declaration block is on the wire");
         let mut patched = frame.clone();
-        // One above the contract's own ceiling (`research/docs/23` §3.3,
-        // v102): the count byte is refused before a single tuple is read.
+        // One above *one stage's* own ceiling (`research/docs/23` §3.3, v102;
+        // E-TC1): the count byte is refused before a single tuple is read, and
+        // the stage named on the refusal is the fragment one the declaration
+        // block belongs to.
         patched[block_at] = u8::try_from(MAX_RENDER_TEXTURES + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched).unwrap_err(),
-            CodecError::RenderTextureDeclarationCount { count, maximum }
-                if count == MAX_RENDER_TEXTURES + 1 && maximum == MAX_RENDER_TEXTURES
+            CodecError::RenderTextureDeclarationCount {
+                stage,
+                count,
+                maximum,
+            } if stage == Some(RenderPipelineStage::Fragment)
+                && count == MAX_RENDER_TEXTURES + 1
+                && maximum == MAX_RENDER_TEXTURES
         ));
         // The encoder refuses the same protocol bound instead of writing a
         // frame the decoder would reject.
@@ -9499,8 +9602,13 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             refused,
-            CodecError::RenderTextureDeclarationCount { count, maximum }
-                if count == MAX_RENDER_TEXTURES + 1 && maximum == MAX_RENDER_TEXTURES
+            CodecError::RenderTextureDeclarationCount {
+                stage,
+                count,
+                maximum,
+            } if stage == Some(RenderPipelineStage::Fragment)
+                && count == MAX_RENDER_TEXTURES + 1
+                && maximum == MAX_RENDER_TEXTURES
         ));
         eprintln!("render texture declaration count refusals: {refused}");
     }

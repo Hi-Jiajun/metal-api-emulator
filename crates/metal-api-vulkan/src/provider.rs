@@ -135,6 +135,50 @@ pub(crate) fn stage_buffer_window(limits: &vk::PhysicalDeviceLimits) -> StageBuf
     }
 }
 
+/// The sampled-texture window one device states (`research/docs/23` §3.3,
+/// E-TC1).
+///
+/// The contract's ceiling ([`MAX_RENDER_TEXTURES`]) is the *review* bound — it
+/// is Vulkan's own per-stage floor for sampled images, so no conformant device
+/// has to refuse a stage that stays inside it — while the number a stage can
+/// actually carry is the device's own `maxPerStageDescriptorSampledImages`. So
+/// the rail declares the smaller of the two per stage, the pair's sum as the
+/// list bound (the pass's own texture list is its fragment stage's
+/// declarations, whose width the wire sizes), and the device's per-set window
+/// beside them for the arrangement check [`crate::render`] runs before it
+/// builds the descriptor set: the canonical arrangement binds a pass's sampled
+/// textures in one set (set 0), so the set's own
+/// `maxDescriptorSetSampledImages` is the third reading of the same shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RenderTextureWindow {
+    /// Sampled textures one *stage* may declare.
+    pub(crate) per_stage: u32,
+    /// Sampled textures one *pass* may declare across both stages.
+    pub(crate) list: u32,
+    /// Sampled-image descriptors one descriptor *set* may hold. The canonical
+    /// arrangement gives a pass's textures one set, so a stage's list has to
+    /// fit this window as well.
+    pub(crate) per_set: u32,
+}
+
+/// The window `research/docs/23` §3.3 (E-TC1) states from one device's limits.
+///
+/// `per_stage` is `min(MAX_RENDER_TEXTURES, maxPerStageDescriptorSampledImages)`;
+/// the list bound is two stages' worth of it, because a render pass has exactly
+/// two stages. Both numbers are read from the selected device rather than
+/// restated, so a device that states a narrower per-stage window declares a
+/// narrower window instead of one it would have to refuse by name at pipeline
+/// layout time.
+pub(crate) fn render_texture_window(limits: &vk::PhysicalDeviceLimits) -> RenderTextureWindow {
+    let per_stage =
+        (MAX_RENDER_TEXTURES as u32).min(limits.max_per_stage_descriptor_sampled_images);
+    RenderTextureWindow {
+        per_stage,
+        list: per_stage.saturating_mul(2),
+        per_set: limits.max_descriptor_set_sampled_images,
+    }
+}
+
 /// The largest instance count the instancing increment executes
 /// (`research/docs/23` §3.3, v31).
 ///
@@ -348,14 +392,19 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // own fact, not the module's) and one texture of the render area's own
         // extent — so a wider request is refused by core admission or by the
         // rail's shape gates rather than silently narrowed. The binding count
-        // is the contract's own ceiling (`research/docs/23` §3.3, v102): a
-        // *translated* fragment stage samples as many textures as its
-        // reflection names, wherever its own `[[texture(n)]]` arguments sit
-        // (`v104`), so the rail declares the list's cap, while the reviewed
+        // is the device's own window clamped by the contract's ceiling
+        // (`research/docs/23` §3.3, v102; E-TC1): a *translated* fragment stage
+        // samples as many textures as its reflection names, wherever its own
+        // `[[texture(n)]]` arguments sit (`v104`), so the rail declares the
+        // window it executes (`render_texture_window`), while the reviewed
         // pair's one-texture window — index zero included — is refused at
         // execution by name (`render_texture_stage_unsupported`).
         supports_render_texture_sampling: true,
-        max_render_textures: MAX_RENDER_TEXTURES as u32,
+        max_render_textures: render_texture_window(limits).list,
+        // The per-stage half of the same pair (E-TC1): the number of sampled
+        // textures one stage may declare, which is what the translated arm's
+        // own list is weighed against before its descriptor set exists.
+        max_render_textures_per_stage: render_texture_window(limits).per_stage,
         supported_render_texture_formats: TextureFormat::RENDER_SAMPLED.to_vec(),
         // The one-dimensional sampled window is executed by the same rail
         // (2026-09-19, census b10's `texture_shape` bucket): `render.rs` uploads
@@ -1116,6 +1165,83 @@ mod tests {
         assert!(capabilities.declares_render_stage_buffer_per_stage_ceiling());
     }
 
+    /// The per-stage sampled-texture window is the device's own answer
+    /// (`research/docs/23` §3.3, E-TC1): the review ceiling clamped by
+    /// `maxPerStageDescriptorSampledImages`, the pair's sum as the list bound,
+    /// and the device's per-set window beside them. The platform's own
+    /// per-stage floor *is* the review ceiling — sixteen sampled images — so a
+    /// device at the floor states sixteen per stage rather than a narrower
+    /// window, and one that states fewer is capped by its own answer.
+    #[test]
+    fn the_render_texture_window_is_the_ceiling_clamped_by_the_device() {
+        let core_floor = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_sampled_images: 16,
+            max_descriptor_set_sampled_images: 16,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_texture_window(&core_floor),
+            RenderTextureWindow {
+                per_stage: MAX_RENDER_TEXTURES as u32,
+                list: metal_api_core::provider::MAX_RENDER_TEXTURE_DECLARATIONS as u32,
+                per_set: 16,
+            },
+            "the platform's per-stage floor is the review ceiling's own number"
+        );
+
+        let lavapipe = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_sampled_images: 1_015_808,
+            max_descriptor_set_sampled_images: 1_015_808,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_texture_window(&lavapipe),
+            RenderTextureWindow {
+                per_stage: MAX_RENDER_TEXTURES as u32,
+                list: metal_api_core::provider::MAX_RENDER_TEXTURE_DECLARATIONS as u32,
+                per_set: 1_015_808,
+            },
+            "the review ceiling caps a wider device at sixteen per stage and thirty-two in the list"
+        );
+
+        let narrow = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_sampled_images: 9,
+            max_descriptor_set_sampled_images: 12,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_texture_window(&narrow),
+            RenderTextureWindow {
+                per_stage: 9,
+                list: 18,
+                per_set: 12,
+            },
+            "a device narrower than the ceiling states its own per-stage number"
+        );
+    }
+
+    /// The mapped capability snapshot carries the sampled-texture window the
+    /// helper states, so a consumer reads the same numbers the rail enforces.
+    #[test]
+    fn the_render_texture_capability_carries_the_device_window() {
+        let limits = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_sampled_images: 20,
+            max_descriptor_set_sampled_images: 24,
+            ..Default::default()
+        };
+        let capabilities = capabilities_from_limits(&limits);
+        assert!(capabilities.supports_render_texture_sampling);
+        assert_eq!(
+            capabilities.max_render_textures_per_stage,
+            MAX_RENDER_TEXTURES as u32
+        );
+        assert_eq!(
+            capabilities.max_render_textures,
+            metal_api_core::provider::MAX_RENDER_TEXTURE_DECLARATIONS as u32
+        );
+        assert!(capabilities.declares_render_texture_per_stage_ceiling());
+    }
+
     #[test]
     fn capabilities_mapping_uses_the_tightest_descriptor_limit() {
         let limits = vk::PhysicalDeviceLimits {
@@ -1124,6 +1250,13 @@ mod tests {
             max_compute_work_group_count: [16, 8, 4],
             max_per_stage_descriptor_storage_buffers: 12,
             max_descriptor_set_storage_buffers: 10,
+            // The sampled-texture face is a `PhysicalDeviceLimits` reading of
+            // its own (`research/docs/23` §3.3, E-TC1), so the tightest-limit
+            // reading covers it too: this device states eleven sampled images
+            // per stage, which is narrower than the review ceiling and is what
+            // the snapshot declares.
+            max_per_stage_descriptor_sampled_images: 11,
+            max_descriptor_set_sampled_images: 12,
             max_per_stage_resources: 14,
             max_storage_buffer_range: 4096,
             max_push_constants_size: 128,
@@ -1198,7 +1331,17 @@ mod tests {
         // host-bytes arm — the translated binding and the reviewed gather in
         // `tests/render_texture_extent_e2e.rs`.
         assert!(capabilities.supports_render_texture_sampling);
-        assert_eq!(capabilities.max_render_textures, MAX_RENDER_TEXTURES as u32);
+        // The sampled-texture pair is the device's own window (`research/docs/23`
+        // §3.3, E-TC1): this device states eleven sampled images per stage —
+        // narrower than the review ceiling — so the rail declares eleven per
+        // stage and the pair's twenty-two in the list, the reading the frame
+        // carries beside the window rather than the contract's own sixteen.
+        assert_eq!(
+            capabilities.max_render_textures_per_stage, 11,
+            "the device's own sampled-image window is what the snapshot states"
+        );
+        assert_eq!(capabilities.max_render_textures, 22);
+        assert!(capabilities.declares_render_texture_per_stage_ceiling());
         assert_eq!(
             capabilities.supported_render_texture_formats,
             TextureFormat::RENDER_SAMPLED.to_vec()
