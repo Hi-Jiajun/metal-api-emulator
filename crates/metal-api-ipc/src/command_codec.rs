@@ -34,8 +34,8 @@ use metal_api_core::provider::{
     TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
     VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
     MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES,
-    MAX_VERTEX_BUFFERS,
+    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_DECLARATIONS,
+    MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -912,6 +912,28 @@ const CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL: u8 = 0x0C;
 /// payload, and why a snapshot that does not declare the bit writes nothing.
 const CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL: u8 = 0x0E;
 
+/// Tag, inside the tail's second family, of the per-stage sampled-texture
+/// window's block (`research/docs/23` §3.3, E-TC1).
+///
+/// The section follows the fragment-output superset's block and carries one
+/// `u32` (big-endian): the number of sampled textures **one stage** of a render
+/// pass may declare ([`ProviderCapabilities::max_render_textures_per_stage`]).
+/// The width is the per-stage stage-buffer window's `u32` rather than the
+/// sampled windows' `u64`, and for the reason that section states it: the
+/// number is a *count* of bindings, which is a `u32` everywhere it is compared
+/// (`ProviderCapabilities::max_render_textures`, `RenderPassDescriptor`'s own
+/// list), not an extent.
+///
+/// The absent section is the older reading, and it is the *stricter* one: a
+/// frame that ends before it says the list bound applies to a pass's whole
+/// texture list, exactly what every pre-E-TC1 snapshot meant by
+/// [`ProviderCapabilities::max_render_textures`]. That is why the section is
+/// the family's next tag rather than a widening of an existing block's
+/// payload, and why a snapshot with the default `0` writes nothing: an old
+/// consumer reading a new frame keeps a rule its provider still honours, and a
+/// new consumer reading an old frame keeps the same one.
+const CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL: u8 = 0x0F;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -1189,6 +1211,13 @@ impl CommandCodec {
                     // shape the provider can hold.
                     || capabilities.declares_render_texture_dimension_1d()
                     || capabilities.declares_render_texture_dimension_3d()
+                    // The per-stage sampled-texture window is a face of its
+                    // own (`research/docs/23` §3.3, E-TC1): a snapshot that
+                    // declares only it still has to write the extended
+                    // payload, or its window would be dropped on the wire and
+                    // every consumer would keep reading the stricter list
+                    // bound as the whole rule.
+                    || capabilities.declares_render_texture_per_stage_ceiling()
                     // The superset fragment interface is a face of its own
                     // (2026-09-20, the third door behind census v46's
                     // `stage_buffer_footprint` bucket): a snapshot that
@@ -2162,11 +2191,8 @@ fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecEr
             maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
         });
     }
-    if contract.textures.len() > MAX_RENDER_TEXTURES {
-        return Err(CodecError::RenderTextureDeclarationCount {
-            count: contract.textures.len(),
-            maximum: MAX_RENDER_TEXTURES,
-        });
+    if let Some(refusal) = render_texture_declaration_count_refusal(contract.textures.len()) {
+        return Err(refusal);
     }
     match (
         contract.stage_buffers.is_empty(),
@@ -2332,6 +2358,50 @@ fn stage_buffer_stage_over_ceiling<T>(
         })
 }
 
+/// The refusal a sampled-texture count earns, if any (`research/docs/23` §3.3,
+/// E-TC1).
+///
+/// One helper for one error variant, asked by both the encoder and the decoder
+/// so the two sides state the same two rules in the same order: the *list* is
+/// bounded by the pair's sum
+/// ([`MAX_RENDER_TEXTURE_DECLARATIONS`], `None` on the refusal) and a stage's
+/// own declarations are bounded by [`MAX_RENDER_TEXTURES`]. The pass's texture
+/// block is its fragment stage's list, so the stage the second arm names is
+/// that one.
+fn render_texture_count_refusal(count: usize) -> Option<CodecError> {
+    if count > MAX_RENDER_TEXTURE_DECLARATIONS {
+        return Some(CodecError::RenderTextureCount {
+            stage: None,
+            count,
+            maximum: MAX_RENDER_TEXTURE_DECLARATIONS,
+        });
+    }
+    (count > MAX_RENDER_TEXTURES).then_some(CodecError::RenderTextureCount {
+        stage: Some(RenderPipelineStage::Fragment),
+        count,
+        maximum: MAX_RENDER_TEXTURES,
+    })
+}
+
+/// The refusal a sampled-texture *declaration* list earns, if any
+/// (`research/docs/23` §3.3, E-TC1): [`render_texture_count_refusal`]'s sibling
+/// for the pipeline contract's own block, which is the same list one face over
+/// and carries its own error variant.
+fn render_texture_declaration_count_refusal(count: usize) -> Option<CodecError> {
+    if count > MAX_RENDER_TEXTURE_DECLARATIONS {
+        return Some(CodecError::RenderTextureDeclarationCount {
+            stage: None,
+            count,
+            maximum: MAX_RENDER_TEXTURE_DECLARATIONS,
+        });
+    }
+    (count > MAX_RENDER_TEXTURES).then_some(CodecError::RenderTextureDeclarationCount {
+        stage: Some(RenderPipelineStage::Fragment),
+        count,
+        maximum: MAX_RENDER_TEXTURES,
+    })
+}
+
 /// The sampler form byte of one render texture declaration
 /// (`research/docs/23` §3.3, v102).
 ///
@@ -2360,18 +2430,17 @@ const RENDER_TEXTURE_SAMPLER_RUNTIME: u8 = 0x02;
 /// carries the module's own declarations the views are paired against —
 /// including, for a runtime `[[sampler(n)]]` binding, the index the pass's
 /// runtime sampler list has to answer with. The list is bound the way every
-/// other length prefix is: a count above [`MAX_RENDER_TEXTURES`] is refused
-/// before a single tuple is written, so a refused registration never emits a
-/// partial block.
+/// other length prefix is: a count above
+/// [`MAX_RENDER_TEXTURE_DECLARATIONS`] — or a list whose *stage* carries more
+/// than [`MAX_RENDER_TEXTURES`], the count rule's own axis (`research/docs/23`
+/// §3.3, E-TC1) — is refused before a single tuple is written, so a refused
+/// registration never emits a partial block.
 fn put_render_texture_declarations(
     encoder: &mut Encoder,
     bindings: &[TextureBindingContract],
 ) -> Result<(), CodecError> {
-    if bindings.len() > MAX_RENDER_TEXTURES {
-        return Err(CodecError::RenderTextureDeclarationCount {
-            count: bindings.len(),
-            maximum: MAX_RENDER_TEXTURES,
-        });
+    if let Some(refusal) = render_texture_declaration_count_refusal(bindings.len()) {
+        return Err(refusal);
     }
     encoder.u8(bindings.len() as u8);
     for binding in bindings {
@@ -2415,15 +2484,17 @@ fn put_render_texture_declarations(
 /// the declaration is what the pass is paired against: a sampler form the
 /// decoder guessed would change which texels a remote read returns, or which
 /// `[[sampler(n)]]` argument the pass has to answer for.
+///
+/// The count is refused above [`MAX_RENDER_TEXTURE_DECLARATIONS`] — or, inside
+/// it, above one stage's own ceiling ([`MAX_RENDER_TEXTURES`]) — before a
+/// single tuple is read, so a corrupt count cannot drive the decoder
+/// (`research/docs/23` §3.3, E-TC1).
 fn get_render_texture_declarations(
     decoder: &mut Decoder<'_>,
 ) -> Result<Vec<TextureBindingContract>, CodecError> {
     let count = usize::from(decoder.u8()?);
-    if count > MAX_RENDER_TEXTURES {
-        return Err(CodecError::RenderTextureDeclarationCount {
-            count,
-            maximum: MAX_RENDER_TEXTURES,
-        });
+    if let Some(refusal) = render_texture_declaration_count_refusal(count) {
+        return Err(refusal);
     }
     let mut bindings = Vec::with_capacity(count);
     for _ in 0..count {
@@ -3485,11 +3556,10 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // keeps its exact bytes and only a texture-bearing pass takes
                 // the tag of its own.
                 let has_render_textures = !pass.textures.is_empty();
-                if has_render_textures && pass.textures.len() > MAX_RENDER_TEXTURES {
-                    return Err(CodecError::RenderTextureCount {
-                        count: pass.textures.len(),
-                        maximum: MAX_RENDER_TEXTURES,
-                    });
+                if has_render_textures {
+                    if let Some(refusal) = render_texture_count_refusal(pass.textures.len()) {
+                        return Err(refusal);
+                    }
                 }
                 // The stage buffer block follows the sampled-texture block's
                 // own rule (`research/docs/23` §3.3, v83): the wide word has
@@ -3829,22 +3899,22 @@ fn put_render_pass(
 /// its own bytes and a dense list keeps exactly the bytes it always had.
 ///
 /// The count is bound here the way the decoder bounds it: a pass that binds
-/// more textures than [`MAX_RENDER_TEXTURES`] is refused before a single view
-/// is written, so a refused frame never carries a partial block.
+/// more textures than [`MAX_RENDER_TEXTURE_DECLARATIONS`] — or one *stage* that
+/// carries more than [`MAX_RENDER_TEXTURES`] (`research/docs/23` §3.3, E-TC1) —
+/// is refused before a single view is written, so a refused frame never carries
+/// a partial block.
 fn put_render_texture_block(
     encoder: &mut Encoder,
     textures: &[TextureView],
 ) -> Result<(), CodecError> {
-    if textures.len() > MAX_RENDER_TEXTURES {
-        return Err(CodecError::RenderTextureCount {
-            count: textures.len(),
-            maximum: MAX_RENDER_TEXTURES,
-        });
+    if let Some(refusal) = render_texture_count_refusal(textures.len()) {
+        return Err(refusal);
     }
     encoder.u8(
         u8::try_from(textures.len()).map_err(|_| CodecError::RenderTextureCount {
+            stage: None,
             count: textures.len(),
-            maximum: MAX_RENDER_TEXTURES,
+            maximum: MAX_RENDER_TEXTURE_DECLARATIONS,
         })?,
     );
     for texture in textures {
@@ -4655,14 +4725,14 @@ fn get_render_sampled_stage_buffer_sampler_pass(
 ///
 /// A count above the contract's own cap is refused with
 /// [`CodecError::RenderTextureCount`] before a single texture is read, so a
-/// corrupt count cannot drive the decoder.
+/// corrupt count cannot drive the decoder. The stage's own ceiling is the
+/// second half of the same rule (`research/docs/23` §3.3, E-TC1): a count
+/// inside the list bound and above [`MAX_RENDER_TEXTURES`] is refused with the
+/// fragment stage named, because the block *is* that stage's declarations.
 fn get_render_texture_block(decoder: &mut Decoder<'_>) -> Result<Vec<TextureView>, CodecError> {
     let texture_count = usize::from(decoder.u8()?);
-    if texture_count > MAX_RENDER_TEXTURES {
-        return Err(CodecError::RenderTextureCount {
-            count: texture_count,
-            maximum: MAX_RENDER_TEXTURES,
-        });
+    if let Some(refusal) = render_texture_count_refusal(texture_count) {
+        return Err(refusal);
     }
     let mut textures = Vec::with_capacity(texture_count);
     for _ in 0..texture_count {
@@ -6273,6 +6343,12 @@ fn put_capabilities(
         // position before the family's escape, or the declaration would be
         // dropped on the wire.
         || capabilities.declares_render_fragment_output_superset_support()
+        // The per-stage sampled-texture window joins the same guard for the
+        // same reason (`research/docs/23` §3.3, E-TC1): a snapshot that
+        // declares only it still has to write the heap/ICB half the decoder
+        // reads by position before the family's escape, or its window would be
+        // dropped on the wire.
+        || capabilities.declares_render_texture_per_stage_ceiling()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6595,6 +6671,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL);
             encoder.bool(capabilities.supports_render_fragment_output_superset);
         }
+        // The per-stage sampled-texture window is the family's next tag and
+        // follows the fragment-output superset's block (`research/docs/23`
+        // §3.3, E-TC1). It carries a `u32` for the reason the constant above
+        // states — the value is a count of bindings, not an extent — and a
+        // snapshot whose window stays at its default `0` writes nothing here,
+        // so the decoder reads the missing section as `0`: the reading every
+        // pre-E-TC1 frame has, where the list bound is the whole rule and a
+        // fragment stage this rail cannot hold is refused by name instead of
+        // being half-admitted.
+        if capabilities.declares_render_texture_per_stage_ceiling() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL);
+            encoder.u32(capabilities.max_render_textures_per_stage);
+        }
     }
     Ok(())
 }
@@ -6760,6 +6850,11 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // (`research/docs/23` §3.3, v70).
         supports_render_texture_sampling: false,
         max_render_textures: 0,
+        // A legacy payload cannot have declared the per-stage window either
+        // (`research/docs/23` §3.3, E-TC1): the list bound applies to the
+        // whole list, which is the stricter rule and the reading every
+        // pre-E-TC1 frame gives.
+        max_render_textures_per_stage: 0,
         supported_render_texture_formats: Vec::new(),
         // A legacy payload cannot have declared presentation, so the present
         // bits take the same "cannot present" defaults the render bits take
@@ -6829,6 +6924,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {}
             CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL => {}
+            CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6878,6 +6974,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL => {
                 capabilities.supports_render_fragment_output_superset = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {
+                capabilities.max_render_textures_per_stage = decoder.u32()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;
@@ -7231,6 +7330,58 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoder's own half of the sampled-texture count rule
+    /// (`research/docs/23` §3.3, E-TC1).
+    ///
+    /// The wire's list bound is the *pair's* sum, so a block whose count is
+    /// inside that bound is one the encoder can frame but the contract cannot
+    /// state: seventeen textures on one fragment stage. The encoder refuses to
+    /// write such a block, so the frame is spelled here by hand — the point is
+    /// that a decoder handed one refuses it with the stage named instead of
+    /// passing a shape on that every consumer would have to re-check. One
+    /// count over the pair's sum is the other arm: a list no two stages could
+    /// hold is refused as one list, so the two refusals name different things.
+    #[test]
+    fn a_texture_block_whose_stage_crosses_the_ceiling_is_refused_by_stage() {
+        let mut encoder = Encoder::new();
+        let over = MAX_RENDER_TEXTURES + 1;
+        encoder.u8(u8::try_from(over).expect("seventeen fits one byte"));
+        for _ in 0..over {
+            // The entry's own bytes never reach the count rule's answer, so the
+            // block only has to be long enough to be read: the refusal is the
+            // count's, and a decoder that read the entries would have driven
+            // itself with a corrupt count.
+            encoder.u64(0);
+        }
+        let bytes = encoder.bytes.clone();
+        let refusal = get_render_texture_block(&mut Decoder::new(&bytes))
+            .expect_err("seventeen textures cross one stage's ceiling");
+        eprintln!("texture block stage refusal: {refusal}");
+        assert!(matches!(
+            refusal,
+            CodecError::RenderTextureCount {
+                stage: Some(RenderPipelineStage::Fragment),
+                count,
+                maximum,
+            } if count == over && maximum == MAX_RENDER_TEXTURES
+        ));
+
+        let mut encoder = Encoder::new();
+        let past_the_pair = MAX_RENDER_TEXTURE_DECLARATIONS + 1;
+        encoder.u8(u8::try_from(past_the_pair).expect("thirty-three fits one byte"));
+        let bytes = encoder.bytes.clone();
+        let refusal = get_render_texture_block(&mut Decoder::new(&bytes))
+            .expect_err("thirty-three textures are past any two stages' lists");
+        assert!(matches!(
+            refusal,
+            CodecError::RenderTextureCount {
+                stage: None,
+                count,
+                maximum,
+            } if count == past_the_pair && maximum == MAX_RENDER_TEXTURE_DECLARATIONS
+        ));
+    }
 
     /// The decoder's own half of the count rule (`research/docs/23` §117,
     /// E-SB2).

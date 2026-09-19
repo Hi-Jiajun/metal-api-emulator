@@ -44,7 +44,8 @@ use metal_api_core::provider::{
     StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp,
     TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout,
     VertexFormat, VertexStep, ViewId, Winding, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_DIMENSION_3D,
+    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_DECLARATIONS,
+    MAX_RENDER_TEXTURE_DIMENSION_3D,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -5685,8 +5686,28 @@ fn resolve_render_textures<'a>(
     reviewed: bool,
     gathered_fetch: bool,
 ) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
+    // The contract's own count rule, restated for a directly-constructed
+    // request (`research/docs/23` §3.3, E-TC1): the list bound is the pair's
+    // sum, and one stage's ceiling is the rule a list inside it meets. The
+    // pass's list is the fragment stage's declarations, so the stage the
+    // refusal names is that one.
+    if pass.textures.len() > MAX_RENDER_TEXTURE_DECLARATIONS {
+        return Err(capability_refusal("render_texture_limit")
+            .with_field(
+                "requested",
+                FieldValue::Unsigned(pass.textures.len() as u64),
+            )
+            .with_field(
+                "maximum",
+                FieldValue::Unsigned(MAX_RENDER_TEXTURE_DECLARATIONS as u64),
+            ));
+    }
     if pass.textures.len() > MAX_RENDER_TEXTURES {
         return Err(capability_refusal("render_texture_limit")
+            .with_field(
+                "stage",
+                FieldValue::Text(RenderPipelineStage::Fragment.name().to_owned()),
+            )
             .with_field(
                 "requested",
                 FieldValue::Unsigned(pass.textures.len() as u64),
@@ -13132,6 +13153,41 @@ impl<'a> OffscreenObjects<'a> {
         // ([`Self::render_texture_slots`]), and a pass whose stages also read a
         // stage buffer in set 0 shares this set with them instead of the two
         // faces fighting for the slot (`research/docs/23` §3.3, v112).
+        // The device's window is the second, narrower bound on the same shape
+        // (`research/docs/23` §3.3, E-TC1). The contract's per-stage ceiling is
+        // a review bound, while the descriptor counts a set layout may carry
+        // are the device's own answers: one stage holds at most
+        // `maxPerStageDescriptorSampledImages` sampled images and one set at
+        // most `maxDescriptorSetSampledImages` of them. The canonical
+        // arrangement binds a pass's sampled textures in one set — set 0, which
+        // the stage buffers share when a pass binds both faces — so the check
+        // is made per set and per stage, exactly as the stage-buffer face's own
+        // arrangement check is (`create_stage_buffers`).
+        let window = crate::provider::render_texture_window(self.context.physical_device_limits());
+        let fragment_textures = textures.len();
+        if fragment_textures as u32 > window.per_stage {
+            return Err(capability_refusal("render_texture_limit")
+                .with_field(
+                    "stage",
+                    FieldValue::Text(RenderPipelineStage::Fragment.name().to_owned()),
+                )
+                .with_field("requested", FieldValue::Unsigned(fragment_textures as u64))
+                .with_field("maximum", FieldValue::Unsigned(u64::from(window.per_stage)))
+                .with_detail(
+                    "one stage declares more sampled textures than the device states sampled \
+                     images for a stage",
+                ));
+        }
+        if fragment_textures as u32 > window.per_set {
+            return Err(capability_refusal("render_texture_limit")
+                .with_field("set", FieldValue::Unsigned(0))
+                .with_field("requested", FieldValue::Unsigned(fragment_textures as u64))
+                .with_field("maximum", FieldValue::Unsigned(u64::from(window.per_set)))
+                .with_detail(
+                    "one descriptor set of this pass carries more sampled textures than the \
+                     device states sampled images in a set",
+                ));
+        }
         let planned_bindings = self.render_texture_slots();
         let combined_count = descriptor_type_count(
             &planned_bindings,

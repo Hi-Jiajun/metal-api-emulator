@@ -1052,6 +1052,11 @@ pub(crate) struct RenderCapabilityBits {
     /// drift from the comment.
     pub(crate) supports_render_texture_sampling: bool,
     pub(crate) max_render_textures: u32,
+    /// The per-stage sampled-texture window, declared beside the list bound it
+    /// narrows (`research/docs/23` §3.3, E-TC1). Always `0` here: the reviewed
+    /// modules sample one texture argument, so the rail states no wider window
+    /// and a fragment stage past the list bound is refused by name.
+    pub(crate) max_render_textures_per_stage: u32,
     pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
     /// The gathered-extent shape's bit (`research/docs/23` §3.3, E-TX10),
     /// declared beside the three render-sampler fields it narrows.
@@ -1161,6 +1166,10 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         supports_render_fragment_output_superset: false,
         supports_render_texture_sampling: render_texture.supports_render_texture_sampling,
         max_render_textures: render_texture.max_render_textures,
+        // The window is the bits' own field rather than a literal here
+        // (`research/docs/23` §3.3, E-TC1): the rail states it once, beside the
+        // reviewed count its own walk applies.
+        max_render_textures_per_stage: render_texture.max_render_textures_per_stage,
         supported_render_texture_formats: render_texture.supported_render_texture_formats,
         supports_render_texture_gathered_extent: render_texture
             .supports_render_texture_gathered_extent,
@@ -1210,6 +1219,15 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
         // declarations a translated module names; declaring them here would
         // promise a shape this rail's plan refuses by name.
         max_render_textures: REVIEWED_SAMPLED_TEXTURE_COUNT as u32,
+        // The per-stage window stays undeclared (`research/docs/23` §3.3,
+        // E-TC1): the reviewed module samples one texture argument, so the
+        // list bound above is the whole rule and a stage that declares
+        // thirteen is refused by name by core admission instead of being
+        // executed against slots no Apple reading sized. The rail's own walk
+        // states the same window one face over
+        // (`REVIEWED_SAMPLED_TEXTURE_COUNT`) when a directly-constructed
+        // request skips admission.
+        max_render_textures_per_stage: 0,
         supported_render_texture_formats: SUPPORTED_RENDER_TEXTURE_FORMATS.to_vec(),
         // The gathered extent stays refused (`research/docs/23` §3.3, E-TX10):
         // this rail answers *every* sampled source of another extent with
@@ -1241,6 +1259,13 @@ pub(crate) fn render_texture_capability_bits() -> RenderTextureCapabilityBits {
 pub(crate) struct RenderTextureCapabilityBits {
     pub(crate) supports_render_texture_sampling: bool,
     pub(crate) max_render_textures: u32,
+    /// The per-stage window this rail states, or `0` for the list-bound-only
+    /// reading (`research/docs/23` §3.3, E-TC1). The reviewed modules sample
+    /// one texture argument, so this rail declares none: a fragment stage that
+    /// declares a wider list — thirteen declarations in the widest shape the
+    /// census has read — is refused by name by core admission rather than
+    /// executed against slots no Apple reading measured.
+    pub(crate) max_render_textures_per_stage: u32,
     pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
     /// Whether this rail executes a sampled source whose extent is not the
     /// render area's (`research/docs/23` §3.3, E-TX10). `false` here is the
@@ -9330,6 +9355,14 @@ mod tests {
         let bits = render_texture_capability_bits();
         assert!(bits.supports_render_texture_sampling);
         assert_eq!(bits.max_render_textures, 1);
+        // The per-stage window stays undeclared (`research/docs/23` §3.3,
+        // E-TC1): this rail's reviewed module samples one texture argument, so
+        // the list bound is the whole rule and a fragment stage that declares
+        // thirteen sampled textures is refused by name by core admission
+        // instead of being executed against slots no Apple reading sized.
+        assert_eq!(bits.max_render_textures_per_stage, 0);
+        assert!(!capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+            .declares_render_texture_per_stage_ceiling());
         assert_eq!(
             bits.supported_render_texture_formats,
             vec![TextureFormat::Rgba8Unorm]
@@ -9366,6 +9399,10 @@ mod tests {
             bits.supports_render_texture_sampling
         );
         assert_eq!(declared.max_render_textures, bits.max_render_textures);
+        assert_eq!(
+            declared.max_render_textures_per_stage,
+            bits.max_render_textures_per_stage
+        );
         assert_eq!(
             declared.supported_render_texture_formats,
             bits.supported_render_texture_formats
@@ -10969,6 +11006,7 @@ mod tests {
             // (`research/docs/23` §3.3, v70).
             supports_render_texture_sampling: false,
             max_render_textures: 0,
+            max_render_textures_per_stage: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,

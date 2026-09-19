@@ -2637,24 +2637,61 @@ impl StoreOp {
 /// of those attachments it can execute today (`docs/23` §4.2).
 pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 
-/// The sampled textures a render pass may bind (`research/docs/23` §3.3,
-/// v70/v102).
+/// Sampled textures **one stage** of a render pass may declare
+/// (`research/docs/23` §3.3, v70/v102; E-TC1). One number, and the bound
+/// belongs to the stage rather than to the pass's list as a whole, because
+/// that is the axis Metal states: `[[texture(n)]]` is an argument of the
+/// *stage's own* texture argument table, so the fragment stage's declarations
+/// are one list and a vertex stage's would be a second one.
 ///
-/// The render-sampler increment admitted one 4×4 `rgba8_unorm` surface,
-/// because the reviewed stage samples exactly one. The census that followed it
-/// found the first blocking shape on the *declaration* face: 2.5% of the
-/// sampled draws declare two or three textures, and a pass had no way to state
-/// them. Eight is the value this increment states, and it is a contract
-/// ceiling rather than a device fact: Vulkan's guaranteed
-/// `maxPerStageDescriptorSampledImages` floor is 16 and Metal's own fragment
-/// texture argument table is larger still, so eight covers the observed
-/// shapes with headroom while staying inside what every admitted device
-/// promises. A provider's `ProviderCapabilities::max_render_textures` stays
-/// independent of this value: the core contract admits the shape, while each
-/// rail declares how many of those bindings it can execute today (`docs/23`
-/// §4.2), and each rail's own window refuses the rest by name
-/// (`render_texture_limit`).
-pub const MAX_RENDER_TEXTURES: usize = 8;
+/// Sixteen is a *review* ceiling rather than this contract's invention: it is
+/// Vulkan's guaranteed `maxPerStageDescriptorSampledImages` floor, so no
+/// admitted device has to refuse a stage that stays inside it, and it is the
+/// width the census's own widest statement asks for. The render-sampler
+/// increment admitted one 4×4 `rgba8_unorm` surface, because the reviewed
+/// stage samples exactly one; the census that followed it found the
+/// *declaration* face at two or three textures and stated eight, and the
+/// census that followed *that* — the preview round whose rows read
+/// `render_provider_out_of_class_texture_count` — found the shape this value
+/// answers: a fragment stage that declares **thirteen** sampled textures
+/// (`/mnt/c/tmp/reims-vgpu-fail.log`, the LPF pipeline's own rows). Thirteen
+/// is what the review states, sixteen is the value it states it as: the
+/// platform's own per-stage floor, the contract's [`MAX_RENDER_SAMPLERS`]
+/// beside it on the same argument table, and three declarations of headroom
+/// over the widest shape the census has read.
+///
+/// The device's own window narrows this ceiling
+/// ([`ProviderCapabilities::max_render_textures_per_stage`] is
+/// `min` of the two), so a rail whose device answers fewer sampled images per
+/// stage refuses the rest by name (`render_texture_limit`) rather than
+/// executing against a descriptor the platform never promised — exactly as
+/// [`MAX_RENDER_STAGE_BUFFERS`] is narrowed by
+/// `ProviderCapabilities::max_render_stage_buffers_per_stage`. A provider's
+/// `ProviderCapabilities::max_render_textures` stays independent of this
+/// value as well: it is the *pass's* list bound, the pair's sum below.
+pub const MAX_RENDER_TEXTURES: usize = 16;
+
+/// Sampled textures one render *pass* may declare across both stages
+/// (E-TC1): two stages' worth of [`MAX_RENDER_TEXTURES`].
+///
+/// This is the pass's list bound, and it is derived rather than chosen: a
+/// render pipeline has exactly two stages, each of which may carry at most
+/// [`MAX_RENDER_TEXTURES`] declarations, so a longer list necessarily names
+/// one stage twice over. It exists as its own value because the wire's
+/// texture block is a length prefix read before any stage is known
+/// (`crates/metal-api-ipc/src/command_codec.rs`), and a decoder's bound on
+/// such a prefix has to be the widest list the contract can state rather than
+/// a second, drifting number.
+///
+/// The render contract states one stage's declarations today — the pass's
+/// `textures` list is its *fragment* stage's, and no vertex-stage sampled
+/// texture list exists yet — so this value is the width of the wire block and
+/// the bound the pair's own arithmetic would reach, while
+/// [`MAX_RENDER_TEXTURES`] is the rule that refuses a list past one stage's
+/// window. A pass whose list is longer than this value is refused as one list
+/// ([`ContractError::RenderTextureLimitExceeded`]), and a list inside it but
+/// past one stage's own ceiling is refused with the stage named.
+pub const MAX_RENDER_TEXTURE_DECLARATIONS: usize = MAX_RENDER_TEXTURES * 2;
 
 /// The widest one-dimensional sampled texture the render sampler's *reviewed*
 /// window states (2026-09-19, census b10's `texture_shape` bucket).
@@ -4870,10 +4907,14 @@ pub struct RenderPassDescriptor {
     /// canonical order: ascending, every index once, every index below
     /// [`MAX_RENDER_TEXTURE_INDEX`], all of them
     /// [`RenderPassDescriptor::validate`]'s rules. The list is capped at
-    /// [`MAX_RENDER_TEXTURES`] single-sample 2D surfaces (`research/docs/23`
-    /// §3.3, v70/v102) — the reviewed stage samples one, and the translated
-    /// stage samples as many as its own reflection names. A pass that binds
-    /// none keeps the exact pre-v70 bytes.
+    /// [`MAX_RENDER_TEXTURES`] single-sample 2D surfaces *per stage*
+    /// (`research/docs/23` §3.3, v70/v102; E-TC1) — the reviewed stage samples
+    /// one, and the translated stage samples as many as its own reflection
+    /// names, thirteen in the widest shape the census has read. The list is
+    /// the fragment stage's own, so one stage's ceiling is the rule that
+    /// answers the list and [`MAX_RENDER_TEXTURE_DECLARATIONS`] is the bound
+    /// the two stages' sum would reach. A pass that binds none keeps the exact
+    /// pre-v70 bytes.
     pub textures: Vec<TextureView>,
     /// The runtime samplers the fragment stage executes with, in canonical
     /// order (`research/docs/23` §3.3, v102).
@@ -5089,8 +5130,8 @@ impl RenderPassDescriptor {
                 return Err(ContractError::StencilResolveWithoutDepthResolve);
             }
         }
-        // Fragment texture bindings (`research/docs/23` §3.3, v70/v104): the
-        // render-sampler shape is a read-only, single-sample 2D texture. The
+        // Fragment texture bindings (`research/docs/23` §3.3, v70/v104; E-TC1):
+        // the render-sampler shape is a read-only, single-sample 2D texture. The
         // list is canonical — ascending `metal_binding`, no index twice — and
         // the index is the view's own statement of the fragment stage's
         // `[[texture(n)]]` argument rather than its position, so a list may
@@ -5100,8 +5141,23 @@ impl RenderPassDescriptor {
         // (`render_texture_format_unsupported` / `render_texture_limit`),
         // exactly as the colour formats split between this validator and
         // `admit_render_passes`.
+        // The count rule is the *stage's* own (`research/docs/23` §3.3,
+        // E-TC1): the list below is the fragment stage's declarations, so the
+        // pass's list bound is the pair's sum
+        // ([`MAX_RENDER_TEXTURE_DECLARATIONS`]) and one stage's ceiling is
+        // [`MAX_RENDER_TEXTURES`]. The list is stated first so a list longer
+        // than any two stages could hold is refused as one list rather than as
+        // a stage's arithmetic.
+        if self.textures.len() > MAX_RENDER_TEXTURE_DECLARATIONS {
+            return Err(ContractError::RenderTextureLimitExceeded {
+                stage: None,
+                requested: self.textures.len(),
+                maximum: MAX_RENDER_TEXTURE_DECLARATIONS,
+            });
+        }
         if self.textures.len() > MAX_RENDER_TEXTURES {
             return Err(ContractError::RenderTextureLimitExceeded {
+                stage: Some(RenderPipelineStage::Fragment),
                 requested: self.textures.len(),
                 maximum: MAX_RENDER_TEXTURES,
             });
@@ -5855,10 +5911,12 @@ pub struct RenderPipelineContract {
     /// each other in both directions, so the declaration cannot name a sampler
     /// the pass leaves unbound and the pass cannot bind one nothing pairs with.
     ///
-    /// The list is capped at [`MAX_RENDER_TEXTURES`] (`v102`): the reviewed
-    /// stage samples one surface, while a translated stage samples as many as
-    /// its own reflection names, and the rails' own windows refuse the rest by
-    /// name.
+    /// The list is capped at [`MAX_RENDER_TEXTURES`] *per stage* (`v102`;
+    /// E-TC1): the reviewed stage samples one surface, while a translated
+    /// stage samples as many as its own reflection names — thirteen in the
+    /// widest statement the census has read — and the rails' own windows
+    /// refuse the rest by name. The declarations are the fragment stage's, so
+    /// [`MAX_RENDER_TEXTURE_DECLARATIONS`] is the list's own bound beside it.
     ///
     /// A pipeline that declares none — every pre-v100 registration — keeps the
     /// exact bytes it had, and its passes bind none either.
@@ -6202,11 +6260,25 @@ impl RenderPipelineContract {
 /// C1b's storage-image sibling states — and the reach is the bounded one: the
 /// render sampler reads a whole, tightly packed view, which is the unit the
 /// pass's own extent rule and the lease channel are stated in.
+///
+/// The count rule is the *stage's* own (E-TC1), exactly as the pass's own
+/// walk states it: the list is the fragment stage's declarations, so its
+/// bound is the pair's sum ([`MAX_RENDER_TEXTURE_DECLARATIONS`]) and one
+/// stage's ceiling ([`MAX_RENDER_TEXTURES`]) is the rule that answers a list
+/// inside it.
 fn validate_render_texture_declarations(
     bindings: &[TextureBindingContract],
 ) -> Result<(), ContractError> {
+    if bindings.len() > MAX_RENDER_TEXTURE_DECLARATIONS {
+        return Err(ContractError::RenderTextureLimitExceeded {
+            stage: None,
+            requested: bindings.len(),
+            maximum: MAX_RENDER_TEXTURE_DECLARATIONS,
+        });
+    }
     if bindings.len() > MAX_RENDER_TEXTURES {
         return Err(ContractError::RenderTextureLimitExceeded {
+            stage: Some(RenderPipelineStage::Fragment),
             requested: bindings.len(),
             maximum: MAX_RENDER_TEXTURES,
         });
@@ -10194,11 +10266,42 @@ pub struct ProviderCapabilities {
     /// texture is refused during admission instead of being executed with a
     /// cleared sampling result the trace did not ask for.
     pub supports_render_texture_sampling: bool,
-    /// Sampled textures one render pass may bind. `0` means the snapshot
-    /// cannot sample at all; the field stays at that default for a snapshot
-    /// whose bit above is false, so a caller reading the limit without
-    /// checking the bit cannot read one as an admission.
+    /// Sampled textures one render *pass* may bind across both stages: the
+    /// pass's list bound (`research/docs/23` §3.3, E-TC1). `0` means the
+    /// snapshot cannot sample at all; the field stays at that default for a
+    /// snapshot whose bit above is false, so a caller reading the limit
+    /// without checking the bit cannot read one as an admission.
+    ///
+    /// The pair of fields is the shape's two axes, exactly as
+    /// [`Self::max_render_stage_buffers`] pairs with the per-stage window
+    /// beside it: this one is what a *pass* carries, and
+    /// [`Self::max_render_textures_per_stage`] is what a *stage* carries. The
+    /// Vulkan rail derives both from the device rather than copying the
+    /// contract's ceiling — `2 × min(MAX_RENDER_TEXTURES,
+    /// maxPerStageDescriptorSampledImages)` — so a device that states a
+    /// narrower per-stage window declares the list it can carry instead of one
+    /// it would have to refuse by name.
     pub max_render_textures: u32,
+    /// Sampled textures **one stage** of a render pass may declare
+    /// (`research/docs/23` §3.3, E-TC1), or `0` for a snapshot that states no
+    /// per-stage window.
+    ///
+    /// A snapshot that states one admits a list whose stages are each inside
+    /// this window and whose total stays inside [`Self::max_render_textures`];
+    /// a snapshot that leaves the field at `0` keeps the older reading, where
+    /// the list bound above applies to the whole list — which is the stricter
+    /// rule whenever the list bound is at most twice this window. That is
+    /// exactly the direction the native rail keeps: its reviewed modules bind
+    /// one sampled texture, so it declares no per-stage window and a list past
+    /// its own bound is refused by name.
+    ///
+    /// The Vulkan rail derives the number from the selected device
+    /// (`min(MAX_RENDER_TEXTURES, maxPerStageDescriptorSampledImages)`, whose
+    /// platform floor is sixteen) and doubles it for the list bound. The
+    /// contract states one stage's declarations today — the pass's texture
+    /// list is its fragment stage's — so on that rail the per-stage rule is the
+    /// cut a wider list meets, with the stage named on the refusal.
+    pub max_render_textures_per_stage: u32,
     /// Texture formats this snapshot admits as render-pass sampling sources.
     /// Empty means none; the render sampler admits
     /// [`TextureFormat::RENDER_SAMPLED`] — the two four-byte 8-bit UNORM byte
@@ -10860,6 +10963,20 @@ impl ProviderCapabilities {
     /// extended payload instead of dropping the declaration on the wire.
     pub fn declares_render_texture_dimension_3d(&self) -> bool {
         self.max_render_texture_dimension_3d != 0
+    }
+
+    /// Whether this snapshot states a *per-stage* sampled-texture window
+    /// (`research/docs/23` §3.3, E-TC1).
+    ///
+    /// A snapshot that states one admits a list whose stages are each inside
+    /// [`Self::max_render_textures_per_stage`] and whose total stays inside
+    /// [`Self::max_render_textures`]; a snapshot that leaves the field at `0`
+    /// keeps the older reading, where the list bound applies to the whole
+    /// list. The predicate is the field itself, so the capability frame writes
+    /// the block exactly when the snapshot has something to say and a consumer
+    /// asks the question in one place.
+    pub fn declares_render_texture_per_stage_ceiling(&self) -> bool {
+        self.max_render_textures_per_stage != 0
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -11635,6 +11752,34 @@ impl ProviderCapabilities {
                     .with_field(
                         "maximum",
                         FieldValue::Unsigned(self.max_render_textures as u64),
+                    ));
+            }
+            // The per-stage window is the second axis of the same shape
+            // (`research/docs/23` §3.3, E-TC1). It is asked only when the
+            // snapshot states one: a snapshot that leaves the field at `0`
+            // keeps the pre-E-TC1 reading, where the list bound above is the
+            // whole rule — which is what the native rail's reviewed pair
+            // declares, and what makes a thirteen-texture fragment stage
+            // refused by name there instead of half-admitted. The pass's list
+            // is the fragment stage's own declarations today, so the count
+            // weighed here is that list's; a vertex-stage list, when the
+            // contract states one, is a second list rather than more of this
+            // one.
+            if self.declares_render_texture_per_stage_ceiling()
+                && pass.textures.len() > self.max_render_textures_per_stage as usize
+            {
+                return Err(capability_error("render_texture_limit")
+                    .with_field(
+                        "stage",
+                        FieldValue::Text(RenderPipelineStage::Fragment.name().to_owned()),
+                    )
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(pass.textures.len() as u64),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(u64::from(self.max_render_textures_per_stage)),
                     ));
             }
             for texture in &pass.textures {
@@ -14447,9 +14592,15 @@ pub enum ContractError {
     // the binding label are caller-fixable structure; the access and the
     // sample count are the shapes the render-sampler increment cannot execute,
     // so they name the field that disagreed rather than a device fact.
-    /// A render pass declares more sampled textures than
-    /// [`MAX_RENDER_TEXTURES`].
+    /// One stage of a render pass declares more sampled textures than
+    /// [`MAX_RENDER_TEXTURES`], or the pass's list declares more than
+    /// [`MAX_RENDER_TEXTURE_DECLARATIONS`].
+    ///
+    /// `stage` names the stage whose own list crossed the bound (`E-TC1`); it
+    /// is `None` for the pipeline-level list, which is the arm the wire's
+    /// length prefix is refused on.
     RenderTextureLimitExceeded {
+        stage: Option<RenderPipelineStage>,
         requested: usize,
         maximum: usize,
     },
@@ -15495,12 +15646,22 @@ impl fmt::Display for ContractError {
                 kind.name()
             ),
             Self::RenderTextureLimitExceeded {
+                stage,
                 requested,
                 maximum,
-            } => write!(
-                formatter,
-                "render pass binds {requested} sampled textures, above the contract maximum {maximum}"
-            ),
+            } => match stage {
+                Some(stage) => write!(
+                    formatter,
+                    "render pass binds {requested} {} stage sampled textures, above the contract \
+                     maximum {maximum} per stage",
+                    stage.name()
+                ),
+                None => write!(
+                    formatter,
+                    "render pass binds {requested} sampled textures across its stages, above the \
+                     contract maximum {maximum}"
+                ),
+            },
             Self::RenderTextureIndexExceeded { index, maximum } => write!(
                 formatter,
                 "render texture binding index {index} is at or past the render contract's own texture index bound {maximum}"
@@ -17195,6 +17356,7 @@ mod tests {
             stencil_resolve_modes: 0,
             supports_render_texture_sampling: false,
             max_render_textures: 0,
+            max_render_textures_per_stage: 0,
             supported_render_texture_formats: Vec::new(),
             supports_render_texture_gathered_extent: false,
             supports_render_texture_gathered_extent_no_copy: false,
@@ -25010,11 +25172,14 @@ mod tests {
         );
 
         // The contract's own ceiling is [`MAX_RENDER_TEXTURES`] sampled
-        // surfaces per pass (`research/docs/23` §3.3, v102): two and three
-        // entries are the census's own shapes and are *admitted*, while the
-        // entry above the cap is refused before its shape is read. The views
-        // carry their own identities, because one view sampled twice is the
-        // duplicate-identity refusal rather than the count rule.
+        // surfaces *per stage* (`research/docs/23` §3.3, v102; E-TC1): two and
+        // three entries are the census's own shapes and are *admitted*, and so
+        // is the thirteen-entry list the census's `texture_count` rows state —
+        // the shape this increment exists for — while the entry above one
+        // stage's ceiling is refused with the stage named, and a list longer
+        // than the pair's sum is refused as one list. The views carry their own
+        // identities, because one view sampled twice is the duplicate-identity
+        // refusal rather than the count rule.
         let mut value = render_texture_trace();
         render_entry(&mut value).textures = vec![sampled_texture_view(0), sampled_texture_view(1)];
         let mut second = sampled_texture_view(1);
@@ -25024,22 +25189,137 @@ mod tests {
         value
             .validate()
             .expect("two sampled textures are inside the v102 ceiling");
-        let mut value = render_texture_trace();
-        let mut textures = Vec::new();
-        for binding in 0..=MAX_RENDER_TEXTURES as u32 {
-            let mut view = sampled_texture_view(binding);
-            view.view_id = ViewId::new(83 + u64::from(binding));
-            view.allocation_id = AllocationId::new(53 + u64::from(binding));
-            textures.push(view);
-        }
-        render_entry(&mut value).textures = textures;
+        let thirteen: Vec<u32> = (0..13).collect();
+        let mut value = render_texture_trace_at(&thirteen);
+        value
+            .validate()
+            .expect("thirteen declarations are inside one stage's ceiling");
+        pair(&mut value).expect(
+            "and they are the shape this increment admits: the census's own `texture_count` \
+             rows state thirteen declarations on one fragment stage",
+        );
+        let above_one_stage: Vec<u32> = (0..=MAX_RENDER_TEXTURES as u32).collect();
+        let value = render_texture_trace_at(&above_one_stage);
         assert_eq!(
             value.validate(),
             Err(ContractError::RenderTextureLimitExceeded {
+                stage: Some(RenderPipelineStage::Fragment),
                 requested: MAX_RENDER_TEXTURES + 1,
                 maximum: MAX_RENDER_TEXTURES,
             })
         );
+        let above_the_pair: Vec<u32> = (0..=MAX_RENDER_TEXTURE_DECLARATIONS as u32).collect();
+        let value = render_texture_trace_at(&above_the_pair);
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderTextureLimitExceeded {
+                stage: None,
+                requested: MAX_RENDER_TEXTURE_DECLARATIONS + 1,
+                maximum: MAX_RENDER_TEXTURE_DECLARATIONS,
+            }),
+            "a list longer than either stage could hold is refused as one list"
+        );
+    }
+
+    /// The per-stage sampled-texture window (`research/docs/23` §3.3, E-TC1).
+    ///
+    /// The preview round this increment answers reads 42 class exits under
+    /// `render_provider_out_of_class_texture_count`, and every one of them is
+    /// the same shape: a fragment stage that declares **thirteen** sampled
+    /// textures (`/mnt/c/tmp/reims-vgpu-fail.log`, the LPF pipeline's rows).
+    /// The pair below is that shape, and the readings are the rules the
+    /// increment separates: the contract's own two bounds (a stage's sixteen,
+    /// the pair's thirty-two), the older reading a snapshot that states no
+    /// per-stage window applies, and the device window a snapshot that states
+    /// one applies — refused by name with the stage and both numbers on the
+    /// refusal.
+    #[test]
+    fn a_per_stage_texture_window_admits_the_census_shape_and_narrows_it() {
+        let thirteen: Vec<u32> = (0..13).collect();
+        let wide = render_texture_trace_at(&thirteen);
+        wide.validate()
+            .expect("thirteen declarations are inside one stage's ceiling");
+
+        // The reading every provider written before this increment answers: the
+        // frame states the list bound and no per-stage window, and the eight
+        // such a provider declares refuses the thirteen by name — the exact
+        // refusal the census rows carry.
+        let mut old = render_texture_capabilities();
+        old.max_render_textures = 8;
+        assert!(!old.declares_render_texture_per_stage_ceiling());
+        let refusal = old
+            .admit(&wide, &landing_resources())
+            .expect_err("eight is the bound this provider states");
+        assert_eq!(refusal.slug, "render_texture_limit");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("requested"),
+            Some(&FieldValue::Unsigned(13))
+        );
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(8))
+        );
+        assert_eq!(
+            refusal.fields.get("stage"),
+            None,
+            "the older reading weighs one list and names no stage"
+        );
+
+        // A snapshot that states the device's window admits the shape: sixteen
+        // per stage is the review ceiling and the platform's own floor, and the
+        // pair's sum is the list bound beside it.
+        let mut widened = old.clone();
+        widened.max_render_textures = MAX_RENDER_TEXTURE_DECLARATIONS as u32;
+        widened.max_render_textures_per_stage = MAX_RENDER_TEXTURES as u32;
+        assert!(widened.declares_render_texture_per_stage_ceiling());
+        widened
+            .admit(&wide, &landing_resources())
+            .expect("the device window admits the thirteen declarations the census states");
+
+        // The window's own boundary: thirteen is inside it.
+        let mut at_the_edge = widened.clone();
+        at_the_edge.max_render_textures_per_stage = 13;
+        at_the_edge
+            .admit(&wide, &landing_resources())
+            .expect("a stage at the window's own number is inside it");
+
+        // A device whose window is twelve refuses the thirteen by name, with
+        // the stage and both numbers on the refusal.
+        let mut narrow = widened.clone();
+        narrow.max_render_textures_per_stage = 12;
+        let refusal = narrow
+            .admit(&wide, &landing_resources())
+            .expect_err("thirteen declarations over a twelve-slot per-stage window");
+        assert_eq!(refusal.slug, "render_texture_limit");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("stage"),
+            Some(&FieldValue::Text("fragment".to_owned()))
+        );
+        assert_eq!(
+            refusal.fields.get("requested"),
+            Some(&FieldValue::Unsigned(13))
+        );
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(12))
+        );
+
+        // The list bound is the pair's sum and is weighed first, so a snapshot
+        // whose own list bound is narrower than the window it states keeps the
+        // stage-less refusal: the arm is the list's, not a stage's.
+        let mut list_only = widened.clone();
+        list_only.max_render_textures = 8;
+        let refusal = list_only
+            .admit(&wide, &landing_resources())
+            .expect_err("the list bound is the first of the two rules");
+        assert_eq!(refusal.slug, "render_texture_limit");
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(8))
+        );
+        assert_eq!(refusal.fields.get("stage"), None);
     }
 
     /// The pass-entry snapshot fixture (`research/docs/23` §118, E-TX15): the

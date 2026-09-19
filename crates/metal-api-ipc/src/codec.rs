@@ -167,11 +167,15 @@ pub enum CodecError {
     /// of free bits; the low byte keeps the meanings it always had.
     UnknownRenderFeature(u16),
     /// A sampled-texture render pass declared more textures than the contract's
-    /// own cap (`research/docs/23` §3.3, v70). The block's count is one byte,
-    /// so this is the protocol's bound; the contract refuses anything above
-    /// [`metal_api_core::provider::MAX_RENDER_TEXTURES`] before a frame is
-    /// written.
+    /// own bound (`research/docs/23` §3.3, v70; E-TC1). The block's count is
+    /// one byte, so this is the protocol's bound; the contract refuses anything
+    /// above [`metal_api_core::provider::MAX_RENDER_TEXTURE_DECLARATIONS`]
+    /// before a frame is written, and a block whose *stage* carries more than
+    /// [`metal_api_core::provider::MAX_RENDER_TEXTURES`] is refused with the
+    /// stage named — the count rule is the stage's own, and a decoder has to
+    /// state the same thing an encoder would.
     RenderTextureCount {
+        stage: Option<RenderPipelineStage>,
         count: usize,
         maximum: usize,
     },
@@ -191,12 +195,15 @@ pub enum CodecError {
         maximum: usize,
     },
     /// A render texture declaration list carried more entries than the
-    /// contract's own cap (`research/docs/23` §3.3, v100/v102). The block's
-    /// count is one byte, so this is the protocol's bound; the contract
+    /// contract's own bound (`research/docs/23` §3.3, v100/v102; E-TC1). The
+    /// block's count is one byte, so this is the protocol's bound; the contract
     /// refuses anything above
-    /// [`metal_api_core::provider::MAX_RENDER_TEXTURES`] before a frame is
-    /// written.
+    /// [`metal_api_core::provider::MAX_RENDER_TEXTURE_DECLARATIONS`] before a
+    /// frame is written, and the stage's own ceiling
+    /// ([`metal_api_core::provider::MAX_RENDER_TEXTURES`]) is the rule a list
+    /// inside it meets.
     RenderTextureDeclarationCount {
+        stage: Option<RenderPipelineStage>,
         count: usize,
         maximum: usize,
     },
@@ -403,10 +410,22 @@ impl fmt::Display for CodecError {
                 formatter,
                 "unknown extended render pass feature bits {features:#06x}"
             ),
-            Self::RenderTextureCount { count, maximum } => write!(
-                formatter,
-                "render pass binds {count} sampled textures, maximum {maximum}"
-            ),
+            Self::RenderTextureCount {
+                stage,
+                count,
+                maximum,
+            } => match stage {
+                Some(stage) => write!(
+                    formatter,
+                    "render pass binds {count} {} stage sampled textures, maximum {maximum} \
+                     per stage",
+                    stage.name()
+                ),
+                None => write!(
+                    formatter,
+                    "render pass binds {count} sampled textures, maximum {maximum}"
+                ),
+            },
             Self::RenderTextureFormatCount { count, maximum } => write!(
                 formatter,
                 "capability snapshot names {count} render texture formats, maximum {maximum}"
@@ -415,10 +434,22 @@ impl fmt::Display for CodecError {
                 formatter,
                 "runtime sampler list carries {count} bindings, maximum {maximum}"
             ),
-            Self::RenderTextureDeclarationCount { count, maximum } => write!(
-                formatter,
-                "render texture declaration block carries {count} bindings, maximum {maximum}"
-            ),
+            Self::RenderTextureDeclarationCount {
+                stage,
+                count,
+                maximum,
+            } => match stage {
+                Some(stage) => write!(
+                    formatter,
+                    "render texture declaration block carries {count} {} stage bindings, maximum \
+                     {maximum} per stage",
+                    stage.name()
+                ),
+                None => write!(
+                    formatter,
+                    "render texture declaration block carries {count} bindings, maximum {maximum}"
+                ),
+            },
             Self::RenderTextureSamplerFormUnsupported { binding } => write!(
                 formatter,
                 "render texture declaration {binding} states a sampler state and a runtime \

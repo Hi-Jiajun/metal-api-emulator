@@ -365,6 +365,7 @@ impl ComputeProvider for FakeProvider {
             // (`research/docs/23` §3.3, v70).
             supports_render_texture_sampling: self.render && self.fragment_texture,
             max_render_textures: u32::from(self.fragment_texture),
+            max_render_textures_per_stage: 0,
             supported_render_texture_formats: self
                 .fragment_texture
                 .then_some(TextureFormat::Rgba8Unorm)
