@@ -7823,6 +7823,10 @@ fn execute_offscreen_render_with_retains(
     // copies come last. All `None` — one relaxed load each, no clock read —
     // when `METAL_API_VULKAN_PHASE_PROFILE` is off, which is the default.
     let _render_setup = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderSetup);
+    // The setup bar's own split (`crate::phase_profile`): the regions below are
+    // disjoint and enclose nothing but themselves, so their sum is bounded by
+    // `render_setup_us` and the difference is the seam between them.
+    let setup_admits = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupAdmits);
     // The attachment count is the rail's own gate, re-run on the request so a
     // hand-built request cannot skip `prepare_render_request`'s admission.
     if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
@@ -8374,6 +8378,7 @@ fn execute_offscreen_render_with_retains(
         .checked_mul(u64::from(height))
         .and_then(|texels| texels.checked_mul(STENCIL_BYTES_PER_TEXEL))
         .ok_or_else(|| contract_refusal("render stencil attachment bytes overflow u64"))?;
+    drop(setup_admits);
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
@@ -8392,6 +8397,8 @@ fn execute_offscreen_render_with_retains(
     // layout is published through the same guard before it drops. Taking them
     // in location order is what keeps two passes naming two resident targets in
     // opposite orders from interleaving their transitions.
+    let setup_attachments =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupAttachments);
     let mut resident_layouts = ResidentTargetLayouts::acquire(request);
     let mut objects = OffscreenObjects::new(context);
     for (index, (attachment, vk_format)) in request.attachments.iter().zip(&vk_formats).enumerate()
@@ -8414,6 +8421,7 @@ fn execute_offscreen_render_with_retains(
             )?,
         }
     }
+    drop(setup_attachments);
     // The combined depth-stencil shape (`research/docs/23` §3.3, v60): Vulkan
     // binds one attachment for both faces, so a pass that opens both creates
     // the one `D32_SFLOAT_S8_UINT` surface and its one resolve landing instead
@@ -8421,6 +8429,8 @@ fn execute_offscreen_render_with_retains(
     // the rail-owned pair is the same surface without a landing: neither face
     // is stored, so the surface's texels leave with the pass and the colour
     // resolve is the whole observation.
+    let setup_depth_stencil =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupDepthStencil);
     if let (Some(depth), Some(stencil)) = (&request.depth, &request.stencil) {
         // The format is the device's answer to the same question the gates
         // above asked, re-asserted here so a directly-constructed request
@@ -8498,6 +8508,9 @@ fn execute_offscreen_render_with_retains(
             objects.create_stencil_readback(stencil_byte_length)?;
         }
     }
+    drop(setup_depth_stencil);
+    let setup_render_pass =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupRenderPass);
     objects.create_render_pass(
         &vk_formats,
         request.depth.as_ref(),
@@ -8516,15 +8529,24 @@ fn execute_offscreen_render_with_retains(
     objects.create_seed_render_pass(&vk_formats)?;
     objects.create_seed_framebuffer(width, height)?;
     objects.create_framebuffer(width, height)?;
+    drop(setup_render_pass);
     // The sampled textures are created before the pipeline, because the
     // sampled pipeline's layout is built from the descriptor set layout they
     // install (`research/docs/23` §3.3, v70).
+    let setup_textures =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupTextures);
     objects.create_render_textures(&request.textures)?;
+    drop(setup_textures);
     // The stage buffers are the pipeline layout's other two sets
     // (`research/docs/23` §3.3, v83), so they are created beside the textures
     // and before the pipeline for the same reason: the layout the pipeline is
     // built with has to exist first.
+    let setup_stage_buffers =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupStageBuffers);
     objects.create_stage_buffers(&request.stage_buffers)?;
+    drop(setup_stage_buffers);
+    let setup_pipeline =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupPipeline);
     objects.create_pipeline(
         &vertex_words,
         &fragment_words,
@@ -8536,6 +8558,7 @@ fn execute_offscreen_render_with_retains(
         request.cull,
         request.blend.as_ref(),
     )?;
+    drop(setup_pipeline);
     // One readback destination per stored attachment; a discarded attachment
     // creates none, because its bytes leave no observable surface to land in
     // (`docs/23` §3.6, v19).
@@ -8545,6 +8568,8 @@ fn execute_offscreen_render_with_retains(
     // width still reads both back whole — unless the pass's own rectangle is
     // narrower, in which case only that rectangle is staged and the buffer is
     // sized for it (`docs/WRITTEN-RECT-READBACK.md`).
+    let setup_readbacks =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupReadbacks);
     let regions = plan_readback_regions(context, request)?;
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
     for (attachment, region) in request.attachments.iter().zip(&regions) {
@@ -8564,6 +8589,8 @@ fn execute_offscreen_render_with_retains(
         // `VkBuffer` is invalid.
         readback_mappings.push(objects.create_readback(staged.max(1))?);
     }
+    drop(setup_readbacks);
+    let setup_inputs = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupInputs);
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
     objects.instance_count = request.instance_count;
@@ -8596,7 +8623,11 @@ fn execute_offscreen_render_with_retains(
         }
         None => {}
     }
+    drop(setup_inputs);
+    let setup_command_pool =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupCommandPool);
     objects.create_command_pool(queue_index)?;
+    drop(setup_command_pool);
     drop(_render_setup);
     let _render_record =
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRecord);

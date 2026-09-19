@@ -32,11 +32,24 @@
 //!   readback_rect_n=... readback_rect_bytes=... readback_rect_extent_bytes=...
 //!   readback_full_n=... readback_full_bytes=... readback_switch_n=...
 //!   readback_shape_n=... readback_bounds_n=... readback_whole_n=...
+//!   setup_admits_us=... setup_attachments_us=... setup_depth_stencil_us=...
+//!   setup_render_pass_us=... setup_textures_us=... setup_stage_buffers_us=...
+//!   setup_pipeline_us=... setup_readbacks_us=... setup_inputs_us=...
+//!   setup_command_pool_us=...
 //!   ```
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
 //! so a reader can add lines together and divide by the summed `n` without
 //! weighting error. µs fields carry three decimals, i.e. nanosecond resolution.
+//!
+//! The `setup_*` fields are the one nested split: they divide `render_setup`
+//! itself into the regions a fix would move (the admissions the rail re-runs,
+//! the attachment and depth images, the render pass and its framebuffers, the
+//! sampled textures, the stage buffers, the pipeline, the readback
+//! destinations, the caller-held inputs and the command pool). `render_setup`
+//! stays their enclosing bar, so `sum(setup_*) <= render_setup_us` and the
+//! difference is the seam between those regions — the plan of the whole setup,
+//! charged to the bar that encloses them rather than to one of them.
 //!
 //! The `readback_*` fields are the one exception in *unit*, not in window: they
 //! count the stored attachments this window's submissions published — how many
@@ -134,9 +147,43 @@ pub(crate) enum Phase {
     /// Completion bookkeeping: the terminal observation, its record insert and
     /// the health synchronisation.
     Settle,
+    /// Inside `render_setup`: the admissions the render rail re-runs on the
+    /// request — attachment count, the all-discarded rule, the format and
+    /// sample-count gates the device is asked about — before the first device
+    /// object exists.
+    SetupAdmits,
+    /// Inside `render_setup`: the colour attachment images (or the resident
+    /// targets a pass borrows instead), their backings and views.
+    SetupAttachments,
+    /// Inside `render_setup`: the depth, stencil or combined depth-stencil
+    /// surface, its resolve target and the readback destinations those faces
+    /// land in.
+    SetupDepthStencil,
+    /// Inside `render_setup`: the render pass, the seed render pass a
+    /// multisampled `Load` runs first, and both framebuffers.
+    SetupRenderPass,
+    /// Inside `render_setup`: the sampled textures — their images, uploads,
+    /// samplers — and the descriptor set layout, pool and set that bind them.
+    SetupTextures,
+    /// Inside `render_setup`: the stage buffers, their sets and the layouts
+    /// those sets occupy in the pipeline layout.
+    SetupStageBuffers,
+    /// Inside `render_setup`: the two shader modules, the pipeline layout and
+    /// the graphics pipeline itself.
+    SetupPipeline,
+    /// Inside `render_setup`: the readback plan and one host-visible
+    /// destination buffer per stored colour attachment.
+    SetupReadbacks,
+    /// Inside `render_setup`: the caller-held vertex and index streams, the
+    /// previous-byte buffers a `Load` uploads from, and the indirect-command
+    /// buffers.
+    SetupInputs,
+    /// Inside `render_setup`: the command pool and the command buffer
+    /// allocated from it.
+    SetupCommandPool,
 }
 
-const PHASE_COUNT: usize = Phase::Settle as usize + 1;
+const PHASE_COUNT: usize = Phase::SetupCommandPool as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -157,6 +204,16 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "render_readback",
     "writebacks",
     "settle",
+    "setup_admits",
+    "setup_attachments",
+    "setup_depth_stencil",
+    "setup_render_pass",
+    "setup_textures",
+    "setup_stage_buffers",
+    "setup_pipeline",
+    "setup_readbacks",
+    "setup_inputs",
+    "setup_command_pool",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
