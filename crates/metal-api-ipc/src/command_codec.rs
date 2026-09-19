@@ -788,6 +788,26 @@ const CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL: u8 = 0x0A;
 /// new consumer reading an old frame keeps the same one.
 const CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL: u8 = 0x07;
 
+/// Tag, inside the tail's second family, of the layout-free vertex count's
+/// block (2026-09-19, census v45's `vertex_span` bucket).
+///
+/// The section follows the one-dimensional sampled window and carries one bool:
+/// whether the snapshot executes a non-indexed draw whose pipeline declares no
+/// vertex layout and whose count is above the milestone's three vertices
+/// ([`ProviderCapabilities::supports_render_vertex_count_above_triangle`]). The
+/// contract admits that shape from this increment on — the triangle list fixes
+/// the count's lower bound, not its value — so a consumer that gates the shape
+/// on this face has to be able to read whether the provider it is talking to
+/// executes the count or keeps the pre-widening "three vertices only" reading.
+///
+/// The absent section is the older reading, and it is the fail-closed one: a
+/// frame that ends before it means the consumer keeps its own refusal by name
+/// for the shape instead of handing the provider a `vertex_id` its module's
+/// position table need not carry. That is why the section is the family's next
+/// tag rather than a widening of the vertex-input block's payload, and why a
+/// snapshot that does not declare the bit writes nothing.
+const CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL: u8 = 0x0B;
+
 /// Tag, inside the tail's second family, of the pixel-coordinate sampler block
 /// (2026-09-19, census v43's `texture_state` axis).
 ///
@@ -5966,6 +5986,15 @@ fn declares_render_texture_face(capabilities: &ProviderCapabilities) -> bool {
 fn declares_vertex_input_face(capabilities: &ProviderCapabilities) -> bool {
     capabilities.declares_vertex_input_support()
         || capabilities.declares_render_vertex_interface_superset_support()
+        // The layout-free count above the milestone's three vertices is the
+        // same face's third question (2026-09-19, census v45's `vertex_span`
+        // bucket): "how many vertices may a draw name when the pipeline
+        // declares no layout at all". It joins this predicate for the same
+        // reason the superset bit does — a snapshot that declares *only* the
+        // widened count still has to write the heap/ICB half the decoder reads
+        // by position before the family's escape, or the declaration would be
+        // dropped on the wire.
+        || capabilities.declares_render_vertex_count_above_triangle()
 }
 
 /// Encode a capability snapshot, including its render bits.
@@ -6110,6 +6139,13 @@ fn put_capabilities(
         // half the decoder reads by position before the family's escape, or the
         // declaration would be dropped on the wire.
         || capabilities.declares_render_texture_dimension_1d()
+        // The layout-free vertex count above the milestone's three joins the
+        // same guard for the same reason (2026-09-19, census v45's
+        // `vertex_span` bucket): a snapshot whose only statement is this bit
+        // still has to write the heap/ICB half the decoder reads by position
+        // before the family's escape, or the declaration would be dropped on
+        // the wire.
+        || capabilities.declares_render_vertex_count_above_triangle()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6374,6 +6410,21 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL);
             encoder.u64(capabilities.max_render_texture_dimension_1d);
         }
+        // The layout-free vertex count above the milestone's three is the
+        // family's next tag and follows the one-dimensional sampled window
+        // (2026-09-19, census v45's `vertex_span` bucket). It carries one bool
+        // rather than a number because the count's own upper bound is the
+        // contract's field width (`u32`) and not a device answer: the question
+        // the block answers is "does this snapshot execute the count at all".
+        // A snapshot that does not declare it writes nothing here, and the
+        // decoder reads the missing section as `false` — the "keep the shape
+        // refused by name" default every consumer of the bit keeps its
+        // fail-closed direction with.
+        if capabilities.declares_render_vertex_count_above_triangle() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL);
+            encoder.bool(capabilities.supports_render_vertex_count_above_triangle);
+        }
     }
     Ok(())
 }
@@ -6469,6 +6520,7 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // whose layout and reflection disagree would be refused by name rather
         // than executed against a vertex input state one side did not state.
         supports_render_vertex_interface_superset: false,
+        supports_render_vertex_count_above_triangle: false,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,
@@ -6590,6 +6642,7 @@ fn decode_capability_extended_tail(
             | CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL => {}
             CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL => {}
+            CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6627,6 +6680,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL => {
                 capabilities.max_render_texture_dimension_1d = decoder.u64()?;
+            }
+            CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL => {
+                capabilities.supports_render_vertex_count_above_triangle = decoder.bool()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

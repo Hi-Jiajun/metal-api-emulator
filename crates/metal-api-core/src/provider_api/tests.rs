@@ -318,6 +318,7 @@ impl ComputeProvider for FakeProvider {
             // (`research/docs/23` §3.3, E-TX11), and this provider reaches it
             // through neither entry point.
             supports_render_vertex_interface_superset: false,
+            supports_render_vertex_count_above_triangle: false,
             // The object rails execute the direct vertex-input shape, so the
             // fixture provider declares the same two instancing bits; the
             // instanced draw call itself is the next increment's encoder work

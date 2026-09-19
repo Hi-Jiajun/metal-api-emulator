@@ -3098,7 +3098,16 @@ def _render_plan(plan, suite):
                      or _kept_frame_attachment(case) is not None,
                      f"{where}: missing fields expected_hex")
         if vertex_input is None:
-            _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
+            # The layout-free arm's count (2026-09-19, census v45's
+            # `vertex_span` bucket): the triangle list fixes the count's *lower*
+            # bound and not its value, so every count from three up is the same
+            # shape with more vertices — the rail issues whichever the case
+            # names. The count above three is the Vulkan rails' arm, and the
+            # rail-scope rule beside `capture_rails` below holds a case to the
+            # rails whose `vertex_id` module carries the positions.
+            _require(case["vertices"] >= 3,
+                     f"{where}: a layout-free draw below the full-screen triangle's three "
+                     "vertices rasterizes no triangle")
             _require(not multiple,
                      f"{where}: the milestone vertex_id shape renders one attachment")
         else:
@@ -3940,6 +3949,20 @@ def _render_plan(plan, suite):
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
+        # The layout-free count above the milestone's three vertices is the
+        # Vulkan rails' arm (2026-09-19, census v45's `vertex_span` bucket):
+        # both native faces compile the reviewed `vertex_id` module, whose
+        # position table carries exactly three entries, so their snapshots keep
+        # the widening undeclared and refuse the shape by name. A case that
+        # named them would claim a capture they cannot report.
+        if vertex_input is None and case["vertices"] != 3:
+            _require(
+                rails and all(rail in (VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL)
+                              for rail in rails),
+                f"{where}: a layout-free draw above the three-vertex triangle runs on the rails "
+                "whose vertex_id module carries the positions ("
+                + ", ".join((VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL))
+                + "), so its capture_rails has to stay inside that list")
         # The pass-entry snapshot arm's marker stays on the rail whose texture
         # walk resolves it (`research/docs/23` §118, E-TX15): the two native
         # faces refuse the declaration by name (Apple has no oracle for the

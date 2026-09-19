@@ -220,10 +220,16 @@ class NonIndexedDrawTests(unittest.TestCase):
                 self.refused(NONINDEXED_ID, mutate, message)
 
     def test_v39_refuses_a_resourceless_draw_that_is_not_the_triangle(self):
-        # The `vertex_id` arm carries no stream to cover, so its count is the
-        # reviewed three and nothing else.
+        # The `vertex_id` arm carries no stream to cover, so its count is
+        # bounded by the reviewed triangle's three — and, since 2026-09-19
+        # (census v45's `vertex_span` bucket), only *below*: a count from three
+        # up is the same shape with more vertices, and the five-rail marker of
+        # this suite cannot claim the widened arm, whose module the two native
+        # faces do not carry.
+        self.refused(TRIANGLE_ID, lambda case: case.update(vertices=2),
+                     "rasterizes no triangle")
         self.refused(TRIANGLE_ID, lambda case: case.update(vertices=6),
-                     "expected the full-screen triangle")
+                     "capture_rails has to stay inside that list")
 
 
 if __name__ == "__main__":

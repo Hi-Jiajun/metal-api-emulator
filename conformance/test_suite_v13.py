@@ -315,7 +315,21 @@ class RenderObservationTests(unittest.TestCase):
                  "clear colour equals the expected texel")
         rejected(lambda case: case["attachment"].update(initial_hex="00000000" * 4),
                  "carries no initial bytes")
-        rejected(lambda case: case.update(vertices=4), "full-screen triangle")
+        # The layout-free arm's count is bounded below by the triangle's three
+        # and not fixed at it (2026-09-19, census v45's `vertex_span` bucket).
+        # Below three the case rasterizes no triangle; above three it is the
+        # Vulkan rails' arm, so this five-rail case cannot cover it.
+        rejected(lambda case: case.update(vertices=2), "rasterizes no triangle")
+        rejected(lambda case: case.update(vertices=4),
+                 "capture_rails has to stay inside that list")
+        # The same case on the rails whose `vertex_id` module carries the
+        # positions is the widening's own fixture shape, and the comparator
+        # admits it: the marker and the count agree with the arm.
+        widened = copy.deepcopy(self.suite)
+        widened["render_cases"][0].update(vertices=4,
+                                          capture_rails=["vulkan", "vulkan-objects"])
+        compare.validate_capture(widened, self.digest,
+                                 synthetic_capture(widened, self.digest))
         rejected(lambda case: case.update(viewport=[0, 0, 1, 2]), "viewport")
         rejected(lambda case: case.update(capture_rails=[]), "capture_rails")
         rejected(lambda case: case.update(capture_rails=["vulkan", "vulkan"]), "capture_rails")

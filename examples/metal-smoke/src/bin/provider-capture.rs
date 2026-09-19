@@ -4231,6 +4231,16 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // bytes), so this table pins the declaring pass, which every rail
         // executes.
         (1, "compute-buffer-v43") => &["render_declaring_pass_entry_snapshot"],
+        // The layout-free count above the milestone's three vertices
+        // (2026-09-19, census v45's `vertex_span` bucket): the plain copy
+        // kernel over the 2x2 attachment's own sixteen-byte view — the bytes
+        // the render cases' pass loads before it draws — beside the two render
+        // cases that name six and five vertices. Those cases run on the Vulkan
+        // trace and object rails (both native faces compile the reviewed
+        // `vertex_id` module, whose three-entry position table has no slot for
+        // a wider count, and the suite's marker keeps the cases off them), so
+        // this table pins the declaring pass, which every rail executes.
+        (1, "compute-buffer-v44") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -7910,8 +7920,37 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     let geometry = render_geometry(case, &where_)?;
     match geometry {
         RenderGeometry::Milestone => {
+            // The layout-free count is bounded *below* by the triangle's three
+            // and not fixed at it since 2026-09-19 (census v45's `vertex_span`
+            // bucket): every count from three up is the same shape with more
+            // vertices. The widened arm runs on the rails whose `vertex_id`
+            // module carries the positions — the Vulkan rail's reviewed module
+            // is a total function of the index, while both native faces compile
+            // the three-entry position table — so the marker has to stay inside
+            // that list.
+            if case.vertices < 3 {
+                return Err(format!(
+                    "{where_}: a layout-free draw below the full-screen triangle's three \
+                     vertices rasterizes no triangle"
+                )
+                .into());
+            }
             if case.vertices != 3 {
-                return Err(format!("{where_}: expected the reviewed full-screen triangle").into());
+                let allowed = ["vulkan", "vulkan-objects"];
+                if case.capture_rails.is_empty()
+                    || case
+                        .capture_rails
+                        .iter()
+                        .any(|rail| !allowed.contains(&rail.as_str()))
+                {
+                    return Err(format!(
+                        "{where_}: a layout-free draw above the three-vertex triangle runs on the \
+                         rails whose vertex_id module carries the positions ({}), so its \
+                         capture_rails has to stay inside that list",
+                        allowed.join(", ")
+                    )
+                    .into());
+                }
             }
             if multiple {
                 return Err(format!(

@@ -221,6 +221,15 @@ def covered_render_case(case, suite, where):
     # rule the contract states and the stricter of the two footprint rules the
     # rails prove, so a stream that is one record long cannot stand in for the
     # shape the class claims.
+    #
+    # The layout-free count is bounded *below* by the triangle's three and not
+    # fixed at it since 2026-09-19 (census v45's `vertex_span` bucket): the
+    # contract admits every count from three up. What a *declared* fixture may
+    # name is still three, because this declaration is the five-rail parity
+    # claim: both native faces compile the reviewed `vertex_id` module, whose
+    # position table carries exactly three entries, so the widened count runs on
+    # the Vulkan rails alone and owes fixtures there
+    # (`conformance/suite-v44.json`, `crates/metal-api-vulkan/tests/render_vertex_count_e2e.rs`).
     if case.get("indices") is None:
         layout = case.get("vertex_layout")
         if layout is None:

@@ -418,6 +418,14 @@ impl NativeMetalProvider {
                 // the same fail-closed default the contract starts from.
                 supports_render_vertex_interface_superset: vertex_bits
                     .supports_render_vertex_interface_superset,
+                // The layout-free count above the milestone's three vertices
+                // (2026-09-19, census v45's `vertex_span` bucket) keeps the
+                // same fail-closed default as the superset interface above,
+                // and for the same kind of reason: this rail's module table
+                // holds one `vertex_id` module, whose position table carries
+                // exactly three entries (`render.rs::capability_bits`).
+                supports_render_vertex_count_above_triangle: vertex_bits
+                    .supports_render_vertex_count_above_triangle,
                 // Instancing is executed by this rail as of v31: the plan
                 // carries each binding's step function and the draw carries the
                 // pass's instance count, both proved on the host before a
