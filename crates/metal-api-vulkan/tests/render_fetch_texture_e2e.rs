@@ -51,6 +51,22 @@ const FETCH_AIR: &str = include_str!("fixtures/render_fetch_texture_2d.frag.ll")
 const FETCH_FAR_AIR: &str = include_str!("fixtures/render_fetch_texture_2d_far.frag.ll");
 const SAMPLING_ENTRY: &str = "render_sample_texture_2d";
 const SAMPLING_AIR: &str = include_str!("fixtures/render_sample_texture_2d_nearest_clamp.frag.ll");
+/// The AIR sampler a pixel-coordinate read leaves behind (`E-RS5`): the same
+/// body as the sampler-free fixture above, with the module's own `constexpr
+/// sampler` stating `coord::pixel`. The pinned translator emulates that state
+/// with shader-side fetches, so the finished module reads the image with
+/// `OpImageFetch` and names no sampler operand anywhere — the state the AIR
+/// metadata still declares is a lowered remnant, not a binding anything reads
+/// through.
+const PIXEL_SAMPLER_ENTRY: &str = "render_sample_texture_2d_pixel_sampler";
+const PIXEL_SAMPLER_AIR: &str =
+    include_str!("fixtures/render_sample_texture_2d_pixel_sampler.frag.ll");
+/// The *bound* control beside it: the same body with normalized coordinates,
+/// so the sample lowers to a genuine `OpSampledImage`, and a magnification
+/// filter outside the reviewed family.
+const MIXED_FILTERS_ENTRY: &str = "render_sample_texture_2d_mixed_filters";
+const MIXED_FILTERS_AIR: &str =
+    include_str!("fixtures/render_sample_texture_2d_mixed_filters.frag.ll");
 
 const ATTACHMENT_VIEW: ViewId = ViewId::new(940);
 const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(941);
@@ -154,6 +170,27 @@ fn contract(entry: &str, footprint: TextureFootprintProof) -> RenderPipelineCont
             runtime_sampler: None,
             footprint,
         }],
+    }
+}
+
+/// The contract a *bound* AIR static sampler's registration states
+/// (`research/docs/23` §3.3, v100): the same shape as [`contract`], with the
+/// texture declared `Sampled` and the one state the review covers. A
+/// registration that pairs an AIR sampler the module reads through has to
+/// repeat that state, and the mixer of the two halves is where the refusal in
+/// the reading below comes from.
+fn sampled_contract(entry: &str) -> RenderPipelineContract {
+    RenderPipelineContract {
+        stage_buffers: Vec::new(),
+        vertex_entry: VERTEX_ENTRY.to_owned(),
+        fragment_entry: entry.to_owned(),
+        color_formats: vec![AttachmentFormat::Rgba8Unorm],
+        vertex_layout: VertexLayout::None,
+        textures: vec![TextureBindingContract::sampled(
+            0,
+            TextureFormat::Rgba8Unorm,
+            SamplerPolicy::reviewed_render_sampler(),
+        )],
     }
 }
 
@@ -712,4 +749,163 @@ fn a_declaration_that_does_not_repeat_the_module_is_refused_by_name() {
     provider
         .release_render_pipeline(&render)
         .expect("the registration is released");
+}
+
+/// Reading 4 (`research/docs/23` §3.3, E-RS5/v118): the AIR static sampler a
+/// pixel-coordinate read leaves behind does not weigh on the registration, and
+/// the frames it lands are the sampler-free sibling's own.
+///
+/// The census shape is one fragment stage that carries a single AIR `constexpr
+/// sampler` while its one texture is read with fetches: the translation
+/// emulates the pixel-coordinate state in the shader, so no instruction reads
+/// the state the metadata declares. Before E-RS5 the registration weighed that
+/// state like any other — the `coord::pixel` axis refused the module by name —
+/// and the class gate had to keep the draw on the engine. This reading holds
+/// the two halves of the fix falsifiable: the module registers under the
+/// declaration that repeats its fetch, both rails land the same frame, that
+/// frame is the sampler-free fixture's frame from the same bytes, and the
+/// payload still decides the bytes (so the reading measures the fetch rather
+/// than the run).
+#[test]
+fn the_air_sampler_a_pixel_coordinate_read_leaves_behind_does_not_weigh_on_the_registration() {
+    let Some((executor, provider)) = executor_and_provider() else {
+        return;
+    };
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let (vertex, fragment) = translated_pair(&executor, PIXEL_SAMPLER_AIR, PIXEL_SAMPLER_ENTRY);
+    let render = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: contract(PIXEL_SAMPLER_ENTRY, TextureFootprintProof::WholeView),
+            vertex,
+            fragment,
+            logical_digest: digest(b"pixel-coordinate sampler left unpaired"),
+        })
+        .expect(
+            "a state no instruction reads through is not weighed, so the fetch declaration \
+             registers",
+        );
+
+    let (trace, resources) = trace_for(
+        &provider,
+        &compute,
+        &render,
+        vec![fetched_texture_view(false)],
+    );
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the pass beside the leftover sampler is admitted");
+    let submitted = provider.submit(admitted).expect("the trace executes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let trace_bytes = submitted
+        .writebacks
+        .iter()
+        .find(|writeback| writeback.view_id == ATTACHMENT_VIEW)
+        .map(|writeback| writeback.bytes.clone())
+        .expect("the attachment has a writeback");
+    let trace_texel = uniform_texel(&trace_bytes);
+    eprintln!(
+        "trace rail beside the leftover sampler: expected {} landed {}",
+        hex(&FETCHED_FRAME),
+        hex(&trace_texel)
+    );
+    assert_eq!(trace_texel, FETCHED_FRAME);
+
+    // The object rail over the same registration and payload: one frame, byte
+    // for byte, exactly as the sampler-free reading holds.
+    let object_bytes = object_readback(&provider, &render, false);
+    eprintln!(
+        "object rail beside the leftover sampler: {} (trace rail {})",
+        hex(&uniform_texel(&object_bytes)),
+        hex(&trace_texel)
+    );
+    assert_eq!(object_bytes, trace_bytes);
+
+    provider
+        .release_render_pipeline(&render)
+        .expect("the registration is released");
+
+    // The AIR state moves nothing: the sampler-free fixture, under its own
+    // registration and the same texture bytes, lands the very same frame.
+    let sibling_bytes = trace_readback(
+        &provider,
+        &executor,
+        &compute,
+        FETCH_AIR,
+        FRAGMENT_ENTRY,
+        false,
+        "sampler-free sibling beside the pixel-coordinate sampler",
+    )
+    .expect("the sampler-free sibling executes");
+    eprintln!(
+        "sampler-free sibling: {} (leftover sampler {})",
+        hex(&uniform_texel(&sibling_bytes)),
+        hex(&trace_texel)
+    );
+    assert_eq!(
+        sibling_bytes, trace_bytes,
+        "the leftover state cannot change what the pass executes, so the two modules land one \
+         frame from one payload"
+    );
+
+    // And the payload still decides the bytes: the same registration over the
+    // descending texture lands the descending frame, which is what rules out a
+    // "nothing ran" reading of the equality above.
+    let moved = trace_readback(
+        &provider,
+        &executor,
+        &compute,
+        PIXEL_SAMPLER_AIR,
+        PIXEL_SAMPLER_ENTRY,
+        true,
+        "pixel-coordinate sampler over the descending texture",
+    )
+    .expect("the descending payload executes");
+    eprintln!("descending payload: {}", hex(&uniform_texel(&moved)));
+    assert_eq!(uniform_texel(&moved), DESCENDING_FRAME);
+}
+
+/// Reading 5 (`research/docs/23` §3.3, E-RS5/v118): the control beside it — a
+/// sampler the module *does* read through is still weighed by its own state
+/// and refused by name.
+///
+/// Same body, same declaration shape as the reading above, one axis moved: the
+/// fixture's coordinates are normalized, so its sample lowers to a genuine
+/// `OpSampledImage`, and its magnification filter is `Linear` while its
+/// minification filter is `Nearest` — a state the reviewed family does not
+/// carry. The refusal has to name that axis, so a registration that stopped
+/// weighing samplers altogether would be a failing reading rather than a
+/// passing one.
+#[test]
+fn a_static_sampler_the_module_reads_through_is_still_weighed_by_name() {
+    let Some((executor, provider)) = executor_and_provider() else {
+        return;
+    };
+    let (vertex, fragment) = translated_pair(&executor, MIXED_FILTERS_AIR, MIXED_FILTERS_ENTRY);
+    let refusal = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: sampled_contract(MIXED_FILTERS_ENTRY),
+            vertex,
+            fragment,
+            logical_digest: digest(b"bound mixed-filter AIR sampler"),
+        })
+        .expect_err("a state the module samples through is weighed and refused");
+    eprintln!("bound mixed-filter sampler: refused: {refusal:?}");
+    assert_eq!(refusal.slug, "render_stage_unsupported_interface");
+    assert_eq!(refusal.class, ProviderErrorClass::Capability);
+    assert_eq!(refusal.fields.get("index"), Some(&FieldValue::Unsigned(0)));
+    assert_eq!(
+        refusal.fields.get("stage"),
+        Some(&FieldValue::Text("fragment".to_owned()))
+    );
+    assert!(
+        refusal.detail.as_deref().unwrap_or_default().contains(
+            "an AIR sampler whose min (Nearest) and mag (Linear) filters differ is outside \
+                 the reviewed family"
+        ),
+        "the refusal names the axis: {:?}",
+        refusal.detail
+    );
 }
