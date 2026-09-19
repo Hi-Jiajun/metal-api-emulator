@@ -542,10 +542,13 @@ pub const MAX_SUPPORTED_PRESENT_MODES: usize = 8;
 
 /// Maximum vertex formats one capability snapshot may declare.
 ///
-/// [`VertexFormat`] is a closed four-value family, so this bound can never
+/// [`VertexFormat`] is a closed nine-value family — the eight storages E-VF1
+/// fixed and the scalar lane appended on 2026-09-20 — so this bound can never
 /// refuse a well-formed snapshot; it only stops a corrupt count from driving
-/// the decoder.
-pub const MAX_SUPPORTED_VERTEX_FORMATS: usize = 8;
+/// the decoder. The bound follows the family rather than the wire vocabulary:
+/// the formats themselves travel by the contract's own codes, and a snapshot
+/// that declares every value (`VertexFormat::ADMITTED`) writes exactly nine.
+pub const MAX_SUPPORTED_VERTEX_FORMATS: usize = 9;
 
 /// Maximum index widths one capability snapshot may declare. Same rule as
 /// [`MAX_SUPPORTED_VERTEX_FORMATS`] over the closed two-value family.

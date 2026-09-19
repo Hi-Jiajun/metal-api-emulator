@@ -204,11 +204,16 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         //
         // The normalized storages arrived with E-VF1 (`research/docs/23` §103):
         // they are Vulkan's own *required* vertex input formats, so this rail
-        // declares all eight of the contract's values, and
-        // `tests/render_normalized_vertex_e2e.rs` measures the fetch on
+        // declares every value of the contract's list, and
+        // `tests/render_normalized_vertex_e2e.rs` measures that fetch on
         // Lavapipe — one draw whose four normalized attributes land the stored
         // integers' own quotients, and the swapped-bytes arm that changes the
-        // frame. The rail that does not declare them yet is the native one
+        // frame. The scalar lane joined them on the same reasoning
+        // (2026-09-20, census v46's `vertex_format` bucket): `R32_SFLOAT` is
+        // required beside its padded siblings, and
+        // `tests/render_scalar_vertex_e2e.rs` measures one scalar attribute's
+        // fetch the same way. The rail that does not declare the widened
+        // storages yet is the native one
         // (`metal-api-native/src/render.rs::DECLARED_VERTEX_FORMATS`), where a
         // declaration waits for an Apple-side reading.
         max_vertex_buffers: metal_api_core::provider::MAX_VERTEX_BUFFERS as u32,

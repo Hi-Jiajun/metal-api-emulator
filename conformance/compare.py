@@ -1219,6 +1219,15 @@ def _vertex_input_declaration(case, where):
     The rules mirror `provider-capture`'s `render_geometry` and the Swift
     oracle's own validation, so a suite one rail would refuse cannot pass here
     either.
+
+    The rails' vertex-input *window* is wider than this fixture vocabulary
+    since 2026-09-20 (census v46's `vertex_format` bucket): the canonical set
+    gained the scalar `float32x1` lane, and its own reading — two scalar
+    attributes sharing one record at offsets zero and four — lives in
+    `crates/metal-api-vulkan/tests/render_scalar_vertex_e2e.rs`. No geometry
+    above spells it: every one is stated over the vector `float32` shapes, so a
+    suite that declared a scalar attribute is refused here against the shape
+    this file states rather than validated against a rule nobody wrote.
     """
     quad_vertices, quad_indices, quad_stride = 4, 6, 8
     layout = case.get("vertex_layout")
