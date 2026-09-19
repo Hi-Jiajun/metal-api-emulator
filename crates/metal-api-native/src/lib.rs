@@ -651,6 +651,15 @@ mod tests {
                             .max()
                             .unwrap(),
                         FootprintProof::Unbounded => panic!("allowlisted shader needs a proof"),
+                        // The allowlisted kernels' contracts are built by
+                        // `bounded_contract`, which states a static or an
+                        // affine reach for every binding it allows: the
+                        // whole-binding arm never reaches this walk, and if one
+                        // ever did it would be the same "no proof" the
+                        // unbounded arm above rejects.
+                        FootprintProof::BindingRange => {
+                            panic!("allowlisted shader needs a proof")
+                        }
                     };
                     (binding.metal_binding, binding.access, end)
                 })

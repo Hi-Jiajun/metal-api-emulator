@@ -410,6 +410,13 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // `tests/render_stage_buffer_namespace_e2e.rs`, its object-API frame,
         // and the conformance case the capture archives keep.
         supports_render_stage_buffer_namespace_split: true,
+        // The stage-buffer whole-binding arm is *not* decided here
+        // (`research/docs/23` §3.3, E-SB3): it is the selected device's own
+        // answer, so the limits-derived snapshot keeps the fail-closed default
+        // and `VulkanExecutor::provider_capabilities` overrides the field with
+        // the `robustBufferAccess` reading the device was created under. A
+        // snapshot built from limits alone therefore never claims the arm.
+        supports_render_stage_buffer_binding_range: false,
         // The texel space is executed (2026-09-19, census v43's
         // `texture_state` axis): a pass that binds a runtime `[[sampler(n)]]`
         // whose state says `normalizedCoordinates = NO` is executed through the

@@ -1689,10 +1689,42 @@ pub struct AffineTerm {
 /// against each pass's dispatch. It is still not a parity identity: native and
 /// Vulkan providers may serialize the proof differently while producing the
 /// same observable writes.
+///
+/// `BindingRange` is the arm for the reaches the *translation* cannot state at
+/// all (`research/docs/23` §3.3, E-SB3). The translator asks every consumer to
+/// keep "the complete caller-provided buffer window available" when one of its
+/// dereferences cannot be expressed (`metal2vulkan::reflect::BufferFootprint`'s
+/// own bound: a data-dependent index reaches `has_unbounded_access`), which is
+/// a statement about the *binding* rather than about a byte count: what the
+/// module may read is whatever the caller bound, and what the provider
+/// executes is that same window in full. The arm therefore publishes no byte
+/// ceiling at all — the declaration is "there is no proof", not "the proof is
+/// N bytes" — and it is deliberately not [`Self::Unbounded`] under a new name:
+/// `Unbounded` says *no proof, so do not execute* (the fail-closed direction
+/// every rail keeps by name), while `BindingRange` says *no proof, so execute
+/// against the declaration's own binding, whole*.
+///
+/// Reading past that binding stays undefined on both platforms: Metal's
+/// `[[buffer(n)]]` argument is the window the caller set, and the Vulkan rail
+/// publishes the arm only on a device whose `robustBufferAccess` was enabled at
+/// creation (an out-of-range read is then clamped and a write discarded, which
+/// is memory-safe and *still* not a promise about any byte's value). The arm
+/// therefore adds no fact the platform does not carry: it executes the bytes
+/// the caller bound and leaves the out-of-range behaviour undefined exactly as
+/// Metal leaves it.
+///
+/// One consequence is worth stating where the arm is defined: because the
+/// declaration states no ceiling, a pass pairing this arm binds the *whole*
+/// view it declares ([`BufferView::validate_shape`] already holds every source
+/// whose own extent it can see — trace-owned bytes and guest run lists — to
+/// exactly the view, and each rail resolves a lease view to the bind's own
+/// window), and a consumer must not narrow that window to a proven reach: there
+/// is no proven reach to narrow to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FootprintProof {
     Static { max_bytes: u64 },
     Affine { accesses: Vec<AffineAccess> },
+    BindingRange,
     Unbounded,
 }
 
@@ -5624,6 +5656,13 @@ pub struct StageBufferBinding {
     /// pass's own view has to cover the extent the accepted proof states —
     /// evaluated against the draw's vertex and instance counts for the affine
     /// arm. [`FootprintProof::Unbounded`] stays a refusal by name.
+    ///
+    /// [`FootprintProof::BindingRange`] is the third executable arm
+    /// (`research/docs/23` §3.3, E-SB3): the translation stated no reach, so
+    /// the declaration states no ceiling either and the pass's own view is what
+    /// the provider executes, whole. Nothing about the pair is weakened — the
+    /// stage still has to bind the slot and the access still has to agree — but
+    /// no byte count is compared, because there is none.
     pub footprint: FootprintProof,
 }
 
@@ -5902,8 +5941,24 @@ impl RenderPipelineContract {
             // (an index buffer whose bytes do not travel with the trace, an
             // overflowing expression) is refused by name rather than admitted
             // against a bound nothing states.
+            //
+            // `BindingRange` is the arm that states no bound at all
+            // (`research/docs/23` §3.3, E-SB3): the translation could not
+            // express the reach, so the pass's own binding *is* the interface —
+            // the provider executes that view in full and the contract has no
+            // ceiling to compare it against. That is the arm `None` below, and
+            // it is why the walk asks for an `Option`: a declaration with a
+            // ceiling still gets the ceiling compared, while a declaration
+            // without one has nothing to be measured against rather than a zero
+            // to pass trivially. The view's own shape rules are what make "the
+            // whole binding" the same statement on both sides
+            // ([`BufferView::validate_shape`] holds a trace-owned source and a
+            // guest run list to exactly the view's extent), and a rail resolves
+            // a lease view to the bind's own window — so a narrowed window is
+            // not admitted *here* as a smaller ceiling, it is refused where the
+            // window is resolved, by name.
             let required = match &declared.footprint {
-                FootprintProof::Static { max_bytes } => *max_bytes,
+                FootprintProof::Static { max_bytes } => Some(*max_bytes),
                 FootprintProof::Affine { accesses } => {
                     let counts = render_affine_axis_counts(
                         pass,
@@ -5911,13 +5966,14 @@ impl RenderPipelineContract {
                         declared.index,
                         resolved_index_bytes,
                     )?;
-                    render_affine_required_bytes(accesses, counts).ok_or(
+                    Some(render_affine_required_bytes(accesses, counts).ok_or(
                         ContractError::StageBufferFootprintProofUnsupported {
                             stage: declared.stage,
                             index: declared.index,
                         },
-                    )?
+                    )?)
                 }
+                FootprintProof::BindingRange => None,
                 FootprintProof::Unbounded => {
                     return Err(ContractError::StageBufferFootprintProofUnsupported {
                         stage: declared.stage,
@@ -5925,13 +5981,15 @@ impl RenderPipelineContract {
                     })
                 }
             };
-            if required > bound.view.length {
-                return Err(ContractError::StageBufferFootprintExceeded {
-                    stage: declared.stage,
-                    index: declared.index,
-                    required,
-                    declared: bound.view.length,
-                });
+            if let Some(required) = required {
+                if required > bound.view.length {
+                    return Err(ContractError::StageBufferFootprintExceeded {
+                        stage: declared.stage,
+                        index: declared.index,
+                        required,
+                        declared: bound.view.length,
+                    });
+                }
             }
         }
         for bound in &pass.stage_buffers {
@@ -6232,6 +6290,16 @@ fn validate_stage_buffer_bindings(
             FootprintProof::Affine { accesses } => {
                 validate_stage_buffer_affine(binding.stage, binding.index, accesses)?
             }
+            // The whole-binding arm is structurally the empty statement
+            // (`research/docs/23` §3.3, E-SB3): it names no byte extent, no
+            // index expression and no axis, so there is nothing about the
+            // declaration itself to hold to a shape — what can be malformed is
+            // the *pair* (a missing binding, an access disagreement) and both
+            // of those are [`RenderPipelineContract::validate_against`]'s rules,
+            // which this walk runs before. `Unbounded` stays the refusal by
+            // name beside it: the arm is a new executable landing, not a
+            // widening of the one that has none.
+            FootprintProof::BindingRange => {}
             FootprintProof::Unbounded => {
                 return Err(ContractError::StageBufferFootprintProofUnsupported {
                     stage: binding.stage,
@@ -10273,6 +10341,45 @@ pub struct ProviderCapabilities {
     /// whose reviewed pair already binds `setVertexBuffer` at set 1 and
     /// `setFragmentBuffer` at set 2 (the Apple device readings).
     pub supports_render_stage_buffer_namespace_split: bool,
+    /// Whether this snapshot executes a stage buffer whose declared footprint
+    /// is [`FootprintProof::BindingRange`] — the reach the translation could
+    /// not state at all (`research/docs/23` §3.3, E-SB3). Defaults to `false`:
+    /// a registration that states the arm is refused by name instead of being
+    /// executed against a window the provider never said it binds whole.
+    ///
+    /// The bit is a *shape* declaration and deliberately not
+    /// [`Self::supports_render_stage_buffers`] under another name. That bit
+    /// answers "can this rail fill a stage-buffer slot at all"; this one
+    /// answers a second question about the same slot: "does it execute the slot
+    /// when nothing states how far into it the module reaches, binding the
+    /// pass's whole view and leaving an out-of-range access exactly as
+    /// undefined as Metal leaves it". A rail can answer the first yes and this
+    /// one no — the native rail does, because its reviewed pair reads each
+    /// argument at the extent its own pinned bytes state and it has no route
+    /// that executes a declaration nothing measured — and a consumer that does
+    /// not read this bit keeps its own fail-closed refusal
+    /// (`render_provider_out_of_class_stage_buffer_footprint`) for the shape.
+    /// It MUST NOT be read as a widening of [`FootprintProof::Unbounded`]:
+    /// that arm still keeps its refusal, sentence and slug, byte for byte,
+    /// whoever declares this bit.
+    ///
+    /// Declared `true` by the snapshots whose rail executes the arm *and* whose
+    /// device carries the reading the arm's semantics rest on: the Vulkan rail
+    /// publishes it exactly when the selected device reported
+    /// `robustBufferAccess` and was created with it enabled, so an
+    /// out-of-range access is clamped (reads) or discarded (writes) instead of
+    /// being an unruly undefined behaviour. Evidence:
+    /// `tests/render_stage_buffer_binding_range_e2e.rs`, where a stage whose
+    /// index is data-dependent is declared with the arm, executed, and lands
+    /// the bound window's own bytes.
+    ///
+    /// The wire is a tagged section of the capability tail's escape family (the
+    /// family's next tag, `0x00 0x0C <bool>`): a frame written before the arm
+    /// existed does not carry it, and a decoder that met the tag in an older
+    /// frame would have refused it as an unknown tail tag rather than read a
+    /// zero — so the absent section reads `false`, the fail-closed direction,
+    /// and a consumer keeps its own by-name refusal for the shape.
+    pub supports_render_stage_buffer_binding_range: bool,
     /// Whether this snapshot executes a render pass that binds a
     /// **pixel-coordinate** runtime sampler (2026-09-19, census v43's
     /// `texture_state` axis). Defaults to `false`: a pass whose
@@ -10604,6 +10711,18 @@ impl ProviderCapabilities {
         self.supports_render_stage_buffer_namespace_split
     }
 
+    /// Whether this snapshot executes the whole-binding stage-buffer arm
+    /// (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself: it
+    /// exists so the question is asked in the same place a consumer asks every
+    /// other "did this snapshot declare the shape" question, and so the
+    /// capability frame's own guard — a snapshot that declares *only* this bit
+    /// still writes the extended payload — has one reader instead of two.
+    pub fn declares_render_stage_buffer_binding_range(&self) -> bool {
+        self.supports_render_stage_buffer_binding_range
+    }
+
     /// Whether this snapshot states a *per-stage* stage-buffer window
     /// (`research/docs/23` §3.3, §117 E-SB2).
     ///
@@ -10863,6 +10982,26 @@ impl ProviderCapabilities {
                             "binding",
                             FieldValue::Unsigned(buffer.metal_binding as u64),
                         ));
+                    }
+                    // The whole-binding arm is the render stage-buffer face's
+                    // (`research/docs/23` §3.3, E-SB3): the capability that
+                    // declares it (`supports_render_stage_buffer_binding_range`)
+                    // is a render bit, and the compute face has no provider that
+                    // published it, so a compute declaration that states the arm
+                    // is refused by name here instead of being executed against a
+                    // window no compute capability declared. The slug is the
+                    // compute face's own — `Unbounded` keeps its own
+                    // (`buffer_footprint_unbounded`) because the two say
+                    // different things: "nothing states a bound" versus "no
+                    // compute provider executes the whole-binding reading".
+                    FootprintProof::BindingRange => {
+                        return Err(
+                            capability_error("buffer_footprint_binding_range_unsupported")
+                                .with_field(
+                                    "binding",
+                                    FieldValue::Unsigned(buffer.metal_binding as u64),
+                                ),
+                        );
                     }
                     FootprintProof::Static { max_bytes } => {
                         if *max_bytes > buffer.length {
@@ -16798,6 +16937,7 @@ mod tests {
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
+            supports_render_stage_buffer_binding_range: false,
             supports_render_pixel_coordinate_sampler: false,
             supports_compute_texture_sampling: false,
             max_compute_textures: 0,
@@ -18040,6 +18180,22 @@ mod tests {
         value.pipelines[0].contract.buffer_bindings[0].footprint = FootprintProof::Unbounded;
         let error = capabilities().admit(&value, &resources()).unwrap_err();
         assert_eq!(error.slug, "buffer_footprint_unbounded");
+    }
+
+    /// The whole-binding arm is the *render* stage-buffer face's
+    /// (`research/docs/23` §3.3, E-SB3), and this is the compute half of that
+    /// statement: the capability that declares the arm is a render bit, no
+    /// compute capability publishes it, so a compute declaration that states it
+    /// is refused by name — with its own slug rather than the unbounded arm's,
+    /// because the two say different things.
+    #[test]
+    fn capabilities_refuse_a_whole_binding_footprint_on_the_compute_face() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.pipelines[0].contract.buffer_bindings[0].footprint = FootprintProof::BindingRange;
+        let error = capabilities().admit(&value, &resources()).unwrap_err();
+        assert_eq!(error.slug, "buffer_footprint_binding_range_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.fields.get("binding"), Some(&FieldValue::Unsigned(0)));
     }
 
     #[test]
@@ -22713,6 +22869,133 @@ mod tests {
         assert_eq!(
             contract_error_refusal(refusal).slug,
             "trace_contract_invalid"
+        );
+    }
+
+    /// The whole-binding footprint arm (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// The arm is the third executable one: a declaration that states no reach
+    /// at all is admitted against the pass's own binding, because the pass's view
+    /// *is* the window the provider executes — there is no ceiling to compare
+    /// it against, so the walk compares nothing. `Unbounded` keeps its refusal
+    /// by name, sentence and slug byte for byte: the new arm is a landing for
+    /// the shape, not a widening of the one that has none. And the pair rules
+    /// this arm sits beside are untouched: the declared slot still has to be
+    /// bound, with the access the declaration states.
+    #[test]
+    fn a_whole_binding_stage_buffer_footprint_is_admitted_where_unbounded_is_not() {
+        // The control: the declaration states the arm, the pass binds the slot,
+        // and admission accepts the pair without a byte comparison.
+        let mut whole = stage_buffer_trace();
+        {
+            let contract = whole.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers[1].footprint = FootprintProof::BindingRange;
+        }
+        stage_buffer_capabilities()
+            .admit(&whole, &landing_resources())
+            .expect("the whole-binding declaration is admitted against the pass's own view");
+
+        // The same declaration beside a *shorter* view is still admitted: the
+        // arm publishes no ceiling, so there is nothing the view could come up
+        // short of. The window the provider executes is that view, whole.
+        let mut narrowed = stage_buffer_trace();
+        {
+            let contract = narrowed.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers[1].footprint = FootprintProof::BindingRange;
+            let pass = render_entry(&mut narrowed);
+            pass.stage_buffers[1].view = stream_view(55, 0, 57, 8);
+        }
+        stage_buffer_capabilities()
+            .admit(&narrowed, &landing_resources())
+            .expect("an unstated reach is not measured against the view's length");
+
+        // `Unbounded` is the arm beside it and keeps its own answer: the slug,
+        // the class and the sentence the consumer keys its refusal on.
+        let mut unbounded = stage_buffer_trace();
+        {
+            let contract = unbounded.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers[1].footprint = FootprintProof::Unbounded;
+        }
+        let refusal = stage_buffer_capabilities()
+            .admit(&unbounded, &landing_resources())
+            .expect_err("the unbounded arm stays a refusal by name");
+        assert_eq!(refusal.slug, "render_stage_buffer_footprint_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some(
+                "fragment stage buffer 0 declares a footprint proof the first stage-buffer \
+                 increment does not evaluate"
+            ),
+            "the unbounded sentence is unchanged word for word"
+        );
+
+        // The pair rules are untouched: the declared slot still has to be bound,
+        // and the access still has to agree.
+        let mut unbound = whole.clone();
+        render_entry(&mut unbound).stage_buffers.pop();
+        let refusal = stage_buffer_capabilities()
+            .admit(&unbound, &landing_resources())
+            .expect_err("the declared slot still has to be bound");
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("render pipeline declares a fragment stage buffer at 0, but the pass binds none there")
+        );
+
+        let mut mismatched = whole.clone();
+        render_entry(&mut mismatched).stage_buffers[1].view.access = BufferAccess::Write;
+        let refusal = stage_buffer_capabilities()
+            .admit(&mismatched, &landing_resources())
+            .expect_err("the access still has to agree field by field");
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+    }
+
+    /// The whole-binding bit is a declaration, not a default
+    /// (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// A snapshot that never spoke about the arm must be read as "do not submit
+    /// a declaration whose reach nothing stated": the bit defaults to `false`,
+    /// its predicate answers the same thing, and setting it is the only way to
+    /// flip either reading. Like the folded shape's bit beside it, it is
+    /// deliberately *not* one of the render bits
+    /// [`ProviderCapabilities::declares_render_support`] answers, and it is not
+    /// one of the stage-buffer fields either: it names a shape, not a slot
+    /// count.
+    #[test]
+    fn the_default_snapshot_does_not_declare_the_whole_binding_arm() {
+        let default = stage_buffer_capabilities();
+        assert!(!default.supports_render_stage_buffer_binding_range);
+        assert!(!default.declares_render_stage_buffer_binding_range());
+
+        let mut declared = default.clone();
+        declared.supports_render_stage_buffer_binding_range = true;
+        assert!(declared.declares_render_stage_buffer_binding_range());
+        assert_eq!(
+            declared.supports_render_stage_buffers,
+            default.supports_render_stage_buffers
+        );
+        assert_eq!(
+            declared.max_render_stage_buffers,
+            default.max_render_stage_buffers
+        );
+        assert_eq!(
+            declared.max_render_stage_buffers_per_stage,
+            default.max_render_stage_buffers_per_stage
+        );
+        assert_eq!(
+            default.declares_render_support(),
+            declared.declares_render_support(),
+            "the shape bit is the capability frame's own tail block, not one of the render bits"
         );
     }
 

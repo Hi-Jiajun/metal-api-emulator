@@ -974,6 +974,20 @@ pub(crate) struct StageBufferCapabilityBits {
     /// (`--stage-buffer-selftest`, `--stage-buffer-write-selftest`) are the
     /// readings for the shape those two stages state.
     pub(crate) supports_render_stage_buffer_namespace_split: bool,
+    /// Whether this rail executes a stage buffer whose declared footprint is
+    /// `FootprintProof::BindingRange` — the reach the translation could not
+    /// state (`research/docs/23` §3.3, E-SB3). This rail keeps the default:
+    /// its reviewed pair reads each `[[buffer(N)]]` argument at the extent its
+    /// own pinned bytes state ([`ReviewedStageBufferReach`]), and executing a
+    /// declaration nothing measured would mean binding an argument whose read
+    /// window the module's own source does not carry — so a registration that
+    /// states the arm is refused by name
+    /// (`render_stage_buffer_binding_range_unsupported`) rather than run
+    /// against a window the rail cannot account for. The Vulkan rail is the
+    /// half that publishes the bit, because a `STORAGE_BUFFER` descriptor's
+    /// whole range is a window it can bind with the device's
+    /// `robustBufferAccess` enabling it.
+    pub(crate) supports_render_stage_buffer_binding_range: bool,
 }
 
 /// The one spelling of the stage-buffer bits, so the macOS snapshot and the
@@ -989,6 +1003,11 @@ pub(crate) fn stage_buffer_capability_bits() -> StageBufferCapabilityBits {
         // native implementation arrives with the bit: the declaration names
         // the shape the two device readings above measured.
         supports_render_stage_buffer_namespace_split: true,
+        // The whole-binding arm stays at the fail-closed default
+        // (`research/docs/23` §3.3, E-SB3): this rail's reviewed modules read
+        // each argument at the extent their own source states, so the arm has
+        // no route here and the registration is refused by name.
+        supports_render_stage_buffer_binding_range: false,
     }
 }
 
@@ -4783,6 +4802,39 @@ fn validate_reviewed_stage_buffers(
                      admit for a stage buffer at all",
                 ));
             }
+            // The whole-binding arm is the Vulkan rail's (`research/docs/23`
+            // §3.3, E-SB3), and this rail keeps its own refusal by name rather
+            // than a shared one: the reviewed pair reads each `[[buffer(N)]]`
+            // argument at the extent its own pinned source states
+            // ([`ReviewedStageBufferReach`]), so a declaration that states no
+            // reach at all would have to be executed against a window this rail
+            // cannot account for — the opposite of what its reviewed modules
+            // carry. The capability frame publishes the same answer
+            // ([`stage_buffer_capability_bits`] keeps the bit closed), so a
+            // consumer never hands this rail the shape; a registration that
+            // states it anyway is refused here, by name, before any Metal
+            // object exists.
+            (FootprintProof::BindingRange, _) => {
+                return Err(capability_refusal(
+                    "render_stage_buffer_binding_range_unsupported",
+                )
+                .with_field("stage", FieldValue::Text(declared.stage.name().to_owned()))
+                .with_field("entry", FieldValue::Text(entry(declared.stage).to_owned()))
+                .with_field("field", FieldValue::Text("bindings".to_owned()))
+                .with_field("index", FieldValue::Unsigned(u64::from(declared.index)))
+                .with_field(
+                    "module",
+                    FieldValue::Text(module.path.to_owned()),
+                )
+                .with_detail(
+                    "the declared footprint states the whole-binding arm, where the translation \
+                     did not state how far into the binding the module reaches: this rail's \
+                     reviewed stages read each `[[buffer(N)]]` argument at the extent their own \
+                     source pins, so there is no route here that executes a declaration nothing \
+                     measured. The Vulkan rail executes the arm on a device whose \
+                     `robustBufferAccess` was enabled, binding the pass's own view whole",
+                ));
+            }
         }
     }
     for slot in module.stage_buffers {
@@ -7649,6 +7701,34 @@ mod tests {
             Some(&FieldValue::Unsigned(STAGE_BUFFER_FRAGMENT_BYTES))
         );
 
+        // The whole-binding arm is the Vulkan rail's (`research/docs/23` §3.3,
+        // E-SB3): the reviewed pair reads each `[[buffer(N)]]` argument at the
+        // extent its own pinned source states, so a declaration that states no
+        // reach at all has no route here — refused by its own name and slug
+        // rather than executed against a window the module's source does not
+        // carry, and the snapshot keeps the bit closed so a consumer never
+        // hands this rail the shape.
+        let mut whole_binding = stage_buffer_pipeline();
+        whole_binding.stage_buffers[1].footprint = FootprintProof::BindingRange;
+        let refused = review_contract(&whole_binding)
+            .expect_err("the whole-binding arm has no route on this rail");
+        eprintln!("native whole-binding arm refused: {refused:?}");
+        assert_eq!(
+            refused.slug,
+            "render_stage_buffer_binding_range_unsupported"
+        );
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("stage"),
+            Some(&FieldValue::Text("fragment".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("index"),
+            Some(&FieldValue::Unsigned(u64::from(
+                STAGE_BUFFER_FRAGMENT_BINDING
+            )))
+        );
+
         // The other direction: naming the module but declaring none of its
         // arguments leaves descriptors the stages read undefined.
         let mut undeclared = stage_buffer_pipeline();
@@ -7719,6 +7799,11 @@ mod tests {
                 .supports_render_stage_buffer_namespace_split,
             "the pre-flip declaration keeps the shape bit closed"
         );
+        // The whole-binding arm stays closed on this rail (`research/docs/23`
+        // §3.3, E-SB3), and its predicate answers the same thing: the reviewed
+        // pair has no route that executes a declaration nothing measured.
+        assert!(!capabilities.supports_render_stage_buffer_binding_range);
+        assert!(!capabilities.declares_render_stage_buffer_binding_range());
     }
 
     /// A stage buffer resolves through the same three-armed source channel a
@@ -10739,6 +10824,11 @@ mod tests {
             max_render_texture_dimension_1d: 0,
             supports_render_stage_buffer_namespace_split: stage_buffers
                 .supports_render_stage_buffer_namespace_split,
+            // The whole-binding arm rides the same face and keeps its
+            // fail-closed default on this rail (`research/docs/23` §3.3,
+            // E-SB3).
+            supports_render_stage_buffer_binding_range: stage_buffers
+                .supports_render_stage_buffer_binding_range,
             // The native rail's reviewed MSL modules spell one `constexpr
             // sampler` in the normalized space, and the rail refuses a runtime
             // `[[sampler(n)]]` argument by name (`render_runtime_sampler_unsupported`),
