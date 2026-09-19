@@ -382,10 +382,6 @@ private struct RenderAttachmentDefinition: Decodable {
     /// (`research/docs/23` §115 之后的增量，E-TX13); absent for every other store
     /// arm, and for every case this oracle compiles.
     let landing_view: LandingViewDefinition?
-    /// The kept-frame landing entry a `"resident"` store's trace carries
-    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b); absent for every other
-    /// store arm, and for every case this oracle compiles.
-    let kept_frame_landing: KeptFrameLandingDefinition?
     let clear_hex: String?
     let initial_hex: String?
     /// The MRT case's per-attachment expectation; absent for the
@@ -720,6 +716,12 @@ private struct RenderCaseDefinition: Decodable {
     /// The MRT case's attachment list, in location order; mutually exclusive
     /// with `attachment`.
     let attachments: [RenderAttachmentDefinition]?
+    /// The kept-frame landing entry a `"resident"` store's trace carries
+    /// (`research/docs/23` §115 之后的增量，E-TX14/R4b): the frame identity and
+    /// the owner window a later entry delivers it into. Absent for every other
+    /// store arm, and for every case this oracle compiles. The default keeps
+    /// the oracle's own literals compiling without restating it.
+    var kept_frame_landing: KeptFrameLandingDefinition? = nil
     /// The single-attachment case's expectation. An MRT case leaves this
     /// absent and spells the expectation on each attachment entry instead.
     let expected_hex: String?
@@ -3315,8 +3317,6 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     for attachment in landingAttachments {
         try require(attachment.landing_view == nil,
                     "\(definition.id): only a landing_view store names a landing view")
-        try require(attachment.kept_frame_landing == nil,
-                    "\(definition.id): only a resident store names a kept-frame landing")
     }
     // The stage-buffer shape (`research/docs/23` §3.3, v83-v86) arrives in two
     // arms. A *translated* case pins two AIR modules this oracle compiles no
