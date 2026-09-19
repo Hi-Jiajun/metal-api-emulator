@@ -235,6 +235,9 @@ impl ComputeProvider for FakeProvider {
             // no one-dimensional sampled window.
             max_render_texture_dimension_1d: 0,
             max_render_texture_dimension_3d: 0,
+            // The fixture provider executes no volume at all, so it lists no
+            // lane and never states a window beside one.
+            supported_render_texture_volume_formats: Vec::new(),
             max_render_stage_buffers: if self.stage_buffers {
                 MAX_RENDER_STAGE_BUFFERS as u32
             } else {

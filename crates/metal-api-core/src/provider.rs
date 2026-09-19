@@ -10408,6 +10408,47 @@ pub struct ProviderCapabilities {
     /// `0`, the fail-closed direction, and a consumer keeps its own refusal by
     /// name for the shape.
     pub max_render_texture_dimension_3d: u64,
+    /// The **volume lanes** this snapshot admits for a three-dimensional
+    /// sampled texture (2026-09-20, census v48's volume lane gate): the formats
+    /// whose `TYPE_3D` sampled image the snapshot's own device answered it can
+    /// create.
+    ///
+    /// The field names a different axis from both of its neighbours.
+    /// [`Self::supported_render_texture_formats`] answers which formats a pass
+    /// may sample from a *surface*, and
+    /// [`Self::max_render_texture_dimension_3d`] answers how large a volume the
+    /// snapshot admits; this one answers *which lanes* may carry a volume at
+    /// all. The three are independent facts rather than one fact spelled three
+    /// ways: Vulkan promises no three-dimensional format any linear tiling, and
+    /// a device is free to hold one lane's volumes while refusing another's —
+    /// which is exactly what the `D3` arm measured, where the RTX 5060 refused
+    /// the linear `R32_SFLOAT` volume the pre-device-copy arm created while
+    /// Lavapipe accepted it.
+    ///
+    /// The list is therefore a *device* answer rather than a reading of the
+    /// surface list above. A consumer that read
+    /// [`Self::supported_render_texture_formats`] as the volume lane set would
+    /// hand the provider a `vkCreateImage` its device was never asked about:
+    /// the census's own remaining pipeline declares its three volumes as
+    /// `texture3d<float, sample>` in the `B8G8R8A8_UNORM` lane, which is a
+    /// surface lane on every device and a volume lane only on the devices that
+    /// answer so.
+    ///
+    /// An **empty** list is the reading a frame written before this section
+    /// existed states, and it is read as the *pre-increment* rule verbatim
+    /// rather than as "no volume lanes at all": before the section existed the
+    /// arm's lane came out of [`Self::supported_render_texture_formats`], so a
+    /// three-dimensional declaration inside a declared window keeps `r32_float`
+    /// as its only lane where that surface list carries the format and no lane
+    /// at all where it does not. Every other lane keeps its refusal by name
+    /// that way, which is the fail-closed direction, and a provider that lists
+    /// lanes states the closed set instead.
+    ///
+    /// The wire is a presence-tagged section of the capability tail (the
+    /// escape family's tag `0x11`, after the `0x0F` per-stage window and the
+    /// `0x10` sibling its own increment precedes): a snapshot that lists no
+    /// lane writes nothing, and the absence reads as the rule above.
+    pub supported_render_texture_volume_formats: Vec<TextureFormat>,
     /// Whether this snapshot executes the *gathered* render-sampler shape: one
     /// render pass whose sampled texture has an extent other than the render
     /// area's, with that source's bytes readable on the host
@@ -11007,6 +11048,21 @@ impl ProviderCapabilities {
     /// extended payload instead of dropping the declaration on the wire.
     pub fn declares_render_texture_dimension_3d(&self) -> bool {
         self.max_render_texture_dimension_3d != 0
+    }
+
+    /// Whether this snapshot states which lanes its three-dimensional sampled
+    /// arm carries (2026-09-20, census v48's volume lane gate).
+    ///
+    /// The predicate is the field's own emptiness, and it exists for the two
+    /// reasons its siblings' do. The first is that the question has one answer:
+    /// an empty list is the reading every frame written before the section
+    /// states, where `r32_float` was the arm's only lane. The second is the
+    /// capability frame's payload guard — a snapshot whose *only* statement is
+    /// this list still has to write the extended payload, or its declaration
+    /// would be dropped on the wire and every consumer would keep the
+    /// pre-increment rule for a lane the provider executes.
+    pub fn declares_render_texture_volume_formats(&self) -> bool {
+        !self.supported_render_texture_volume_formats.is_empty()
     }
 
     /// Whether this snapshot states a *per-stage* sampled-texture window
@@ -11957,6 +12013,44 @@ impl ProviderCapabilities {
                                     FieldValue::Unsigned(self.max_render_texture_dimension_3d),
                                 ));
                         }
+                    }
+                    // The volume's *lane* is the arm's second half (2026-09-20,
+                    // census v48's volume lane gate), and it is asked after the
+                    // window for the same reason the window is asked after the
+                    // format list: a snapshot may admit a volume of this size
+                    // and still have no image in this byte order. The answer is
+                    // the device's own list when there is one, and the frame
+                    // written before that section states the **pre-increment
+                    // rule verbatim** rather than an empty set: the arm's lane
+                    // came out of the format list above, so the older reading is
+                    // `r32_float` where that list carries it and no lane at all
+                    // where it does not.
+                    let volume_lanes: &[TextureFormat] =
+                        if self.declares_render_texture_volume_formats() {
+                            &self.supported_render_texture_volume_formats
+                        } else if self
+                            .supported_render_texture_formats
+                            .contains(&TextureFormat::R32Float)
+                        {
+                            &[TextureFormat::R32Float]
+                        } else {
+                            &[]
+                        };
+                    if !volume_lanes.contains(&texture.format) {
+                        return Err(capability_error("render_texture_volume_format_unsupported")
+                            .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                            .with_field(
+                                "binding",
+                                FieldValue::Unsigned(u64::from(texture.metal_binding)),
+                            )
+                            .with_field("format", FieldValue::Text(format!("{:?}", texture.format)))
+                            .with_detail(
+                                "a three-dimensional sampled texture is executed in a lane its \
+                                 device answered it can create and fill a `TYPE_3D` image with, \
+                                 and this snapshot lists no such lane for this format; the pass \
+                                 is refused instead of being handed an image the device was \
+                                 never asked about",
+                            ));
                     }
                 }
             }
@@ -17356,6 +17450,7 @@ mod tests {
             supports_render_pass_entry_snapshot: false,
             max_render_texture_dimension_1d: 0,
             max_render_texture_dimension_3d: 0,
+            supported_render_texture_volume_formats: Vec::new(),
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
@@ -25384,6 +25479,128 @@ mod tests {
             Some(&FieldValue::Unsigned(8))
         );
         assert_eq!(refusal.fields.get("stage"), None);
+    }
+
+    /// The volume lane list is the `D3` arm's second question (2026-09-20,
+    /// census v48's volume lane gate): the window says *how large* a volume may
+    /// be, and this list says *which byte order* may carry one at all.
+    ///
+    /// The fixture rewrites the render-sampler pass's one sampled surface into
+    /// the arm's own shape — a single-sample, non-arrayed `4 x 4 x 2` volume
+    /// whose source is its own thirty-two texels — and then walks the three
+    /// readings a snapshot can state: no list at all (the pre-increment rule,
+    /// where `r32_float` was the only lane), the device's own list (which
+    /// admits exactly the lanes it names), and no window (the arm's
+    /// fail-closed default, which refuses the shape before any lane is read).
+    #[test]
+    fn the_volume_lane_list_is_the_devices_own_answer_beside_the_window() {
+        let mut value = render_texture_trace();
+        // The fixture's declaration and view move together, exactly as they do
+        // for the BGRA8 and narrow-lane readings above.
+        render_entry(&mut value).textures[0].texture_type = TextureType::D3;
+        render_entry(&mut value).textures[0].depth = 2;
+        if let Some(render) = value.pipelines[0].render.as_mut() {
+            render.textures[0].texture_type = TextureType::D3;
+        }
+        match &mut render_entry(&mut value).textures[0].source {
+            // Thirty-two texels of the four-byte lane the fixture samples
+            // (`4 x 4 x 2`), which is what the contract's own `expected_bytes`
+            // counts once the volume's third extent is stated.
+            TextureSource::OwnedBytes(bytes) => bytes.resize(128, 0x11),
+            other => panic!("the fixture's source is its own bytes, not {other:?}"),
+        }
+        value
+            .validate()
+            .expect("the volume fixture is structurally valid");
+
+        // The window alone is not the answer: a snapshot that declares one and
+        // lists no lane keeps the pre-increment reading, where the arm carried
+        // `r32_float` alone — so the fixture's own eight-bit lane keeps its
+        // refusal by name.
+        let mut window_only = render_texture_capabilities();
+        window_only.max_render_texture_dimension_3d = MAX_RENDER_TEXTURE_DIMENSION_3D;
+        assert!(!window_only.declares_render_texture_volume_formats());
+        let refusal = window_only
+            .admit(&value, &landing_resources())
+            .expect_err("a window without a lane keeps the pre-increment reading");
+        assert_eq!(refusal.slug, "render_texture_volume_format_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("Rgba8Unorm".to_owned()))
+        );
+
+        // The same snapshot restating the census's own volume lane admits the
+        // pass: the list is the second half of the question and it is the
+        // device's answer rather than a widening of the surface list above.
+        let mut listed = window_only.clone();
+        listed.supported_render_texture_volume_formats = vec![TextureFormat::Rgba8Unorm];
+        assert!(listed.declares_render_texture_volume_formats());
+        listed
+            .admit(&value, &landing_resources())
+            .expect("the snapshot that lists the volume's own lane admits the pass");
+
+        // A list that names another lane refuses this one by the same name: the
+        // field is a set, not a "some lane exists" bit.
+        let mut other_lane = window_only.clone();
+        other_lane.supported_render_texture_volume_formats = vec![TextureFormat::R32Float];
+        let refusal = other_lane
+            .admit(&value, &landing_resources())
+            .expect_err("a list without the pass's own lane refuses it");
+        assert_eq!(refusal.slug, "render_texture_volume_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("Rgba8Unorm".to_owned()))
+        );
+
+        // The same snapshot *without* the lane list is the pre-increment
+        // reading, and it is the older rule verbatim rather than an empty set:
+        // the arm's one lane came out of the format list above, so a float
+        // volume inside a declared window is still admitted by a frame written
+        // before the section existed, and every other lane keeps its refusal by
+        // name.
+        let mut float_volume = value.clone();
+        render_entry(&mut float_volume).textures[0].format = TextureFormat::R32Float;
+        if let Some(render) = float_volume.pipelines[0].render.as_mut() {
+            render.textures[0].format = TextureFormat::R32Float;
+        }
+        float_volume
+            .validate()
+            .expect("the float volume pair is structurally valid");
+        let mut pre_increment = window_only.clone();
+        pre_increment.supported_render_texture_formats =
+            vec![TextureFormat::R32Float, TextureFormat::Rgba8Unorm];
+        assert!(!pre_increment.declares_render_texture_volume_formats());
+        pre_increment
+            .admit(&float_volume, &landing_resources())
+            .expect("the pre-increment reading keeps `r32_float` as the arm's one lane");
+        let refusal = pre_increment
+            .admit(&value, &landing_resources())
+            .expect_err("and refuses every lane the section never named");
+        assert_eq!(refusal.slug, "render_texture_volume_format_unsupported");
+        // A snapshot whose surface list carries no `r32_float` at all states no
+        // lane either — and it answers before the lane question is asked, at the
+        // format gate, because the pre-increment rule was read off that very
+        // list (`render_texture_format_unsupported` is the sentence the arm
+        // shipped for a format the frame does not carry).
+        let mut no_lane = pre_increment.clone();
+        no_lane.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        let refusal = no_lane
+            .admit(&float_volume, &landing_resources())
+            .expect_err("a surface list without the float lane states no volume lane either");
+        assert_eq!(refusal.slug, "render_texture_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("R32Float".to_owned()))
+        );
+
+        // And the window is still asked first: a snapshot that declares no
+        // window refuses the shape before any lane is read, which is the
+        // reading a device with no three-dimensional arm at all states.
+        let refusal = render_texture_capabilities()
+            .admit(&value, &landing_resources())
+            .expect_err("a snapshot with no volume window refuses the shape");
+        assert_eq!(refusal.slug, "render_texture_dimension_3d_unsupported");
     }
 
     /// The pass-entry snapshot fixture (`research/docs/23` §118, E-TX15): the

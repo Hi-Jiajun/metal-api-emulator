@@ -405,6 +405,9 @@ mod tests {
             max_render_stage_buffers_per_stage: 0,
             max_render_texture_dimension_1d: 0,
             max_render_texture_dimension_3d: 0,
+            // The native rail executes no three-dimensional sampled arm, so it
+            // lists no volume lane and states no window beside one.
+            supported_render_texture_volume_formats: Vec::new(),
             supports_render_stage_buffer_namespace_split: false,
             // The whole-binding stage-buffer arm (`research/docs/23` §3.3,
             // E-SB3) is a render face this snapshot does not declare either.

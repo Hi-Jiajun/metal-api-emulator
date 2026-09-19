@@ -9137,6 +9137,17 @@ mod tests {
             0,
             "the native snapshot declares no three-dimensional sampled window"
         );
+        // The volume *lane* list is the same face's other half (2026-09-20,
+        // census v48's volume lane gate): this rail answers for no lane either,
+        // so a consumer reads the shape's refusal by name rather than a lane
+        // the rail would have to meet with an image it has no MSL sibling for.
+        let native = capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING));
+        assert!(
+            native.supported_render_texture_volume_formats.is_empty(),
+            "the native snapshot lists no volume lane: {:?}",
+            native.supported_render_texture_volume_formats
+        );
+        assert!(!native.declares_render_texture_volume_formats());
         let mut pass = sampled_pass(4);
         let mut view = sampled_texture_view(4);
         view.texture_type = TextureType::D3;
@@ -10960,6 +10971,10 @@ mod tests {
             // arm's fail-closed default.
             max_render_texture_dimension_1d: 0,
             max_render_texture_dimension_3d: 0,
+            // The three-dimensional sampled arm is not a native path at all
+            // (2026-09-20, the `D3` arm): the rail refuses the shape by name,
+            // so it lists no volume lane beside the window it never states.
+            supported_render_texture_volume_formats: Vec::new(),
             supports_render_stage_buffer_namespace_split: stage_buffers
                 .supports_render_stage_buffer_namespace_split,
             // The whole-binding arm rides the same face and keeps its

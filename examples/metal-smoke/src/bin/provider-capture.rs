@@ -4300,6 +4300,13 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // them), so this table pins the declaring pass, which every rail
         // executes.
         (1, "compute-buffer-v46") => &["render_declaring_gathered_extent"],
+        // The volume lane the device answers for (2026-09-20, census v48's
+        // volume lane gate): the same declaring pass, beside the render case
+        // whose volume travels in the eight-bit `bgra8_unorm` lane the census's
+        // own LPF family declares. The texture definition's `format` is what
+        // selects it, and the object lane builds the same volume through
+        // `new_volume_texture_with_bytes`.
+        (1, "compute-buffer-v47") => &["render_declaring_gathered_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()

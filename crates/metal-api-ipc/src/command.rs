@@ -6333,6 +6333,70 @@ mod tests {
         assert_eq!(decoded.max_render_texture_dimension_3d, 0);
     }
 
+    /// The volume lane list is the family's next tag and repeats the
+    /// render-sampler block's shape (2026-09-20, census v48's volume lane
+    /// gate): a snapshot whose *only* statement is this list still writes the
+    /// extended payload, the section is `0x00 0x11` plus one big-endian `u64`
+    /// count and one byte per format, and a frame that ends before it decodes
+    /// as the **empty** list — the reading every consumer holds to the
+    /// pre-increment rule, where `r32_float` was the three-dimensional arm's
+    /// only lane.
+    #[test]
+    fn an_only_volume_lane_list_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        assert!(!capabilities.declares_render_texture_volume_formats());
+        capabilities.supported_render_texture_volume_formats =
+            vec![TextureFormat::R32Float, TextureFormat::Bgra8Unorm];
+        assert!(capabilities.declares_render_texture_volume_formats());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        let mut section = vec![0x00, 0x11];
+        section.extend_from_slice(&2_u64.to_be_bytes());
+        section.extend_from_slice(&[0x01, 0x03]);
+        assert_eq!(
+            frame.windows(2).position(|pair| pair == [0x00, 0x11]),
+            Some(frame.len() - section.len()),
+            "the lane list is the family's last section in this frame"
+        );
+        assert_eq!(
+            &frame[frame.len() - section.len()..],
+            &section[..],
+            "the list is one presence tag, one family tag, a count and one byte per lane"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert_eq!(
+            decoded.supported_render_texture_volume_formats,
+            capabilities.supported_render_texture_volume_formats
+        );
+        assert!(decoded.declares_render_texture_volume_formats());
+
+        // The absent section reads the empty list: the same snapshot with the
+        // lanes back at their default writes a shorter frame, and the decoder's
+        // answer for the missing block is the pre-increment reading rather than
+        // a lane the frame never named.
+        let mut bare = fake_capabilities();
+        bare.supports_render_vertex_count_above_triangle = true;
+        let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: bare,
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supported_render_texture_volume_formats.is_empty());
+        assert!(!decoded.declares_render_texture_volume_formats());
+    }
+
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
     /// frame's identity and shape and the window's second declaration, in a
     /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -7660,6 +7724,7 @@ mod tests {
                     supports_render_pass_entry_snapshot: false,
                     max_render_texture_dimension_1d: 0,
                     max_render_texture_dimension_3d: 0,
+                    supported_render_texture_volume_formats: Vec::new(),
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
@@ -8055,6 +8120,7 @@ mod tests {
             supports_render_pass_entry_snapshot: false,
             max_render_texture_dimension_1d: 0,
             max_render_texture_dimension_3d: 0,
+            supported_render_texture_volume_formats: Vec::new(),
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,

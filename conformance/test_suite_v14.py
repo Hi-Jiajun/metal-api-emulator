@@ -547,7 +547,11 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # v46 carries the three-dimensional sampled volume (2026-09-20, the
         # `D3` sampled texture arm), whose translated render case and declaring
         # pass `test_suite_v46.py` pins.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 45)
+        # v47 carries the same volume one lane over — the eight-bit order the
+        # census's LPF family declares, and the lane list the device answers for
+        # beside the window (2026-09-20, census v48's volume lane gate), whose
+        # translated render case and declaring pass `test_suite_v47.py` pins.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 46)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -568,6 +572,7 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v38", "compute-buffer-v39",
                                       "compute-buffer-v43", "compute-buffer-v44",
                                       "compute-buffer-v45", "compute-buffer-v46",
+                                      "compute-buffer-v47",
                                       "compute-buffer-v40", "compute-buffer-v41",
                                       "compute-buffer-v42"):
                     continue

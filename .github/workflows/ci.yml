@@ -102,6 +102,7 @@ jobs:
           cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v44.json --output /tmp/vulkan-captures/vulkan-capture-v44.json
           cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v45.json --output /tmp/vulkan-captures/vulkan-capture-v45.json
           cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v46.json --output /tmp/vulkan-captures/vulkan-capture-v46.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v47.json --output /tmp/vulkan-captures/vulkan-capture-v47.json
           python3 conformance/compare.py --suite conformance/suite-v20.json --check /tmp/vulkan-captures/vulkan-capture-v20.json
           python3 conformance/compare.py --suite conformance/suite-v21.json --check /tmp/vulkan-captures/vulkan-capture-v21.json
           python3 conformance/compare.py --suite conformance/suite-v22.json --check /tmp/vulkan-captures/vulkan-capture-v22.json
@@ -129,6 +130,7 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v44.json --check /tmp/vulkan-captures/vulkan-capture-v44.json
           python3 conformance/compare.py --suite conformance/suite-v45.json --check /tmp/vulkan-captures/vulkan-capture-v45.json
           python3 conformance/compare.py --suite conformance/suite-v46.json --check /tmp/vulkan-captures/vulkan-capture-v46.json
+          python3 conformance/compare.py --suite conformance/suite-v47.json --check /tmp/vulkan-captures/vulkan-capture-v47.json
 
       - name: Capture Vulkan through shared object API
         run: |
@@ -136,7 +138,7 @@ jobs:
           icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
           test "${#icds[@]}" -eq 1
           export VK_ICD_FILENAMES="${icds[0]}"
-          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46; do
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47; do
             suite="conformance/suite-v${version}.json"
             if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
             cargo run --locked -p metal-smoke --bin provider-capture -- --api objects --suite "$suite" --output "/tmp/vulkan-captures/vulkan-objects-v${version}.json"
@@ -149,7 +151,7 @@ jobs:
           icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
           test "${#icds[@]}" -eq 1
           export VK_ICD_FILENAMES="${icds[0]}"
-          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46; do
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47; do
             suite="conformance/suite-v${version}.json"
             if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
             cargo run --locked -p metal-smoke --bin provider-capture -- --api objects --async --suite "$suite" --output "/tmp/vulkan-captures/vulkan-objects-async-v${version}.json"
@@ -231,10 +233,12 @@ jobs:
           python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v44.json --output-dir /tmp/native-evidence/v44 --source-revision "$GITHUB_SHA"
           python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v45.json --output-dir /tmp/native-evidence/v45 --source-revision "$GITHUB_SHA"
           python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v46.json --output-dir /tmp/native-evidence/v46 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v47.json --output-dir /tmp/native-evidence/v47 --source-revision "$GITHUB_SHA"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
           statuses = [json.loads(Path('/tmp/native-evidence', version, 'status.json').read_text()) for version in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v19', 'v20', 'v21', 'v22', 'v23', 'v24', 'v25', 'v26', 'v27', 'v28', 'v29', 'v30', 'v31', 'v32', 'v33', 'v34', 'v35', 'v36', 'v37', 'v38', 'v39', 'v40', 'v41', 'v42', 'v43', 'v44', 'v45', 'v46')]
+          statuses = [json.loads(Path('/tmp/native-evidence', version, 'status.json').read_text()) for version in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v19', 'v20', 'v21', 'v22', 'v23', 'v24', 'v25', 'v26', 'v27', 'v28', 'v29', 'v30', 'v31', 'v32', 'v33', 'v34', 'v35', 'v36', 'v37', 'v38', 'v39', 'v40', 'v41', 'v42', 'v43', 'v44', 'v45', 'v47')]
           combined = 'captured' if all(s['capture_status'] == 'captured' for s in statuses) else 'unavailable'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('capture_status=' + combined + '\n')
@@ -310,6 +314,7 @@ jobs:
           target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v44.json --output /tmp/native-evidence/rust-provider-v44.json
           target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v45.json --output /tmp/native-evidence/rust-provider-v45.json
           target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v46.json --output /tmp/native-evidence/rust-provider-v46.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v47.json --output /tmp/native-evidence/rust-provider-v47.json
           python3 conformance/compare.py --suite conformance/suite-v20.json --check /tmp/native-evidence/rust-provider-v20.json
           python3 conformance/compare.py --suite conformance/suite-v21.json --check /tmp/native-evidence/rust-provider-v21.json
           python3 conformance/compare.py --suite conformance/suite-v22.json --check /tmp/native-evidence/rust-provider-v22.json
@@ -337,10 +342,11 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v44.json --check /tmp/native-evidence/rust-provider-v44.json
           python3 conformance/compare.py --suite conformance/suite-v45.json --check /tmp/native-evidence/rust-provider-v45.json
           python3 conformance/compare.py --suite conformance/suite-v46.json --check /tmp/native-evidence/rust-provider-v46.json
+          python3 conformance/compare.py --suite conformance/suite-v47.json --check /tmp/native-evidence/rust-provider-v47.json
       - name: Capture Rust Metal through shared object API
         if: steps.capture.outputs.capture_status == 'captured'
         run: |
-          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46; do
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47; do
             suite="conformance/suite-v${version}.json"
             if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
             target/debug/provider-capture --api objects --backend native-metal-provider --suite "$suite" --output "/tmp/native-evidence/metal-objects-v${version}.json"
@@ -349,7 +355,7 @@ jobs:
       - name: Capture Rust Metal through async object API
         if: steps.capture.outputs.capture_status == 'captured'
         run: |
-          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46; do
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47; do
             suite="conformance/suite-v${version}.json"
             if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
             target/debug/provider-capture --api objects --async --backend native-metal-provider --suite "$suite" --output "/tmp/native-evidence/metal-objects-async-v${version}.json"
@@ -1062,6 +1068,7 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v44.json --native /tmp/native-evidence/v44/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v44.json --metal-provider /tmp/native-evidence/rust-provider-v44.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v44.json --metal-objects /tmp/native-evidence/metal-objects-v44.json
           python3 conformance/compare.py --suite conformance/suite-v45.json --native /tmp/native-evidence/v45/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v45.json --metal-provider /tmp/native-evidence/rust-provider-v45.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v45.json --metal-objects /tmp/native-evidence/metal-objects-v45.json
           python3 conformance/compare.py --suite conformance/suite-v46.json --native /tmp/native-evidence/v46/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v46.json --metal-provider /tmp/native-evidence/rust-provider-v46.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v46.json --metal-objects /tmp/native-evidence/metal-objects-v46.json
+          python3 conformance/compare.py --suite conformance/suite-v47.json --native /tmp/native-evidence/v47/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v47.json --metal-provider /tmp/native-evidence/rust-provider-v47.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v47.json --metal-objects /tmp/native-evidence/metal-objects-v47.json
       # Gate 2's G2-f: the per-API-class A/B parity, derived from the captures
       # the lines above already validated. The classes are declared in
       # `conformance/narrow-class.json`; `narrow_class.py` holds each fixture to
