@@ -230,6 +230,10 @@ impl ComputeProvider for FakeProvider {
             supports_render_kept_frame_landing: false,
             supports_render_pixel_coordinate_sampler: false,
             supports_render_pass_entry_snapshot: false,
+            // The fixture provider executes the reviewed 2D window alone
+            // (2026-09-19, census b10's `texture_shape` bucket), so it declares
+            // no one-dimensional sampled window.
+            max_render_texture_dimension_1d: 0,
             max_render_stage_buffers: if self.stage_buffers {
                 MAX_RENDER_STAGE_BUFFERS as u32
             } else {

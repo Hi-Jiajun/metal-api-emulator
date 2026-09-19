@@ -3856,9 +3856,30 @@ fn create_color_image_view(
     format: vk::Format,
     what: &str,
 ) -> Result<vk::ImageView, ExecutionFailure> {
+    create_sampled_image_view(context, image, format, vk::ImageViewType::TYPE_2D, what)
+}
+
+/// Create a single-mip, single-layer colour view of `view_type` over `image`
+/// (2026-09-19, census b10's `texture_shape` bucket).
+///
+/// [`create_color_image_view`] is this function with the 2D view type: the
+/// sampled-texture rail's one-dimensional arm creates a `TYPE_1D` or
+/// `TYPE_1D_ARRAY` view over its single-row image, and a Vulkan image view is
+/// the one place the module's own `OpTypeImage` dimensionality has to be
+/// matched (`Dim 1D` against `Dim 2D`) — a 2D view over a one-dimensional image
+/// is not a legal read at all. Everything else is unchanged: one mip, the
+/// view's own format, and the `COLOR` aspect, which is the aspect both the
+/// sampled rail and the attachment rail use.
+fn create_sampled_image_view(
+    context: &VulkanContext,
+    image: vk::Image,
+    format: vk::Format,
+    view_type: vk::ImageViewType,
+    what: &str,
+) -> Result<vk::ImageView, ExecutionFailure> {
     let info = vk::ImageViewCreateInfo::default()
         .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
+        .view_type(view_type)
         .format(format)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,

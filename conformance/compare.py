@@ -145,6 +145,13 @@ MAX_READBACK_WINDOW_DIMENSION = 64
 # suite that named the lane is refused here instead of validated against a
 # rule nobody wrote. The rail's own reading of the lane lives in
 # `crates/metal-api-vulkan/tests/render_rgba16f_texture_e2e.rs`.
+#
+# The same rule covers the two single-component float lanes the rails'
+# one-dimensional arm executes (`r32_float`/`r16_float`, 2026-09-19, census
+# b10's `texture_shape` bucket): a float LUT's texel is its own value, and the
+# conversion into an 8-bit attachment is the API's rule rather than a
+# comparator expectation this table could state. Their reading lives in
+# `crates/metal-api-vulkan/tests/render_texture_1d_lut_e2e.rs`.
 SAMPLED_TEXTURE_FORMATS = ("rgba8_unorm", "bgra8_unorm", "r8_unorm", "rg8_unorm")
 # The colour attachment's admitted layouts: the sampled shape renders into the
 # eight-bit four-component surface both rails read back, which is what the
@@ -2867,8 +2874,9 @@ def _render_plan(plan, suite):
                      f"{texture_where}: the reviewed sampling fixtures read one 8-bit "
                      "unorm surface, in either four-component byte order "
                      "(rgba8_unorm/bgra8_unorm) or in the narrow r8_unorm/rg8_unorm "
-                     "lanes — the eight-byte rgba16_float lane the rails execute has "
-                     "no comparator expectation rule")
+                     "lanes — the eight-byte rgba16_float lane and the two "
+                     "single-component float lanes (r32_float/r16_float) the rails "
+                     "execute have no comparator expectation rule")
             attachment_format = _string(attachment.get("format"),
                                         f"{where}.attachment.format")
             _require(attachment_format in COLOUR_ATTACHMENT_FORMATS,

@@ -675,6 +675,19 @@ pub enum TextureFormat {
     /// neither is a colour attachment, so [`AttachmentFormat`] does not name
     /// them and an R8 view bound as a render target keeps its existing refusal.
     R8G8Unorm,
+    /// `VK_FORMAT_R16_SFLOAT` / `MTLPixelFormat::R16Float`.
+    ///
+    /// The two-byte half-float sibling of [`Self::R32Float`], admitted by the
+    /// same widening (`research/docs/23` §119, census b10's `texture_shape`
+    /// bucket): the census's second one-dimensional LUT is a `1024x1`
+    /// `R16_SFLOAT` guest view beside the `16384x1` `R32_SFLOAT` one, and a
+    /// sample of it is the single half component its own name states, filled
+    /// into the shader's red channel with green/blue zero and alpha one by the
+    /// API's own rule for the channels the format does not carry. Like the two
+    /// narrow UNORM lanes it is a *sampling* source only: [`AttachmentFormat`]
+    /// names neither half-float width, so an `r16_float` view bound as a colour
+    /// attachment keeps its existing refusal.
+    R16Float,
 }
 
 impl TextureFormat {
@@ -710,12 +723,27 @@ impl TextureFormat {
     /// The native rail's reviewed table stays narrower because its Apple-side
     /// reading is the increment that would widen it
     /// (`metal-api-native/src/render.rs`, `SUPPORTED_RENDER_TEXTURE_FORMATS`).
-    pub const RENDER_SAMPLED: [Self; 5] = [
+    ///
+    /// The two single-component float lanes are the widening census b10's
+    /// `texture_shape` bucket asked for (2026-09-19): the 215 records that
+    /// bucket counted are one-dimensional single-row LUTs — a `16384x1`
+    /// `R32_SFLOAT` view and a `1024x1` `R16_SFLOAT` one — so the contract has
+    /// to be able to *name* those texels before any rail can upload them. They
+    /// are appended after the five lanes above, exactly as every earlier
+    /// widening was, so the wire codes and every capability list keep their
+    /// existing order. A float lane is not a byte order of the four-component
+    /// window and not a narrow UNORM fill either: `r32_float` reads its one
+    /// float component and `r16_float` its one half component, each into the
+    /// shader's red channel with the missing channels filled by the API's own
+    /// rule, and neither is quantised into the 8-bit window on the way in.
+    pub const RENDER_SAMPLED: [Self; 7] = [
         Self::Rgba8Unorm,
         Self::Bgra8Unorm,
         Self::R8Unorm,
         Self::R8G8Unorm,
         Self::Rgba16Float,
+        Self::R32Float,
+        Self::R16Float,
     ];
 
     /// Tightly packed bytes one texel occupies in this format. Sampling and
@@ -728,6 +756,7 @@ impl TextureFormat {
             Self::Rgba16Float => 8,
             Self::R8Unorm => 1,
             Self::R8G8Unorm => 2,
+            Self::R16Float => 2,
         }
     }
 }
@@ -752,6 +781,19 @@ impl TextureType {
             self,
             Self::D1Array | Self::D2Array | Self::D2MultisampleArray
         )
+    }
+
+    /// Whether this type has one spatial axis (2026-09-19, census b10's
+    /// `texture_shape` bucket).
+    ///
+    /// The one-dimensional family the render sampler's LUT arm states: a
+    /// one-dimensional image is one row of texels, so a view of one of these
+    /// types is the shape whose `height` is `1` by definition rather than by
+    /// the fixture's own choice. The arrayed spelling is the same row plus the
+    /// slice axis (`Self::D1Array`), which is the kind the census's 215
+    /// records bind.
+    pub const fn is_one_dim(self) -> bool {
+        matches!(self, Self::D1 | Self::D1Array)
     }
 
     pub const fn is_multisample(self) -> bool {
@@ -1433,6 +1475,27 @@ impl TextureView {
                 texture_type: self.texture_type,
                 array_length: self.array_length,
             });
+        }
+        // A one-dimensional texture is one row of texels by definition
+        // (2026-09-19, census b10's `texture_shape` bucket): Metal's
+        // `MTLTextureType1D` and `MTLTextureType1DArray` descriptors state a
+        // width — and, for the arrayed spelling, a slice count — while their
+        // height and depth are not fields the API has at all. A declaration
+        // that states another value there names a surface no provider could
+        // execute, because the view's own byte extent would be a two- or
+        // three-dimensional grid while the image it names has one spatial axis;
+        // the rule is therefore structural rather than a capability, exactly as
+        // the sample-count and non-arrayed array-length rules beside it are.
+        if self.texture_type.is_one_dim() {
+            for (field, dimension) in [("height", self.height), ("depth", self.depth)] {
+                if dimension != 1 {
+                    return Err(ContractError::TextureDimensionMismatch {
+                        texture_type: self.texture_type,
+                        field,
+                        dimension,
+                    });
+                }
+            }
         }
         let expected = self.expected_bytes()?;
         if let TextureSource::OwnedBytes(bytes) = &self.source {
@@ -2546,6 +2609,22 @@ pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 /// §4.2), and each rail's own window refuses the rest by name
 /// (`render_texture_limit`).
 pub const MAX_RENDER_TEXTURES: usize = 8;
+
+/// The widest one-dimensional sampled texture the render sampler's *reviewed*
+/// window states (2026-09-19, census b10's `texture_shape` bucket).
+///
+/// The bucket's own two shapes are the largest statements the census has ever
+/// made here: a `16384x1` `r32_float` colour-transfer LUT and a `1024x1`
+/// `r16_float` one (`evidence/gate3-census-b10-2026-09-19/`). A
+/// one-dimensional image's texel count is its `width` — Vulkan fixes
+/// `height`/`depth` at one for the type — so the number this ceiling caps is
+/// that texel count, and it is a *review* ceiling rather than a device fact,
+/// exactly as [`MAX_RENDER_TEXTURES`] is: a provider's own answer is the
+/// smaller of this value and its device's `maxImageDimension1D`
+/// (`ProviderCapabilities::max_render_texture_dimension_1d`), so a device that
+/// cannot hold the widest reviewed LUT declares a narrower window instead of
+/// one it would have to refuse at `vkCreateImage`.
+pub const MAX_RENDER_TEXTURE_DIMENSION_1D: u64 = 16_384;
 
 /// The highest texture index a render texture declaration or pass binding may
 /// carry (`research/docs/23` §3.3, v104).
@@ -9934,6 +10013,40 @@ pub struct ProviderCapabilities {
     /// is the single vocabulary, exactly as [`Self::supported_color_formats`]
     /// is.
     pub supported_render_texture_formats: Vec<TextureFormat>,
+    /// The widest one-dimensional sampled texture this snapshot admits, in
+    /// texels of its own row (2026-09-19, census b10's `texture_shape` bucket).
+    /// `0` — the field's own default — means the snapshot admits **no**
+    /// one-dimensional sampled texture at all.
+    ///
+    /// The field names a different axis from every field above it. Those answer
+    /// "does this snapshot sample a render pass's texture", "how many
+    /// bindings", "which formats"; this one answers "how wide may the
+    /// one-dimensional arm's own source be". The distinction is the device's
+    /// fact and not a spelling of the 2D window: a one-dimensional Vulkan image
+    /// is bounded by `maxImageDimension1D` rather than by
+    /// `maxImageDimension2D`, so a device may hold a wide one-dimensional LUT
+    /// and a narrow two-dimensional attachment in the same snapshot, and the
+    /// two limits are not interchangeable.
+    ///
+    /// The value is `min(`[`MAX_RENDER_TEXTURE_DIMENSION_1D`]`, the device's own
+    /// `maxImageDimension1D`)` — the review ceiling clamped by what the device
+    /// says — exactly as [`Self::max_render_stage_buffers_per_stage`] is the
+    /// review ceiling clamped by the device's descriptor window.
+    ///
+    /// Declared non-zero by the snapshots whose rail executes the arm: the
+    /// Vulkan rail uploads a single-row `vk::ImageType::TYPE_1D` image in the
+    /// lane's own format and samples it through a `TYPE_1D`/`TYPE_1D_ARRAY`
+    /// view (`tests/render_texture_1d_lut_e2e.rs`), and the native rail leaves
+    /// it at the default because no Apple-side reading states a Metal 1D
+    /// equivalence this generation accepts.
+    ///
+    /// The wire is a presence-tagged section of the capability tail (the
+    /// escape family's next tag): a frame written before the arm existed does
+    /// not carry it, and a decoder that met the tag in an older frame would
+    /// have refused it as an unknown tail tag rather than read a zero — so the
+    /// absent section reads `0`, the fail-closed direction, and a consumer
+    /// keeps its own refusal by name for the shape.
+    pub max_render_texture_dimension_1d: u64,
     /// Whether this snapshot executes the *gathered* render-sampler shape: one
     /// render pass whose sampled texture has an extent other than the render
     /// area's, with that source's bytes readable on the host
@@ -10399,6 +10512,21 @@ impl ProviderCapabilities {
     /// reader instead of two.
     pub fn declares_render_pass_entry_snapshot_support(&self) -> bool {
         self.supports_render_pass_entry_snapshot
+    }
+
+    /// Whether this snapshot admits a one-dimensional sampled texture at all
+    /// (2026-09-19, census b10's `texture_shape` bucket).
+    ///
+    /// The field *is* the window, so the predicate is the field's own
+    /// difference from its default: `0` is the fail-closed reading, and it is
+    /// what a snapshot that never spoke about the arm states. It exists for the
+    /// same two reasons its siblings' do — one place answers "did this
+    /// snapshot declare the shape", and the capability frame's payload guard
+    /// asks it, so a snapshot whose *only* statement is this window still
+    /// writes the extended payload instead of dropping the declaration on the
+    /// wire.
+    pub fn declares_render_texture_dimension_1d(&self) -> bool {
+        self.max_render_texture_dimension_1d != 0
     }
 
     /// Whether this snapshot declares the folded stage-buffer shape
@@ -11152,6 +11280,51 @@ impl ProviderCapabilities {
                         .with_field("view", FieldValue::Unsigned(texture.view_id.get()))
                         .with_field("format", FieldValue::Text(format!("{:?}", texture.format))));
                 }
+                // The one-dimensional window is the face's fifth question
+                // (2026-09-19, census b10's `texture_shape` bucket): a snapshot
+                // may sample every admitted format and still admit no
+                // one-dimensional source at all, and a device whose own
+                // `maxImageDimension1D` is narrower than the declaration's row
+                // cannot create the image the view names. `0` is the arm's
+                // fail-closed default — the value a frame written before the
+                // window existed reads — so a snapshot that never spoke about
+                // it refuses the shape by name instead of handing its rail a
+                // width its device never promised.
+                if texture.texture_type.is_one_dim() {
+                    if self.max_render_texture_dimension_1d == 0 {
+                        return Err(capability_error("render_texture_dimension_1d_unsupported")
+                            .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                            .with_field(
+                                "binding",
+                                FieldValue::Unsigned(u64::from(texture.metal_binding)),
+                            )
+                            .with_field(
+                                "texture_type",
+                                FieldValue::Text(format!("{:?}", texture.texture_type)),
+                            )
+                            .with_detail(
+                                "a one-dimensional sampled texture is a single row of \
+                                     texels whose width the provider's device bounds by \
+                                     `maxImageDimension1D` rather than by the 2D window; this \
+                                     snapshot declares no such window, so the pass is refused \
+                                     instead of being executed against an image its device was \
+                                     never asked about",
+                            ));
+                    }
+                    if texture.width > self.max_render_texture_dimension_1d {
+                        return Err(capability_error("render_texture_dimension_1d_limit")
+                            .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                            .with_field(
+                                "binding",
+                                FieldValue::Unsigned(u64::from(texture.metal_binding)),
+                            )
+                            .with_field("width", FieldValue::Unsigned(texture.width))
+                            .with_field(
+                                "maximum",
+                                FieldValue::Unsigned(self.max_render_texture_dimension_1d),
+                            ));
+                    }
+                }
             }
         }
         Ok(())
@@ -11703,7 +11876,9 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::SourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "buffer_source_length_mismatch")
         }
-        E::TextureSampleCountMismatch { .. } | E::TextureArrayLengthMismatch { .. } => {
+        E::TextureSampleCountMismatch { .. }
+        | E::TextureArrayLengthMismatch { .. }
+        | E::TextureDimensionMismatch { .. } => {
             (ProviderErrorClass::Args, "texture_shape_mismatch")
         }
         E::TextureBindingUnsupported(_) => (
@@ -13393,6 +13568,14 @@ pub enum ContractError {
         texture_type: TextureType,
         array_length: u64,
     },
+    /// A one-dimensional texture type carrying a height or a depth other than
+    /// one (2026-09-19, census b10's `texture_shape` bucket).
+    TextureDimensionMismatch {
+        texture_type: TextureType,
+        /// Which axis disagrees: `"height"` or `"depth"`.
+        field: &'static str,
+        dimension: u64,
+    },
     /// Retained for binding shapes that are not implemented yet. Admission no
     /// longer uses it: `ComputePass::validate` accepts texture bindings and both
     /// providers execute them, so the variant currently has **no construction
@@ -14457,6 +14640,15 @@ impl fmt::Display for ContractError {
             } => write!(
                 formatter,
                 "texture type {texture_type:?} does not admit array length {array_length}"
+            ),
+            Self::TextureDimensionMismatch {
+                texture_type,
+                field,
+                dimension,
+            } => write!(
+                formatter,
+                "texture type {texture_type:?} has one spatial axis, so its {field} cannot be \
+                 {dimension}"
             ),
             Self::TextureBindingUnsupported(binding) => write!(
                 formatter,
@@ -16512,6 +16704,7 @@ mod tests {
         ProviderCapabilities {
             supports_render_kept_frame_landing: false,
             supports_render_pass_entry_snapshot: false,
+            max_render_texture_dimension_1d: 0,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
@@ -23999,6 +24192,12 @@ mod tests {
                 TextureFormat::R8Unorm,
                 TextureFormat::R8G8Unorm,
                 TextureFormat::Rgba16Float,
+                // The two single-component float lanes the 2026-09-19
+                // widening appended (`research/docs/23` §119, census b10's
+                // `texture_shape` bucket): the order is the wire's, so the five
+                // lanes above keep theirs.
+                TextureFormat::R32Float,
+                TextureFormat::R16Float,
             ]
         );
         // A narrow format is a sampling source only: the colour-attachment

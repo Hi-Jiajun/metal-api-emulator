@@ -15,6 +15,7 @@ use metal_api_core::provider::{
     PresentMode, ProviderCapabilities, SemanticDigest, StencilResolveFilter, StorageMode,
     TextureBindingContract, TextureFormat, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
     MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    MAX_RENDER_TEXTURE_DIMENSION_1D,
 };
 use metal_api_core::ExecutorError;
 
@@ -50,6 +51,26 @@ pub(crate) fn attachment_dimension_window(limits: &vk::PhysicalDeviceLimits) -> 
         u64::from(limits.max_framebuffer_width).min(REVIEWED_ATTACHMENT_CEILING[0]),
         u64::from(limits.max_framebuffer_height).min(REVIEWED_ATTACHMENT_CEILING[1]),
     ]
+}
+
+/// The one-dimensional sampled window a device with these limits declares
+/// (2026-09-19, census b10's `texture_shape` bucket).
+///
+/// The contract's review ceiling
+/// ([`MAX_RENDER_TEXTURE_DIMENSION_1D`]) states how wide the widest *reviewed*
+/// LUT is, and the device's own `maxImageDimension1D` states how wide a
+/// one-dimensional image this device can hold — a limit of its own rather than
+/// a reading of `maxImageDimension2D`. The snapshot publishes the smaller of
+/// the two, so a device that cannot hold the census's `16384x1` colour-transfer
+/// LUT declares a narrower window instead of a width every `vkCreateImage` of
+/// the rail's own one-dimensional arm would refuse.
+///
+/// The rail's execution path asks the same two halves in the other order — the
+/// device's answer first, the ceiling second — exactly as the attachment
+/// window beside it does, so a directly-constructed request cannot jump either
+/// gate (`render.rs`, the sampled view gate's one-dimensional arm).
+pub(crate) fn render_texture_dimension_1d(limits: &vk::PhysicalDeviceLimits) -> u64 {
+    u64::from(limits.max_image_dimension1_d).min(MAX_RENDER_TEXTURE_DIMENSION_1D)
 }
 
 /// The stage-buffer window one device states (`research/docs/23` §3.3, §117
@@ -276,6 +297,18 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         supports_render_texture_sampling: true,
         max_render_textures: MAX_RENDER_TEXTURES as u32,
         supported_render_texture_formats: TextureFormat::RENDER_SAMPLED.to_vec(),
+        // The one-dimensional sampled window is executed by the same rail
+        // (2026-09-19, census b10's `texture_shape` bucket): `render.rs` uploads
+        // a single-row `vk::ImageType::TYPE_1D` image in the lane's own format
+        // and samples it through a `TYPE_1D`/`TYPE_1D_ARRAY` view.
+        // `tests/render_texture_1d_lut_e2e.rs` reads back the LUT's own texels
+        // through both rails on Lavapipe, and the census's own boot reads them
+        // on the RTX 5060. The window is the device's own
+        // `maxImageDimension1D` clamped by the contract's review ceiling, and a
+        // device whose answer is below the reviewed LUT's 16384 texels declares
+        // the narrower width rather than one it would refuse at
+        // `vkCreateImage`.
+        max_render_texture_dimension_1d: render_texture_dimension_1d(limits),
         // The gathered extent is executed for the arm whose source has host
         // bytes (`research/docs/23` §3.3, §111, E-TX5/E-TX10): a reviewed
         // module's sample coordinate is the fragment's own centre, so
