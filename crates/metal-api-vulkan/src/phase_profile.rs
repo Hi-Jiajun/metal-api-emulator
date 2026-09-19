@@ -756,6 +756,10 @@ struct Local {
     /// bytes the owner's pages received.
     landing_n: u64,
     landing_bytes: u64,
+    /// The readback staging buffers this window's passes allocated, by which
+    /// memory type the selection took.
+    staging_cached_n: u64,
+    staging_plain_n: u64,
 }
 
 /// An empty window, spelled out because the slot tables are longer than the
@@ -794,6 +798,8 @@ impl Default for Local {
             render_present_n: 0,
             landing_n: 0,
             landing_bytes: 0,
+            staging_cached_n: 0,
+            staging_plain_n: 0,
         }
     }
 }
@@ -906,6 +912,8 @@ impl Local {
         let render_present_n = std::mem::take(&mut self.render_present_n);
         let landing_n = std::mem::take(&mut self.landing_n);
         let landing_bytes = std::mem::take(&mut self.landing_bytes);
+        let staging_cached_n = std::mem::take(&mut self.staging_cached_n);
+        let staging_plain_n = std::mem::take(&mut self.staging_plain_n);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
@@ -933,7 +941,8 @@ impl Local {
              import_drop_n={import_drop_n} \
              render_offscreen_n={render_offscreen_n} \
              render_present_n={render_present_n} \
-             landing_n={landing_n} landing_bytes={landing_bytes}",
+             landing_n={landing_n} landing_bytes={landing_bytes} \
+             staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n}",
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
@@ -960,9 +969,32 @@ fn micros(ns: u64) -> f64 {
     ns as f64 / 1_000.0
 }
 
+/// Count one readback staging buffer's memory selection
+/// (`crate::readback_memory`) for the emitting thread's window.
+///
+/// The two outcomes partition every staging allocation: it took the device's
+/// host-cached type, or it fell back to the first host-visible one (no cached
+/// type, or the switch's control arm). A round that reads a small
+/// `staging_cached_n` can tell which of the two it is looking at from the
+/// `STAGING readback memory` line the process prints once.
+#[inline]
+pub(crate) fn note_staging_memory(cached: bool) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        if cached {
+            local.staging_cached_n += 1;
+        } else {
+            local.staging_plain_n += 1;
+        }
+    });
+}
+
 /// Whether the profile is on, read once from the process environment.
 #[inline]
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         parse_enabled(

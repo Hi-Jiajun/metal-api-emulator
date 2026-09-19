@@ -11453,6 +11453,16 @@ struct ReadbackObjects {
 /// kept-frame landing's copy-out use this one allocation shape
 /// (`research/docs/23` §115 之后的增量，E-TX14/R4b), so a landing cannot end up
 /// with a destination the pass's readback would refuse.
+/// Create one host-visible `TRANSFER_DST` staging buffer, bind it and map it.
+///
+/// The memory type is chosen by `crate::readback_memory` rather than by a flag
+/// pair stated here: every byte this buffer exists for is read *by the host*
+/// once the device has copied into it, and on this host the first type that
+/// satisfies `HOST_VISIBLE | HOST_COHERENT` is the device's own window, whose
+/// reads run at ~168 MB/s however large the copy is (the sp7 round's
+/// `readback_full` and `landing_fetch` readings, `docs/READBACK-MEMORY.md`).
+/// The helper still falls back to that exact pair when the device states no
+/// cached type, which is what the mechanism's control arm states.
 fn allocate_host_readback(
     context: &VulkanContext,
     byte_length: u64,
@@ -11464,19 +11474,15 @@ fn allocate_host_readback(
     let buffer = unsafe { context.device.create_buffer(&info, None) }
         .map_err(|error| execution_refusal("create readback buffer", &error.to_string()))?;
     let requirements = unsafe { context.device.get_buffer_memory_requirements(buffer) };
-    let memory_type = match context.memory_type(
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) {
-        Ok(index) => index,
-        Err(error) => {
-            unsafe { context.device.destroy_buffer(buffer, None) };
-            return Err(execution_refusal(
-                "find readback memory type",
-                &error.to_string(),
-            ));
-        }
-    };
+    let memory_type =
+        match crate::readback_memory::select(context.memory_types(), requirements.memory_type_bits)
+        {
+            Ok(choice) => choice.index,
+            Err(detail) => {
+                unsafe { context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal("find readback memory type", &detail));
+            }
+        };
     let allocation = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type);

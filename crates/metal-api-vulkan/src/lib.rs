@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 mod compute_provider;
 mod phase_profile;
 mod provider;
+mod readback_memory;
 mod readback_rect;
 mod render;
 mod render_import_pool;
@@ -2721,6 +2722,15 @@ impl VulkanContext {
                     required.as_raw()
                 ))
             })
+    }
+
+    /// The device's whole memory-type list, for the one caller that has to
+    /// *choose* among the types rather than state required flags
+    /// (`crate::readback_memory`): a readback staging buffer wants the host's
+    /// cached type when the device states one, which is a question about the
+    /// list rather than a flag pair this rail can require.
+    pub(crate) fn memory_types(&self) -> &[vk::MemoryType] {
+        &self.memory.memory_types[..self.memory.memory_type_count as usize]
     }
 
     /// Alignment required for `VK_EXT_external_memory_host` imports, or zero
