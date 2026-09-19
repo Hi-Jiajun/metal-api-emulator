@@ -90,6 +90,13 @@
       "rule": "render-covered-attachment",
       "why": "the class's one attachment reaches the comparison through a stored writeback; a resident store publishes none and the owner window a later landing entry fills is the whole observation, and this rail-fact owes its own fixture"
     }
+    ,
+    {
+      "suite": "suite-v43.json",
+      "case": "pass_entry_snapshot_4x4",
+      "rule": "render-covered-attachment",
+      "why": "the class's one sampled declaration carries its own bytes and resolves before the pass opens; a pass-entry snapshot names the pass's own attachment and the rail's copy of its entry content is the whole read, and this rail-fact owes its own fixture"
+    }
       ]
     }
   ]

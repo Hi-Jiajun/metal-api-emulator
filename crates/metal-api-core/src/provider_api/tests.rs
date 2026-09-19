@@ -229,6 +229,7 @@ impl ComputeProvider for FakeProvider {
             supports_render_stage_buffers: self.stage_buffers,
             supports_render_kept_frame_landing: false,
             supports_render_pixel_coordinate_sampler: false,
+            supports_render_pass_entry_snapshot: false,
             max_render_stage_buffers: if self.stage_buffers {
                 MAX_RENDER_STAGE_BUFFERS as u32
             } else {

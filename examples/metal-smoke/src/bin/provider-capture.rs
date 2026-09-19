@@ -678,6 +678,18 @@ impl CopyCounters {
         }
     }
 
+    /// Cumulative pass-entry snapshot copies and the bytes they moved
+    /// (`research/docs/23` §118, E-TX15). The native rail declares the arm
+    /// `false` and refuses it by name, so its reading is `(0, 0)` — the
+    /// fail-closed direction the counter states rather than a missing one.
+    fn attachment_snapshot_counts(&self) -> (usize, usize) {
+        match self {
+            Self::Vulkan { executor, .. } => executor.attachment_snapshot_counts(),
+            #[cfg(target_os = "macos")]
+            Self::Native(_) => (0, 0),
+        }
+    }
+
     /// The reviewed 2/4/8 sample counts the device admits, as the
     /// contract-code bitmask (`research/docs/23` §3.3, v61): bit `i` =
     /// `SampleCount` code `i`. The device-gated sample-count cases are owed
@@ -1434,7 +1446,9 @@ fn register_render_pipeline(
     // instead.
     if matches!(
         geometry,
-        RenderGeometry::GatheredExtent | RenderGeometry::SupersetVertexInput
+        RenderGeometry::GatheredExtent
+            | RenderGeometry::SupersetVertexInput
+            | RenderGeometry::PassEntrySnapshot
     ) {
         return Err(format!(
             "render case {}: the translated arm registers its translated stages",
@@ -1595,6 +1609,9 @@ fn register_render_pipeline(
         // Unreachable for the same reason: the declared-superset arm's stages
         // are the translator's too (`research/docs/23` §3.3, E-TX11).
         RenderGeometry::SupersetVertexInput => unreachable!(),
+        // Unreachable for the same reason: the pass-entry snapshot arm's stages
+        // are the translator's too (`research/docs/23` §118, E-TX15).
+        RenderGeometry::PassEntrySnapshot => unreachable!(),
     };
     // The sampled case's declaration (`research/docs/23` §3.3, v100): the
     // fragment stage reads the pass's one texture at binding 0, and the state
@@ -1605,6 +1622,16 @@ fn register_render_pipeline(
     // the older byte order.
     let textures = match geometry {
         RenderGeometry::SampledTexture => vec![TextureBindingContract::sampled(
+            0,
+            sampled_case_texture_format(case)?,
+            SamplerPolicy::reviewed_render_sampler(),
+        )],
+        // The pass-entry snapshot arm's declaration (`research/docs/23` §118,
+        // E-TX15) is the gathered arm's one texture slot: the translated
+        // fragment stage samples the pass's own attachment at Metal binding
+        // zero, so the registration pairs the same declaration the gathered arm
+        // states, and only the pass's view source differs.
+        RenderGeometry::PassEntrySnapshot => vec![TextureBindingContract::sampled(
             0,
             sampled_case_texture_format(case)?,
             SamplerPolicy::reviewed_render_sampler(),
@@ -1730,13 +1757,14 @@ fn register_translated_stage_buffer_pipeline(
     // — every Metal resource in set 0 — which is the arrangement the rail's own
     // `render_texture_extent_e2e` reading measured.
     let gathered = geometry == RenderGeometry::GatheredExtent;
+    let snapshot = geometry == RenderGeometry::PassEntrySnapshot;
     // The declared-superset pair reads no `[[buffer(N)]]` argument either
     // (`research/docs/23` §3.3, E-TX11): its vertex module's inputs are the
     // vertex attributes the contract declares, so it takes the translator's
     // default layout — every Metal resource in set 0 — exactly as the
     // gathered-extent pair does.
     let superset = geometry == RenderGeometry::SupersetVertexInput;
-    let (vertex_set, fragment_set) = if gathered || superset {
+    let (vertex_set, fragment_set) = if gathered || superset || snapshot {
         (GATHERED_EXTENT_SET, GATHERED_EXTENT_SET)
     } else {
         (STAGE_BUFFER_VERTEX_SET, STAGE_BUFFER_FRAGMENT_SET)
@@ -1784,7 +1812,7 @@ fn register_translated_stage_buffer_pipeline(
     // extent is the view's own — the register gate pairs this declaration with
     // the module's reflection field by field, so a module that reads another
     // binding is refused rather than executed against the wrong bytes.
-    let textures = if gathered {
+    let textures = if gathered || snapshot {
         vec![TextureBindingContract::sampled(
             0,
             sampled_case_texture_format(case)?,
@@ -3274,6 +3302,16 @@ struct CaseResult {
     /// which is not a provider.
     copy_in: Option<u32>,
     copy_out: Option<u32>,
+    /// The pass-entry snapshot copies this case's pass recorded, and the bytes
+    /// they moved (`research/docs/23` §118, E-TX15). Absent from every case
+    /// that declares no snapshot texture, and from the Swift reference oracle,
+    /// which is not a provider. The frame alone cannot tell "the sampled image
+    /// was filled from the attachment's entry content" from "the sampled image
+    /// was something else", so this is the arm's provenance reading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment_snapshots: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment_snapshot_bytes: Option<u32>,
     /// Per-command-buffer counters, one entry per committed command buffer and
     /// in commit order. Recorded only for cases that split their sequence, so
     /// the flat totals above stay the sum of the groups
@@ -3846,6 +3884,7 @@ fn main() -> Result<()> {
             .ok_or("render case declaring pass is not a case of this suite")?;
         let before = counters.read();
         let (acquires_before, presents_before) = counters.present_counts();
+        let (snapshots_before, snapshot_bytes_before) = counters.attachment_snapshot_counts();
         let geometry = render_geometry(case, &format!("render case {}", case.id))?;
         let attachment_formats = render_case_attachments(case)
             .iter()
@@ -3947,6 +3986,20 @@ fn main() -> Result<()> {
         let (acquires_after, presents_after) = counters.present_counts();
         result.copy_in = Some(u32::try_from(after.0 - before.0)?);
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
+        // The snapshot arm's provenance reading (`research/docs/23` §118,
+        // E-TX15): the device-side copies this case's pass recorded. The
+        // counter is cumulative, so the reading is the difference across the
+        // case — the same shape the two buffer-copy counters beside it use.
+        let (snapshots_after, snapshot_bytes_after) = counters.attachment_snapshot_counts();
+        if case.fragment_textures.as_ref().is_some_and(|definitions| {
+            definitions
+                .iter()
+                .any(|definition| definition.source.as_deref() == Some("pass_entry_snapshot"))
+        }) {
+            result.attachment_snapshots = Some(u32::try_from(snapshots_after - snapshots_before)?);
+            result.attachment_snapshot_bytes =
+                Some(u32::try_from(snapshot_bytes_after - snapshot_bytes_before)?);
+        }
         if case.present.is_some() {
             result.present = Some(PresentCounts {
                 acquire: u32::try_from(acquires_after - acquires_before)?,
@@ -4168,6 +4221,16 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // the two Vulkan rails, so this table pins the declaring pass, which
         // every rail executes.
         (1, "compute-buffer-v42") => &["render_declaring_stage_buffer_per_stage"],
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15): the
+        // plain copy kernel over the 4x4 attachment's own sixty-four-byte
+        // view — the bytes the render case's pass loads before drawing —
+        // beside the render case whose sampled declaration names that same
+        // attachment through the new arm. The render case runs on the Vulkan
+        // trace rail alone (the native rails refuse the arm by name and the
+        // object rails have no entry for a declaration that carries no
+        // bytes), so this table pins the declaring pass, which every rail
+        // executes.
+        (1, "compute-buffer-v43") => &["render_declaring_pass_entry_snapshot"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4406,6 +4469,15 @@ enum RenderGeometry {
     /// is the translating rail's, so its marker stays inside the two Vulkan
     /// rails and no MSL sibling exists to pin.
     SupersetVertexInput,
+    /// The pass-entry snapshot arm (`research/docs/23` §118, E-TX15): two
+    /// translated AIR stages beside one sampled declaration that names the
+    /// pass's *own* attachment and carries no bytes. The declaration states the
+    /// arm's semantics — the read is the attachment's content as the pass's
+    /// load arm establishes it, before the first draw — and the rail takes that
+    /// copy before the render pass opens. The arm is the translating rail's, so
+    /// its marker stays inside the Vulkan trace rail and no MSL sibling exists
+    /// to pin.
+    PassEntrySnapshot,
 }
 
 /// One sampled texture a render case binds (`research/docs/23` §3.3, v70): the
@@ -4425,9 +4497,35 @@ struct FragmentTextureDefinition {
     initial_hex: Option<String>,
     #[serde(default)]
     texel_rule: Option<String>,
+    /// How the pass's sampled declaration supplies this texture's bytes
+    /// (`research/docs/23` §118, E-TX15). `"bytes"` — the default, and every
+    /// pre-v43 case — uploads this definition's own texels; the absent field
+    /// and the explicit spelling are the same arm. `"pass_entry_snapshot"`
+    /// names the pass's *own* attachment and carries no bytes at all: the
+    /// declaration's identity has to be the attachment's, and what the
+    /// fragment stage reads is the entry content the attachment's own
+    /// `initial_hex` states.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 impl FragmentTextureDefinition {
+    /// The source arm this declaration states (`research/docs/23` §118,
+    /// E-TX15). The spelling is closed: an unknown name is a refusal rather
+    /// than a silent fall-through to the byte arm.
+    fn source_arm(&self) -> Result<SampledSourceArm> {
+        match self.source.as_deref() {
+            None | Some("bytes") => Ok(SampledSourceArm::Bytes),
+            Some("pass_entry_snapshot") => Ok(SampledSourceArm::PassEntrySnapshot),
+            Some(other) => Err(format!(
+                "the render sampler's sources are the uploaded bytes (absent or \"bytes\") and \
+                 the pass's own attachment as it stands when the pass opens \
+                 (\"pass_entry_snapshot\"), not {other:?}"
+            )
+            .into()),
+        }
+    }
+
     /// The `TextureFormat` this declaration names (`research/docs/23` §3.3,
     /// §107, §113): the render sampler's four admitted lanes — the two
     /// four-byte 8-bit UNORM byte orders and the two narrow formats. Which byte
@@ -6060,6 +6158,317 @@ fn reviewed_sampled_geometry(
     Ok(RenderGeometry::SampledTexture)
 }
 
+/// The source arm one `fragment_textures` entry states
+/// (`research/docs/23` §118, E-TX15).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SampledSourceArm {
+    /// The definition's own texels, uploaded into the rail's sampled image.
+    Bytes,
+    /// The pass's own colour attachment as it stands when the pass opens: the
+    /// rail copies the attachment's entry content into a same-format image
+    /// before the render pass and binds that copy.
+    PassEntrySnapshot,
+}
+
+/// The pass-entry snapshot arm's own claims (`research/docs/23` §118, E-TX15).
+///
+/// The arm is the census's shape: the pass's fragment stage samples the very
+/// colour attachment the pass draws into, and the canonical answer is the
+/// bytes that attachment holds when the pass opens. The case states it with
+/// two translated AIR stages — the same reviewed pair the gathered-extent arm
+/// uses, whose fragment module reads two fixed texel centres — beside a
+/// sampled declaration that names the attachment itself and carries no bytes.
+///
+/// The fixture's falsifiers are its own: the expectation is the module's
+/// reading of the *entry* bytes (uniform `0xc0/0x40/0/0xff` for the fixture's
+/// gradient), so a rail that sampled the pass's own output, bound a fresh
+/// image, or read a clear would land other bytes; the entry texels are pairwise
+/// distinct and none is the all-zero word a fresh image holds; and the
+/// capture's snapshot counter has to report one copy of the attachment's
+/// tightly packed extent, which is the reading that separates "the copy ran"
+/// from "the bytes happen to match".
+fn reviewed_pass_entry_snapshot_geometry(
+    case: &RenderCase,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    let textures = case
+        .fragment_textures
+        .as_deref()
+        .ok_or_else(|| format!("{where_}: the pass-entry snapshot arm samples one texture"))?;
+    if textures.len() != 1 {
+        return Err(
+            format!("{where_}: the pass-entry snapshot arm binds exactly one texture").into(),
+        );
+    }
+    let texture = &textures[0];
+    if texture.source_arm()? != SampledSourceArm::PassEntrySnapshot {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: this arm's declaration states the \
+             pass_entry_snapshot source"
+        )
+        .into());
+    }
+    let translated = case.translated_stages.as_ref().ok_or_else(|| {
+        format!(
+            "{where_}: the pass-entry snapshot arm registers two translated AIR stages, whose \
+             fragment module states the texel centres it reads"
+        )
+    })?;
+    if !case.stage_buffers.is_empty() {
+        return Err(format!(
+            "{where_}: the pass-entry snapshot arm carries no stage-buffer declaration"
+        )
+        .into());
+    }
+    if case.vertex_layout.is_some() || !case.vertex_buffers.is_empty() || case.indices.is_some() {
+        return Err(format!(
+            "{where_}: the pass-entry snapshot arm is the vertex_id triangle and binds no vertex \
+             stream, layout or index buffer"
+        )
+        .into());
+    }
+    if case.attachments.is_some() {
+        return Err(format!("{where_}: the pass-entry snapshot arm stores one attachment").into());
+    }
+    if case.depth.is_some()
+        || case.stencil.is_some()
+        || case.cull.is_some()
+        || case.blend.is_some()
+        || case.multisample.is_some()
+        || case.depth_resolve.is_some()
+        || case.stencil_resolve.is_some()
+        || case.present.is_some()
+        || case.icb.is_some()
+        || case.expected_rule.is_some()
+        || case.readback_windows.is_some()
+        || case.coverage.is_some()
+    {
+        return Err(format!(
+            "{where_}: a pass-entry snapshot case carries no depth, stencil, cull, blend, \
+             multisample, resolve, present, indirect, rule or coverage section"
+        )
+        .into());
+    }
+    // The pass clips its draw to a strict sub-rectangle (`research/docs/23`
+    // §3.3, v29): the drawn texels carry the fragment's own reading of the
+    // entry bytes while the rest keep those bytes, so "the snapshot content"
+    // and "the pass's own raster" are two readings in one frame.
+    let scissor = case.scissor.ok_or_else(|| {
+        format!(
+            "{where_}: the pass-entry snapshot arm clips its draw to a strict sub-rectangle, so \
+             the frame carries both the module's reading and the entry bytes"
+        )
+    })?;
+    let [scissor_x, scissor_y, scissor_width, scissor_height] = scissor;
+    if scissor_width == 0 || scissor_height == 0 {
+        return Err(format!("{where_}.scissor: a zero extent").into());
+    }
+    if case.vertices != GATHERED_EXTENT_VERTICES {
+        return Err(format!(
+            "{where_}: the pass-entry snapshot arm draws the translated stage's \
+             {GATHERED_EXTENT_VERTICES}-vertex triangle"
+        )
+        .into());
+    }
+    if case.instance_count != 1 || case.base_vertex != 0 {
+        return Err(format!(
+            "{where_}: the pass-entry snapshot arm draws one instance with no vertex offset"
+        )
+        .into());
+    }
+    if case.metal.is_some() {
+        return Err(format!(
+            "{where_}: a translated case has no MSL sibling to pin, so it carries no metal source"
+        )
+        .into());
+    }
+    if translated.vertex.path == translated.fragment.path {
+        return Err(
+            format!("{where_}: the two translated stages name their own AIR modules").into(),
+        );
+    }
+    // The translating rail owns the arm: the two Vulkan faces translate AIR,
+    // and the native rails refuse the arm by name.
+    let allowed = ["vulkan"];
+    if case.capture_rails.is_empty()
+        || case
+            .capture_rails
+            .iter()
+            .any(|rail| !allowed.contains(&rail.as_str()))
+    {
+        return Err(format!(
+            "{where_}: a pass-entry snapshot case runs on the rail whose texture walk resolves \
+             the arm ({}), so its capture_rails has to stay inside that list",
+            allowed.join(", ")
+        )
+        .into());
+    }
+    let attachment = case.attachment.as_ref().ok_or_else(|| {
+        format!("{where_}: the pass-entry snapshot arm needs its stored attachment")
+    })?;
+    if texture.allocation != attachment.allocation || texture.view != attachment.view {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: a pass-entry snapshot declaration names the pass's \
+             own attachment, so its (allocation, view) pair has to be the attachment's"
+        )
+        .into());
+    }
+    if texture.format != attachment.format
+        || texture.width != attachment.width
+        || texture.height != attachment.height
+    {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: a pass-entry snapshot declaration restates the \
+             attachment's own format and extent — the snapshot *is* that texel grid"
+        )
+        .into());
+    }
+    if texture.initial_hex.is_some() || texture.texel_rule.is_some() {
+        return Err(format!(
+            "{where_}.fragment_textures[0]: a pass-entry snapshot declaration carries no bytes; \
+             the entry content is the attachment's own initial_hex"
+        )
+        .into());
+    }
+    let attachment_layout = attachment_format(&attachment.format)?;
+    if !matches!(
+        attachment_layout,
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+    ) || attachment.store != "store"
+    {
+        return Err(format!(
+            "{where_}.attachment: the pass-entry snapshot arm stores one 8-bit four-component \
+             unorm attachment, in either byte order"
+        )
+        .into());
+    }
+    if attachment.load != "load" {
+        return Err(format!(
+            "{where_}.attachment: the pass-entry snapshot reads the bytes the attachment holds \
+             when the pass opens, so the case states the loading arm (`load` with initial_hex); \
+             the resident arm's own reading is the rail's e2e"
+        )
+        .into());
+    }
+    if attachment.width == 0 || attachment.height == 0 {
+        return Err(format!("{where_}.attachment: a zero extent").into());
+    }
+    let entry = unhex(attachment.initial_hex.as_deref().ok_or_else(|| {
+        format!("{where_}.attachment: the snapshot's entry content is the attachment's initial_hex")
+    })?)?;
+    let texel_bytes = texture.format()?.bytes_per_texel();
+    if entry.len() as u64 != attachment.width * attachment.height * texel_bytes {
+        return Err(format!(
+            "{where_}.attachment.initial_hex: the entry content has to be the attachment's own \
+             tightly packed extent"
+        )
+        .into());
+    }
+    let expected = unhex(case.expected_hex.as_deref().ok_or_else(|| {
+        format!("{where_}: the pass-entry snapshot shape needs its expectation")
+    })?)?;
+    if expected.len() != entry.len() {
+        return Err(
+            format!("{where_}.expected_hex: the frame is the attachment's own extent").into(),
+        );
+    }
+    let entry_texels = entry
+        .chunks_exact(4)
+        .map(<[u8]>::to_vec)
+        .collect::<std::collections::BTreeSet<_>>();
+    if entry_texels.len() != entry.len() / 4
+        || entry_texels.contains(&vec![0x00; 4])
+        || entry_texels.contains(&vec![0xff; 4])
+    {
+        return Err(format!(
+            "{where_}.attachment: the entry texels have to be pairwise distinct and unlike the \
+             all-zero word a fresh image holds, or a rail that never copied could pass"
+        )
+        .into());
+    }
+    // The frame's two halves, checked against the case's own scissor
+    // (`research/docs/23` §3.3, v29): a texel inside the clipped rectangle
+    // carries the fragment stage's reading (one colour, because the module's
+    // two samples are fixed coordinates), and a texel outside it keeps the
+    // entry byte the load handed the attachment. Both halves have to appear —
+    // that is what keeps "the draw ran" and "the copy ran" readable at once.
+    let width = attachment.width;
+    let mut drawn: Option<[u8; 4]> = None;
+    let mut drawn_count = 0_usize;
+    let mut kept_count = 0_usize;
+    for (position, texel) in expected.chunks_exact(4).enumerate() {
+        let x = (position as u64) % width;
+        let y = (position as u64) / width;
+        let inside = x >= scissor_x
+            && y >= scissor_y
+            && x < scissor_x + scissor_width
+            && y < scissor_y + scissor_height;
+        if inside {
+            let texel: [u8; 4] = texel.try_into().expect("a four-byte texel");
+            match drawn {
+                None => drawn = Some(texel),
+                Some(value) if value == texel => {}
+                Some(_) => {
+                    return Err(format!(
+                        "{where_}.expected_hex: the drawn texels disagree about the fragment's \
+                         reading, but the module's two samples are fixed coordinates"
+                    )
+                    .into())
+                }
+            }
+            drawn_count += 1;
+        } else {
+            let previous = &entry[position * 4..position * 4 + 4];
+            if texel != previous {
+                return Err(format!(
+                    "{where_}.expected_hex: a texel outside the scissor has to keep the entry \
+                     byte the load handed it"
+                )
+                .into());
+            }
+            kept_count += 1;
+        }
+    }
+    if drawn_count == 0 || kept_count == 0 {
+        return Err(format!(
+            "{where_}.scissor: the clip has to leave at least one drawn and one kept texel"
+        )
+        .into());
+    }
+    if Some(entry[0..4].try_into().expect("a four-byte texel")) == drawn
+        && entry.chunks_exact(4).all(|chunk| chunk == &entry[0..4])
+    {
+        return Err(format!(
+            "{where_}.expected_hex: the fragment's reading is the entry's own word, so the two \
+             halves are indistinguishable"
+        )
+        .into());
+    }
+    if let Some(drawn) = drawn {
+        if entry.chunks_exact(4).any(|chunk| chunk == drawn) {
+            return Err(format!(
+                "{where_}.expected_hex: the fragment's reading equals an entry texel, so a rail \
+                 that never sampled the snapshot could pass"
+            )
+            .into());
+        }
+    }
+    if expected == entry
+        || expected
+            .chunks_exact(4)
+            .any(|chunk| chunk == [0x00, 0x00, 0x00, 0x00])
+    {
+        return Err(format!(
+            "{where_}.expected_hex: the expectation has to be the module's own reading of the \
+             entry bytes — the fixture's two fixed samples land one colour, and a frame equal to \
+             the entry content or to a fresh image's zeros cannot tell the snapshot from a pass \
+             that never read it"
+        )
+        .into());
+    }
+    Ok(RenderGeometry::PassEntrySnapshot)
+}
+
 /// Classify the gathered-extent arm and pin the shape's own claims
 /// (`research/docs/23` §3.3, §111, E-TX10).
 ///
@@ -7189,6 +7598,26 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     // translated case that carries no stage buffer would otherwise be read as
     // one.
     if case.translated_stages.is_some() && case.fragment_textures.is_some() {
+        // Two shapes share the translated-and-sampled arrangement
+        // (`research/docs/23` §118, E-TX15): the gathered-extent arm's source
+        // is *another* extent, while the pass-entry snapshot's source is the
+        // pass's own attachment. The declaration's own source arm is what
+        // separates them, so the snapshot arm is classified first and each
+        // arm's claims are pinned by its own walk.
+        let snapshot = case
+            .fragment_textures
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .any(|texture| {
+                matches!(
+                    texture.source_arm(),
+                    Ok(SampledSourceArm::PassEntrySnapshot)
+                )
+            });
+        if snapshot {
+            return reviewed_pass_entry_snapshot_geometry(case, where_);
+        }
         return reviewed_gathered_extent_geometry(case, where_);
     }
     // The declared-superset vertex interface (`research/docs/23` §3.3, E-TX11)
@@ -7624,6 +8053,15 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             // as the reviewed sampler's is, so the arm names no landing and the
             // case states no present or indirect action.
         }
+        RenderGeometry::PassEntrySnapshot => {
+            // The pass-entry snapshot arm's own claims were pinned by
+            // `reviewed_pass_entry_snapshot_geometry` above — the translated
+            // pair, the declaration's identity, the entry bytes and the
+            // Vulkan-only marker — so what is left here is the pass's own half.
+            // The declaration reads the pass's own attachment, so it names no
+            // landing of its own, and the case states no present or indirect
+            // action.
+        }
         RenderGeometry::StageBuffers => {
             // The stage-buffer geometry and its declarations were pinned by
             // `reviewed_stage_buffer_geometry` above; what is left here is the
@@ -7768,6 +8206,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // translator's, and the shape module above pinned that it carries no
         // MSL pin.
         RenderGeometry::SupersetVertexInput => {
+            (case.vertex_entry.as_str(), case.fragment_entry.as_str())
+        }
+        // The pass-entry snapshot arm names its own two AIR entries for the
+        // same reason (`research/docs/23` §118, E-TX15): its stages are the
+        // translator's, and the shape module above pinned that it carries no
+        // MSL pin.
+        RenderGeometry::PassEntrySnapshot => {
             (case.vertex_entry.as_str(), case.fragment_entry.as_str())
         }
         // A translated stage-buffer case names its own two AIR entries rather
@@ -9774,6 +10219,16 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4)][..],
         ),
+        // E-TX15: the pass-entry snapshot declaring pass is the same plain copy
+        // kernel over the 4x4 attachment's own sixty-four-byte view — the
+        // bytes the render case's pass loads before it draws and samples
+        // (`research/docs/23` §118).
+        "render_declaring_pass_entry_snapshot" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 64), (1, "write", 4)][..],
+        ),
         // E-TX11: the declared-superset arm's declaring pass is the same
         // kernel over the 2x2 render area's own sixteen-byte view beside the
         // copy landing (`research/docs/23` §3.3).
@@ -11244,7 +11699,17 @@ fn run_render_case(
                         array_length: 1,
                         sample_count: 1,
                         access: TextureAccess::Sampled,
-                        source: TextureSource::OwnedBytes(definition.texels()?),
+                        // The two source arms (`research/docs/23` §118,
+                        // E-TX15): the byte arm uploads the definition's own
+                        // texels, while the pass-entry snapshot names the
+                        // pass's attachment and carries none — the rail takes
+                        // the copy before the pass opens.
+                        source: match definition.source_arm()? {
+                            SampledSourceArm::Bytes => {
+                                TextureSource::OwnedBytes(definition.texels()?)
+                            }
+                            SampledSourceArm::PassEntrySnapshot => TextureSource::PassEntrySnapshot,
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>>>()
@@ -11770,6 +12235,8 @@ fn run_render_case(
         allocations: images,
         copy_in: None,
         copy_out: None,
+        attachment_snapshots: None,
+        attachment_snapshot_bytes: None,
         group_counts: None,
         present: None,
         heap: None,
@@ -11991,6 +12458,8 @@ fn run_object_case(
             allocations,
             copy_in: None,
             copy_out: None,
+            attachment_snapshots: None,
+            attachment_snapshot_bytes: None,
             group_counts: case.command_buffers.as_ref().map(|_| group_counts),
             present: None,
             heap: None,
@@ -13229,6 +13698,8 @@ fn run_object_render_case(
         allocations: images_report,
         copy_in: None,
         copy_out: None,
+        attachment_snapshots: None,
+        attachment_snapshot_bytes: None,
         group_counts: None,
         present: None,
         heap: None,
@@ -13577,6 +14048,8 @@ fn run_case(
             .collect(),
         copy_in: None,
         copy_out: None,
+        attachment_snapshots: None,
+        attachment_snapshot_bytes: None,
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
         present: None,
         heap: None,

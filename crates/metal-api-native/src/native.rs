@@ -495,6 +495,11 @@ impl NativeMetalProvider {
                 // snapshot keeps the fail-closed default and the rail refuses
                 // such a pass by name (`render_pixel_coordinate_sampler_unsupported`).
                 supports_render_pixel_coordinate_sampler: false,
+                // The pass-entry snapshot arm (`research/docs/23` §118,
+                // E-TX15) is refused by the texture walk beside the same two
+                // bits, because Apple has no oracle for the shape.
+                supports_render_pass_entry_snapshot: render_bits
+                    .supports_render_pass_entry_snapshot,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled

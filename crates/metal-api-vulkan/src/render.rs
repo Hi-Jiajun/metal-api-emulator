@@ -5182,6 +5182,7 @@ fn texture_source_name(source: &TextureSource) -> &'static str {
         TextureSource::StagedLease(_) => "staged_lease",
         TextureSource::BorrowedNoCopy(_) => "borrowed_no_copy",
         TextureSource::TraceView => "trace_view",
+        TextureSource::PassEntrySnapshot => "pass_entry_snapshot",
     }
 }
 
@@ -5444,21 +5445,37 @@ fn resolve_render_textures<'a>(
                 extent,
             ));
         }
-        let source = resolve_render_texture_source(
-            view,
-            leases,
-            usize::try_from(binding).unwrap_or(usize::MAX),
-            produced,
-        )?;
-        let expected = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
-            .ok_or_else(|| contract_refusal("render texture bytes overflow u64"))?;
-        if u64::try_from(source.len()).unwrap_or(u64::MAX) != expected {
-            return Err(contract_refusal(&format!(
-                "render texture binding {binding} resolves {} bytes for a {width}x{height} surface",
-                source.len()
-            )));
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15) is
+        // resolved against the pass itself rather than through the byte
+        // channel: what it reads is the attachment this pass opens, so the
+        // declaration has to name one of *this* pass's colour attachments and
+        // that attachment has to have prior contents to copy.
+        let source = if matches!(view.source, TextureSource::PassEntrySnapshot) {
+            RenderInputSource::AttachmentSnapshot {
+                attachment: resolve_pass_entry_snapshot_attachment(pass, view, binding)?,
+            }
+        } else {
+            resolve_render_texture_source(
+                view,
+                leases,
+                usize::try_from(binding).unwrap_or(usize::MAX),
+                produced,
+            )?
+        };
+        // The byte arms are sized against the declaration; the snapshot arm
+        // has no host bytes at all — its extent *is* the attachment's, which
+        // the resolver above held the declaration to — so the rule is theirs.
+        if !matches!(source, RenderInputSource::AttachmentSnapshot { .. }) {
+            let expected = u64::from(width)
+                .checked_mul(u64::from(height))
+                .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
+                .ok_or_else(|| contract_refusal("render texture bytes overflow u64"))?;
+            if u64::try_from(source.len()).unwrap_or(u64::MAX) != expected {
+                return Err(contract_refusal(&format!(
+                    "render texture binding {binding} resolves {} bytes for a {width}x{height} surface",
+                    source.len()
+                )));
+            }
         }
         // The one other-extent source that is *not* gathered on the host: the
         // owner's no-copy window read by the pair's gathered sibling
@@ -5667,6 +5684,21 @@ pub(crate) enum RenderInputSource<'a> {
         bytes: Vec<u8>,
         leases: Vec<LeaseId>,
     },
+    /// The pass's own colour attachment as it stands when the pass opens
+    /// (`TextureSource::PassEntrySnapshot`, `research/docs/23` §118, E-TX15):
+    /// the rail copies the attachment image's current contents into a
+    /// same-format device-local image *before* the render pass opens and binds
+    /// that copy as the sampled view. What differs from every arm above is that
+    /// the bytes never exist on the host: the source is a device-side
+    /// `vkCmdCopyImage`, which is why this arm carries the attachment's
+    /// position rather than a window.
+    ///
+    /// The position is the attachment list's own index, resolved by
+    /// [`resolve_render_textures`] against the pass the declaration belongs to,
+    /// so the copy's source is the very image the pass writes — and the copy
+    /// runs before the first command of the pass, so no draw of this pass can
+    /// be a producer of the bytes it reads.
+    AttachmentSnapshot { attachment: usize },
 }
 
 impl RenderInputSource<'_> {
@@ -5682,6 +5714,10 @@ impl RenderInputSource<'_> {
             Self::Borrowed { window, .. } => window.len,
             Self::ProducedBytes(bytes) => bytes.len(),
             Self::GatheredBytes { bytes, .. } => bytes.len(),
+            // The snapshot has no host bytes at all: its extent is the
+            // attachment's, which `resolve_render_textures` has already held
+            // the declaration to, and the copy is the device's own.
+            Self::AttachmentSnapshot { .. } => 0,
         }
     }
 
@@ -5705,6 +5741,14 @@ impl RenderInputSource<'_> {
             Self::Borrowed { window, .. } => unsafe {
                 std::slice::from_raw_parts(window.pointer as *const u8, window.len)
             },
+            // The pass-entry snapshot arm is a *texture* source
+            // (`research/docs/23` §118, E-TX15): its bytes are the
+            // attachment's own texels, which the device copies into the
+            // sampled image before the pass opens. Nothing reads a footprint
+            // proof out of it — the proof this rail states for the arm is the
+            // attachment's tightly packed extent, which core's contract walk
+            // already held the declaration to.
+            Self::AttachmentSnapshot { .. } => &[],
         }
     }
 
@@ -5718,7 +5762,7 @@ impl RenderInputSource<'_> {
             Self::StagedBytes(bytes) => Some(bytes),
             Self::ProducedBytes(bytes) => Some(bytes),
             Self::GatheredBytes { bytes, .. } => Some(bytes),
-            Self::Borrowed { .. } => None,
+            Self::Borrowed { .. } | Self::AttachmentSnapshot { .. } => None,
         }
     }
 
@@ -5728,7 +5772,8 @@ impl RenderInputSource<'_> {
             Self::TraceBytes(_)
             | Self::StagedBytes(_)
             | Self::ProducedBytes(_)
-            | Self::GatheredBytes { .. } => None,
+            | Self::GatheredBytes { .. }
+            | Self::AttachmentSnapshot { .. } => None,
             Self::Borrowed { lease, .. } => Some(*lease),
         }
     }
@@ -6607,6 +6652,96 @@ impl<'a> ProducedTraceViews<'a> {
     }
 }
 
+/// Resolve the attachment a pass-entry snapshot declaration reads
+/// (`research/docs/23` §118, E-TX15).
+///
+/// The declaration's whole meaning is "the bytes this pass's own colour
+/// attachment holds when the pass opens", so the value-level resolver asks the
+/// four questions core's contract walk asks and answers each with its own
+/// name: the `(allocation, view)` pair has to be one of *this* pass's colour
+/// attachments, the declaration has to restate that attachment's format and
+/// extent, the attachment's load arm has to establish prior contents
+/// (`Load`/`Resident` — a clear's entry content is the clear colour and
+/// `DontCare`'s is undefined, so neither is a copy of what the attachment
+/// held), and the sampled view has to be a plain single-sample 2D view. The
+/// gate is re-asked here rather than trusted from core, the same way every
+/// other rail-side resolver re-asks the pass's shape against the values it was
+/// handed.
+fn resolve_pass_entry_snapshot_attachment(
+    pass: &RenderPassDescriptor,
+    view: &TextureView,
+    binding: u32,
+) -> Result<usize, ProviderError> {
+    let attachment = pass.color_attachments.iter().position(|attachment| {
+        attachment.view_id == view.view_id && attachment.allocation_id == view.allocation_id
+    });
+    let Some(attachment) = attachment else {
+        return Err(pass_entry_snapshot_refusal(
+            "render_pass_entry_snapshot_unattached",
+            binding,
+            view,
+            "the declaration names a pass-entry snapshot, but the pass opens no colour \
+             attachment with this (allocation, view) pair: the arm reads the bytes the pass's \
+             own attachment holds when it opens, and this pass holds no such attachment",
+        ));
+    };
+    let attachment_view = &pass.color_attachments[attachment];
+    if attachment_view.format.as_texture_format() != view.format
+        || [attachment_view.width, attachment_view.height] != [view.width, view.height]
+    {
+        return Err(pass_entry_snapshot_refusal(
+            "render_pass_entry_snapshot_shape_mismatch",
+            binding,
+            view,
+            "the declaration has to restate the attachment's own format and extent: the \
+             snapshot is that attachment's texel grid, so another texel order or another extent \
+             would sample bytes the attachment never held",
+        ));
+    }
+    if !matches!(attachment_view.load, LoadOp::Load | LoadOp::Resident) {
+        return Err(pass_entry_snapshot_refusal(
+            "render_pass_entry_snapshot_load_unsupported",
+            binding,
+            view,
+            "the arm promises the bytes the attachment held when the pass opened, and only the \
+             load and resident load arms keep those bytes: a clear establishes the clear \
+             colour and an undefined attachment establishes nothing to copy",
+        ));
+    }
+    if view.texture_type != TextureType::D2
+        || view.depth != 1
+        || view.array_length != 1
+        || view.sample_count != 1
+    {
+        return Err(pass_entry_snapshot_refusal(
+            "render_pass_entry_snapshot_shape_unsupported",
+            binding,
+            view,
+            "one attachment has one single-sample 2D pass-entry content, and the arm copies \
+             exactly that: a layered, 3D or multisampled declaration names no single grid to \
+             copy",
+        ));
+    }
+    Ok(attachment)
+}
+
+/// One pass-entry snapshot refusal (`research/docs/23` §118, E-TX15), in the
+/// same field shape the other sampled-source refusals publish so a capture
+/// reads the binding, the identity and the arm the same way everywhere.
+fn pass_entry_snapshot_refusal(
+    slug: &'static str,
+    binding: u32,
+    view: &TextureView,
+    detail: &str,
+) -> ProviderError {
+    capability_refusal(slug)
+        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+        .with_field("allocation", FieldValue::Unsigned(view.allocation_id.get()))
+        .with_field("source", FieldValue::Text("pass_entry_snapshot".to_owned()))
+        .with_detail(detail)
+}
+
 /// Resolve one sampled texture's bytes into the source the rail uploads or
 /// imports (`research/docs/23` §75, R5c).
 ///
@@ -6652,6 +6787,27 @@ fn resolve_render_texture_source<'a>(
                 })?;
             Ok(RenderInputSource::ProducedBytes(bytes))
         }
+        // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15). What
+        // the declaration reads is the pass's own attachment, so this entry
+        // has no bytes, no lease and no trace production to resolve: the pass
+        // the declaration belongs to is carried here by its caller, which is
+        // where the attachment's position lives. Reaching this function with
+        // the arm means a caller resolved a texture outside a pass — the one
+        // shape the arm cannot state — so it is refused by name rather than
+        // given the "no earlier pass stored these bytes" answer the
+        // trace-produced arm would give.
+        TextureSource::PassEntrySnapshot => Err(capability_refusal(
+            "render_texture_source_unsupported",
+        )
+        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+        .with_field("allocation", FieldValue::Unsigned(view.allocation_id.get()))
+        .with_field("source", FieldValue::Text("pass_entry_snapshot".to_owned()))
+        .with_detail(
+            "a pass-entry snapshot reads the attachment of the pass that declares it, and this \
+             resolution carries no pass: the arm is answered by the pass's own texture walk, \
+             which knows the attachment it copies",
+        )),
         TextureSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
@@ -8828,6 +8984,20 @@ fn execute_offscreen_render_with_retains(
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupAttachments);
     let mut resident_layouts = ResidentTargetLayouts::acquire(request);
     let mut objects = OffscreenObjects::new(context);
+    // The colour attachments a sampled declaration snapshots
+    // (`research/docs/23` §118, E-TX15): their images are the copy's own
+    // source, so each one asks for `TRANSFER_SRC` beside the usages the store
+    // arm and the load arm already decided. The list is read from the resolved
+    // sources rather than re-derived from the pass, so a directly-constructed
+    // request cannot ask for a usage the resolution never proved.
+    let snapshot_reads = request
+        .textures
+        .iter()
+        .filter_map(|texture| match texture.source {
+            RenderInputSource::AttachmentSnapshot { attachment } => Some(attachment),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     for (index, (attachment, vk_format)) in request.attachments.iter().zip(&vk_formats).enumerate()
     {
         match attachment.resident {
@@ -8845,6 +9015,7 @@ fn execute_offscreen_render_with_retains(
                 attachment.seed,
                 store_publishes(attachment.store),
                 samples,
+                snapshot_reads.contains(&index),
             )?,
         }
     }
@@ -10061,6 +10232,10 @@ struct SampledTextureObjects {
     /// no-copy arm's `vkCmdCopyBufferToImage` covers (`research/docs/23` §75,
     /// R5c).
     extent: [u32; 2],
+    /// The view's texel size in bytes (`research/docs/23` §107): the unit the
+    /// upload's row pitch and the pass-entry snapshot's own byte accounting
+    /// are stated in.
+    texel_bytes: u32,
     /// Whether the reviewed pair's *gathered* sibling reads this image
     /// (`research/docs/23` §111, E-TX12): the source is the owner's no-copy
     /// window of another extent, so the image keeps the source's own extent,
@@ -10070,6 +10245,13 @@ struct SampledTextureObjects {
     /// The owner-window buffer a no-copy texture is copied out of, or `None`
     /// for the two uploaded arms.
     copy_source: Option<(vk::Buffer, vk::DeviceMemory)>,
+    /// The colour attachment this texture is a pass-entry snapshot of, or
+    /// `None` for every other arm (`research/docs/23` §118, E-TX15). `Some`
+    /// means the image starts `UNDEFINED` and is filled by the pre-pass
+    /// `vkCmdCopyImage` `record` issues from this attachment's own image —
+    /// which is why the position is kept here rather than re-derived from the
+    /// declaration when the copy runs.
+    snapshot_from: Option<usize>,
     /// The descriptor slot (or pair of slots) this texture is bound to
     /// (`research/docs/23` §3.3, v100).
     slot: RenderTextureSlot,
@@ -11083,6 +11265,7 @@ impl<'a> OffscreenObjects<'a> {
         seed: Option<ClearColor>,
         storing: bool,
         samples: vk::SampleCountFlags,
+        snapshot_read: bool,
     ) -> Result<(), ProviderError> {
         let loading = matches!(load, LoadOp::Load);
         // A multisampled attachment's `Load` is seeded by a clear inside a
@@ -11111,7 +11294,14 @@ impl<'a> OffscreenObjects<'a> {
                     // itself is never copied out; the resolve target below
                     // carries the transfer usage instead
                     // (`research/docs/23` §3.3, v51).
-                    | if storing && samples == vk::SampleCountFlags::TYPE_1 {
+                    // A stored attachment's frame leaves through
+                    // `vkCmdCopyImageToBuffer`, and a snapshot-read
+                    // attachment's entry content leaves through the pre-pass
+                    // `vkCmdCopyImage` the sampled declaration states
+                    // (`research/docs/23` §118, E-TX15). Both are transfer
+                    // *sources*, so the usage is asked for whenever either
+                    // reads the image.
+                    | if (storing || snapshot_read) && samples == vk::SampleCountFlags::TYPE_1 {
                         vk::ImageUsageFlags::TRANSFER_SRC
                     } else {
                         vk::ImageUsageFlags::empty()
@@ -12140,10 +12330,14 @@ impl<'a> OffscreenObjects<'a> {
         for texture in textures {
             let [width, height] = texture.extent;
             let format = texture.format;
-            // The no-copy arm's image is a transfer destination, never a host
-            // write: the device copy lands in it, so it lives in device-local
-            // `OPTIMAL` memory and starts undefined.
+            // The two device-copied arms — the owner's no-copy window and the
+            // pass's own attachment (`research/docs/23` §118, E-TX15) — are
+            // transfer destinations, never host writes: a device copy lands in
+            // them, so they live in device-local `OPTIMAL` memory and start
+            // undefined.
             let borrowing = matches!(texture.source, RenderInputSource::Borrowed { .. });
+            let device_copy =
+                borrowing || matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. });
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
@@ -12155,21 +12349,21 @@ impl<'a> OffscreenObjects<'a> {
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(if borrowing {
+                .tiling(if device_copy {
                     vk::ImageTiling::OPTIMAL
                 } else {
                     vk::ImageTiling::LINEAR
                 })
                 .usage(
                     vk::ImageUsageFlags::SAMPLED
-                        | if borrowing {
+                        | if device_copy {
                             vk::ImageUsageFlags::TRANSFER_DST
                         } else {
                             vk::ImageUsageFlags::empty()
                         },
                 )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(if borrowing {
+                .initial_layout(if device_copy {
                     vk::ImageLayout::UNDEFINED
                 } else {
                     vk::ImageLayout::PREINITIALIZED
@@ -12177,7 +12371,7 @@ impl<'a> OffscreenObjects<'a> {
             let (image, memory, requirements) = crate::allocate_image_backing(
                 self.context,
                 &info,
-                if borrowing {
+                if device_copy {
                     vk::MemoryPropertyFlags::DEVICE_LOCAL
                 } else {
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
@@ -12239,6 +12433,11 @@ impl<'a> OffscreenObjects<'a> {
                     self.upload_render_texture(&target, texels)?;
                     None
                 }
+                // The pass-entry snapshot arm has no host bytes to upload
+                // (`research/docs/23` §118, E-TX15): the image is a
+                // device-local transfer destination the pre-pass copy fills,
+                // so nothing is written here and no buffer is imported.
+                RenderInputSource::AttachmentSnapshot { .. } => None,
             };
             let view =
                 crate::create_color_image_view(self.context, image, format, "render texture")
@@ -12290,7 +12489,13 @@ impl<'a> OffscreenObjects<'a> {
                     )
                 })
                 .transpose()?;
-            if copy_source.is_none() {
+            // The three byte arms and the gathered window are host uploads;
+            // the no-copy window is an import and the pass-entry snapshot is a
+            // device-side image copy, so neither counts one
+            // (`research/docs/23` §118, E-TX15).
+            if copy_source.is_none()
+                && !matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. })
+            {
                 self.context.record_buffer_upload();
                 // The gathered surface is what the upload carries, so its own
                 // length is the one this accounting states
@@ -12301,14 +12506,20 @@ impl<'a> OffscreenObjects<'a> {
                     .map_or_else(|| texture.source.len(), Vec::len);
                 self.context.record_buffer_upload_bytes(uploaded);
             }
+            let snapshot_from = match texture.source {
+                RenderInputSource::AttachmentSnapshot { attachment } => Some(attachment),
+                _ => None,
+            };
             self.textures.push(SampledTextureObjects {
                 image,
                 memory,
                 view,
                 sampler,
                 extent: [width, height],
+                texel_bytes: u32::try_from(texture.texel_bytes).unwrap_or(u32::MAX),
                 gathered_fetch: texture.gathered_fetch,
                 copy_source,
+                snapshot_from,
                 slot: texture.slot,
             });
         }
@@ -12749,7 +12960,7 @@ impl<'a> OffscreenObjects<'a> {
                 // rail-owned one is the host-visible allocation that was just
                 // filled, which the readback re-maps.
                 if stream.writable {
-                    self.stage_buffer_landings.push(match &stream.source {
+                    let landing = match &stream.source {
                         // A stage buffer's source is a `BufferSource` arm, so
                         // the render sampler's produced arm cannot reach this
                         // list; it joins the rail-owned arm for the same
@@ -12776,7 +12987,27 @@ impl<'a> OffscreenObjects<'a> {
                             owner_pointer: window.pointer,
                             length: window.len,
                         },
-                    });
+                        // The pass-entry snapshot arm is a *texture* source
+                        // (`research/docs/23` §118, E-TX15): a stage buffer
+                        // resolves through its own buffer arms, so this list
+                        // never carries it. It is refused by name here rather
+                        // than read back through the buffer memory that
+                        // happens to sit beside it.
+                        RenderInputSource::AttachmentSnapshot { .. } => {
+                            return Err(capability_refusal(
+                                "render_pass_entry_snapshot_unattached",
+                            )
+                            .with_field("stage", FieldValue::Text(stream.stage.name().to_owned()))
+                            .with_field("index", FieldValue::Unsigned(u64::from(stream.index)))
+                            .with_detail(
+                                "a writable stage buffer carries a buffer source, and the \
+                                 pass-entry snapshot arm reads a colour attachment: the two \
+                                 are different channels, so the landing is refused instead of \
+                                 being read back through this buffer's memory",
+                            ));
+                        }
+                    };
+                    self.stage_buffer_landings.push(landing);
                 }
                 self.stage_buffer_inputs.push((buffer, memory));
                 buffer_infos.push(
@@ -13700,6 +13931,24 @@ impl<'a> OffscreenObjects<'a> {
             RenderInputSource::Borrowed { window, .. } => {
                 self.import_host_pointer_buffer(window, usage, name)
             }
+            // The pass-entry snapshot arm is a *texture* source
+            // (`research/docs/23` §118, E-TX15): its bytes live in the
+            // attachment image the device copies before the pass opens, so a
+            // buffer-shaped input has no window to bind and no host bytes to
+            // upload. This entry's three roles — a vertex stream, the index
+            // buffer and a loading attachment's transfer source — never carry
+            // it, and it is refused by name rather than bound from an empty
+            // buffer.
+            RenderInputSource::AttachmentSnapshot { .. } => {
+                Err(capability_refusal("render_texture_source_unsupported")
+                    .with_field("input", FieldValue::Text(name.to_owned()))
+                    .with_field("source", FieldValue::Text("pass_entry_snapshot".to_owned()))
+                    .with_detail(
+                        "the pass-entry snapshot arm describes a colour attachment's own \
+                         entry content, and a buffer-shaped input has no such window: the arm \
+                         is bound by the pass's sampled-texture copy",
+                    ))
+            }
         }
     }
 
@@ -14519,6 +14768,162 @@ impl<'a> OffscreenObjects<'a> {
                 );
             }
         }
+        // The pass-entry snapshot copies (`research/docs/23` §118, E-TX15).
+        //
+        // A sampled declaration that reads its own pass's attachment cannot
+        // bind that attachment's image: the pass is about to write it, and a
+        // fragment reading texels the same draw's raster may still be writing
+        // is the one race no rail can order (Vulkan's render pass data race
+        // rules admit a fragment reading the sample it covers and nothing
+        // wider). So the rail takes the copy the arm promises — a device-side
+        // `vkCmdCopyImage` from the attachment's image into the sampled
+        // image — *before* `vkCmdBeginRenderPass`, which is what makes the
+        // read's producer the attachment's entry state rather than any draw of
+        // this pass. It is the same shape the engine's own fallback takes
+        // (`crates/reims-vgpu/src/backend/vulkan/engine/exec.rs`: "capture the
+        // prior resident content into a same-format GPU image before changing
+        // the attachment"), on the same queue and in the same command buffer,
+        // so nothing is read back to the host and nothing is uploaded twice.
+        //
+        // The source sits in one of two places, and the copy leaves both as it
+        // found them: a loading attachment was just left in
+        // `COLOR_ATTACHMENT_OPTIMAL` by the upload above, while a resident
+        // target holds whatever layout its guard published — which is exactly
+        // the `initialLayout` the render pass below declares, so the copy's
+        // closing barrier restores it before the pass opens.
+        for texture in &self.textures {
+            let Some(attachment) = texture.snapshot_from else {
+                continue;
+            };
+            let objects = &self.attachments[attachment];
+            let source_layout = objects.initial_layout;
+            let [width, height] = texture.extent;
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            unsafe {
+                // The sampled image starts `UNDEFINED`: every texel it will
+                // hold comes from the copy below.
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(texture.image)
+                        .subresource_range(subresource)
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+                );
+                // The attachment's entry content is made visible to the
+                // transfer stage and left in the transfer read layout. Both
+                // producer classes are named: a loading attachment's bytes
+                // arrived through `vkCmdCopyBufferToImage` (a transfer write),
+                // while a resident target's were written by an earlier pass's
+                // colour store (`COLOR_ATTACHMENT_WRITE`).
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TRANSFER
+                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[vk::ImageMemoryBarrier::default()
+                        .old_layout(source_layout)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(objects.image)
+                        .subresource_range(subresource)
+                        .src_access_mask(
+                            vk::AccessFlags::TRANSFER_WRITE
+                                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        )
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+                );
+                let copy = [vk::ImageCopy::default()
+                    .src_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .dst_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })];
+                self.context.device.cmd_copy_image(
+                    self.command,
+                    objects.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    texture.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copy,
+                );
+                // The copy's two ends are published together: the sampled
+                // image to the fragment stage that reads it (in the `GENERAL`
+                // layout every other sampled texture of this rail is bound
+                // in), and the attachment back to the layout the render pass
+                // declares as its `initialLayout`.
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                            .new_layout(source_layout)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(objects.image)
+                            .subresource_range(subresource)
+                            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                            .dst_access_mask(
+                                vk::AccessFlags::COLOR_ATTACHMENT_READ
+                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                            ),
+                        vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(texture.image)
+                            .subresource_range(subresource)
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ),
+                    ],
+                );
+            }
+            // The provenance reading the frame alone cannot give: the copy
+            // ran, and it moved the attachment's tightly packed extent.
+            self.context.record_attachment_snapshot(
+                (width as usize)
+                    .saturating_mul(height as usize)
+                    .saturating_mul(texture.texel_bytes as usize),
+            );
+        }
         // Host-visible linear textures are uploaded in `PREINITIALIZED` and
         // the sampled descriptor binds them in `GENERAL`, so the first
         // transition needs only the new layout, not an access scope — the same
@@ -14539,6 +14944,13 @@ impl<'a> OffscreenObjects<'a> {
                 base_array_layer: 0,
                 layer_count: 1,
             };
+            // A pass-entry snapshot's image was already carried from
+            // `UNDEFINED` to `GENERAL` by the copy block above
+            // (`research/docs/23` §118, E-TX15), so it has no
+            // `PREINITIALIZED` state to transition out of here.
+            if texture.snapshot_from.is_some() {
+                continue;
+            }
             if let Some((buffer, _)) = texture.copy_source {
                 let [width, height] = texture.extent;
                 unsafe {

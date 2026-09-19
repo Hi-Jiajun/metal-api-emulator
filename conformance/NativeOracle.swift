@@ -2570,8 +2570,18 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // declaring pass as an ordinary compute case.
     case "compute-buffer-v42":
         expectedIDs = ["render_declaring_stage_buffer_per_stage"]
+    // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15): the plain
+    // copy kernel over the 4x4 attachment's own sixty-four-byte view — the
+    // bytes the render case's pass loads before it draws — beside the render
+    // case whose sampled declaration names that same attachment through the new
+    // arm. That render case names the Vulkan trace rail alone (this rail has no
+    // Apple oracle for a fragment reading the attachment the same pass writes,
+    // so it refuses the arm by name), so this oracle validates and executes the
+    // declaring pass as an ordinary compute case.
+    case "compute-buffer-v43":
+        expectedIDs = ["render_declaring_pass_entry_snapshot"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v42 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v43 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

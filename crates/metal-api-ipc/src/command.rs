@@ -3741,6 +3741,64 @@ mod tests {
         );
     }
 
+    /// The pass-entry snapshot source arm (`research/docs/23` §118, E-TX15):
+    /// the declaration names the pass's own attachment and carries no texel
+    /// bytes either, so the arm is one tag after the trace-view arm — and an
+    /// older decoder reads that tag as an unknown texture source rather than as
+    /// whatever payload follows it.
+    #[test]
+    fn a_pass_entry_snapshot_source_round_trips_without_texel_bytes() {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        let mut view = sampled_texture_view(0);
+        let texels = match view.source.clone() {
+            TextureSource::OwnedBytes(bytes) => bytes,
+            other => panic!("the fixture starts from owned bytes, got {other:?}"),
+        };
+        view.source = TextureSource::PassEntrySnapshot;
+        view.view_id = pass.color_attachments[0].view_id;
+        view.allocation_id = pass.color_attachments[0].allocation_id;
+        view.format = pass.color_attachments[0].format.as_texture_format();
+        view.width = pass.color_attachments[0].width;
+        view.height = pass.color_attachments[0].height;
+        pass.color_attachments[0].load = LoadOp::Load;
+        pass.textures = vec![view.clone()];
+        let request = CommandRequest::Submit {
+            trace: trace.clone(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert!(
+            !frame.windows(texels.len()).any(|window| window == texels),
+            "a pass-entry snapshot declaration carries no texel bytes"
+        );
+        // The arm is one tag, exactly as the trace-produced arm is: the two
+        // frames differ in that one byte (`4` against `3`) and nowhere else, so
+        // the new declaration adds no payload an older decoder could read as
+        // its own.
+        let mut trace_view = trace;
+        let Some(TracePass::Render(pass)) = trace_view.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.textures[0].source = TextureSource::TraceView;
+        let other = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: trace_view,
+            resources: resources(),
+        })
+        .unwrap();
+        assert_eq!(other.len(), frame.len(), "one tag either way");
+        let differing = frame
+            .iter()
+            .zip(&other)
+            .filter(|(left, right)| left != right)
+            .map(|(left, right)| (*left, *right))
+            .collect::<Vec<_>>();
+        assert_eq!(differing, vec![(4_u8, 3_u8)]);
+    }
+
     #[test]
     fn a_sampled_render_pass_takes_its_own_tag_and_round_trips() {
         let request = CommandRequest::Submit {
@@ -5574,6 +5632,97 @@ mod tests {
         assert!(!decoded.supports_render_kept_frame_landing);
     }
 
+    /// The pass-entry snapshot block is the tail's second family's *eighth* tag,
+    /// so it follows the per-stage stage-buffer window and touches nothing
+    /// before it (`research/docs/23` §118, E-TX15). A decoder of the previous
+    /// increment reads the escape byte followed by a family tag it does not
+    /// know — a typed refusal rather than a snapshot silently read as some
+    /// other section's payload.
+    #[test]
+    fn the_pass_entry_snapshot_block_is_the_tail_familys_ninth_tag() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = 8;
+        capabilities.max_render_stage_buffers_per_stage = 8;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            &without[without.len() - 6..],
+            &[0x00, 0x07, 0x00, 0x00, 0x00, 0x08]
+        );
+
+        capabilities.supports_render_pass_entry_snapshot = true;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the pass-entry snapshot capability frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x09, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the pass-entry snapshot block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+    }
+
+    /// A snapshot that declares *only* the pass-entry snapshot arm still writes
+    /// the extended payload (`research/docs/23` §118, E-TX15): the declaration
+    /// travels in the frame's own tagged tail, so the bits beside it keep their
+    /// own readings, and a frame that ends before the block reads the arm as the
+    /// fail-closed `false`.
+    #[test]
+    fn an_only_pass_entry_snapshot_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_pass_entry_snapshot = true;
+        assert!(capabilities.declares_render_pass_entry_snapshot_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x09, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_pass_entry_snapshot);
+        assert!(!decoded.supports_render_kept_frame_landing);
+        assert!(!decoded.supports_render_attachment_landing_view);
+        assert!(!decoded.supports_render_texture_gathered_extent);
+        assert!(!decoded.supports_render_texture_sampling);
+
+        // A frame that ends before the block reads the bit as the fail-closed
+        // `false`, so a consumer refuses the declaration rather than assuming
+        // it.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_pass_entry_snapshot);
+    }
+
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
     /// frame's identity and shape and the window's second declaration, in a
     /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -5736,16 +5885,17 @@ mod tests {
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
         // until E-TX13 assigned it to the attachment landing view, `0x06`
-        // until E-TX14 assigned it to the kept-frame landing entry, and `0x07`
-        // until E-SB2 assigned it to the stage buffer per-stage window, and
-        // `0x08` until the texel space took it — exactly the drift the closed
-        // set exists to make visible.)
+        // until E-TX14 assigned it to the kept-frame landing entry, `0x07` until
+        // E-SB2 assigned it to the stage buffer per-stage window, `0x08` until
+        // the texel space took it, and `0x09` until E-TX15 assigned it to the
+        // pass-entry snapshot arm — exactly the drift the closed set exists to
+        // make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x09;
+        unknown_tag[tag_at] = 0x0a;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x09)
+            CodecError::UnknownCapabilityTail(0x0a)
         ));
     }
 
@@ -6891,6 +7041,7 @@ mod tests {
                 epoch: DeviceEpoch::new(7),
                 capabilities: ProviderCapabilities {
                     supports_render_kept_frame_landing: false,
+                    supports_render_pass_entry_snapshot: false,
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
@@ -7278,6 +7429,7 @@ mod tests {
     fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             supports_render_kept_frame_landing: false,
+            supports_render_pass_entry_snapshot: false,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,

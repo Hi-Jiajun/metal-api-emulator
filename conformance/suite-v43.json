@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v43",
+  "guard_byte": 168,
+  "cases": [
+    {
+      "id": "render_declaring_pass_entry_snapshot",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 64,
+          "allocation_size": 64,
+          "access": "read",
+          "initial_hex": "001100ff401100ff801100ffc01100ff002200ff402200ff802200ffc02200ff003300ff403300ff803300ffc03300ff004400ff404400ff804400ffc04400ff"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "fefefefe"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "bytes_hex": "001100ff"
+        }
+      ]
+    }
+  ],
+  "render_cases": [
+    {
+      "id": "pass_entry_snapshot_4x4",
+      "declaring_case": "render_declaring_pass_entry_snapshot",
+      "vertex_entry": "render_fullscreen_triangle",
+      "fragment_entry": "render_sample_texture_2d",
+      "translated_stages": {
+        "vertex": {
+          "path": "../crates/metal-api-vulkan/tests/fixtures/render_offscreen_2x2.vert.ll",
+          "sha256": "be63f8b9efc815f929706fd5ee42e71ec3d12aa9b10d7444e0af8caf67755ddc"
+        },
+        "fragment": {
+          "path": "../crates/metal-api-vulkan/tests/fixtures/render_sample_texture_2d_nearest_clamp.frag.ll",
+          "sha256": "96c4de8def6de8d3776fef860d39638d22e71eac2db53cdf007fe27513cfeb8d"
+        }
+      },
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "fragment_textures": [
+        {
+          "allocation": 900,
+          "view": 910,
+          "format": "rgba8_unorm",
+          "width": 4,
+          "height": 4,
+          "source": "pass_entry_snapshot"
+        }
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "load",
+        "initial_hex": "001100ff401100ff801100ffc01100ff002200ff402200ff802200ffc02200ff003300ff403300ff803300ffc03300ff004400ff404400ff804400ffc04400ff",
+        "store": "store"
+      },
+      "expected_hex": "c04000ffc04000ff801100ffc01100ffc04000ffc04000ff802200ffc02200ffc04000ffc04000ff803300ffc03300ffc04000ffc04000ff804400ffc04400ff",
+      "capture_rails": [
+        "vulkan"
+      ],
+      "scissor": [
+        0,
+        0,
+        2,
+        4
+      ]
+    }
+  ]
+}

@@ -449,6 +449,9 @@ mod tests {
             supports_render_texture_gathered_extent_no_copy: false,
             supports_render_attachment_landing_view: false,
             supports_render_kept_frame_landing: false,
+            // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15) is
+            // refused by this rail's texture walk for the same reason.
+            supports_render_pass_entry_snapshot: false,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
