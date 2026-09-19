@@ -4700,6 +4700,14 @@ pub(crate) fn execute_render_pass<'a>(
     leases: Option<&RenderLeaseContext<'_>>,
     produced: Option<&'a ProducedTraceViews<'a>>,
 ) -> Result<OffscreenReadback, ProviderError> {
+    // The render half's residual, split (`crate::phase_profile`): this entry's
+    // own admissions and request resolution are one region, the input retains
+    // another, and the owner-window landing after the pass a third. All of
+    // them sit *outside* the five `render_*` children — the pass executor's own
+    // bars begin where it is called — which is exactly the time the render
+    // half's first split charged to no bar at all.
+    crate::phase_profile::note_render_shape(crate::phase_profile::RenderShape::Offscreen);
+    let _prepare = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPrepare);
     refuse_attachment_extent(context, pass)?;
     let request = prepare_render_request_with_resident(
         stages,
@@ -4717,13 +4725,19 @@ pub(crate) fn execute_render_pass<'a>(
         context.admitted_stencil_resolve_modes(),
         context.spirv_feature_policy(),
     )?;
+    drop(_prepare);
+    let _retain = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRetain);
     let retains = RenderInputRetains::retain(leases, &request)?;
+    drop(_retain);
     let readback = execute_offscreen_render_with_retains(context, &request, retains)?;
     // The owner-window landing follows the readback (`research/docs/23` §114,
     // E-TX8): the pass's own texels are in the provider's buffer by now, and
     // the guest's pages receive exactly those bytes — the second destination
     // the borrowed store states.
+    let _land_owner =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderLandOwner);
     land_owner_windows(&request, &readback, leases)?;
+    drop(_land_owner);
     Ok(readback)
 }
 
@@ -10072,6 +10086,17 @@ fn execute_offscreen_render_with_retains(
             retains.retire();
         }
     }
+    // The pass's objects are torn down here rather than by the scope's own end
+    // so the render half's residual can *name* that teardown
+    // (`crate::phase_profile::Phase::RenderTeardown`): `OffscreenObjects::drop`
+    // destroys everything the pass built — its images, views, samplers,
+    // descriptor pools, framebuffers, render passes, readback buffers, fence
+    // and command pool — and that work was charged to no bar at all. The drop
+    // stays in the same order it had: after the fence, after the readback, and
+    // after the input retains retired.
+    let _teardown = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTeardown);
+    drop(objects);
+    drop(_teardown);
     readback
 }
 
@@ -13368,11 +13393,20 @@ impl<'a> OffscreenObjects<'a> {
             // until the fence signals, so it is destroyed with the image.
             let copy_source = match &texture.source {
                 RenderInputSource::Borrowed { window, .. } => {
-                    match self.import_host_pointer_buffer(
+                    // The import is its own region of `setup_textures`: it is
+                    // the one arm that allocates a buffer *and* a memory object
+                    // per declaration per pass, and no pooled or cached path
+                    // covers it today (`crate::phase_profile`).
+                    let _import = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::TextureImport,
+                    );
+                    let imported = self.import_host_pointer_buffer(
                         window,
                         vk::BufferUsageFlags::TRANSFER_SRC,
                         "render texture",
-                    ) {
+                    );
+                    drop(_import);
+                    match imported {
                         Ok(source) => Some(source),
                         Err(error) => {
                             unsafe {
@@ -13417,24 +13451,32 @@ impl<'a> OffscreenObjects<'a> {
             // declaration built gets the view this rail always built for it.
             let view = match pooled_view {
                 Some(view) => view,
-                None => crate::create_sampled_image_view(
-                    self.context,
-                    image,
-                    format,
-                    texture.view_type,
-                    "render texture",
-                )
-                .map_err(|error| {
-                    unsafe {
-                        if let Some((buffer, buffer_memory)) = copy_source {
-                            self.context.device.destroy_buffer(buffer, None);
-                            self.context.device.free_memory(buffer_memory, None);
+                None => {
+                    // The view a pooled backing does not carry is its own
+                    // region (`crate::phase_profile`): it is device state the
+                    // declaration rebuilds per pass exactly as the backing was.
+                    let _view =
+                        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TextureView);
+                    let created = crate::create_sampled_image_view(
+                        self.context,
+                        image,
+                        format,
+                        texture.view_type,
+                        "render texture",
+                    );
+                    drop(_view);
+                    created.map_err(|error| {
+                        unsafe {
+                            if let Some((buffer, buffer_memory)) = copy_source {
+                                self.context.device.destroy_buffer(buffer, None);
+                                self.context.device.free_memory(buffer_memory, None);
+                            }
+                            self.context.device.destroy_image(image, None);
+                            self.context.device.free_memory(memory, None);
                         }
-                        self.context.device.destroy_image(image, None);
-                        self.context.device.free_memory(memory, None);
-                    }
-                    execution_refusal("create render texture view", &error.detail)
-                })?,
+                        execution_refusal("create render texture view", &error.detail)
+                    })?
+                }
             };
             // The state the sampler is created with is the *declaration's*
             // (`research/docs/23` §3.3, v100): on this rail the fragment
@@ -13457,20 +13499,24 @@ impl<'a> OffscreenObjects<'a> {
                     // makes such a sampler a legal use.
                     let sampler_info =
                         crate::sampler_create_info(policy, texture.slot.coordinates());
-                    unsafe { self.context.device.create_sampler(&sampler_info, None) }.map_err(
-                        |error| {
-                            unsafe {
-                                if let Some((buffer, buffer_memory)) = copy_source {
-                                    self.context.device.destroy_buffer(buffer, None);
-                                    self.context.device.free_memory(buffer_memory, None);
-                                }
-                                self.context.device.destroy_image_view(view, None);
-                                self.context.device.destroy_image(image, None);
-                                self.context.device.free_memory(memory, None);
+                    let _sampler = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::TextureSampler,
+                    );
+                    let created =
+                        unsafe { self.context.device.create_sampler(&sampler_info, None) };
+                    drop(_sampler);
+                    created.map_err(|error| {
+                        unsafe {
+                            if let Some((buffer, buffer_memory)) = copy_source {
+                                self.context.device.destroy_buffer(buffer, None);
+                                self.context.device.free_memory(buffer_memory, None);
                             }
-                            execution_refusal("create render texture sampler", &error.to_string())
-                        },
-                    )
+                            self.context.device.destroy_image_view(view, None);
+                            self.context.device.destroy_image(image, None);
+                            self.context.device.free_memory(memory, None);
+                        }
+                        execution_refusal("create render texture sampler", &error.to_string())
+                    })
                 })
                 .transpose()?;
             // The three byte arms and the gathered window are host uploads;
@@ -13527,6 +13573,12 @@ impl<'a> OffscreenObjects<'a> {
         // the stage buffers share when a pass binds both faces — so the check
         // is made per set and per stage, exactly as the stage-buffer face's own
         // arrangement check is (`create_stage_buffers`).
+        // The sampled set's own region (`crate::phase_profile`): the layout, the
+        // pool, the set and the writes that bind this pass's textures are
+        // rebuilt per pass, so they are the third candidate a pooling increment
+        // could take — beside the backing and the view.
+        let _descriptor =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TextureDescriptor);
         let window = crate::provider::render_texture_window(self.context.physical_device_limits());
         let fragment_textures = textures.len();
         if fragment_textures as u32 > window.per_stage {
@@ -13617,6 +13669,7 @@ impl<'a> OffscreenObjects<'a> {
             execution_refusal("allocate descriptor set", "driver returned no set")
         })?;
         self.write_render_texture_descriptors(self.descriptor_set);
+        drop(_descriptor);
         Ok(())
     }
 

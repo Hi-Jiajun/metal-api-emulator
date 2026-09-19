@@ -1317,11 +1317,25 @@ impl VulkanComputeProvider {
             let planned = match planned {
                 PlannedRenderEntry::Pass(pass) => pass,
                 PlannedRenderEntry::Landing(landing) => {
+                    // A landing-only entry runs in the plan's own order rather
+                    // than through the rail, so it is its own region of the
+                    // render half's residual (`crate::phase_profile`).
+                    let _landing = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::RenderLanding,
+                    );
                     self.land_kept_frame_entry(landing, pool, &leases)?;
                     continue;
                 }
             };
             if let Some(present) = &planned.pass.present {
+                // The present rail's resolution and its own pass are two more
+                // regions of the render half's residual
+                // (`crate::phase_profile`): the five `render_*` children divide
+                // the *offscreen* executor, and a present pass has its own
+                // setup, recording, readback and teardown shape.
+                let _resolve =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderResolve);
+                crate::phase_profile::note_render_shape(crate::phase_profile::RenderShape::Present);
                 // The present rail renders exactly one attachment into the
                 // provider-owned target; the pre-MRT gate stays in place rather
                 // than being widened, so present keeps its single-attachment
@@ -1410,6 +1424,9 @@ impl VulkanComputeProvider {
                 // (`research/docs/23` §110, E-TX3), so it resolves through the
                 // same view of what has landed so far.
                 let produced = render::ProducedTraceViews::new(&writebacks, &produced_latest);
+                drop(_resolve);
+                let _present =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPresent);
                 let texels = render::execute_present_render(
                     &executor.context,
                     &planned.stages,
@@ -1419,6 +1436,9 @@ impl VulkanComputeProvider {
                     Some(&leases),
                     Some(&produced),
                 )?;
+                drop(_present);
+                let _publish =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPublish);
                 if let Some(view) = view {
                     let position = writebacks.len();
                     writebacks.push(BufferWriteback {
@@ -1429,6 +1449,7 @@ impl VulkanComputeProvider {
                     });
                     produced_latest.insert((view.allocation_id, view.view_id), position);
                 }
+                drop(_publish);
                 continue;
             }
 
@@ -1439,6 +1460,13 @@ impl VulkanComputeProvider {
             // what the rail resolves into bytes, so a lease-backed attachment
             // load is imported (or refused by name) inside the rail rather
             // than being snapshotted here (`research/docs/23` §74, R5b).
+            //
+            // Everything below, up to the rail call, is one region of the
+            // render half's residual (`crate::phase_profile`): it is the outer
+            // loop's own resolution of the declarations, the resident targets
+            // and the produced-bytes context the pass is handed.
+            let _resolve =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderResolve);
             let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
             let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
             // The landing views the second owner-window arm carries
@@ -1674,6 +1702,7 @@ impl VulkanComputeProvider {
             // R7 arm borrows: the same two contexts the offscreen rail
             // resolves every render input against.
             let produced = render::ProducedTraceViews::new(&writebacks, &produced_latest);
+            drop(_resolve);
             let outcome = match trace.indirect.as_deref() {
                 Some(payload) => {
                     let outcome = render::execute_indirect_render_pass(
@@ -1711,6 +1740,14 @@ impl VulkanComputeProvider {
                     Some(&produced),
                 ),
             };
+            // The pass has returned: everything the delivery of its bytes
+            // costs from here — the resident and re-kept identities, the
+            // writeback pushes in location order, the stage-buffer and
+            // depth/stencil landings — is one region of the render half's
+            // residual (`crate::phase_profile`). The error arm returns instead,
+            // so a refused pass charges no publication.
+            let _publish =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPublish);
             let readback = match outcome {
                 Ok(readback) => {
                     // The pass completed, so the bytes the resident targets
@@ -1801,6 +1838,7 @@ impl VulkanComputeProvider {
                     bytes: texels,
                 });
             }
+            drop(_publish);
         }
         Ok(writebacks)
     }
