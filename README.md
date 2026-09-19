@@ -296,7 +296,7 @@ Existing evidence does not establish general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this
-project's current scope. See the [collaboration draft](UPSTREAM-DISCUSSION-DRAFT.md).
+project's current scope.
 
 ## Build and test the standalone workspace
 
