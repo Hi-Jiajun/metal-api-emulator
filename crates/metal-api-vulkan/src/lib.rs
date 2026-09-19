@@ -19,8 +19,8 @@ use metal_api_core::completion::AbandonmentOutcome;
 use metal_api_core::provider::{
     BorrowedLeaseRegistry, CompletionDisposition, FieldValue, LeaseId, PipelineContract,
     ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderLifecycle,
-    ProviderPhase, QueuePriority, QueueSchedulingPolicy, Retryability, SemanticDigest,
-    TerminalRefusal, MAX_SERIAL_RESOURCES,
+    ProviderPhase, QueuePriority, QueueSchedulingPolicy, Retryability, SamplerCoordinates,
+    SemanticDigest, TerminalRefusal, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -1032,6 +1032,59 @@ impl TranslatedRenderStage {
     /// The reflection of the AIR the module was translated from.
     pub fn reflection(&self) -> &ShaderReflection {
         &self.reflection
+    }
+
+    /// The same stage with the module the pixel-coordinate arm executes
+    /// (2026-09-19, census v43's `texture_state` axis), or `None` when the
+    /// module has no such sibling.
+    ///
+    /// A pass that binds a runtime `[[sampler(n)]]` whose
+    /// `normalizedCoordinates` is `NO` is executed through an unnormalized
+    /// `VkSampler`, and Vulkan forbids such a sampler from being used by an
+    /// `ImplicitLod` sample (`VUID-vkCmdDraw-None-08610`) or by a sample
+    /// carrying a LOD bias or an offset (`-08611`). The sibling is the same
+    /// module with every implicit sample rewritten to
+    /// `OpImageSampleExplicitLod` with a `Lod` operand of zero — the level the
+    /// family's `minLod = maxLod = 0` pin already selects — which is why the
+    /// two forms land the same frame (`tests/render_pixel_coordinate_sampler_e2e.rs`).
+    ///
+    /// The reflection travels unchanged: the rewrite moves one operand of each
+    /// sampling instruction and leaves the entry point, the bindings and every
+    /// interface shape byte for byte, so the sibling registers under the same
+    /// contract. `None` is the fail-closed answer for a module with a sample
+    /// form no unnormalized sampler may be used with — a `Proj`, `Dref`,
+    /// sparse or gather instruction, an offset-carrying sample, or an implicit
+    /// sample whose image operands include anything but a LOD bias — and a
+    /// provider refuses the texel space for such a pipeline by name
+    /// (`render_pixel_sampler_variant_unavailable`).
+    ///
+    /// The rail derives the same sibling at registration; this entry point
+    /// exists so a host can ask the question with the same walk instead of a
+    /// second rule of its own.
+    pub fn explicit_lod_sibling(&self) -> Option<Self> {
+        if self.stage != RenderStage::Fragment {
+            return None;
+        }
+        let spirv = crate::render::pixel_coordinate_sampler_variant(&self.spirv)?;
+        Some(Self {
+            stage: self.stage,
+            spirv,
+            reflection: self.reflection.clone(),
+        })
+    }
+
+    /// Whether this stage's module can be executed with a pixel-coordinate
+    /// runtime sampler (2026-09-19, census v43's `texture_state` axis).
+    ///
+    /// The predicate a host's class gate reads before it declares the texel
+    /// space to this provider: it is exactly "the sibling exists", so the gate
+    /// and the rail cannot answer the question differently — a draw the gate
+    /// admits is a draw the registration can execute, which is the property
+    /// that keeps an admitted shape from meeting a provider refusal.
+    ///
+    /// A vertex stage answers `false`: the arm is the fragment module's.
+    pub fn executes_pixel_coordinate_samplers(&self) -> bool {
+        self.stage == RenderStage::Fragment && self.explicit_lod_sibling().is_some()
     }
 }
 
@@ -3261,7 +3314,23 @@ pub(crate) fn static_sampler_policy(
 /// family's own fixed values: `minLod`/`maxLod` pinned to `0..=0` (every
 /// canonical view carries one mip level, so level zero is the only reachable
 /// level and a mip filter can only name the mode it is selected under), no
-/// comparison, `unnormalizedCoordinates` false and no anisotropy.
+/// comparison and no anisotropy.
+///
+/// `coordinates` is the third axis of the render-side state (2026-09-19,
+/// census v43's `texture_state`): a runtime `[[sampler(n)]]` whose
+/// `normalizedCoordinates` is `NO` is executed with Vulkan's *unnormalized*
+/// texel space, so the create-info sets `unnormalizedCoordinates` and states
+/// the same three axes the normalized form does. That flag is not free: Vulkan
+/// requires `minFilter == magFilter`, `mipmapMode = NEAREST`, `minLod =
+/// maxLod = 0`, no anisotropy, no comparison and the two addressing axes in
+/// `{CLAMP_TO_EDGE, CLAMP_TO_BORDER}` (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01072`
+/// … `-01077`) — every one of them a fixed value of this family already, with
+/// the mip filter and the address mode the two the render admission narrows for
+/// this arm (`research/docs/23` §3.3). Its samples are legal only when the
+/// module's own instructions carry an explicit LOD and no bias or offset
+/// (`VUID-vkCmdDraw-None-08610`/`-08611`), which is why the rail executes the
+/// fragment module's explicit-LOD sibling for such a pass
+/// (`render.rs::pixel_coordinate_sampler_variant`).
 ///
 /// `addressModeW` is the family's own copy of the mode `addressMode{U,V}`
 /// carries: the render family samples one single-sample, non-arrayed 2D view
@@ -3273,6 +3342,7 @@ pub(crate) fn static_sampler_policy(
 /// the same sample program the equal-axes state always did.
 pub(crate) fn sampler_create_info(
     policy: metal_api_core::provider::SamplerPolicy,
+    coordinates: metal_api_core::provider::SamplerCoordinates,
 ) -> vk::SamplerCreateInfo<'static> {
     use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
 
@@ -3308,6 +3378,10 @@ pub(crate) fn sampler_create_info(
         .address_mode_v(address)
         .address_mode_w(address)
         .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
+        // The texel space, when the pass states one: `VK_FALSE` is the
+        // normalized space every earlier increment published, so the field's
+        // default keeps those frames' create-info byte for byte.
+        .unnormalized_coordinates(coordinates.is_pixel())
         .min_lod(0.0)
         .max_lod(0.0)
 }
@@ -5911,7 +5985,13 @@ impl ExecutionResources {
                         .into());
                     }
                 }
-                let info = sampler_create_info(policy);
+                // The static-sampler arm is the *compute* narrow class's, whose
+                // modules sample the normalized space: a pixel-coordinate AIR
+                // sampler is lowered to shader-side fetches by the translator
+                // and never reaches a `VkSampler` (`research/docs/23` §3.3,
+                // E-RS5/v118), so this arm states the space every one of its
+                // states has ever been executed in.
+                let info = sampler_create_info(policy, SamplerCoordinates::Normalized);
                 let sampler = unsafe { self.context.device.create_sampler(&info, None) }.map_err(
                     |error| {
                         ExecutionFailure::vulkan(error, format!("create static sampler: {error}"))
@@ -8913,7 +8993,10 @@ mod tests {
                     None,
                 ),
             ] {
-                let info = sampler_create_info(SamplerPolicy { filter, address });
+                let info = sampler_create_info(
+                    SamplerPolicy { filter, address },
+                    SamplerCoordinates::Normalized,
+                );
                 let vk_filter = if linear {
                     vk::Filter::LINEAR
                 } else {

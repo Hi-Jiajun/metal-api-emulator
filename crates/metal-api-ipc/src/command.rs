@@ -5372,6 +5372,118 @@ mod tests {
         assert!(!decoded.supports_render_texture_sampling);
     }
 
+    /// A runtime sampler block that states the coordinate axis (2026-09-19,
+    /// census v43's `texture_state`) marks its header with the flag bit and
+    /// appends one space byte per entry, and a decoder that predates the axis
+    /// reads that header as a count above the contract's cap.
+    #[test]
+    fn a_pixel_coordinate_sampler_pass_marks_its_block_and_round_trips() {
+        let mut trace = sampled_runtime_sampler_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.samplers = vec![RenderSamplerBinding::with_coordinates(
+            0,
+            SamplerPolicy {
+                filter: SamplerFilter::LinearMipLinear,
+                address: SamplerAddressMode::ClampToZero,
+            },
+            metal_api_core::provider::SamplerCoordinates::Pixel,
+        )];
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the pixel-coordinate sampler frame re-encodes byte for byte"
+        );
+        // The block is the normalized one's header with the flag bit set, one
+        // coordinate-space byte appended, and nothing else moved: the entry's
+        // four state bytes keep the codes the family published.
+        const PIXEL_SAMPLER_BLOCK: [u8; 8] = [0x81, 0x00, 0x00, 0x00, 0x00, 0x05, 0x04, 0x01];
+        assert!(
+            frame
+                .windows(PIXEL_SAMPLER_BLOCK.len())
+                .any(|window| window == PIXEL_SAMPLER_BLOCK),
+            "the flagged block is on the wire"
+        );
+        assert!(
+            usize::from(PIXEL_SAMPLER_BLOCK[0]) > metal_api_core::provider::MAX_RENDER_SAMPLERS,
+            "a decoder that predates the axis reads the flagged header as a count above the cap \
+             and refuses the frame by name"
+        );
+    }
+
+    /// The coordinate axis' capability block is the tail's second family's
+    /// *eighth* tag, so it follows the per-stage stage-buffer window and
+    /// touches nothing before it (2026-09-19, census v43's `texture_state`).
+    ///
+    /// A decoder of the previous increment reads the escape byte followed by a
+    /// family tag it does not know — a typed refusal rather than a snapshot
+    /// silently read as "the texel space was not declared".
+    #[test]
+    fn the_pixel_coordinate_sampler_block_is_the_tail_familys_eighth_tag() {
+        let mut capabilities = fake_capabilities();
+        // The frame has to be on the extended payload already, or the new bit
+        // would change the payload's own form rather than only appending its
+        // section: the landing-view bit is the oldest face that does that.
+        capabilities.supports_render_attachment_landing_view = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(without.ends_with(&[0x00, 0x05, 0x01]));
+        assert!(!without.ends_with(&[0x00, 0x08, 0x01]));
+
+        capabilities.supports_render_pixel_coordinate_sampler = true;
+        assert!(capabilities.declares_render_pixel_coordinate_sampler_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the pixel-coordinate sampler capability frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x08, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the new block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_pixel_coordinate_sampler);
+        // A frame that ends before the block reads the bit as the fail-closed
+        // `false`, so a consumer keeps the census's refusal for the shape.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_pixel_coordinate_sampler);
+    }
+
     /// The kept-frame landing block is the tail's second family's *sixth* tag,
     /// so it follows the landing-view block and touches nothing before it
     /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -5619,20 +5731,21 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x08` is the next tag the
+        // The family's tags are a closed set and `0x09` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
         // until E-TX13 assigned it to the attachment landing view, `0x06`
         // until E-TX14 assigned it to the kept-frame landing entry, and `0x07`
-        // until E-SB2 assigned it to the stage buffer per-stage window —
-        // exactly the drift the closed set exists to make visible.)
+        // until E-SB2 assigned it to the stage buffer per-stage window, and
+        // `0x08` until the texel space took it — exactly the drift the closed
+        // set exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x08;
+        unknown_tag[tag_at] = 0x09;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x08)
+            CodecError::UnknownCapabilityTail(0x09)
         ));
     }
 
@@ -6782,6 +6895,7 @@ mod tests {
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
                     supports_render_stage_buffer_namespace_split: false,
+                    supports_render_pixel_coordinate_sampler: false,
                     max_passes: 2,
                     supports_threads_exact: true,
                     supports_threadgroups: false,
@@ -7168,6 +7282,7 @@ mod tests {
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
+            supports_render_pixel_coordinate_sampler: false,
             max_passes: 1,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -8272,6 +8387,7 @@ mod tests {
                 filter: SamplerFilter::LinearMipLinear,
                 address: SamplerAddressMode::ClampToZero,
             },
+            coordinates: metal_api_core::provider::SamplerCoordinates::Normalized,
         }
     }
 

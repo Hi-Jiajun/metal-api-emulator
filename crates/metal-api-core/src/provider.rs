@@ -945,6 +945,51 @@ pub struct SamplerPolicy {
     pub address: SamplerAddressMode,
 }
 
+/// The coordinate space a render pass's runtime sampler states its samples in
+/// (2026-09-19, census v43's `texture_state` axis).
+///
+/// Metal states this as `MTLSamplerDescriptor.normalizedCoordinates`, and the
+/// translator decodes it into `metal2vulkan`'s own two-name vocabulary: a
+/// `normalizedCoordinates = YES` sampler takes coordinates in `[0, 1]`, and a
+/// `NO` sampler takes them in **texels** — the space the translator's AIR
+/// vocabulary spells `coord::pixel`.
+///
+/// Both spaces are the same sample program over the same view: the pinned
+/// translator's own pixel-space lowering (`metal2vulkan`'s
+/// `passes::air_calls::images::fetch_coord`, whose comment states "Metal's
+/// pixel-space nearest fetch selects texel `floor(coord)`") is the formula
+/// Vulkan's unnormalized texel-coordinate system states — `i = floor(u)` for
+/// nearest and `i0 = floor(u - 0.5)`, `alpha = frac(u - 0.5)` for linear
+/// (`Vulkan-Docs` `chapters/textures.adoc`), where Vulkan's *normalized*
+/// coordinates are converted with `u = s * width`. A rail that executes the
+/// pixel space therefore states the same coordinates the guest's shader
+/// computed, and a rail that executes the normalized space multiplies them by
+/// the extent — which is what makes the axis a *state* rather than an
+/// encoding detail.
+///
+/// The axis travels with the pass's runtime sampler bindings
+/// ([`RenderSamplerBinding`]) rather than with the pipeline contract, because
+/// that is where Metal states it: `normalizedCoordinates` is a property of the
+/// `MTLSamplerState` the draw binds, and one pipeline may be drawn with a
+/// normalized and a pixel-coordinate sampler. A rail that can execute only one
+/// space keeps the other refused by name instead of substituting a scale factor
+/// the guest never stated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerCoordinates {
+    /// Coordinates in `[0, 1]` on every axis: the space every named state in
+    /// [`SamplerPolicy`] has been executed in until this axis existed.
+    Normalized,
+    /// Coordinates in texels, on the two axes a 2D view reads.
+    Pixel,
+}
+
+impl SamplerCoordinates {
+    /// Whether this space measures in texels rather than in `[0, 1]`.
+    pub const fn is_pixel(self) -> bool {
+        matches!(self, Self::Pixel)
+    }
+}
+
 impl SamplerPolicy {
     /// The state a texel read lowered to a sample needs.
     ///
@@ -1004,19 +1049,54 @@ impl SamplerPolicy {
 /// runtime sampler nothing pairs with and cannot leave one the module reads
 /// unbound ([`ContractError::UnpairedRuntimeSamplerBinding`] /
 /// [`ContractError::MissingRuntimeSamplerBinding`]).
+///
+/// The state is [`SamplerPolicy`]'s two axes beside the coordinate space the
+/// samples are stated in ([`SamplerCoordinates`], 2026-09-19). The third axis
+/// arrived with census v43's `texture_state` bucket, whose records are *all*
+/// pixel-coordinate samplers: the guest binds a sampler whose
+/// `normalizedCoordinates` is `NO`, and the coordinates its shader computed are
+/// texel values rather than `[0, 1]` fractions. The pipeline contract states
+/// none of this — the axis is a property of the sampler object the draw binds,
+/// exactly as the filter and the address mode are — so it lives here beside
+/// them, and a pass may bind a normalized sampler to a pipeline another pass
+/// binds a pixel-coordinate one to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderSamplerBinding {
     /// The Metal `[[sampler(n)]]` argument index this state belongs to.
     pub metal_binding: u32,
     /// The state the descriptor's sampler is created with.
     pub policy: SamplerPolicy,
+    /// The space the samples through this argument are stated in.
+    ///
+    /// [`SamplerCoordinates::Normalized`] is the space every earlier increment
+    /// published and the default [`Self::new`] states; a pass that binds a
+    /// pixel-coordinate sampler says so here, and a rail that cannot execute
+    /// the space refuses the draw by name instead of executing the samples as
+    /// fractions of the extent.
+    pub coordinates: SamplerCoordinates,
 }
 
 impl RenderSamplerBinding {
+    /// One runtime sampler state in the normalized coordinate space — the
+    /// shape every earlier increment published.
     pub const fn new(metal_binding: u32, policy: SamplerPolicy) -> Self {
         Self {
             metal_binding,
             policy,
+            coordinates: SamplerCoordinates::Normalized,
+        }
+    }
+
+    /// One runtime sampler state in one stated coordinate space.
+    pub const fn with_coordinates(
+        metal_binding: u32,
+        policy: SamplerPolicy,
+        coordinates: SamplerCoordinates,
+    ) -> Self {
+        Self {
+            metal_binding,
+            policy,
+            coordinates,
         }
     }
 }
@@ -9877,6 +9957,30 @@ pub struct ProviderCapabilities {
     /// whose reviewed pair already binds `setVertexBuffer` at set 1 and
     /// `setFragmentBuffer` at set 2 (the Apple device readings).
     pub supports_render_stage_buffer_namespace_split: bool,
+    /// Whether this snapshot executes a render pass that binds a
+    /// **pixel-coordinate** runtime sampler (2026-09-19, census v43's
+    /// `texture_state` axis). Defaults to `false`: a pass whose
+    /// [`RenderSamplerBinding::coordinates`] is [`SamplerCoordinates::Pixel`]
+    /// is refused by name during admission, so a trace never reaches a rail
+    /// that would have to guess which space its shader's coordinates are in.
+    ///
+    /// The bit is not [`Self::supports_render_texture_gathered_extent`]'s or
+    /// any other shape's under another name: it answers one state question —
+    /// "does this rail execute the texel space" — and a rail may answer it
+    /// without any of the others. The Vulkan rail publishes it: its translated
+    /// fragment stages are executed through a *derived* explicit-LOD sibling
+    /// when such a pass names the space, which is what makes the unnormalized
+    /// sampler legal (`VUID-vkCmdDraw-None-08610`/`-08611`) without changing
+    /// which texels the sample returns. The native rail keeps the default: its
+    /// reviewed modules state a `constexpr sampler` in the normalized space,
+    /// and Apple has no oracle for the texel space on this face.
+    ///
+    /// A consumer's fail-closed direction is the default: a provider that does
+    /// not declare the bit keeps the census's refusal sentence and slug for
+    /// this shape (`render_provider_out_of_class_texture_state`), so a
+    /// provider that has not been rebuilt against the axis is never handed a
+    /// pass it would execute in the wrong space.
+    pub supports_render_pixel_coordinate_sampler: bool,
     /// Whether this snapshot can execute the present action of
     /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
     /// contract and the refusals, while the Vulkan "readable swapchain
@@ -10103,6 +10207,21 @@ impl ProviderCapabilities {
         self.supports_render_kept_frame_landing
     }
 
+    /// Whether this snapshot executes a render pass that binds a
+    /// pixel-coordinate runtime sampler (2026-09-19, census v43's
+    /// `texture_state` axis).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so the question is asked in the same place a consumer asks
+    /// every other shape question, and so the capability frame's own guards —
+    /// a snapshot that declares *only* this bit still writes the extended
+    /// payload — have one reader instead of two. A trace that states the space
+    /// while this reads `false` is refused by name in admission, not executed
+    /// with the samples read as fractions of the extent.
+    pub fn declares_render_pixel_coordinate_sampler_support(&self) -> bool {
+        self.supports_render_pixel_coordinate_sampler
+    }
+
     /// Whether this snapshot declares the folded stage-buffer shape
     /// (`research/docs/23` §3.3, E-TX9).
     ///
@@ -10212,6 +10331,14 @@ impl ProviderCapabilities {
         // ask for. The pass's own access/shape rules already ran in
         // `trace.validate()` above.
         self.admit_render_texture_inputs(trace)?;
+
+        // Runtime sampler admission is the state gate beside the texture walk
+        // (2026-09-19, census v43's `texture_state` axis): a pass whose runtime
+        // sampler states the texel space is refused here unless the snapshot
+        // declares that it executes the space, so a rail never reads a guest's
+        // texel coordinates as fractions of the extent. The pass's own
+        // canonical-order and index rules already ran in `trace.validate()`.
+        self.admit_render_pixel_samplers(trace)?;
 
         // Stage buffer admission is the third render gate and sits in the same
         // walk (`research/docs/23` §3.3, v83): a pass that binds bytes its
@@ -10817,6 +10944,55 @@ impl ProviderCapabilities {
                     return Err(capability_error("render_texture_format_unsupported")
                         .with_field("view", FieldValue::Unsigned(texture.view_id.get()))
                         .with_field("format", FieldValue::Text(format!("{:?}", texture.format))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Runtime sampler admission (2026-09-19, census v43's `texture_state`
+    /// axis).
+    ///
+    /// The pass's own rules — the list's canonical order, its ceiling and the
+    /// pairing with the textures that read through it — already ran in
+    /// `trace.validate()`. This gate answers what only the snapshot knows:
+    /// whether it executes the coordinate space the pass's runtime samplers
+    /// state. A snapshot that does not declare
+    /// [`Self::supports_render_pixel_coordinate_sampler`] refuses the pass by
+    /// name, because the two spaces are the same sample program over
+    /// *different* coordinates: executing a guest's texel coordinates as
+    /// normalized ones reads a different texel of the same texture with every
+    /// counter on the rail still reading zero, which is exactly the failure
+    /// mode admission exists to stop.
+    ///
+    /// The walk is per pass and per binding so the refusal can name the
+    /// `[[sampler(n)]]` argument that stated the space. A pass that states only
+    /// the normalized space — every pre-increment frame — never enters it.
+    fn admit_render_pixel_samplers(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        for (pass_index, entry) in trace.passes.iter().enumerate() {
+            let Some(pass) = entry.as_render() else {
+                continue;
+            };
+            for sampler in &pass.samplers {
+                if !sampler.coordinates.is_pixel() {
+                    continue;
+                }
+                if !self.supports_render_pixel_coordinate_sampler {
+                    return Err(capability_error(
+                        "render_pixel_coordinate_sampler_unsupported",
+                    )
+                    .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                    .with_field(
+                        "sampler_binding",
+                        FieldValue::Unsigned(u64::from(sampler.metal_binding)),
+                    )
+                    .with_detail(
+                        "a pass whose runtime sampler states the texel space needs a rail that \
+                         executes it: the guest's shader computed its coordinates in texels, and \
+                         a rail that read them as fractions of the extent would sample another \
+                         texel of the same texture with nothing named; this snapshot does not \
+                         declare the space",
+                    ));
                 }
             }
         }
@@ -16002,6 +16178,7 @@ mod tests {
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
+            supports_render_pixel_coordinate_sampler: false,
             supports_compute_texture_sampling: false,
             max_compute_textures: 0,
             supported_compute_texture_formats: Vec::new(),
@@ -22974,6 +23151,35 @@ mod tests {
         value
     }
 
+    /// The runtime-sampler fixture beside the sampled one (2026-09-19, census
+    /// v43's `texture_state` axis): the same pass, with its declaration pairing
+    /// the texture with a runtime `[[sampler(0)]]` argument and the pass
+    /// stating that argument's state — in the texel space when the caller asks
+    /// for it.
+    fn pixel_sampler_trace(coordinates: SamplerCoordinates) -> ComputeTrace {
+        let mut value = render_texture_trace();
+        if let Some(render) = value.pipelines[0].render.as_mut() {
+            render.textures = vec![TextureBindingContract {
+                metal_binding: 0,
+                access: TextureAccess::Sampled,
+                texture_type: TextureType::D2,
+                format: TextureFormat::Rgba8Unorm,
+                sampler: None,
+                runtime_sampler: Some(0),
+                footprint: TextureFootprintProof::WholeView,
+            }];
+        }
+        render_entry(&mut value).samplers = vec![RenderSamplerBinding::with_coordinates(
+            0,
+            SamplerPolicy {
+                filter: SamplerFilter::Linear,
+                address: SamplerAddressMode::ClampToZero,
+            },
+            coordinates,
+        )];
+        value
+    }
+
     /// The render snapshot extended with the three render-sampler bits.
     fn render_texture_capabilities() -> ProviderCapabilities {
         let mut provider = render_capabilities();
@@ -23348,6 +23554,44 @@ mod tests {
         render_capabilities()
             .admit(&plain, &landing_resources())
             .expect("the pre-v70 pass keeps admitting without the bits");
+    }
+
+    /// The texel space is the snapshot's own answer (2026-09-19, census v43's
+    /// `texture_state` axis): a pass whose runtime sampler states it is refused
+    /// by name unless the snapshot declares the bit, and the refusal names the
+    /// `[[sampler(n)]]` argument that stated it.
+    #[test]
+    fn the_pixel_coordinate_sampler_bit_gates_the_space_the_pass_states() {
+        let value = pixel_sampler_trace(SamplerCoordinates::Pixel);
+        value.validate().expect("the fixture is structurally valid");
+        let refusal = render_texture_capabilities()
+            .admit(&value, &landing_resources())
+            .expect_err("a snapshot that executes only the normalized space refuses the pass");
+        assert_eq!(refusal.slug, "render_pixel_coordinate_sampler_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("sampler_binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // The bit is the whole gate: a snapshot that declares the space admits
+        // the very same pass, and every other render bit keeps its reading.
+        let mut pixel = render_texture_capabilities();
+        pixel.supports_render_pixel_coordinate_sampler = true;
+        assert!(pixel.declares_render_pixel_coordinate_sampler_support());
+        pixel
+            .admit(&value, &landing_resources())
+            .expect("a snapshot that declares the space admits the pass");
+
+        // The normalized statement is admitted by *both* snapshots: the axis
+        // never narrows the shape every earlier increment published.
+        let normalized = pixel_sampler_trace(SamplerCoordinates::Normalized);
+        normalized
+            .validate()
+            .expect("the normalized fixture is structurally valid");
+        render_texture_capabilities()
+            .admit(&normalized, &landing_resources())
+            .expect("the normalized space needs no declaration");
     }
 
     #[test]

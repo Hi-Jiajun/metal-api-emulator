@@ -404,6 +404,10 @@ mod tests {
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
+            // The ICB snapshot is a compute face; the render bits stay at the
+            // defaults the reviewed render rail keeps (2026-09-19, census
+            // v43's `texture_state` axis among them).
+            supports_render_pixel_coordinate_sampler: false,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,

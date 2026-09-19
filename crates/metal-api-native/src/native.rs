@@ -488,6 +488,13 @@ impl NativeMetalProvider {
                 // same reason: no owner-window write route exists here, so the
                 // snapshot keeps the fail-closed default.
                 supports_render_kept_frame_landing: render_bits.supports_render_kept_frame_landing,
+                // The texel space (2026-09-19, census v43's `texture_state`
+                // axis) has no module on this rail either: the reviewed MSL
+                // modules spell one `constexpr sampler` in the normalized
+                // space and take no `[[sampler(n)]]` argument at all, so the
+                // snapshot keeps the fail-closed default and the rail refuses
+                // such a pass by name (`render_pixel_coordinate_sampler_unsupported`).
+                supports_render_pixel_coordinate_sampler: false,
                 // The compute-side texture bits name the shape this rail has
                 // executed since v11 (`research/docs/16` §4.8, `docs/26`
                 // §21.3): `native.rs` creates one `MTLTexture` per sampled

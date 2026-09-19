@@ -887,6 +887,11 @@ impl VulkanComputeProvider {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: None,
+            // The reviewed arm executes the rail's own modules, which state the
+            // normalized space: there is no translated module to derive a
+            // pixel-coordinate sibling from (2026-09-19, census v43's
+            // `texture_state` axis).
+            fragment_pixel_spirv: None,
         };
         self.register_render_stages(stages, logical_digest)
     }
@@ -921,6 +926,12 @@ impl VulkanComputeProvider {
             fragment_spirv: fragment.spirv,
             vertex_translation: Some(vertex.reflection),
             fragment_translation: Some(fragment.reflection),
+            // The explicit-LOD sibling the pixel-coordinate arm executes is
+            // derived once the stage pair has been validated: the walk reads
+            // the module bytes the rail is about to execute, so it runs on the
+            // same module the reflection gate accepted
+            // (2026-09-19, census v43's `texture_state` axis).
+            fragment_pixel_spirv: None,
         };
         self.register_render_stages(stages, logical_digest)
     }
@@ -933,7 +944,7 @@ impl VulkanComputeProvider {
     /// pipeline to the trace table, the registry and the execution path.
     fn register_render_stages(
         &self,
-        stages: render::RenderStages,
+        mut stages: render::RenderStages,
         logical_digest: SemanticDigest,
     ) -> Result<CompiledComputePipeline, ProviderError> {
         self.ensure_usable()?;
@@ -945,6 +956,13 @@ impl VulkanComputeProvider {
         // accounting, in the same order the translation entry point asks it.
         render::validate_module_capabilities(&stages, self.spirv_feature_policy())?;
         stages.validate()?;
+        // The pixel-coordinate arm's module is derived here, once, from the
+        // module the gate above accepted (2026-09-19, census v43's
+        // `texture_state` axis): a pass that states the texel space executes
+        // the sibling, and a module with no sibling keeps the arm refused by
+        // name instead of executing an `ImplicitLod` sample through an
+        // unnormalized sampler (`VUID-vkCmdDraw-None-08610`).
+        stages.derive_pixel_variant();
         let function = FunctionIdentity {
             logical_digest,
             entry_name: stages.contract.vertex_entry.clone(),

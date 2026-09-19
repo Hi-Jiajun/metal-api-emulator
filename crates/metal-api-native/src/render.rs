@@ -1042,6 +1042,12 @@ pub(crate) struct RenderCapabilityBits {
     /// also always `false` here: this rail has no owner-window write route, so
     /// it refuses the entry by name.
     pub(crate) supports_render_kept_frame_landing: bool,
+    /// The texel space (2026-09-19, census v43's `texture_state` axis). Kept
+    /// beside the render-sampler bits for the same reason, and also always
+    /// `false` here: the reviewed MSL modules spell one `constexpr sampler` in
+    /// the normalized space and take no `[[sampler(n)]]` argument at all, so
+    /// the rail refuses such a pass by name.
+    pub(crate) supports_render_pixel_coordinate_sampler: bool,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -1125,6 +1131,11 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         // fail-closed default beside the two bits above.
         supports_render_attachment_landing_view: false,
         supports_render_kept_frame_landing: false,
+        // The texel space has no module on this rail either (2026-09-19,
+        // census v43's `texture_state` axis): the reviewed MSL modules state one
+        // `constexpr sampler` in the normalized space, so the snapshot keeps the
+        // fail-closed default and core admission refuses such a pass by name.
+        supports_render_pixel_coordinate_sampler: false,
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -3442,6 +3453,35 @@ pub(crate) fn plan<'a>(
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
 ) -> Result<RenderPlan<'a>, ProviderError> {
+    // A pass that states the texel space is refused here, before any reviewed
+    // module is planned (2026-09-19, census v43's `texture_state` axis). The
+    // rail's own capability snapshot keeps the bit at its default, so core
+    // admission already answers this shape; this second check is the
+    // directly-constructed request's, and it names the rail rather than the
+    // snapshot. The reviewed MSL modules spell one `constexpr sampler` in the
+    // normalized space and take no `[[sampler(n)]]` argument at all, so there
+    // is no module here a texel coordinate could be executed against.
+    if let Some(sampler) = request
+        .pass
+        .samplers
+        .iter()
+        .find(|sampler| sampler.coordinates.is_pixel())
+    {
+        return Err(
+            capability_refusal("render_pixel_coordinate_sampler_unsupported")
+                .with_field(
+                    "sampler_binding",
+                    FieldValue::Unsigned(u64::from(sampler.metal_binding)),
+                )
+                .with_field("rail", FieldValue::Text("native".to_owned()))
+                .with_detail(
+                    "this rail's reviewed modules sample through their own `constexpr sampler` in \
+                 the normalized space, so a pass whose runtime sampler states the texel space \
+                 has no module behind it here; the Vulkan rail's translated arm is where the \
+                 space runs, through the fragment module's explicit-LOD sibling",
+                ),
+        );
+    }
     plan_with_leases(request, None, depth_resolve_modes, stencil_resolve_modes)
 }
 
@@ -8840,6 +8880,51 @@ mod tests {
         .expect("the reviewed state admits the reviewed pass");
     }
 
+    /// The texel space has no rail here (2026-09-19, census v43's
+    /// `texture_state` axis): the reviewed MSL modules spell one `constexpr
+    /// sampler` in the normalized space and take no `[[sampler(n)]]` argument
+    /// at all, so the snapshot keeps the fail-closed default and a
+    /// directly-constructed pass that states the space is refused by name
+    /// before any Metal object exists.
+    #[test]
+    fn the_texel_space_is_never_declared_and_a_pass_that_states_it_is_refused() {
+        assert!(!capability_bits(16384).supports_render_pixel_coordinate_sampler);
+        assert!(!capabilities(&capability_bits(16384))
+            .declares_render_pixel_coordinate_sampler_support());
+
+        let mut pass = sampled_pass(4);
+        pass.samplers = vec![
+            metal_api_core::provider::RenderSamplerBinding::with_coordinates(
+                0,
+                SamplerPolicy {
+                    filter: SamplerFilter::Linear,
+                    address: SamplerAddressMode::ClampToZero,
+                },
+                metal_api_core::provider::SamplerCoordinates::Pixel,
+            ),
+        ];
+        let pipeline = sampled_pipeline();
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &pipeline,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        eprintln!("texel space refused: {error:?}");
+        assert_eq!(error.slug, "render_pixel_coordinate_sampler_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("rail"),
+            Some(&FieldValue::Text("native".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("sampler_binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
     /// The reviewed window in the runtime-sampler increment
     /// (`research/docs/23` §3.3, v102): this rail has no MSL module that takes
     /// a `[[sampler(n)]]` argument, and its reviewed module samples one
@@ -10497,6 +10582,13 @@ mod tests {
             max_render_stage_buffers_per_stage: stage_buffers.max_render_stage_buffers_per_stage,
             supports_render_stage_buffer_namespace_split: stage_buffers
                 .supports_render_stage_buffer_namespace_split,
+            // The native rail's reviewed MSL modules spell one `constexpr
+            // sampler` in the normalized space, and the rail refuses a runtime
+            // `[[sampler(n)]]` argument by name (`render_runtime_sampler_unsupported`),
+            // so the texel space (2026-09-19, census v43's `texture_state`
+            // axis) has no module behind it here either: the bit keeps its
+            // default and admission refuses such a pass before the rail.
+            supports_render_pixel_coordinate_sampler: bits.supports_render_pixel_coordinate_sampler,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,

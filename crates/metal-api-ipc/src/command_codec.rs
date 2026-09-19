@@ -27,14 +27,15 @@ use metal_api_core::provider::{
     RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
     RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding,
     RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, Retryability,
-    SampleCount, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
-    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
-    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
-    TextureAccess, TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource,
-    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexLayout, VertexStep, ViewId, Winding, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
-    MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    SampleCount, SamplerAddressMode, SamplerCoordinates, SamplerFilter, SamplerPolicy,
+    SemanticDigest, ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
+    StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
+    StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFootprintProof,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
+    MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES,
+    MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -403,6 +404,23 @@ const RENDER_WIDE_FEATURE_KNOWN: u16 = RENDER_FEATURE_KNOWN as u16
     | RENDER_WIDE_FEATURE_DEPTH_RESOLVE
     | RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
 
+/// Flag bit of the runtime sampler block's count byte (2026-09-19, census
+/// v43's `texture_state` axis): set when the block carries one
+/// coordinate-space byte per entry
+/// ([`ProviderCapabilities::supports_render_pixel_coordinate_sampler`]).
+///
+/// The count's own space is `0..=MAX_RENDER_SAMPLERS` (`16`, the contract's
+/// `[[sampler(n)]]` ceiling), so the high bit is free in every frame this
+/// channel has ever written — a decoder that predates the axis reads a flagged
+/// header as a count above its cap and answers
+/// [`CodecError::RenderSamplerCount`], which is the fail-closed direction the
+/// wire's other widenings took (an unknown pass tag, an unknown capability
+/// tail tag, an unknown state code). The flag is a property of the whole
+/// block: a list that states the axis on one entry states it on all of them,
+/// so a per-entry escape — which would leave the block's length a function of
+/// its contents — is not needed.
+const RENDER_SAMPLER_COORDINATES_FLAG: u8 = 0x80;
+
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
 const VERTEX_LAYOUT_NONE: u8 = 0x00;
@@ -735,6 +753,24 @@ const CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL: u8 = 0x06;
 /// new consumer reading an old frame keeps the same one.
 const CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL: u8 = 0x07;
 
+/// Tag, inside the tail's second family, of the pixel-coordinate sampler block
+/// (2026-09-19, census v43's `texture_state` axis).
+///
+/// The section follows the per-stage stage-buffer window and carries one bool:
+/// whether the snapshot executes a render pass whose runtime sampler states the
+/// texel space ([`ProviderCapabilities::supports_render_pixel_coordinate_sampler`]).
+/// It is the family's eighth tag rather than a widening of the render-sampler
+/// block, because that block's bytes carry a *state family* whose coordinate
+/// axis never had a byte: a consumer that gates a draw on this face has to be
+/// able to tell "the provider I am talking to executes the texel space" from
+/// "it reads the same sampler list and executes the normalized space alone".
+///
+/// The absent section is the older reading and the fail-closed one: a frame
+/// that ends before it says the consumer keeps the census's refusal sentence
+/// and slug for this shape, so a provider that has not been rebuilt against the
+/// axis is never handed a pass it would execute in the wrong space.
+const CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL: u8 = 0x08;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -987,6 +1023,13 @@ impl CommandCodec {
                     // every consumer would keep reading the stricter list
                     // bound as the whole rule.
                     || capabilities.declares_render_stage_buffer_per_stage_ceiling()
+                    // The pixel-coordinate sampler bit is a face of its own
+                    // (2026-09-19, census v43's `texture_state` axis): a
+                    // snapshot that declares only it still has to write the
+                    // extended payload, or its declaration would be dropped on
+                    // the wire and every consumer would keep the census's
+                    // refusal sentence for the shape.
+                    || capabilities.declares_render_pixel_coordinate_sampler_support()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -2945,6 +2988,33 @@ fn get_sampler_address(decoder: &mut Decoder<'_>) -> Result<SamplerAddressMode, 
     }
 }
 
+/// One sampler coordinate-space code (2026-09-19, census v43's
+/// `texture_state` axis), ordered like the enum: normalized `0`, pixel `1`.
+///
+/// The pair is written only inside a runtime sampler block whose header
+/// carries [`RENDER_SAMPLER_COORDINATES_FLAG`], so every pre-increment frame
+/// keeps its bytes and a decoder that predates the axis refuses the flagged
+/// header as a count above the contract's cap
+/// ([`CodecError::RenderSamplerCount`]) rather than reading one of these bytes
+/// as another state.
+fn put_sampler_coordinates(encoder: &mut Encoder, coordinates: SamplerCoordinates) {
+    encoder.u8(match coordinates {
+        SamplerCoordinates::Normalized => 0,
+        SamplerCoordinates::Pixel => 1,
+    });
+}
+
+fn get_sampler_coordinates(decoder: &mut Decoder<'_>) -> Result<SamplerCoordinates, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(SamplerCoordinates::Normalized),
+        1 => Ok(SamplerCoordinates::Pixel),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "sampler coordinates",
+            value,
+        }),
+    }
+}
+
 /// One texture footprint code (`research/docs/23` §91).
 ///
 /// The proof is a two-value family — the whole view `0`, unbounded `1` — and
@@ -3626,7 +3696,10 @@ fn put_stage_buffer_block(
 
 /// Encode the runtime sampler block of a [`PASS_KIND_RENDER_SAMPLERS`] pass and
 /// its three combinations (`research/docs/23` §3.3, v102): a `u8` count and
-/// that many `(metal_binding, filter, address)` tuples.
+/// that many `(metal_binding, filter, address)` tuples, or — for a list that
+/// states the coordinate axis (2026-09-19, census v43's `texture_state`) — the
+/// same count with [`RENDER_SAMPLER_COORDINATES_FLAG`] set and one
+/// coordinate-space byte after every entry's two state bytes.
 ///
 /// Each entry is the state one `[[sampler(n)]]` argument executes with, and
 /// the entry's own `metal_binding` is that argument's Metal index, exactly as a
@@ -3636,6 +3709,15 @@ fn put_stage_buffer_block(
 /// single entry is written, exactly as the decoder bounds it; the list's
 /// canonical-order and index rules stay the contract's
 /// (`validate_render_sampler_bindings`), which runs in admission.
+///
+/// The coordinate axis travels in the flagged form rather than in every frame
+/// because it is a *third* state byte: a block that wrote it unconditionally
+/// would shift every later byte of every pre-increment frame, and a block that
+/// wrote it per entry behind an escape would leave a reader counting bytes it
+/// cannot see. The flag rides in the count's high bit — the count's own space
+/// is `0..=MAX_RENDER_SAMPLERS` (16), so a pre-increment decoder reads a
+/// flagged header as a count above its cap and refuses the frame by name
+/// instead of executing a tuple it would mis-slice.
 fn put_render_sampler_block(
     encoder: &mut Encoder,
     samplers: &[RenderSamplerBinding],
@@ -3646,11 +3728,27 @@ fn put_render_sampler_block(
             maximum: MAX_RENDER_SAMPLERS,
         });
     }
-    encoder.u8(samplers.len() as u8);
+    // One flag for the whole block: the axis is a state of the tuple's third
+    // byte, so a list that states it on one entry states it on all of them —
+    // the alternative, a per-entry escape, would make the block's length a
+    // function of its contents for a reader that never learned the escape.
+    let carries_coordinates = samplers
+        .iter()
+        .any(|sampler| sampler.coordinates.is_pixel());
+    let header = samplers.len() as u8
+        | if carries_coordinates {
+            RENDER_SAMPLER_COORDINATES_FLAG
+        } else {
+            0
+        };
+    encoder.u8(header);
     for sampler in samplers {
         encoder.u32(sampler.metal_binding);
         put_sampler_filter(encoder, sampler.policy.filter);
         put_sampler_address(encoder, sampler.policy.address);
+        if carries_coordinates {
+            put_sampler_coordinates(encoder, sampler.coordinates);
+        }
     }
     Ok(())
 }
@@ -4411,17 +4509,23 @@ fn get_stage_buffer_block(decoder: &mut Decoder<'_>) -> Result<Vec<StageBufferVi
 }
 
 /// Decode one runtime sampler block (`research/docs/23` §3.3, v102): a `u8`
-/// count and that many `(metal_binding, filter, address)` tuples.
+/// count and that many `(metal_binding, filter, address)` tuples, with one
+/// coordinate-space byte per entry when the header carries
+/// [`RENDER_SAMPLER_COORDINATES_FLAG`] (2026-09-19, census v43).
 ///
 /// The count is refused above the contract's own cap before a single entry is
-/// read, and each state byte goes through the named filter/address decoders, so
-/// a value this version does not know is refused by name rather than folded
-/// onto a neighbouring state: a filter or address the decoder guessed would
-/// change which texels a remote read returns.
+/// read, and each state byte goes through the named filter/address/coordinate
+/// decoders, so a value this version does not know is refused by name rather
+/// than folded onto a neighbouring state: a filter, address or coordinate space
+/// the decoder guessed would change which texels a remote read returns. A
+/// flagged header whose count is *also* above the cap is refused the same way —
+/// the flag bit is not a count.
 fn get_render_sampler_block(
     decoder: &mut Decoder<'_>,
 ) -> Result<Vec<RenderSamplerBinding>, CodecError> {
-    let count = usize::from(decoder.u8()?);
+    let header = decoder.u8()?;
+    let carries_coordinates = header & RENDER_SAMPLER_COORDINATES_FLAG != 0;
+    let count = usize::from(header & !RENDER_SAMPLER_COORDINATES_FLAG);
     if count > MAX_RENDER_SAMPLERS {
         return Err(CodecError::RenderSamplerCount {
             count,
@@ -4430,12 +4534,18 @@ fn get_render_sampler_block(
     }
     let mut samplers = Vec::with_capacity(count);
     for _ in 0..count {
+        let metal_binding = decoder.u32()?;
+        let filter = get_sampler_filter(decoder)?;
+        let address = get_sampler_address(decoder)?;
+        let coordinates = if carries_coordinates {
+            get_sampler_coordinates(decoder)?
+        } else {
+            SamplerCoordinates::Normalized
+        };
         samplers.push(RenderSamplerBinding {
-            metal_binding: decoder.u32()?,
-            policy: SamplerPolicy {
-                filter: get_sampler_filter(decoder)?,
-                address: get_sampler_address(decoder)?,
-            },
+            metal_binding,
+            policy: SamplerPolicy { filter, address },
+            coordinates,
         });
     }
     Ok(samplers)
@@ -5918,6 +6028,11 @@ fn put_capabilities(
         // only it still has to write the heap/ICB half the decoder reads by
         // position before the family's escape.
         || capabilities.declares_render_stage_buffer_per_stage_ceiling()
+        // The pixel-coordinate sampler bit joins the same guard for the same
+        // reason (2026-09-19, census v43's `texture_state` axis): a snapshot
+        // that declares only it still has to write the heap/ICB half the
+        // decoder reads by position before the family's escape.
+        || capabilities.declares_render_pixel_coordinate_sampler_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6145,6 +6260,17 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL);
             encoder.u32(capabilities.max_render_stage_buffers_per_stage);
         }
+        // The pixel-coordinate sampler block is the family's eighth tag and
+        // follows the per-stage stage-buffer window (2026-09-19, census v43's
+        // `texture_state` axis). A snapshot whose bit stays at its default
+        // writes nothing here, and the decoder reads the missing section as
+        // `false` — the "keep the census's refusal sentence and slug" default
+        // every consumer of the bit keeps its fail-closed direction with.
+        if capabilities.declares_render_pixel_coordinate_sampler_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL);
+            encoder.bool(capabilities.supports_render_pixel_coordinate_sampler);
+        }
     }
     Ok(())
 }
@@ -6200,6 +6326,10 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // older reading too (`research/docs/23` §117, E-SB2): the list bound
         // applies to the whole list, which is the stricter rule.
         max_render_stage_buffers_per_stage: 0,
+        // A legacy payload cannot have declared the texel space either
+        // (2026-09-19, census v43's `texture_state` axis): a consumer of the
+        // bit keeps the census's refusal sentence and slug for the shape.
+        supports_render_pixel_coordinate_sampler: false,
         // A legacy payload cannot have declared the folded shape either
         // (`research/docs/23` §3.3, E-TX9): the section arrived after the
         // compute-texture block, so a frame that ends earlier reads the
@@ -6345,7 +6475,8 @@ fn decode_capability_extended_tail(
             | CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL
             | CAPABILITY_RENDER_ATTACHMENT_LANDING_VIEW_TAIL
             | CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL
-            | CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL => {}
+            | CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL
+            | CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6374,6 +6505,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL => {
                 capabilities.max_render_stage_buffers_per_stage = decoder.u32()?;
+            }
+            CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL => {
+                capabilities.supports_render_pixel_coordinate_sampler = decoder.bool()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

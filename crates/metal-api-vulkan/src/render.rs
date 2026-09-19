@@ -377,6 +377,11 @@ pub(crate) enum RenderTextureSlot {
         image: u32,
         sampler_binding: u32,
         sampler: SamplerPolicy,
+        /// The space the module's samples through this argument are stated in
+        /// (2026-09-19, census v43's `texture_state` axis): the pass's own
+        /// statement, carried here so the `VkSampler` is created with the
+        /// matching `unnormalizedCoordinates` value.
+        coordinates: metal_api_core::provider::SamplerCoordinates,
     },
     /// A translated fragment stage's sampler-free texture: the translator
     /// emits the sampled image alone (`OpTypeImage`) and the module reads it
@@ -392,6 +397,25 @@ impl RenderTextureSlot {
         match self {
             Self::Combined { sampler, .. } | Self::Split { sampler, .. } => Some(*sampler),
             Self::Fetch { .. } => None,
+        }
+    }
+
+    /// The coordinate space this slot's samples are stated in
+    /// (2026-09-19, census v43's `texture_state` axis).
+    ///
+    /// The reviewed pair states the normalized space — its module and its
+    /// `constexpr sampler` were reviewed together, and a runtime sampler state
+    /// is refused beside it by name — and the translated arm's runtime slots
+    /// carry the pass's own statement. A fetch slot creates no sampler at all,
+    /// so its samples are the module's own `OpImageFetch` coordinates and the
+    /// space is unread; the normalized name is the one every reader that never
+    /// states the axis means.
+    pub(crate) const fn coordinates(&self) -> metal_api_core::provider::SamplerCoordinates {
+        match self {
+            Self::Combined { .. } | Self::Fetch { .. } => {
+                metal_api_core::provider::SamplerCoordinates::Normalized
+            }
+            Self::Split { coordinates, .. } => *coordinates,
         }
     }
 }
@@ -499,6 +523,64 @@ fn runtime_sampler_refusal(
              this `[[sampler(n)]]` argument, so a request naming another filtering or addressing \
              mode would be executed with a sampler the module was not lowered against",
         )
+}
+
+/// The refusal a pass gets when it states a coordinate space a texture
+/// binding's samples cannot be executed in (2026-09-19, census v43's
+/// `texture_state` axis).
+///
+/// The pixel-coordinate arm executes the texel space through an unnormalized
+/// `VkSampler`, whose Vulkan state is narrower than the family's: the filter
+/// has one half and no mip filtering, and the addressing mode has to be able to
+/// answer an out-of-range texel (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01072`
+/// … `-01077`). The refusal carries the pairing — the texture binding that
+/// reads through the argument, the `[[sampler(n)]]` index — beside the state
+/// the pass stated, and the detail says which half the rail cannot create
+/// rather than substituting a value the pass never stated.
+fn pixel_sampler_state_refusal(
+    texture_binding: u32,
+    sampler_binding: u32,
+    stated: &metal_api_core::provider::RenderSamplerBinding,
+    detail: &str,
+) -> ProviderError {
+    capability_refusal("render_pixel_sampler_state_unsupported")
+        .with_field("binding", FieldValue::Unsigned(u64::from(texture_binding)))
+        .with_field(
+            "sampler_binding",
+            FieldValue::Unsigned(u64::from(sampler_binding)),
+        )
+        .with_field(
+            "filter",
+            FieldValue::Text(format!("{:?}", stated.policy.filter)),
+        )
+        .with_field(
+            "address",
+            FieldValue::Text(format!("{:?}", stated.policy.address)),
+        )
+        .with_field(
+            "coordinates",
+            FieldValue::Text(format!("{:?}", stated.coordinates)),
+        )
+        .with_detail(detail.to_owned())
+}
+
+/// The refusal a pass gets when it binds a pixel-coordinate sampler to a
+/// registration whose fragment module has no explicit-LOD sibling
+/// (2026-09-19, census v43's `texture_state` axis).
+///
+/// The module's own sample forms are what decide it
+/// ([`pixel_coordinate_sampler_variant`]): a `Proj`, `Dref`, sparse or gather
+/// instruction, an offset-carrying sample, or an implicit sample whose image
+/// operands include anything but a LOD bias cannot be executed through an
+/// unnormalized sampler, and the rail refuses the pass by name instead of
+/// running an instruction the API forbids.
+fn pixel_sampler_variant_refusal(fragment_entry: &str, detail: &str) -> ProviderError {
+    capability_refusal("render_pixel_sampler_variant_unavailable")
+        .with_field(
+            "fragment_entry",
+            FieldValue::Text(fragment_entry.to_owned()),
+        )
+        .with_detail(detail.to_owned())
 }
 
 /// One reviewed fragment module: the SPIR-V the rail owns for it, and the entry
@@ -1477,9 +1559,44 @@ pub(crate) struct RenderStages {
     /// The translation of the fragment module, when the module is not the
     /// reviewed module of the contract's colour format list.
     pub fragment_translation: Option<ShaderReflection>,
+    /// The fragment module's explicit-LOD sibling, when the rail can derive one
+    /// (2026-09-19, census v43's `texture_state` axis).
+    ///
+    /// [`pixel_coordinate_sampler_variant`] computes it once, at registration:
+    /// a pass that binds a pixel-coordinate runtime sampler executes this
+    /// module instead of `fragment_spirv`, because an unnormalized `VkSampler`
+    /// may not be used by an `ImplicitLod` sample
+    /// (`VUID-vkCmdDraw-None-08610`). `None` means the module has no sibling —
+    /// a sample form no unnormalized sampler may execute — so such a pass is
+    /// refused by name rather than run through the registration's module.
+    ///
+    /// The field is filled by [`Self::derive_pixel_variant`], which the
+    /// provider's registration path calls; a directly-constructed value that
+    /// skipped it keeps `None`, and the pixel-coordinate arm is then refused by
+    /// name rather than executed with the wrong module.
+    pub fragment_pixel_spirv: Option<Vec<u8>>,
 }
 
 impl RenderStages {
+    /// Derive the fragment module's explicit-LOD sibling
+    /// (2026-09-19, census v43's `texture_state` axis).
+    ///
+    /// Called once per registration, after the stage pair has been validated:
+    /// the walk reads the module bytes the rail is about to execute, so it has
+    /// to run on the same module the reflection gate accepted, and it has to
+    /// answer before a trace can name the pipeline. `None` is the rail's
+    /// fail-closed answer and is recorded rather than refused: the *normalized*
+    /// passes this registration already executes are unaffected, and only a
+    /// pass that states the texel space meets the refusal
+    /// (`render_pixel_sampler_variant_unavailable`).
+    pub(crate) fn derive_pixel_variant(&mut self) {
+        self.fragment_pixel_spirv = if self.fragment_translation.is_some() {
+            pixel_coordinate_sampler_variant(&self.fragment_spirv)
+        } else {
+            None
+        };
+    }
+
     /// Structural validation of one registration, before any trace can name it.
     ///
     /// The entry names and the module bytes are checked here because both are
@@ -2800,8 +2917,12 @@ fn translated_texture_slots(
             });
             continue;
         };
-        let (sampler, policy) = match pair_sampler {
-            TranslatedSampler::Module { descriptor, policy } => (descriptor, policy),
+        let (sampler, policy, coordinates) = match pair_sampler {
+            TranslatedSampler::Module { descriptor, policy } => (
+                descriptor,
+                policy,
+                metal_api_core::provider::SamplerCoordinates::Normalized,
+            ),
             TranslatedSampler::Runtime {
                 metal_binding,
                 descriptor,
@@ -2833,8 +2954,46 @@ fn translated_texture_slots(
                             module,
                         ));
                     }
+                    // A translation that named its own runtime state was
+                    // lowered against a *normalized* state — the AIR decode has
+                    // no pixel-coordinate name — so it cannot execute the texel
+                    // space (2026-09-19, census v43's `texture_state`).
+                    if bound.coordinates.is_pixel() {
+                        return Err(pixel_sampler_state_refusal(
+                            pair.texture_binding,
+                            metal_binding,
+                            bound,
+                            "the translation this registration names was lowered against a \
+                             runtime sampler state, which states the normalized space: executing \
+                             it with texel coordinates would sample the texture through \
+                             instructions the state never described",
+                        ));
+                    }
                 }
-                (descriptor, bound.policy)
+                if bound.coordinates.is_pixel() {
+                    // The state's own family: the two fields an unnormalized
+                    // `VkSampler` may still state, beside the values this family
+                    // already fixes (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01072`
+                    // … `-01077`).
+                    if bound.policy.filter.is_mipmapped()
+                        || !matches!(
+                            bound.policy.address,
+                            metal_api_core::provider::SamplerAddressMode::ClampToEdge
+                                | metal_api_core::provider::SamplerAddressMode::ClampToZero
+                        )
+                    {
+                        return Err(pixel_sampler_state_refusal(
+                            pair.texture_binding,
+                            metal_binding,
+                            bound,
+                            "an unnormalized sampler states one filter for both halves, no mip \
+                             filtering, and the two addressing modes that can answer an \
+                             out-of-range texel; this state names another one, so the rail would \
+                             have to substitute a value the pass never stated",
+                        ));
+                    }
+                }
+                (descriptor, bound.policy, bound.coordinates)
             }
         };
         slots.push(RenderTextureSlot::Split {
@@ -2842,6 +3001,7 @@ fn translated_texture_slots(
             image: pair.image,
             sampler_binding: sampler,
             sampler: policy,
+            coordinates,
         });
     }
     Ok(slots)
@@ -3509,6 +3669,225 @@ struct DescriptorReads {
 /// `None`. That is not a hole: [`RenderStages::validate`] refuses such a module
 /// by name at registration, before a trace can select it, and this walk runs
 /// only on modules registration has already accepted.
+/// One `ImageOperands` bit this rewrite reads (SPIR-V `ImageOperands` mask).
+///
+/// The mask word follows a sampling instruction's four fixed operands, so the
+/// rewrite has to know which bits move a sample: `Lod` is the bit it *adds*,
+/// `Bias` the one an implicit sample may carry and an explicit one may not, and
+/// the two offset bits are the values `VUID-vkCmdDraw-None-08611` forbids an
+/// unnormalized sampler from being used with at all.
+const SPIRV_IMAGE_OPERAND_BIAS: u32 = 0x1;
+const SPIRV_IMAGE_OPERAND_LOD: u32 = 0x2;
+const SPIRV_IMAGE_OPERAND_CONST_OFFSET: u32 = 0x8;
+const SPIRV_IMAGE_OPERAND_OFFSET: u32 = 0x10;
+
+/// The explicit-LOD sibling of one translated fragment module (2026-09-19,
+/// census v43's `texture_state` axis).
+///
+/// ## What the sibling is for
+///
+/// A pass that binds a **pixel-coordinate** runtime sampler executes its
+/// samples through an unnormalized `VkSampler`, and Vulkan forbids such a
+/// sampler from being used by an `ImplicitLod` sample
+/// (`VUID-vkCmdDraw-None-08610`) or by any sample carrying a LOD bias or an
+/// offset (`-08611`). The pinned translator emits `OpImageSampleImplicitLod`
+/// for a runtime `[[sampler(n)]]` sample — it cannot do otherwise, because the
+/// state is bound at draw time — so the rail derives this sibling and executes
+/// *it* for such a pass. The rewrite is one instruction per sample site:
+/// `OpImageSampleImplicitLod` becomes `OpImageSampleExplicitLod` with a `Lod`
+/// operand of zero, and a `Bias` operand (whose value the family's `0..=0`
+/// `minLod`/`maxLod` pin already discards) is dropped.
+///
+/// ## Why it is the same frame
+///
+/// The two forms differ in one thing: whether the LOD is computed from the
+/// coordinate derivatives or named. Every canonical view carries **one mip
+/// level** — `TextureView::expected_bytes` is a single level's tightly packed
+/// extent, and nothing in the contract can state another — and the family's
+/// create-info pins `minLod = maxLod = 0`, so the computed LOD is clamped to
+/// zero on every sample of every state this rail creates. `Lod 0` is that same
+/// level, and the family's `minFilter == magFilter` rule makes the filtered
+/// half identical too. `tests/render_pixel_coordinate_sampler_e2e.rs` states
+/// the claim as an oracle: the same module's implicit and explicit siblings
+/// land byte-identical frames under the same sampler.
+///
+/// ## When there is no sibling
+///
+/// `None` is the fail-closed answer: a module with a sample form no
+/// unnormalized sampler may be used with — a `Proj`, `Dref`, sparse or gather
+/// instruction (`-08610`), an offset-carrying sample (`-08611`), or an
+/// implicit sample whose image operands include anything but a bias (a
+/// gradient, whose LOD the rewrite would have to guess) — has no sibling, so a
+/// pass that binds the pixel-coordinate space to it is refused by name rather
+/// than executed through an instruction the API forbids.
+pub(crate) fn pixel_coordinate_sampler_variant(module: &[u8]) -> Option<Vec<u8>> {
+    let words = spirv_words(module)?;
+    if words.len() < 5 {
+        return None;
+    }
+    // Instructions as `(offset, word_count, opcode)` triples, in module order.
+    let mut instructions = Vec::new();
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        if word_count == 0 || cursor + word_count > words.len() {
+            return None;
+        }
+        instructions.push((cursor, word_count, header & 0xffff));
+        cursor += word_count;
+    }
+    // The `Lod` operand's type and — when the module already carries one — the
+    // float zero it can reuse. A module that samples a float texture declares
+    // the type; the reflection gate refuses every other component before this
+    // walk runs.
+    let float_type = instructions.iter().find_map(|(at, _count, opcode)| {
+        (*opcode == spirv::Op::TypeFloat as u32 && words[*at + 2] == 32).then(|| words[*at + 1])
+    })?;
+    let existing_zero = instructions.iter().find_map(|(at, _count, opcode)| {
+        (*opcode == spirv::Op::Constant as u32
+            && words[*at + 1] == float_type
+            && words[*at + 3] == 0)
+            .then(|| words[*at + 2])
+    });
+    let mut out = Vec::with_capacity(words.len() + 4);
+    out.extend_from_slice(&words[..5]);
+    // Where a fresh `OpConstant %float 0` would have to land: the types and
+    // constants section ends where the first function begins, and SPIR-V
+    // requires every constant to precede every function declaration.
+    let mut function_at = None;
+    let mut lod_slots = Vec::new();
+    for (at, count, opcode) in instructions {
+        let operands = &words[at + 1..at + count];
+        if opcode == spirv::Op::ImageSampleImplicitLod as u32 {
+            if operands.len() < 4 {
+                return None;
+            }
+            let mask = operands.get(4).copied().unwrap_or(0);
+            if mask & !SPIRV_IMAGE_OPERAND_BIAS != 0 {
+                return None;
+            }
+            if mask & SPIRV_IMAGE_OPERAND_BIAS != 0 && operands.len() < 6 {
+                return None;
+            }
+            // The rewritten instruction: the same four operands, the `Lod`
+            // mask, and a placeholder the `Lod` id is patched into once the
+            // constant that carries it is known.
+            out.push((7u32 << 16) | spirv::Op::ImageSampleExplicitLod as u32);
+            out.extend_from_slice(&operands[..4]);
+            out.push(SPIRV_IMAGE_OPERAND_LOD);
+            out.push(0);
+            lod_slots.push(out.len() - 1);
+            continue;
+        }
+        if opcode == spirv::Op::ImageSampleExplicitLod as u32 {
+            let mask = operands.get(4).copied().unwrap_or(0);
+            if mask & (SPIRV_IMAGE_OPERAND_CONST_OFFSET | SPIRV_IMAGE_OPERAND_OFFSET) != 0 {
+                return None;
+            }
+        } else if matches!(
+            opcode,
+            x if x == spirv::Op::ImageSampleDrefImplicitLod as u32
+                || x == spirv::Op::ImageSampleDrefExplicitLod as u32
+                || x == spirv::Op::ImageSampleProjImplicitLod as u32
+                || x == spirv::Op::ImageSampleProjExplicitLod as u32
+                || x == spirv::Op::ImageSampleProjDrefImplicitLod as u32
+                || x == spirv::Op::ImageSampleProjDrefExplicitLod as u32
+                || x == spirv::Op::ImageGather as u32
+                || x == spirv::Op::ImageDrefGather as u32
+                // The sparse family's sampling forms, which `-08610` names
+                // beside `OpImageSample*`.
+                || (305..=312).contains(&x)
+        ) {
+            return None;
+        }
+        if opcode == spirv::Op::Function as u32 && function_at.is_none() {
+            function_at = Some(out.len());
+        }
+        out.extend_from_slice(&words[at..at + count]);
+    }
+    // The `Lod` id is patched into the rewritten instructions *before* a fresh
+    // constant is spliced in: the splice shifts every offset after it, and the
+    // recorded slots are offsets into the pre-splice module.
+    let (lod_id, fresh_constant) = match existing_zero {
+        Some(id) => (id, None),
+        None => {
+            let function_at = function_at?;
+            let id = out[3];
+            // One fresh id, and a bound that covers it.
+            out[3] = id + 1;
+            (
+                id,
+                Some((
+                    function_at,
+                    [(4u32 << 16) | spirv::Op::Constant as u32, float_type, id, 0],
+                )),
+            )
+        }
+    };
+    for slot in lod_slots {
+        out[slot] = lod_id;
+    }
+    if let Some((function_at, constant)) = fresh_constant {
+        out.splice(function_at..function_at, constant);
+    }
+    Some(out.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+/// Whether `module` is already the explicit form the pixel-coordinate arm
+/// executes: no implicit sample, no LOD bias and no offset values anywhere
+/// (2026-09-19, census v43's `texture_state` axis).
+///
+/// This is the execution path's own gate for a request that reaches it without
+/// passing through [`prepare_render_request`]'s variant selection: a
+/// hand-built request could carry the *registration's* module beside a
+/// pixel-coordinate slot, and an unnormalized sampler may not be used by the
+/// implicit sample that module carries (`VUID-vkCmdDraw-None-08610`). The walk
+/// answers the question the API asks rather than the one the rewrite asks: an
+/// instruction that is legal as written.
+fn pixel_coordinate_sampler_legal(module: &[u8]) -> bool {
+    let Some(words) = spirv_words(module) else {
+        return false;
+    };
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        if word_count == 0 || cursor + word_count > words.len() {
+            return false;
+        }
+        let opcode = header & 0xffff;
+        let operands = &words[cursor + 1..cursor + word_count];
+        if opcode == spirv::Op::ImageSampleImplicitLod as u32 {
+            // The implicit form is the one `-08610` forbids outright; a bias
+            // would be a second reason (`-08611`), and this arm does not
+            // distinguish them because the answer is the same.
+            return false;
+        }
+        if opcode == spirv::Op::ImageSampleExplicitLod as u32 {
+            let mask = operands.get(4).copied().unwrap_or(0);
+            if mask & (SPIRV_IMAGE_OPERAND_CONST_OFFSET | SPIRV_IMAGE_OPERAND_OFFSET) != 0 {
+                return false;
+            }
+        } else if matches!(
+            opcode,
+            x if x == spirv::Op::ImageSampleDrefImplicitLod as u32
+                || x == spirv::Op::ImageSampleDrefExplicitLod as u32
+                || x == spirv::Op::ImageSampleProjImplicitLod as u32
+                || x == spirv::Op::ImageSampleProjExplicitLod as u32
+                || x == spirv::Op::ImageSampleProjDrefImplicitLod as u32
+                || x == spirv::Op::ImageSampleProjDrefExplicitLod as u32
+                || x == spirv::Op::ImageGather as u32
+                || x == spirv::Op::ImageDrefGather as u32
+                || (305..=312).contains(&x)
+        ) {
+            return false;
+        }
+        cursor += word_count;
+    }
+    true
+}
+
 fn descriptor_reads(module: &[u8]) -> Option<DescriptorReads> {
     let words = spirv_words(module)?;
     if words.len() < 5 {
@@ -4531,6 +4910,27 @@ fn prepare_render_request_with_resident<'a>(
         );
     }
     let texture_slots = render_texture_slots(stages, pass, extent)?;
+    // Whether this pass's samples are stated in texels decides which fragment
+    // module the pipeline below is built from (2026-09-19, census v43's
+    // `texture_state` axis): an unnormalized sampler may not be used by an
+    // `ImplicitLod` sample (`VUID-vkCmdDraw-None-08610`), so such a pass runs
+    // the registration's explicit-LOD sibling instead — or is refused by name
+    // when the module has no sibling, rather than run through a sample form the
+    // API forbids.
+    let pixel_coordinates = texture_slots
+        .iter()
+        .any(|slot| slot.coordinates().is_pixel());
+    if pixel_coordinates && stages.fragment_pixel_spirv.is_none() {
+        return Err(pixel_sampler_variant_refusal(
+            &stages.contract.fragment_entry,
+            "a pass that binds a pixel-coordinate runtime sampler executes the fragment module's \
+             explicit-LOD sibling, because Vulkan forbids an unnormalized sampler from being \
+             used by an implicit-LOD sample (`VUID-vkCmdDraw-None-08610`); this registration's \
+             fragment module has no such sibling — one of its samples is a `Proj`, `Dref`, \
+             sparse or gather instruction, carries offset values, or carries image operands \
+             other than a LOD bias — so the pass is refused by name instead",
+        ));
+    }
     let textures = resolve_render_textures(
         pass,
         extent,
@@ -4737,7 +5137,10 @@ fn prepare_render_request_with_resident<'a>(
         translated_fragment: match stages.fragment_translation {
             Some(_) => Some(OffscreenFragmentStage {
                 entry: bound_stage_entry(stages, RenderStage::Fragment)?.into_owned(),
-                spirv: &stages.fragment_spirv,
+                spirv: match (pixel_coordinates, stages.fragment_pixel_spirv.as_deref()) {
+                    (true, Some(variant)) => variant,
+                    _ => &stages.fragment_spirv,
+                },
             }),
             None => None,
         },
@@ -7876,6 +8279,30 @@ fn execute_offscreen_render_with_retains(
             // pass that binds one, is refused there ("the fragment stage names
             // another number of sampled textures than the pass binds") rather
             // than executed with the binding dropped.
+            //
+            // A request that states the texel space has to carry a module the
+            // API lets an unnormalized sampler be used with (2026-09-19,
+            // census v43's `texture_state` axis): `prepare_render_request`
+            // already selected the explicit-LOD sibling, and this second walk
+            // answers the same question of the bytes it was handed, because a
+            // directly-constructed request could name the registration's own
+            // module beside a pixel-coordinate slot.
+            if request
+                .textures
+                .iter()
+                .any(|texture| texture.slot.coordinates().is_pixel())
+                && !pixel_coordinate_sampler_legal(fragment.spirv)
+            {
+                return Err(pixel_sampler_variant_refusal(
+                    fragment.entry.as_str(),
+                    "a pass that binds a pixel-coordinate runtime sampler executes the fragment \
+                     module's explicit-LOD sibling, because Vulkan forbids an unnormalized \
+                     sampler from being used by an implicit-LOD sample or by a sample carrying a \
+                     LOD bias or offset (`VUID-vkCmdDraw-None-08610`/`-08611`); the module this \
+                     request names carries one of those forms, so it is refused by name instead \
+                     of executed",
+                ));
+            }
             (fragment.spirv, fragment.entry.as_str())
         }
         None => {
@@ -11839,7 +12266,14 @@ impl<'a> OffscreenObjects<'a> {
                 .slot
                 .sampler()
                 .map(|policy| {
-                    let sampler_info = crate::sampler_create_info(policy);
+                    // The pass's own statement of the coordinate space travels
+                    // beside the policy: a pixel-coordinate runtime sampler is
+                    // created with `unnormalizedCoordinates`
+                    // (2026-09-19, census v43's `texture_state` axis), and the
+                    // module the pipeline runs is the explicit-LOD sibling that
+                    // makes such a sampler a legal use.
+                    let sampler_info =
+                        crate::sampler_create_info(policy, texture.slot.coordinates());
                     unsafe { self.context.device.create_sampler(&sampler_info, None) }.map_err(
                         |error| {
                             unsafe {
@@ -15229,6 +15663,7 @@ mod tests {
                 .to_vec(),
             vertex_translation: None,
             fragment_translation: None,
+            fragment_pixel_spirv: None,
         }
     }
 
@@ -15298,6 +15733,7 @@ mod tests {
             fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
             vertex_translation: None,
             fragment_translation: None,
+            fragment_pixel_spirv: None,
         }
     }
 
@@ -15480,6 +15916,7 @@ mod tests {
             .to_vec(),
             vertex_translation: None,
             fragment_translation: None,
+            fragment_pixel_spirv: None,
         }
     }
 
@@ -15508,6 +15945,7 @@ mod tests {
             fragment_spirv: SAMPLED_UNORM8_FRAG_SPV.to_vec(),
             vertex_translation: None,
             fragment_translation: None,
+            fragment_pixel_spirv: None,
         }
     }
 
@@ -15954,6 +16392,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         stages
             .validate_stage_pair()
@@ -16066,6 +16505,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         stages
             .validate_stage_pair()
@@ -16117,6 +16557,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         let refused = stages
             .validate_stage_pair()
@@ -16252,6 +16693,185 @@ mod tests {
         );
     }
 
+    /// Rebuild `module` with `mask` spliced onto its first `opcode`
+    /// instruction, so a test can state an image operand the pinned translator
+    /// does not emit (`2026-09-19`, census v43's `texture_state` axis).
+    ///
+    /// The operand id is a placeholder: the walk under test reads the *mask*
+    /// word, which is where the API's rule lives, and a module that never
+    /// reaches a driver needs no typed operand behind it.
+    fn splice_image_operand(module: &[u8], opcode: spirv::Op, mask: u32) -> Vec<u8> {
+        let words = spirv_words(module).expect("the fixture parses");
+        let mut out = Vec::with_capacity(words.len() + 2);
+        out.extend_from_slice(&words[..5]);
+        let mut cursor = 5;
+        let mut spliced = false;
+        while cursor < words.len() {
+            let header = words[cursor];
+            let word_count = (header >> 16) as usize;
+            if header & 0xffff == opcode as u32 && !spliced {
+                spliced = true;
+                out.push(((word_count + 2) as u32) << 16 | (header & 0xffff));
+                out.extend_from_slice(&words[cursor + 1..cursor + word_count]);
+                out.push(mask);
+                out.push(0);
+                cursor += word_count;
+                continue;
+            }
+            out.extend_from_slice(&words[cursor..cursor + word_count]);
+            cursor += word_count;
+        }
+        assert!(spliced, "the fixture carries the instruction to splice");
+        out.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    /// Rewrite the image-operands mask of the first `opcode` instruction, so a
+    /// test can state an operand the translated module does not carry.
+    fn set_image_mask(module: &[u8], opcode: spirv::Op, mask: u32) -> Vec<u8> {
+        let mut words = spirv_words(module).expect("the fixture parses");
+        let mut cursor = 5;
+        let mut done = false;
+        while cursor < words.len() {
+            let header = words[cursor];
+            let word_count = (header >> 16) as usize;
+            if !done && header & 0xffff == opcode as u32 && word_count >= 6 {
+                words[cursor + 5] = mask;
+                done = true;
+            }
+            cursor += word_count;
+        }
+        assert!(
+            done,
+            "the fixture carries an instruction with image operands"
+        );
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    /// Count one opcode in a module.
+    fn opcode_count(module: &[u8], opcode: spirv::Op) -> usize {
+        let words = spirv_words(module).expect("the fixture parses");
+        let mut count = 0;
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let header = words[cursor];
+            let word_count = (header >> 16) as usize;
+            if header & 0xffff == opcode as u32 {
+                count += 1;
+            }
+            cursor += word_count;
+        }
+        count
+    }
+
+    /// The explicit-LOD sibling, and the three sample forms that keep a module
+    /// from having one (2026-09-19, census v43's `texture_state` axis).
+    ///
+    /// The rewrite is what makes the texel space a legal Vulkan use: every
+    /// implicit sample becomes `OpImageSampleExplicitLod` with a `Lod 0`
+    /// operand, a LOD bias is dropped (the family's `0..=0` pin discards it
+    /// anyway), and a form no unnormalized sampler may be used with — an
+    /// offset, a `Proj`/`Dref`/gather instruction — leaves the module with no
+    /// sibling at all.
+    #[test]
+    fn the_pixel_coordinate_sibling_rewrites_implicit_samples_and_refuses_banned_forms() {
+        use metal2vulkan::passes::Stage;
+
+        let fixture = include_str!("../tests/fixtures/render_sample_texture_2d_runtime.frag.ll");
+        let (module, _reflection) =
+            translate_fixture_with_layout(fixture, Stage::Fragment, DescriptorLayout::default());
+        assert!(
+            !pixel_coordinate_sampler_legal(&module),
+            "the registration's module samples with an implicit LOD"
+        );
+        assert_eq!(opcode_count(&module, spirv::Op::ImageSampleImplicitLod), 3);
+        assert_eq!(opcode_count(&module, spirv::Op::ImageSampleExplicitLod), 0);
+
+        let sibling = pixel_coordinate_sampler_variant(&module).expect("the fixture has a sibling");
+        assert!(pixel_coordinate_sampler_legal(&sibling));
+        assert_eq!(opcode_count(&sibling, spirv::Op::ImageSampleImplicitLod), 0);
+        assert_eq!(opcode_count(&sibling, spirv::Op::ImageSampleExplicitLod), 3);
+        let module_words = spirv_words(&module).expect("the fixture parses").len();
+        let sibling_words = spirv_words(&sibling).expect("the sibling parses").len();
+        assert_eq!(
+            sibling_words,
+            module_words + 4 + 3 * 2,
+            "the rewrite adds one `%float 0` constant and two operand words per sample site"
+        );
+        assert_eq!(
+            pixel_coordinate_sampler_variant(&sibling).expect("the sibling has a sibling"),
+            sibling,
+            "the sibling is already the explicit form, so its own sibling is itself"
+        );
+
+        // A LOD bias is dropped rather than carried: `VUID-vkCmdDraw-None-08611`
+        // forbids a bias beside an unnormalized sampler, and the family's
+        // `minLod = maxLod = 0` pin makes the value invisible to the frame.
+        let biased = splice_image_operand(
+            &module,
+            spirv::Op::ImageSampleImplicitLod,
+            SPIRV_IMAGE_OPERAND_BIAS,
+        );
+        let rewritten =
+            pixel_coordinate_sampler_variant(&biased).expect("a bias is a shape the rewrite drops");
+        let words = spirv_words(&rewritten).expect("the rewrite parses");
+        let mut cursor = 5;
+        let mut seen = 0;
+        while cursor < words.len() {
+            let header = words[cursor];
+            let word_count = (header >> 16) as usize;
+            if header & 0xffff == spirv::Op::ImageSampleExplicitLod as u32 {
+                assert_eq!(
+                    words[cursor + 5],
+                    SPIRV_IMAGE_OPERAND_LOD,
+                    "the rewritten instruction states Lod and nothing else"
+                );
+                seen += 1;
+            }
+            cursor += word_count;
+        }
+        assert_eq!(seen, 3, "every sample site is rewritten");
+
+        // An offset is the one operand the rewrite cannot drop: it moves the
+        // footprint, so the module keeps its sample form and has no sibling.
+        let offset = set_image_mask(
+            &sibling,
+            spirv::Op::ImageSampleExplicitLod,
+            SPIRV_IMAGE_OPERAND_LOD | SPIRV_IMAGE_OPERAND_OFFSET,
+        );
+        assert!(pixel_coordinate_sampler_variant(&offset).is_none());
+        assert!(!pixel_coordinate_sampler_legal(&offset));
+
+        // The `Proj` family is banned whatever its LOD form
+        // (`VUID-vkCmdDraw-None-08610`), so a module that carries one has no
+        // sibling either.
+        let proj = splice_image_operand(
+            &module,
+            spirv::Op::ImageSampleImplicitLod,
+            SPIRV_IMAGE_OPERAND_BIAS,
+        );
+        let proj_words = spirv_words(&proj).expect("the splice parses");
+        let mut retyped = Vec::with_capacity(proj_words.len());
+        let mut cursor = 5;
+        let mut rewritten = false;
+        while cursor < proj_words.len() {
+            let header = proj_words[cursor];
+            let word_count = (header >> 16) as usize;
+            if !rewritten && header & 0xffff == spirv::Op::ImageSampleImplicitLod as u32 {
+                rewritten = true;
+                retyped
+                    .push((word_count as u32) << 16 | spirv::Op::ImageSampleProjImplicitLod as u32);
+                retyped.extend_from_slice(&proj_words[cursor + 1..cursor + word_count]);
+                cursor += word_count;
+                continue;
+            }
+            retyped.extend_from_slice(&proj_words[cursor..cursor + word_count]);
+            cursor += word_count;
+        }
+        let proj: Vec<u8> = retyped.into_iter().flat_map(u32::to_le_bytes).collect();
+        assert!(pixel_coordinate_sampler_variant(&proj).is_none());
+        assert!(!pixel_coordinate_sampler_legal(&proj));
+    }
+
     /// A runtime sampler's state is the *request's* statement, so the one
     /// disagreement it can carry is with the state the translation was given
     /// (`research/docs/23` §3.3, v102): the rail creates the descriptor's
@@ -16335,6 +16955,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         stages
             .validate_stage_pair()
@@ -16460,6 +17081,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         stages
             .validate_stage_pair()
@@ -16603,6 +17225,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         stages
             .validate_stage_pair()
@@ -16724,6 +17347,7 @@ mod tests {
             fragment_spirv,
             vertex_translation: None,
             fragment_translation: Some(reflection),
+            fragment_pixel_spirv: None,
         };
         let refused = stages
             .validate_stage_pair()
@@ -17889,6 +18513,7 @@ mod tests {
             fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
             vertex_translation: None,
             fragment_translation: None,
+            fragment_pixel_spirv: None,
         };
         assert!(
             stages("vertex_main", FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec())

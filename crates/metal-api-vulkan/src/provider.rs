@@ -357,6 +357,21 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // `tests/render_stage_buffer_namespace_e2e.rs`, its object-API frame,
         // and the conformance case the capture archives keep.
         supports_render_stage_buffer_namespace_split: true,
+        // The texel space is executed (2026-09-19, census v43's
+        // `texture_state` axis): a pass that binds a runtime `[[sampler(n)]]`
+        // whose state says `normalizedCoordinates = NO` is executed through the
+        // fragment module's *derived* explicit-LOD sibling
+        // (`render.rs::pixel_coordinate_sampler_variant`), which is what makes
+        // the unnormalized sampler a legal Vulkan use
+        // (`VUID-vkCmdDraw-None-08610`/`-08611`) while every sample keeps the
+        // texel the guest's own coordinates name. Evidence: the registered
+        // runtime-sampler fixture's pixel-coordinate arm in
+        // `tests/render_pixel_coordinate_sampler_e2e.rs`, which reads back the
+        // same texels the translator's own pixel-space lowering computes. The
+        // bit names exactly that window — one filter family and two address
+        // modes, the ones an unnormalized `VkSampler` may state — so a wider
+        // state is refused by the rail by name rather than narrowed.
+        supports_render_pixel_coordinate_sampler: true,
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:
