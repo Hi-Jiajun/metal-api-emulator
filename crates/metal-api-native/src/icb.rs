@@ -403,6 +403,7 @@ mod tests {
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
+            max_render_texture_dimension_1d: 0,
             supports_render_stage_buffer_namespace_split: false,
             // The ICB snapshot is a compute face; the render bits stay at the
             // defaults the reviewed render rail keeps (2026-09-19, census

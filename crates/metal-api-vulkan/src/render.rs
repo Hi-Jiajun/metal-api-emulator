@@ -1280,6 +1280,22 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// descriptor's channel mapping stays Vulkan's identity default and the
     /// guest's own channel order is what the fragment stage reads.
     pub format: vk::Format,
+    /// The `VkImageType` this rail creates for the view (2026-09-19, census
+    /// b10's `texture_shape` bucket): `TYPE_2D` for every lane the window
+    /// carried before the one-dimensional arm, and `TYPE_1D` for the
+    /// single-row LUT whose own type has one spatial axis. The image's
+    /// `extent.height` is `1` for both, so the two differ in the type alone —
+    /// and in what the descriptor's own image type must be for the module's
+    /// `OpTypeImage` (`Dim 1D` against `Dim 2D`) to be a legal read.
+    pub image_type: vk::ImageType,
+    /// The `VkImageViewType` the descriptor's image view is created with
+    /// (2026-09-19, census b10's `texture_shape` bucket): the declaration's own
+    /// array axis, which is the module's. Every 2D lane states `TYPE_2D`
+    /// (the window admits no arrayed 2D view), the plain one-dimensional
+    /// declaration states `TYPE_1D`, and the arrayed one states
+    /// `TYPE_1D_ARRAY` over its single slice — the layer axis a `float2`
+    /// coordinate's second component names.
+    pub view_type: vk::ImageViewType,
     /// Tightly packed bytes one texel of those bytes occupies
     /// (`research/docs/23` §113/§107): four for the two four-component byte
     /// orders, one and two for the narrow lanes, eight for the half-float
@@ -2662,11 +2678,32 @@ fn translated_texture_pairs(
         let Some(shape) = binding.texture_shape.as_ref() else {
             return Err(mismatch("the reflection names no shape for this texture"));
         };
-        if shape.dimension != TextureDimension::D2
-            || shape.arrayed
-            || shape.multisampled
-            || shape.array_ref
-            || shape.writable
+        // The one-dimensional arm (2026-09-19, census b10's `texture_shape`
+        // bucket). The bucket's 215 records are one-dimensional single-row
+        // LUTs — a `16384x1` `R32_SFLOAT` colour-transfer table and a `1024x1`
+        // `R16_SFLOAT` one — whose modules declare `texture1d<float, sample>`
+        // or `texture1d_array<float, sample>`. The rail can execute both
+        // spellings: the image is a single-row `TYPE_1D` one in the lane's own
+        // format, and the view's type is the module's own array axis
+        // (`TYPE_1D` for the plain declaration, `TYPE_1D_ARRAY` for the arrayed
+        // one), which is what makes a `float2` sample coordinate `(u, layer)`
+        // legal. Everything else about the shape is the 2D window's rule
+        // unchanged: single-sample, read-only, not a descriptor array.
+        //
+        // The *declaration* has to restate that axis, and the check for it sits
+        // below beside the other field-by-field agreements, because the
+        // contract's own texture type is read there.
+        let one_dim = shape.dimension == TextureDimension::D1
+            && !shape.multisampled
+            && !shape.array_ref
+            && !shape.writable
+            && shape.array_length.is_none();
+        if !one_dim
+            && (shape.dimension != TextureDimension::D2
+                || shape.arrayed
+                || shape.multisampled
+                || shape.array_ref
+                || shape.writable)
         {
             return Err(capability_refusal("render_texture_shape_unsupported")
                 .with_field("binding", index)
@@ -2677,7 +2714,10 @@ fn translated_texture_pairs(
                 .with_field("arrayed", FieldValue::Bool(shape.arrayed))
                 .with_field("multisampled", FieldValue::Bool(shape.multisampled))
                 .with_field("writable", FieldValue::Bool(shape.writable))
-                .with_detail("the render sampler reads a single-sample non-arrayed 2D surface"));
+                .with_detail(
+                    "the render sampler reads either a single-sample non-arrayed 2D surface or \
+                     the one-dimensional single-row LUT its own frame's window admits",
+                ));
         }
         if shape.component != TextureComponent::Float {
             return Err(capability_refusal("render_texture_format_unsupported")
@@ -2718,6 +2758,36 @@ fn translated_texture_pairs(
                 "the module reads a sampled texture the contract does not declare",
             ));
         };
+        // The one-dimensional arm's own field-by-field agreement: the
+        // declaration has to restate which of the two one-dimensional shapes
+        // the module declared, and every other reflected fact about it is the
+        // `Sampled`/`Fetched` pairing below. A plain declaration for an arrayed
+        // module (or the reverse) is refused by name with both halves in hand,
+        // because the view the rail creates has to be the view the module's own
+        // sample coordinate is written against.
+        if one_dim {
+            let expected = if shape.arrayed {
+                TextureType::D1Array
+            } else {
+                TextureType::D1
+            };
+            if declared.texture_type != expected {
+                return Err(capability_refusal("render_texture_shape_unsupported")
+                    .with_field("binding", index)
+                    .with_field(
+                        "texture_type",
+                        FieldValue::Text(format!("{:?}", declared.texture_type)),
+                    )
+                    .with_field("arrayed", FieldValue::Bool(shape.arrayed))
+                    .with_detail(
+                        "the module samples a one-dimensional surface, and the declaration has \
+                         to restate whether that surface is arrayed: the view the rail creates \
+                         is the module's own array axis (`TYPE_1D` or `TYPE_1D_ARRAY`), and a \
+                         declaration naming the other one would bind a view the module's own \
+                         sample coordinate is not written against",
+                    ));
+            }
+        }
         if !TextureFormat::RENDER_SAMPLED.contains(&declared.format) {
             return Err(capability_refusal("render_texture_format_unsupported")
                 .with_field("binding", index)
@@ -5384,7 +5454,18 @@ fn resolve_render_textures<'a>(
                      components rather than four 8-bit bytes",
                 ));
         }
-        if view.texture_type != TextureType::D2
+        // The one-dimensional arm (2026-09-19, census b10's `texture_shape`
+        // bucket) is the same single-sample, single-slice, single-descriptor
+        // statement one spatial axis over: the image this rail creates for it
+        // is a single-row `TYPE_1D` one, and the view's type is the
+        // declaration's own array axis (`TYPE_1D` or `TYPE_1D_ARRAY`), which is
+        // what makes the module's `float`/`float2` sample coordinate legal. Its
+        // height is one by definition, and the structural contract rule has
+        // already refused any declaration that said otherwise
+        // (`ContractError::TextureDimensionMismatch`); the check below repeats
+        // it because a directly-constructed request can reach this rail without
+        // passing through the contract's own validation.
+        if !view.texture_type.is_one_dim() && view.texture_type != TextureType::D2
             || view.sample_count != 1
             || view.depth != 1
             || view.array_length != 1
@@ -5398,12 +5479,30 @@ fn resolve_render_textures<'a>(
                 .with_field("sample_count", FieldValue::Unsigned(view.sample_count))
                 .with_field("depth", FieldValue::Unsigned(view.depth))
                 .with_field("array_length", FieldValue::Unsigned(view.array_length))
-                .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
+                .with_detail(
+                    "the reviewed sampling module reads a single-sample 2D surface, and the \
+                     one-dimensional arm beside it reads a single-row `D1`/`D1Array` surface \
+                     with one slice",
+                ));
         }
         let width = narrow_dimension(view.width)?;
         let height = narrow_dimension(view.height)?;
         if width == 0 || height == 0 {
             return Err(contract_refusal("render texture has a zero dimension"));
+        }
+        if view.texture_type.is_one_dim() && height != 1 {
+            return Err(capability_refusal("render_texture_shape_unsupported")
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+                .with_field(
+                    "texture_type",
+                    FieldValue::Text(format!("{:?}", view.texture_type)),
+                )
+                .with_field("height", FieldValue::Unsigned(view.height))
+                .with_detail(
+                    "a one-dimensional image is one row of texels: Vulkan fixes a `TYPE_1D` \
+                     image's height at one, so a declaration stating more names a surface the \
+                     rail would have to read as a grid of rows it never declared",
+                ));
         }
         // The widened window (`research/docs/23` §111, E-TX5). The reviewed
         // pair leaves its sample coordinate implicit — the fragment's own
@@ -5514,6 +5613,21 @@ fn resolve_render_textures<'a>(
             gathered_fetch: fetched,
             extent: upload_extent,
             format: render_texture_vk_format(view.format)?,
+            // The declaration's own spatial axis decides the object type: a
+            // one-dimensional view is a single-row `TYPE_1D` image (Vulkan
+            // fixes its `height`/`depth` at one, which is the shape the LUT
+            // has), and every other admitted lane is the `TYPE_2D` window the
+            // rail has always created.
+            image_type: if view.texture_type.is_one_dim() {
+                vk::ImageType::TYPE_1D
+            } else {
+                vk::ImageType::TYPE_2D
+            },
+            view_type: match view.texture_type {
+                TextureType::D1Array => vk::ImageViewType::TYPE_1D_ARRAY,
+                TextureType::D1 => vk::ImageViewType::TYPE_1D,
+                _ => vk::ImageViewType::TYPE_2D,
+            },
             texel_bytes: view.format.bytes_per_texel(),
             slot: slots[position],
         });
@@ -7527,9 +7641,9 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
 }
 
 /// The `VkFormat` a sampled render texture's own `TextureFormat` names
-/// (`research/docs/23` §3.3, §107, §113).
+/// (`research/docs/23` §3.3, §107, §113, §119).
 ///
-/// The five admitted formats are two four-byte 8-bit UNORM byte orders, the
+/// The seven admitted formats are two four-byte 8-bit UNORM byte orders, the
 /// one- and two-byte narrow lanes, and the eight-byte half-float lane. The
 /// first pair is what the census's BGRA8 binds state
 /// (`evidence/gate3-census-v13-2026-09-17/`): the guest view's
@@ -7546,8 +7660,17 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
 /// `R16G16B16A16_SFLOAT` guest view is uploaded as the four half-float
 /// components its own name states, so the sample carries the format's extended
 /// range (a value above one is a legal texel, and the 8-bit attachment it lands
-/// in is where the conversion's clamp is observable). A format outside the
-/// window is refused with the view's own name rather than uploaded under
+/// in is where the conversion's clamp is observable). The two single-component
+/// float lanes are the widening the census's `texture_shape` bucket asked for
+/// (`evidence/gate3-census-b10-2026-09-19/`, §119): a `16384x1` `R32_SFLOAT`
+/// colour-transfer LUT and a `1024x1` `R16_SFLOAT` one, uploaded as the float
+/// texels their own names state rather than quantised into the 8-bit window
+/// (`reims-vgpu-protocol`'s `pixel_format` states why that quantisation is not
+/// this rail's rule: a float LUT's channels are its own values, extended range
+/// included). They are the first formats whose *image type* is not 2D — the
+/// rail builds a one-dimensional image for them (`TextureType::is_one_dim`) —
+/// and the reflection's own array axis decides the view's. A format outside
+/// the window is refused with the view's own name rather than uploaded under
 /// another.
 pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Format, ProviderError> {
     if !TextureFormat::RENDER_SAMPLED.contains(&format) {
@@ -7570,9 +7693,18 @@ pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Form
         // the half-float format the guest's own view names, so the sample
         // carries the extended range and no byte-order question exists.
         TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        // The two single-component float lanes (2026-09-19, census b10's
+        // `texture_shape` bucket): the uploaded image and the sampled view are
+        // the single-component float formats the guest's own views name, so a
+        // sample of the texel is its own value — `r32_float`'s four bytes as
+        // one float, `r16_float`'s two as one half — with the shader's red
+        // channel reading it and the API filling the channels the format does
+        // not carry.
+        TextureFormat::R32Float => vk::Format::R32_SFLOAT,
+        TextureFormat::R16Float => vk::Format::R16_SFLOAT,
         // Refused above; the arm keeps the match exhaustive so a widened
         // contract format forces a decision here.
-        TextureFormat::R32Uint | TextureFormat::R32Float => vk::Format::UNDEFINED,
+        TextureFormat::R32Uint => vk::Format::UNDEFINED,
     })
 }
 
@@ -12354,7 +12486,13 @@ impl<'a> OffscreenObjects<'a> {
             let device_copy =
                 borrowing || matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. });
             let info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
+                // The view's own type (2026-09-19, census b10's
+                // `texture_shape` bucket): `TYPE_2D` for every lane the window
+                // carried before the one-dimensional arm and `TYPE_1D` for the
+                // single-row LUT beside them, whose height is already `1` by
+                // construction — which is exactly what Vulkan requires of a
+                // `TYPE_1D` image.
+                .image_type(texture.image_type)
                 .format(format)
                 .extent(vk::Extent3D {
                     width,
@@ -12454,19 +12592,24 @@ impl<'a> OffscreenObjects<'a> {
                 // so nothing is written here and no buffer is imported.
                 RenderInputSource::AttachmentSnapshot { .. } => None,
             };
-            let view =
-                crate::create_color_image_view(self.context, image, format, "render texture")
-                    .map_err(|error| {
-                        unsafe {
-                            if let Some((buffer, buffer_memory)) = copy_source {
-                                self.context.device.destroy_buffer(buffer, None);
-                                self.context.device.free_memory(buffer_memory, None);
-                            }
-                            self.context.device.destroy_image(image, None);
-                            self.context.device.free_memory(memory, None);
-                        }
-                        execution_refusal("create render texture view", &error.detail)
-                    })?;
+            let view = crate::create_sampled_image_view(
+                self.context,
+                image,
+                format,
+                texture.view_type,
+                "render texture",
+            )
+            .map_err(|error| {
+                unsafe {
+                    if let Some((buffer, buffer_memory)) = copy_source {
+                        self.context.device.destroy_buffer(buffer, None);
+                        self.context.device.free_memory(buffer_memory, None);
+                    }
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                execution_refusal("create render texture view", &error.detail)
+            })?;
             // The state the sampler is created with is the *declaration's*
             // (`research/docs/23` §3.3, v100): on this rail the fragment
             // module's samples take their filtering and addressing from the
@@ -16506,17 +16649,18 @@ mod tests {
             vk::Format::B8G8R8A8_UNORM.as_raw()
         );
 
-        // A format outside the window — here the single-component `r32_float`
-        // texel, the lane no sampled widening has admitted (`rgba16_float`
-        // joined the window with the eight-byte lane) — is refused by name,
-        // with the declaration's own format in the fields.
+        // A format outside the window — here the single-component `r32_uint`
+        // texel, the one format no sampled widening has admitted (the two
+        // single-component *float* lanes joined it with the 2026-09-19
+        // one-dimensional arm, census b10's `texture_shape` bucket) — is
+        // refused by name, with the declaration's own format in the fields.
         let mut other_format = sampled_pass(4);
         let mut view = sampled_texture_view(4, 4);
-        view.format = TextureFormat::R32Float;
+        view.format = TextureFormat::R32Uint;
         view.source = TextureSource::OwnedBytes(vec![0x5a; 4 * 4 * 4]);
         other_format.textures = vec![view];
         let mut wide_stages = reviewed_sampled_stages();
-        wide_stages.contract.textures[0].format = TextureFormat::R32Float;
+        wide_stages.contract.textures[0].format = TextureFormat::R32Uint;
         let refused = match prepare_render_request(
             &wide_stages,
             &other_format,

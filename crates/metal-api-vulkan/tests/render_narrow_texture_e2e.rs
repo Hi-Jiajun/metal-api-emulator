@@ -681,15 +681,17 @@ fn the_narrow_lane_sits_beside_the_four_component_sibling() {
         "the sibling's own texture bytes carry the same three lanes here"
     );
 
-    // A lane outside the window: the single-component `r32_float` texel —
-    // `rgba16_float` joined the window with the eight-byte lane, so the
-    // outside format this probe pins moved to the width the sampler never
-    // reads. The registration's own format walk refuses it before any device
-    // object exists, and the fields name the binding and the format.
+    // A lane outside the window: the single-component `r32_uint` texel —
+    // `rgba16_float` joined the window with the eight-byte lane and the two
+    // single-component float lanes with the 2026-09-19 one-dimensional arm
+    // (census b10's `texture_shape` bucket), so the outside format this probe
+    // pins moved to the integer texel the sampler never reads. The
+    // registration's own format walk refuses it before any device object
+    // exists, and the fields name the binding and the format.
     let (vertex, fragment) = translated_pair(&executor, FRAGMENT_AIR, FRAGMENT_ENTRY);
     let refused = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
-            contract: contract(TextureFormat::R32Float),
+            contract: contract(TextureFormat::R32Uint),
             vertex,
             fragment,
             logical_digest: digest(b"wide texture"),
@@ -700,7 +702,7 @@ fn the_narrow_lane_sits_beside_the_four_component_sibling() {
     assert_eq!(refused.class, ProviderErrorClass::Capability);
     assert_eq!(
         refused.fields.get("format"),
-        Some(&FieldValue::Text("R32Float".to_owned()))
+        Some(&FieldValue::Text("R32Uint".to_owned()))
     );
     assert_eq!(
         refused.fields.get("binding"),

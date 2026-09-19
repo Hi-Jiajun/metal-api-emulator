@@ -4574,7 +4574,11 @@ mod tests {
             capabilities,
         })
         .unwrap();
-        for unknown in [7u8, 0x80, 0xff] {
+        // `7` is the code the 2026-09-19 widening assigned to `r16_float`
+        // (census b10's `texture_shape` bucket), so the probe's first unknown
+        // moves to `8` — the family's next unassigned code — exactly as it did
+        // when the two narrow lanes took `5` and `6`.
+        for unknown in [8u8, 0x80, 0xff] {
             let mut patched = frame.clone();
             *patched.last_mut().expect("the frame is non-empty") = unknown;
             assert!(matches!(
@@ -5880,7 +5884,7 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x09` is the next tag the
+        // The family's tags are a closed set and `0x0b` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
@@ -5888,14 +5892,15 @@ mod tests {
         // until E-TX14 assigned it to the kept-frame landing entry, `0x07` until
         // E-SB2 assigned it to the stage buffer per-stage window, `0x08` until
         // the texel space took it, and `0x09` until E-TX15 assigned it to the
-        // pass-entry snapshot arm — exactly the drift the closed set exists to
-        // make visible.)
+        // pass-entry snapshot arm, and `0x0a` until the one-dimensional sampled
+        // window took it — exactly the drift the closed set exists to make
+        // visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x0a;
+        unknown_tag[tag_at] = 0x0b;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x0a)
+            CodecError::UnknownCapabilityTail(0x0b)
         ));
     }
 
@@ -7042,6 +7047,7 @@ mod tests {
                 capabilities: ProviderCapabilities {
                     supports_render_kept_frame_landing: false,
                     supports_render_pass_entry_snapshot: false,
+                    max_render_texture_dimension_1d: 0,
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
@@ -7430,6 +7436,7 @@ mod tests {
         ProviderCapabilities {
             supports_render_kept_frame_landing: false,
             supports_render_pass_entry_snapshot: false,
+            max_render_texture_dimension_1d: 0,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,

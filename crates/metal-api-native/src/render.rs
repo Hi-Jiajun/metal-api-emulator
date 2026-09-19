@@ -1248,15 +1248,24 @@ pub(crate) const MAX_RENDER_TEXTURES: u32 = metal_api_core::provider::MAX_RENDER
 ///
 /// The Vulkan rail widened the same table to every lane the contract's
 /// [`TextureFormat::RENDER_SAMPLED`] names beyond the first: the second 8-bit
-/// byte order, the narrow lanes and the eight-byte half-float lane
-/// (`research/docs/23` §107/§113). This rail's table stays at the one format
-/// its review covers, so a `bgra8_unorm`, `r8_unorm`, `rg8_unorm` or
-/// `rgba16_float` sampled texture is refused here by name at admission
+/// byte order, the narrow lanes, the eight-byte half-float lane and the two
+/// single-component float lanes (`research/docs/23` §107/§113/§119). This
+/// rail's table stays at the one format its review covers, so a `bgra8_unorm`,
+/// `r8_unorm`, `rg8_unorm`, `rgba16_float`, `r32_float` or `r16_float` sampled
+/// texture is refused here by name at admission
 /// (`render_texture_format_unsupported`) instead of being executed as an
 /// unmeasured claim. The reviewed MSL sibling samples a `texture2d<float>` —
 /// the pixel format is the plan's own fact — so the mechanical widening would
 /// be the pixel format's own name, and the Apple-side self-test reading is what
 /// would have to land with it, exactly as the present/stage-buffer flips state.
+///
+/// The one-dimensional arm has a second reason to stay refused on this rail
+/// (2026-09-19, census b10's `texture_shape` bucket): the reviewed MSL module
+/// samples a `texture2d<float>`, and no Apple-side reading states the Metal 1D
+/// equivalence a `texture1d_array<float, sample>` module would need. The shape
+/// therefore keeps the rail's own `render_texture_shape_unsupported` refusal
+/// (`metal-api-core`'s `MAX_RENDER_TEXTURE_DIMENSION_1D` is declared only by
+/// the snapshots whose rail executes the arm).
 pub(crate) const SUPPORTED_RENDER_TEXTURE_FORMATS: [TextureFormat; 1] = [TextureFormat::Rgba8Unorm];
 
 /// The present bits this provider declares as of the present-track flip.
@@ -4804,8 +4813,10 @@ fn resolve_render_textures<'a>(
                 .with_detail(
                     "the reviewed sampling module reads one rgba8_unorm surface; this rail's \
                      table names that one format, and the other 8-bit byte order is the Vulkan \
-                     rail's widened arm (`research/docs/23` §107) pending the Apple-side \
-                     reading its own flip would owe",
+                     rail's widened arm (`research/docs/23` §107), exactly as the narrow lanes, \
+                     the eight-byte half-float lane and the two single-component float lanes \
+                     beside it are (§113, §119), pending the Apple-side reading each flip would \
+                     owe",
                 ));
         }
         if view.texture_type != TextureType::D2
@@ -8810,16 +8821,16 @@ mod tests {
     }
 
     /// The lanes the *other* rail widened are outside this one and stay refused
-    /// here (`research/docs/23` §113/§107).
+    /// here (`research/docs/23` §113/§107/§119).
     ///
-    /// Metal can express all three formats (`.r8Unorm` / `.rg8Unorm` /
-    /// `.rgba16Float`), but this rail executes its reviewed MSL module and
-    /// declares exactly the formats that review covers; a snapshot that listed
-    /// a format it refuses would be a claim without a reading. So every lane
-    /// beyond the reviewed `rgba8_unorm` texel keeps the format refusal, with
-    /// the same slug and the same fields as every other unadmitted format, and
-    /// the refusal happens before the first Metal object exists (the plan step
-    /// is where it lands).
+    /// Metal can express every one of these formats (`.r8Unorm` / `.rg8Unorm` /
+    /// `.rgba16Float` / `.r32Float` / `.r16Float`), but this rail executes its
+    /// reviewed MSL module and declares exactly the formats that review covers;
+    /// a snapshot that listed a format it refuses would be a claim without a
+    /// reading. So every lane beyond the reviewed `rgba8_unorm` texel keeps the
+    /// format refusal, with the same slug and the same fields as every other
+    /// unadmitted format, and the refusal happens before the first Metal object
+    /// exists (the plan step is where it lands).
     #[test]
     fn the_formats_the_reviewed_module_does_not_read_stay_refused_by_name() {
         let sampled = sampled_pipeline();
@@ -8827,6 +8838,8 @@ mod tests {
             TextureFormat::R8Unorm,
             TextureFormat::R8G8Unorm,
             TextureFormat::Rgba16Float,
+            TextureFormat::R32Float,
+            TextureFormat::R16Float,
         ] {
             let mut pass = sampled_pass(4);
             let mut view = sampled_texture_view(4);
@@ -8861,6 +8874,47 @@ mod tests {
                 Some(&metal_api_core::provider::FieldValue::Unsigned(0))
             );
         }
+
+        // The one-dimensional arm (2026-09-19, census b10's `texture_shape`
+        // bucket) is the same table's other half: no Apple-side reading states
+        // the Metal 1D equivalence the arm would need, so a `D1Array` view
+        // bound beside the reviewed module keeps the shape's own refusal — and
+        // the snapshot declares no one-dimensional window at all, which is the
+        // fail-closed direction every consumer of the field reads.
+        assert_eq!(
+            capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+                .max_render_texture_dimension_1d,
+            0,
+            "the native snapshot declares no one-dimensional sampled window"
+        );
+        let mut pass = sampled_pass(4);
+        let mut view = sampled_texture_view(4);
+        view.texture_type = TextureType::D1Array;
+        view.height = 1;
+        view.source = TextureSource::OwnedBytes(vec![0x5a; 4 * 4]);
+        pass.textures = vec![view];
+        // The declaration restates the view's type, which is the pairing the
+        // contract holds the two to — so what answers the shape here is the
+        // rail's own gate rather than the structural rule that would catch a
+        // declaration naming another type.
+        let mut one_dim = sampled.clone();
+        one_dim.textures[0].texture_type = TextureType::D1Array;
+        let error = plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &one_dim,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .unwrap_err();
+        eprintln!("D1Array refused: {error:?}");
+        assert_eq!(error.slug, "render_texture_shape_unsupported");
+        assert_eq!(
+            error.fields.get("texture_type"),
+            Some(&metal_api_core::provider::FieldValue::Text(
+                "D1Array".to_owned()
+            ))
+        );
     }
 
     /// The declaration repeats the state the reviewed module's own `constexpr
@@ -10626,6 +10680,12 @@ mod tests {
             // (`research/docs/23` §83), so the snapshot declares no per-stage
             // window and keeps the list bound as the whole rule (§117 E-SB2).
             max_render_stage_buffers_per_stage: stage_buffers.max_render_stage_buffers_per_stage,
+            // The native rail declares no one-dimensional sampled window
+            // (2026-09-19, census b10's `texture_shape` bucket): no Apple-side
+            // reading states the Metal 1D equivalence this generation accepts,
+            // so the shape keeps its refusal by name and the field stays at the
+            // arm's fail-closed default.
+            max_render_texture_dimension_1d: 0,
             supports_render_stage_buffer_namespace_split: stage_buffers
                 .supports_render_stage_buffer_namespace_split,
             // The native rail's reviewed MSL modules spell one `constexpr

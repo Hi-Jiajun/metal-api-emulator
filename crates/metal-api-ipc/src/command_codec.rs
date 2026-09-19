@@ -745,6 +745,27 @@ const CAPABILITY_RENDER_KEPT_FRAME_LANDING_TAIL: u8 = 0x06;
 /// rule every section before it follows.
 const CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL: u8 = 0x09;
 
+/// Tag, inside the tail's second family, of the one-dimensional sampled
+/// window's block (2026-09-19, census b10's `texture_shape` bucket).
+///
+/// The section follows the pass-entry snapshot block and carries one `u64`
+/// (big-endian): the widest one-dimensional sampled texture the snapshot
+/// admits, in texels of its own row
+/// ([`ProviderCapabilities::max_render_texture_dimension_1d`]). The value is
+/// the *device's* own answer clamped by the contract's review ceiling, so a
+/// consumer that gates a one-dimensional bind on this face has to be able to
+/// read which window the provider it is talking to states.
+///
+/// The absent section is the older reading, and it is the fail-closed one: a
+/// frame that ends before it reads `0`, which says the snapshot admits no
+/// one-dimensional sampled texture at all, so a consumer keeps its own
+/// refusal by name for the shape instead of handing the provider an image
+/// whose width its device never promised. That is why the section is the
+/// family's next tag rather than a widening of the render-sampler block's
+/// payload, and why a snapshot whose window stays at the default `0` writes
+/// nothing.
+const CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL: u8 = 0x0A;
+
 /// Tag, inside the tail's second family, of the stage-buffer per-stage
 /// window's block (`research/docs/23` §3.3, §117 E-SB2).
 ///
@@ -799,11 +820,13 @@ pub const MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS: usize = 8;
 /// sampling sources.
 ///
 /// The contract's own list is the closed [`TextureFormat`] family (five values
-/// before the narrow lanes, seven after them — `research/docs/23` §113) and the
-/// render sampler's admitted window is four of those, so this bound can never
-/// refuse a well-formed snapshot; it only stops a corrupt count from driving
-/// the decoder — the same rule [`MAX_SUPPORTED_COLOR_FORMATS`] states for the
-/// attachment formats.
+/// before the narrow lanes, seven after them — `research/docs/23` §113 — and
+/// nine once the two single-component float lanes joined, 2026-09-19) and the
+/// render sampler's admitted window is
+/// [`TextureFormat::RENDER_SAMPLED`]'s seven, so this bound stays above the
+/// family and can never refuse a well-formed snapshot; it only stops a corrupt
+/// count from driving the decoder — the same rule
+/// [`MAX_SUPPORTED_COLOR_FORMATS`] states for the attachment formats.
 pub const MAX_SUPPORTED_RENDER_TEXTURE_FORMATS: usize = 8;
 
 /// Maximum number of bytes one present target's sentinel may carry.
@@ -2902,6 +2925,15 @@ fn put_texture_format(encoder: &mut Encoder, format: TextureFormat) {
         // unknown code instead of silently narrowing its reading.
         TextureFormat::R8Unorm => 5,
         TextureFormat::R8G8Unorm => 6,
+        // The two single-component float lanes are appended for the same
+        // reason (2026-09-19, census b10's `texture_shape` bucket): `r32_float`
+        // already had a code from the compute texture face, but a *texture
+        // format* code is one namespace for both faces, so the render window's
+        // second lane takes the family's next free code and `r16_float` — the
+        // family's newest member — takes the one after it. A decoder that
+        // predates them refuses the frame by unknown code instead of silently
+        // narrowing its reading.
+        TextureFormat::R16Float => 7,
     });
 }
 
@@ -2914,6 +2946,7 @@ fn get_texture_format(decoder: &mut Decoder<'_>) -> Result<TextureFormat, CodecE
         4 => Ok(TextureFormat::Rgba16Float),
         5 => Ok(TextureFormat::R8Unorm),
         6 => Ok(TextureFormat::R8G8Unorm),
+        7 => Ok(TextureFormat::R16Float),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture format",
             value,
@@ -6071,6 +6104,12 @@ fn put_capabilities(
         // still has to write the heap/ICB half the decoder reads by position
         // before the family's escape.
         || capabilities.declares_render_pass_entry_snapshot_support()
+        // The one-dimensional sampled window joins the same guard for the same
+        // reason (2026-09-19, census b10's `texture_shape` bucket): a snapshot
+        // whose only statement is this window still has to write the heap/ICB
+        // half the decoder reads by position before the family's escape, or the
+        // declaration would be dropped on the wire.
+        || capabilities.declares_render_texture_dimension_1d()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6320,6 +6359,21 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL);
             encoder.bool(capabilities.supports_render_pass_entry_snapshot);
         }
+        // The one-dimensional sampled window is the family's next tag and
+        // follows the pass-entry snapshot block (2026-09-19, census b10's
+        // `texture_shape` bucket). It carries a `u64` rather than a bool
+        // because the window is the device's own answer clamped by the
+        // contract's review ceiling, and a consumer that gates a
+        // one-dimensional bind on this face has to know how wide the provider's
+        // row may be. A snapshot whose window stays at its default `0` writes
+        // nothing here, and the decoder reads the missing section as `0` — the
+        // "keep the shape refused by name" default every consumer of the
+        // window keeps its fail-closed direction with.
+        if capabilities.declares_render_texture_dimension_1d() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL);
+            encoder.u64(capabilities.max_render_texture_dimension_1d);
+        }
     }
     Ok(())
 }
@@ -6402,6 +6456,13 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         supports_render_kept_frame_landing: false,
         supports_render_pass_entry_snapshot: false,
         supports_render_attachment_landing_view: false,
+        // The one-dimensional sampled window (2026-09-19, census b10's
+        // `texture_shape` bucket) is the family's next block after the
+        // pass-entry snapshot: a legacy payload cannot carry it either, so it
+        // reads the fail-closed default — no one-dimensional sampled texture is
+        // admissible, and a consumer keeps its own refusal by name for the
+        // shape.
+        max_render_texture_dimension_1d: 0,
         // The superset vertex interface's bit (`research/docs/23` §3.3,
         // E-TX11) is the family's third block: a legacy payload cannot carry
         // it either, so it reads the same fail-closed default — a registration
@@ -6528,6 +6589,7 @@ fn decode_capability_extended_tail(
             | CAPABILITY_RENDER_STAGE_BUFFER_PER_STAGE_TAIL
             | CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL => {}
             CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL => {}
+            CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6562,6 +6624,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL => {
                 capabilities.supports_render_pass_entry_snapshot = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL => {
+                capabilities.max_render_texture_dimension_1d = decoder.u64()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

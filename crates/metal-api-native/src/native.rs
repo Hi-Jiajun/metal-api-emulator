@@ -332,6 +332,13 @@ impl NativeMetalProvider {
                 // a wider pair is refused by name by core admission.
                 max_render_stage_buffers_per_stage: stage_buffer_bits
                     .max_render_stage_buffers_per_stage,
+                // The one-dimensional sampled window stays undeclared on the
+                // native rail (2026-09-19, census b10's `texture_shape`
+                // bucket): no Apple-side reading states the Metal 1D
+                // equivalence this generation accepts, so the field keeps the
+                // arm's fail-closed default and the shape stays refused by
+                // name.
+                max_render_texture_dimension_1d: 0,
                 // The folded shape's bit (`research/docs/23` §3.3, E-TX9):
                 // the reviewed pair binds its two stages at set 1 and set 2,
                 // so this snapshot declares the arrangement the pair's Apple
