@@ -345,6 +345,14 @@ impl NativeMetalProvider {
                 // device readings measured rather than a new native path.
                 supports_render_stage_buffer_namespace_split: stage_buffer_bits
                     .supports_render_stage_buffer_namespace_split,
+                // The whole-binding arm stays closed on this rail
+                // (`research/docs/23` §3.3, E-SB3): the reviewed pair reads
+                // each argument at the extent its own source states, so a
+                // declaration whose reach nothing measured keeps its refusal
+                // by name instead of being executed against a window this rail
+                // cannot account for.
+                supports_render_stage_buffer_binding_range: stage_buffer_bits
+                    .supports_render_stage_buffer_binding_range,
                 max_passes: 8,
                 supports_threads_exact: true,
                 supports_threadgroups: false,

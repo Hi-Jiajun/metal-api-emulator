@@ -767,6 +767,19 @@ impl VulkanComputeProvider {
             .spirv_feature_policy()
     }
 
+    /// Whether this provider's device carries the reading the stage-buffer
+    /// whole-binding arm rests on (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// The registration gate asks it beside
+    /// [`Self::spirv_feature_policy`], so a declaration whose footprint is
+    /// `FootprintProof::BindingRange` is accepted exactly on the devices whose
+    /// capability snapshot publishes the arm.
+    pub fn supports_robust_buffer_access(&self) -> bool {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .supports_robust_buffer_access()
+    }
+
     /// Report whether this provider can still admit new work.
     ///
     /// Health and admission are the same query on the same lifecycle, so a
@@ -955,6 +968,14 @@ impl VulkanComputeProvider {
         // the rail a module of its own. It is asked before the module's own
         // accounting, in the same order the translation entry point asks it.
         render::validate_module_capabilities(&stages, self.spirv_feature_policy())?;
+        // The whole-binding stage-buffer arm is a *device* reading beside the
+        // module facts (`research/docs/23` §3.3, E-SB3): the arm executes a
+        // declaration whose reach the translation could not state by binding the
+        // pass's own view whole, so the rail accepts it only on the devices
+        // whose `robustBufferAccess` was enabled at creation — the same reading
+        // its capability snapshot publishes the bit from. A device without it
+        // refuses the registration by name, before any pipeline exists.
+        render::validate_stage_buffer_binding_range(&stages, self.supports_robust_buffer_access())?;
         stages.validate()?;
         // The pixel-coordinate arm's module is derived here, once, from the
         // module the gate above accepted (2026-09-19, census v43's

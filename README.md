@@ -305,6 +305,9 @@ the wire statement a consumer reads and the evidence it was accepted on:
 
 - [STAGE-BUFFER-NAMESPACE.md](docs/STAGE-BUFFER-NAMESPACE.md) — two translated
   stages reading the same `[[buffer(n)]]` index (E-TX9).
+- [STAGE-BUFFER-BINDING-RANGE.md](docs/STAGE-BUFFER-BINDING-RANGE.md) — a stage
+  buffer whose reach the translation could not state, executed against the
+  pass's own binding whole (E-SB3).
 - [NARROW-SAMPLED-FORMATS.md](docs/NARROW-SAMPLED-FORMATS.md) — sampled textures
   with one or two 8-bit channels (`r8_unorm` / `rg8_unorm`).
 - [GATHERED-TEXTURE-EXTENT.md](docs/GATHERED-TEXTURE-EXTENT.md) — a sampled source

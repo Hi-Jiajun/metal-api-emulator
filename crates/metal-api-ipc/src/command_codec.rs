@@ -829,6 +829,28 @@ const CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL: u8 = 0x0B;
 /// axis is never handed a pass it would execute in the wrong space.
 const CAPABILITY_RENDER_PIXEL_COORDINATE_SAMPLER_TAIL: u8 = 0x08;
 
+/// Tag, inside the tail's second family, of the stage-buffer whole-binding
+/// block (`research/docs/23` §3.3, E-SB3).
+///
+/// The section follows the layout-free vertex count's block and carries one
+/// bool: whether the snapshot executes a stage buffer whose declared footprint
+/// is `FootprintProof::BindingRange` — the reach the translation could not
+/// state, executed against the pass's own whole binding
+/// ([`ProviderCapabilities::supports_render_stage_buffer_binding_range`]). It
+/// is the family's next tag rather than a widening of the stage-buffer block's
+/// payload, because that block's two fields answer "does this rail fill a slot
+/// at all" and "how many slots", while this one answers "does it execute a slot
+/// nothing measured the reach of" — and a consumer that gates the shape on this
+/// face has to be able to tell the second from the first.
+///
+/// The absent section is the older reading and the fail-closed one: a frame
+/// that ends before it means the consumer keeps its own refusal by name for the
+/// shape (`render_provider_out_of_class_stage_buffer_footprint`) instead of
+/// handing the provider a declaration whose reach nothing stated. That is why
+/// the section is the family's next tag rather than a reuse of the stage-buffer
+/// block's, and why a snapshot that does not declare the bit writes nothing.
+const CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL: u8 = 0x0C;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -1926,6 +1948,14 @@ fn put_footprint(encoder: &mut Encoder, footprint: &FootprintProof) {
                 }
             }
         }
+        // The whole-binding arm carries no payload (`research/docs/23` §3.3,
+        // E-SB3): the declaration's whole statement is "no reach was stated",
+        // so the tag is the message. A code of its own rather than a reuse of
+        // the unbounded one, because the two land differently — that arm keeps
+        // its by-name refusal, this one is executed against the pass's own
+        // binding — and a decoder that read the two as one code would execute
+        // what the older frames meant to refuse.
+        FootprintProof::BindingRange => encoder.u8(3),
         FootprintProof::Unbounded => encoder.u8(2),
     }
 }
@@ -1966,6 +1996,7 @@ fn get_footprint(decoder: &mut Decoder<'_>) -> Result<FootprintProof, CodecError
             Ok(FootprintProof::Affine { accesses })
         }
         2 => Ok(FootprintProof::Unbounded),
+        3 => Ok(FootprintProof::BindingRange),
         value => Err(CodecError::UnknownEnumValue {
             field: "footprint proof",
             value,
@@ -5926,6 +5957,11 @@ fn declares_render_stage_buffer_support(capabilities: &ProviderCapabilities) -> 
         // extended payload, or the declaration would be dropped on the wire —
         // the failure this predicate exists to prevent for every block.
         || capabilities.declares_render_stage_buffer_namespace_split()
+        // The whole-binding arm's bit is the same face's newest statement
+        // (`research/docs/23` §3.3, E-SB3), for the same reason: a snapshot
+        // that declares *only* it has to write the escape family's section, or
+        // the declaration would be dropped on the wire.
+        || capabilities.declares_render_stage_buffer_binding_range()
 }
 
 /// Whether any compute texture capability bit differs from its default
@@ -6428,6 +6464,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL);
             encoder.bool(capabilities.supports_render_vertex_count_above_triangle);
         }
+        // The stage-buffer whole-binding block is the family's next tag and
+        // follows the layout-free vertex count's block (`research/docs/23`
+        // §3.3, E-SB3). It carries one bool rather than a number because the
+        // arm states no byte extent at all: the question the block answers is
+        // "does this snapshot execute a declaration whose reach nothing
+        // stated", not "how wide may the window be". A snapshot that does not
+        // declare it writes nothing here, and the decoder reads the missing
+        // section as `false` — the "keep the shape refused by name" default
+        // every consumer of the bit keeps its fail-closed direction with.
+        if capabilities.declares_render_stage_buffer_binding_range() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL);
+            encoder.bool(capabilities.supports_render_stage_buffer_binding_range);
+        }
     }
     Ok(())
 }
@@ -6492,6 +6542,11 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // compute-texture block, so a frame that ends earlier reads the
         // consumer's fail-closed default.
         supports_render_stage_buffer_namespace_split: false,
+        // The whole-binding arm (`research/docs/23` §3.3, E-SB3) is the tail
+        // family's newest block, so a legacy payload cannot carry it either: a
+        // declaration whose reach nothing stated keeps its by-name refusal
+        // until a snapshot says otherwise.
+        supports_render_stage_buffer_binding_range: false,
         // The gathered-extent shape's bit (`research/docs/23` §3.3, E-TX10) is
         // the second block of the frame's tagged tail family, so it arrived
         // even later than the folded shape: a legacy payload cannot carry it
@@ -6646,6 +6701,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_PASS_ENTRY_SNAPSHOT_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_DIMENSION_1D_TAIL => {}
             CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL => {}
+            CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6686,6 +6742,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_VERTEX_COUNT_ABOVE_TRIANGLE_TAIL => {
                 capabilities.supports_render_vertex_count_above_triangle = decoder.bool()?;
+            }
+            CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL => {
+                capabilities.supports_render_stage_buffer_binding_range = decoder.bool()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;
@@ -7071,6 +7130,54 @@ mod tests {
                 count,
                 maximum,
             } if count == over && maximum == MAX_RENDER_STAGE_BUFFERS
+        ));
+    }
+
+    /// The stage-buffer footprint's fourth code (`research/docs/23` §3.3,
+    /// E-SB3): the whole-binding arm is a tag of its own — one byte, code `3`,
+    /// no payload — and a code the closed family does not define is refused
+    /// rather than read as the nearest arm. Both directions are what the
+    /// consumer's fail-closed reading rests on: an older frame's code `2` keeps
+    /// meaning `Unbounded` (the refusal), and a frame that carries `3` says the
+    /// arm this increment added instead of being read as either.
+    #[test]
+    fn the_whole_binding_footprint_round_trips_and_an_unknown_code_is_refused() {
+        for footprint in [
+            FootprintProof::Static { max_bytes: 16 },
+            FootprintProof::Affine {
+                accesses: vec![AffineAccess {
+                    base_offset: 4,
+                    access_size: 4,
+                    terms: vec![AffineTerm { axis: 0, stride: 8 }],
+                }],
+            },
+            FootprintProof::BindingRange,
+            FootprintProof::Unbounded,
+        ] {
+            let mut encoder = Encoder::new();
+            put_footprint(&mut encoder, &footprint);
+            let bytes = encoder.bytes.clone();
+            assert_eq!(
+                get_footprint(&mut Decoder::new(&bytes)).expect("the arm round trips"),
+                footprint
+            );
+        }
+        let mut encoder = Encoder::new();
+        put_footprint(&mut encoder, &FootprintProof::BindingRange);
+        let bytes = encoder.bytes.clone();
+        assert_eq!(
+            bytes,
+            vec![3],
+            "the whole-binding arm is one tag byte and carries nothing"
+        );
+        let mut unknown = bytes;
+        unknown[0] = 4;
+        assert!(matches!(
+            get_footprint(&mut Decoder::new(&unknown)),
+            Err(CodecError::UnknownEnumValue {
+                field: "footprint proof",
+                value: 4,
+            })
         ));
     }
 }

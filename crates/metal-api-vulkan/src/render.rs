@@ -2045,6 +2045,11 @@ fn validate_translated_stage(
 /// registration gate and the execution gate answer the same question, and a
 /// caller that translated a stage under another device's policy cannot hand
 /// this rail a module the device could not create.
+///
+/// The stage-buffer whole-binding arm's *device* half is asked beside it
+/// ([`validate_stage_buffer_binding_range`]): a module fact this gate cannot
+/// see, because the arm is about how the rail reaches the pass's own bytes
+/// rather than about a SPIR-V capability.
 pub(crate) fn validate_module_capabilities(
     stages: &RenderStages,
     policy: SpirvFeaturePolicy,
@@ -2066,6 +2071,59 @@ pub(crate) fn validate_module_capabilities(
         })?;
     }
     Ok(())
+}
+
+/// The device half of the stage-buffer whole-binding arm
+/// (`research/docs/23` §3.3, E-SB3).
+///
+/// A declaration whose footprint is
+/// [`FootprintProof::BindingRange`](metal_api_core::provider::FootprintProof)
+/// states no reach: the translator could not express it, so the pass's own view
+/// *is* the window the module may reach, and the provider binds exactly those
+/// bytes. An access past that view is then possible by construction, and the
+/// arm's whole claim about it is "undefined, and memory-safe": reads clamp and
+/// writes are discarded, which is what `robustBufferAccess` enabled at device
+/// creation buys. A device that never reported the feature cannot make that
+/// claim, so the rail refuses the registration **by name** there instead of
+/// executing the arm on a device where the same access is unruly undefined
+/// behaviour.
+///
+/// The gate is asked beside [`validate_module_capabilities`] at the one
+/// registration path (`register_render_stages`), so the capability snapshot a
+/// consumer reads the bit from and the gate a registration meets are the same
+/// reading. It is deliberately not part of [`RenderStages::validate_stage_pair`]:
+/// that walk is the module-versus-contract pairing, which is a fact about the
+/// bytes the caller handed over and holds on any device, while this one is the
+/// device's own answer — the same split the SPIR-V policy above keeps.
+pub(crate) fn validate_stage_buffer_binding_range(
+    stages: &RenderStages,
+    robust_buffer_access: bool,
+) -> Result<(), ProviderError> {
+    if robust_buffer_access {
+        return Ok(());
+    }
+    let Some(declared) = stages
+        .contract
+        .stage_buffers
+        .iter()
+        .find(|binding| matches!(binding.footprint, FootprintProof::BindingRange))
+    else {
+        return Ok(());
+    };
+    Err(
+        capability_refusal("render_stage_buffer_binding_range_unsupported")
+            .with_field("stage", FieldValue::Text(declared.stage.name().to_owned()))
+            .with_field("index", FieldValue::Unsigned(u64::from(declared.index)))
+            .with_field("entry", FieldValue::Text("robust_buffer_access".to_owned()))
+            .with_detail(
+                "the declaration states a stage buffer whose reach the translation could not \
+                 express, so this rail would execute it by binding the pass's own view whole and \
+                 leaving an access past that view to the device's robustness; the selected device \
+                 did not report `robustBufferAccess` (or was not created with it enabled), so the \
+                 registration is refused by name rather than executed on a device that would take \
+                 the same access into undefined behaviour",
+            ),
+    )
 }
 
 /// The vertex half's own agreement with the contract.
@@ -3433,6 +3491,51 @@ fn validate_translated_stage_buffers(
                     "the declared footprint is unbounded, which the render contract does not \
                      admit for a stage buffer at all",
                 ))
+            }
+            // The whole-binding arm pairs with the reflection's *own* "nothing
+            // states a reach" reading (`research/docs/23` §3.3, E-SB3): the
+            // translator answers `has_unbounded_access` when a dereference's
+            // index could not be expressed (a data-dependent index) and states
+            // no range at all when it reached nothing, and both are the same
+            // statement the declaration makes — "the caller's window is what the
+            // module may read". Any other reflection states a reach the
+            // declaration does not repeat, in either direction: a static or
+            // affine reach under a whole-window declaration would execute a
+            // measured module under a declaration that measured nothing, which
+            // is the same two-measurements mismatch the two arms above refuse
+            // from the other side. The device half (whether this rail may bind a
+            // window with no stated reach at all) is asked at the registration
+            // gate, [`validate_stage_buffer_binding_range`], because it is a
+            // device reading rather than a module one.
+            FootprintProof::BindingRange => {
+                let states_no_reach = footprint.has_unbounded_access
+                    || (footprint.static_ranges.is_empty()
+                        && footprint.strided_accesses.is_empty());
+                if !states_no_reach {
+                    return Err(mismatch(index)
+                        .with_field(
+                            "reflected_bytes",
+                            FieldValue::Unsigned(
+                                footprint
+                                    .static_ranges
+                                    .iter()
+                                    .map(|range| range.offset.saturating_add(range.size))
+                                    .max()
+                                    .unwrap_or_default(),
+                            ),
+                        )
+                        .with_field(
+                            "reflected_strided_accesses",
+                            FieldValue::Unsigned(footprint.strided_accesses.len() as u64),
+                        )
+                        .with_detail(
+                            "the declaration states the whole-binding arm, where the translation \
+                             stated no reach at all, and the reflection beside it states a bounded \
+                             reach: the two ends describe the same module differently, and this \
+                             arm pairs a declaration that measured nothing with a reflection that \
+                             measured nothing",
+                        ));
+                }
             }
         }
     }
@@ -16509,6 +16612,45 @@ mod tests {
     }
 
     /// One registration for the reviewed dual `[Rgba8Unorm, Rgba8Unorm]` shape.
+    ///
+    /// The whole-binding device gate's own unit test sits beside it
+    /// (`the_whole_binding_arm_needs_the_devices_robustness_reading`): the gate
+    /// reads the contract's declarations alone, so a reviewed pair with no
+    /// translated reflection is enough to ask it.
+    #[test]
+    fn the_whole_binding_arm_needs_the_devices_robustness_reading() {
+        // A registration with no whole-binding declaration passes whoever asks:
+        // the gate is about the arm, not about the stage-buffer face.
+        let mut stages = reviewed_dual_stages();
+        validate_stage_buffer_binding_range(&stages, false)
+            .expect("no declaration states the arm, so no device reading is asked for");
+
+        // The same registration with the arm declared: refused by name on a
+        // device that never reported the reading, accepted beside one that did.
+        stages.contract.stage_buffers = vec![StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::BindingRange,
+        }];
+        let refused = validate_stage_buffer_binding_range(&stages, false)
+            .expect_err("a device without robustBufferAccess refuses the arm by name");
+        eprintln!("whole-binding arm without device robustness: {refused:?}");
+        assert_eq!(
+            refused.slug,
+            "render_stage_buffer_binding_range_unsupported"
+        );
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refused.fields.get("stage"),
+            Some(&FieldValue::Text("fragment".to_owned()))
+        );
+        assert_eq!(refused.fields.get("index"), Some(&FieldValue::Unsigned(0)));
+        validate_stage_buffer_binding_range(&stages, true)
+            .expect("the device that carries the reading accepts the arm");
+    }
+
     fn reviewed_dual_stages() -> RenderStages {
         RenderStages {
             contract: RenderPipelineContract {

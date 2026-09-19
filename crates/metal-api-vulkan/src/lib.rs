@@ -496,6 +496,17 @@ impl VulkanExecutor {
         self.context.sampler_mirror_clamp_to_edge()
     }
 
+    /// Whether the selected device reported `robustBufferAccess` and was
+    /// created with it enabled (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// The render rail's registration gate reads this same reading before it
+    /// accepts a stage-buffer declaration whose footprint is
+    /// `FootprintProof::BindingRange`, so the capability snapshot a consumer
+    /// reads and the gate a registration meets are one answer.
+    pub fn supports_robust_buffer_access(&self) -> bool {
+        self.context.robust_buffer_access()
+    }
+
     /// The SPIR-V capability policy this device answers with (R8).
     ///
     /// [`TranslatedComputePipeline::translate_with_policy`] and
@@ -530,6 +541,15 @@ impl VulkanExecutor {
         capabilities.stencil_resolve_modes =
             provider::stencil_resolve_mode_mask(self.context.stencil_resolve_modes);
         capabilities.supports_render_stencil_resolve = capabilities.stencil_resolve_modes != 0;
+        // The stage-buffer whole-binding arm is the device's own answer too
+        // (`research/docs/23` §3.3, E-SB3): the arm is executed by binding the
+        // pass's own view whole, so it is published exactly on the devices whose
+        // `robustBufferAccess` was enabled at creation — the reading every
+        // out-of-range access in the arm's window lands behind. A device that
+        // reported no such feature keeps the bit closed, and the registration
+        // that states the arm is refused by name instead.
+        capabilities.supports_render_stage_buffer_binding_range =
+            self.context.robust_buffer_access();
         capabilities
     }
 
@@ -1265,6 +1285,20 @@ pub(crate) struct VulkanContext {
     /// mode the device was never told about. Every other address mode the
     /// family names is Vulkan 1.0 core with no feature of its own.
     sampler_mirror_clamp_to_edge: bool,
+    /// Whether the device reported `robustBufferAccess` and was created with it
+    /// enabled (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// The stage-buffer whole-binding arm executes a declaration whose reach the
+    /// translation did not state, so the descriptor's own range is the whole of
+    /// what the module may legally reach; this reading is what makes the
+    /// capability snapshot publish the arm
+    /// ([`ProviderCapabilities::supports_render_stage_buffer_binding_range`]) and
+    /// what the rail's own sentence says about the out-of-range half. A device
+    /// that does not report the feature keeps the bit closed and the arm refused
+    /// by name, exactly as a device that reports it but is never asked to enable
+    /// it would: the two readings are one question, the way the mirror-clamp bit
+    /// above is.
+    robust_buffer_access: bool,
     queue_locks: Vec<Mutex<()>>,
     enqueue_probe: Mutex<Option<EnqueueProbe>>,
     /// The single admission and terminal-state authority for this device.
@@ -1464,13 +1498,32 @@ impl VulkanContext {
         let mut mirror_clamp_query =
             vk::PhysicalDeviceFeatures2::default().push_next(&mut mirror_clamp_features);
         unsafe { instance.get_physical_device_features2(physical, &mut mirror_clamp_query) };
+        // The core 1.0 block travels in the same query as the 1.2 chain, so the
+        // reading is taken from the query's own head before the chained struct
+        // is read (`research/docs/23` §3.3, E-SB3).
+        let robust_buffer_access = mirror_clamp_query.features.robust_buffer_access == vk::TRUE;
         let sampler_mirror_clamp_to_edge =
             mirror_clamp_features.sampler_mirror_clamp_to_edge == vk::TRUE;
+        // `robustBufferAccess` is the reading the stage-buffer whole-binding arm
+        // rests on (`research/docs/23` §3.3, E-SB3). The arm executes a
+        // declaration whose reach the translation could not state by binding the
+        // pass's own view whole, so an access past that view is possible by
+        // construction; with the feature enabled the driver clamps a read and
+        // discards a write instead of taking an out-of-range access into
+        // undefined behaviour, which is the platform the arm's own sentence
+        // claims ("still undefined, and memory-safe"). The same
+        // `VkPhysicalDeviceFeatures2` query above already carries the core
+        // 1.0 block beside the 1.2 chain, so the reading costs no second call —
+        // and, like the mirror-clamp bit, the feature is enabled iff the device
+        // reported it: asking for a feature a device does not have is a
+        // device-creation error.
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_int8(shader_int8)
             .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge);
-        let physical_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+        let physical_features = vk::PhysicalDeviceFeatures::default()
+            .shader_int64(true)
+            .robust_buffer_access(robust_buffer_access);
         let mut float_controls2_enable =
             vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default()
                 .shader_float_controls2(float_controls2.enabled());
@@ -1584,6 +1637,7 @@ impl VulkanContext {
             device_name,
             float_controls2,
             sampler_mirror_clamp_to_edge,
+            robust_buffer_access,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
             enqueue_probe: Mutex::new(None),
             lifecycle: Mutex::new(ProviderLifecycle::new(
@@ -1676,6 +1730,12 @@ impl VulkanContext {
     /// (`research/docs/23` §109).
     pub(crate) const fn sampler_mirror_clamp_to_edge(&self) -> bool {
         self.sampler_mirror_clamp_to_edge
+    }
+
+    /// Whether this device was created with `robustBufferAccess` enabled
+    /// (`research/docs/23` §3.3, E-SB3).
+    pub(crate) const fn robust_buffer_access(&self) -> bool {
+        self.robust_buffer_access
     }
 
     /// The SPIR-V capability policy this device answers with (R8).

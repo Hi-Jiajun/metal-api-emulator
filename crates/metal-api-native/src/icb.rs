@@ -405,6 +405,9 @@ mod tests {
             max_render_stage_buffers_per_stage: 0,
             max_render_texture_dimension_1d: 0,
             supports_render_stage_buffer_namespace_split: false,
+            // The whole-binding stage-buffer arm (`research/docs/23` §3.3,
+            // E-SB3) is a render face this snapshot does not declare either.
+            supports_render_stage_buffer_binding_range: false,
             // The ICB snapshot is a compute face; the render bits stay at the
             // defaults the reviewed render rail keeps (2026-09-19, census
             // v43's `texture_state` axis among them).

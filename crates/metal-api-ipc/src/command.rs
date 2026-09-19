@@ -5822,6 +5822,122 @@ mod tests {
         assert!(!decoded.supports_indirect_command_buffers);
     }
 
+    /// The stage-buffer whole-binding block is the tail's escape family's next
+    /// tag, `0x00 0x0c <bool>` (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// The reading is that the section appends itself to a frame that was
+    /// already on the extended payload, changes no earlier byte, and re-encodes
+    /// after a decode; a frame that ends before it reads the bit as the
+    /// fail-closed `false`, which is the consumer's own by-name refusal for the
+    /// shape; and a family tag the walk does not know is still a typed refusal —
+    /// a snapshot that sent `0x0d` (a section this increment does not define)
+    /// would be refused rather than read as "the bit was not declared".
+    #[test]
+    fn the_whole_binding_block_is_the_tail_familys_next_tag() {
+        let mut capabilities = fake_capabilities();
+        // The frame has to be on the extended payload already, or the new bit
+        // would change the payload's own form rather than only appending its
+        // section: the stage-buffer pair and the landing-view bit are the two
+        // faces that do that, and both are declared here so the only byte the
+        // new bit can move is its own section.
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = 4;
+        capabilities.supports_render_attachment_landing_view = true;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(without
+            .windows(3)
+            .any(|window| window == [0x00, 0x05, 0x01]));
+        assert!(!without.ends_with(&[0x00, 0x0c, 0x01]));
+
+        capabilities.supports_render_stage_buffer_binding_range = true;
+        assert!(capabilities.declares_render_stage_buffer_binding_range());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the whole-binding frame re-encodes byte for byte"
+        );
+        let block = [0x00, 0x0c, 0x01];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the new block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_stage_buffer_binding_range);
+        assert!(decoded.supports_render_attachment_landing_view);
+        // A frame that ends before the block reads the bit as the fail-closed
+        // `false`, so a consumer keeps its own refusal by name for the shape.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_stage_buffer_binding_range);
+
+        // A family tag outside the closed set stays a typed refusal: the walk
+        // must not read a section it does not define as "no declaration".
+        let mut frame_with_unknown = frame.clone();
+        let last = frame_with_unknown.len() - 1;
+        frame_with_unknown[last - 2] = 0x0d;
+        let refused = CommandCodec::decode_response(&frame_with_unknown)
+            .expect_err("an unknown family tag is refused");
+        assert!(
+            format!("{refused:?}").contains("UnknownCapabilityTail"),
+            "the refusal is the tail's own typed arm: {refused:?}"
+        );
+    }
+
+    /// A declaration whose *only* statement is the whole-binding arm still
+    /// writes the extended payload (`research/docs/23` §3.3, E-SB3): the block
+    /// sits after the heap/ICB half the decoder reads by position before the
+    /// family's escape, so a snapshot that never wrote that half would drop the
+    /// declaration on the wire.
+    #[test]
+    fn an_only_whole_binding_declaration_still_writes_the_extended_payload() {
+        let mut capabilities = fake_capabilities();
+        assert!(!capabilities.declares_render_support());
+        capabilities.supports_render_stage_buffer_binding_range = true;
+        assert!(capabilities.declares_render_stage_buffer_binding_range());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(&frame[frame.len() - 3..], &[0x00, 0x0c, 0x01]);
+        let decoded = match CommandCodec::decode_response(&frame).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(decoded.supports_render_stage_buffer_binding_range);
+        assert!(!decoded.supports_render_stage_buffers);
+        assert!(!decoded.supports_render_vertex_count_above_triangle);
+        assert!(!decoded.supports_heaps);
+    }
+
     /// A landing-only entry is a pass kind of its own: one tag, then the kept
     /// frame's identity and shape and the window's second declaration, in a
     /// fixed order (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -5979,24 +6095,25 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x0c` is the next tag the
+        // The family's tags are a closed set and `0x0d` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
         // until E-TX13 assigned it to the attachment landing view, `0x06`
         // until E-TX14 assigned it to the kept-frame landing entry, `0x07` until
         // E-SB2 assigned it to the stage buffer per-stage window, `0x08` until
-        // the texel space took it, and `0x09` until E-TX15 assigned it to the
+        // the texel space took it, `0x09` until E-TX15 assigned it to the
         // pass-entry snapshot arm, `0x0a` until the one-dimensional sampled
-        // window took it, and `0x0b` until the layout-free count above the
-        // milestone's three vertices took it — exactly the drift the closed set
-        // exists to make visible.)
+        // window took it, `0x0b` until the layout-free count above the
+        // milestone's three vertices took it, and `0x0c` until E-SB3 assigned it
+        // to the stage-buffer whole-binding arm — exactly the drift the closed
+        // set exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x0c;
+        unknown_tag[tag_at] = 0x0d;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x0c)
+            CodecError::UnknownCapabilityTail(0x0d)
         ));
     }
 
@@ -7148,6 +7265,7 @@ mod tests {
                     max_render_stage_buffers: 0,
                     max_render_stage_buffers_per_stage: 0,
                     supports_render_stage_buffer_namespace_split: false,
+                    supports_render_stage_buffer_binding_range: false,
                     supports_render_pixel_coordinate_sampler: false,
                     max_passes: 2,
                     supports_threads_exact: true,
@@ -7538,6 +7656,7 @@ mod tests {
             max_render_stage_buffers: 0,
             max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
+            supports_render_stage_buffer_binding_range: false,
             supports_render_pixel_coordinate_sampler: false,
             max_passes: 1,
             supports_threads_exact: true,
