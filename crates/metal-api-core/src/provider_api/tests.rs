@@ -233,6 +233,16 @@ impl ComputeProvider for FakeProvider {
             } else {
                 0
             },
+            // The object API's own entry point counts the same way the
+            // contract does (`research/docs/23` §117, E-SB2): the fixture
+            // declares the per-stage window beside the list bound, so a test
+            // can bind a stage's worth of slots without the *pass* bound
+            // standing in for it.
+            max_render_stage_buffers_per_stage: if self.stage_buffers {
+                MAX_RENDER_STAGE_BUFFERS as u32
+            } else {
+                0
+            },
             // The folded shape's bit rides the same ask (`research/docs/23`
             // §3.3, E-TX9): the object API's stage-buffer fixture declares the
             // two namespaces when it declares the face at all.
@@ -2376,8 +2386,13 @@ fn the_ninth_stage_buffer_binding_is_refused_by_the_widened_ceiling() {
     eprintln!("object stage-buffer ceiling refusal: {refusal:?}");
     assert!(matches!(
         refusal,
-        Error::Contract(ContractError::RenderStageBufferLimitExceeded { requested, maximum })
-            if requested == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
+        Error::Contract(ContractError::RenderStageBufferLimitExceeded {
+            stage,
+            requested,
+            maximum,
+        }) if stage == Some(RenderPipelineStage::Fragment)
+            && requested == MAX_RENDER_STAGE_BUFFERS + 1
+            && maximum == MAX_RENDER_STAGE_BUFFERS
     ));
 }
 

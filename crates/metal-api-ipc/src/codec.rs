@@ -23,7 +23,7 @@ use metal_api_core::completion::wire::{
 };
 use metal_api_core::provider::{
     CompletionToken, ContractError, DeviceEpoch, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    Retryability, SubmissionId,
+    RenderPipelineStage, Retryability, SubmissionId,
 };
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -211,12 +211,16 @@ pub enum CodecError {
     RenderTextureSamplerFormUnsupported {
         binding: u32,
     },
-    /// A stage buffer list carried more entries than the contract's own cap
-    /// (`research/docs/23` §3.3, v83). The block's count is one byte, so this
-    /// is the protocol's bound; the contract refuses anything above
-    /// [`metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS`] before a frame
-    /// is written.
+    /// A stage buffer list carried more entries than the contract's own bound
+    /// (`research/docs/23` §3.3, v83; §117 E-SB2). The block's count is one
+    /// byte, so this is the protocol's bound; the contract refuses anything
+    /// above [`metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS`]
+    /// before a frame is written, and a list whose *stage* carries more than
+    /// [`metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS`] is refused with
+    /// the stage named — the count rule is the stage's own, and a decoder has
+    /// to state the same thing an encoder would.
     RenderStageBufferCount {
+        stage: Option<RenderPipelineStage>,
         count: usize,
         maximum: usize,
     },
@@ -420,10 +424,21 @@ impl fmt::Display for CodecError {
                 "render texture declaration {binding} states a sampler state and a runtime \
                  sampler index, but the block carries exactly one of the two forms"
             ),
-            Self::RenderStageBufferCount { count, maximum } => write!(
-                formatter,
-                "stage buffer list carries {count} bindings, maximum {maximum}"
-            ),
+            Self::RenderStageBufferCount {
+                stage,
+                count,
+                maximum,
+            } => match stage {
+                Some(stage) => write!(
+                    formatter,
+                    "stage buffer list carries {count} {} bindings, maximum {maximum} per stage",
+                    stage.name()
+                ),
+                None => write!(
+                    formatter,
+                    "stage buffer list carries {count} bindings, maximum {maximum}"
+                ),
+            },
             Self::ComputeTextureCount { count, maximum } => write!(
                 formatter,
                 "compute texture declaration block carries {count} bindings, maximum {maximum}"

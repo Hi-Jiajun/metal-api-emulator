@@ -5220,6 +5220,373 @@ fn a_stage_buffer_list_above_the_widened_ceiling_is_refused_by_name() {
     assert_eq!(refusal.class, ProviderErrorClass::Capability);
 }
 
+/// The vertex half of the *per-stage* shape (E-SB2, `research/docs/23` §117):
+/// seven `[[buffer(n)]]` arguments — positions in `b0` and six offsets folded
+/// into the clip position — translated into the canonical namespace set 1.
+const PER_STAGE_CEILING_VERTEX_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_seven.vert.ll");
+const PER_STAGE_CEILING_VERTEX_ENTRY: &str = "render_stage_buffer_seven_positions";
+
+/// The fragment half is the widened increment's own six-argument module
+/// (`render_stage_buffer_six.frag.ll`), so the pair declares thirteen slots:
+/// seven on the vertex stage, six on the fragment stage — neither past the
+/// contract's per-stage ceiling, the pair past the old list bound of eight.
+const PER_STAGE_CEILING_FRAGMENT_AIR: &str =
+    include_str!("fixtures/render_stage_buffer_six.frag.ll");
+const PER_STAGE_CEILING_FRAGMENT_ENTRY: &str = "render_stage_buffer_six_rgba8";
+
+/// The thirteen views and allocations the fixture binds: one each, so a rail
+/// that folds two declarations into one slot cannot pass.
+const PER_STAGE_CEILING_VERTEX_VIEW_BASE: u64 = 780;
+const PER_STAGE_CEILING_VERTEX_ALLOCATION_BASE: u64 = 880;
+const PER_STAGE_CEILING_FRAGMENT_VIEW_BASE: u64 = 800;
+const PER_STAGE_CEILING_FRAGMENT_ALLOCATION_BASE: u64 = 900;
+
+/// The three `float2` clip positions the vertex stage's `b0` carries: the
+/// oversize triangle that covers every pixel centre of a 2x2 viewport.
+fn per_stage_ceiling_positions() -> Vec<u8> {
+    [(-1.0_f32, -1.0_f32), (3.0, -1.0), (-1.0, 3.0)]
+        .into_iter()
+        .flat_map(|(x, y)| [x, y])
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+/// The vertex stage's six offset payloads: zeros, so the position the module
+/// returns is exactly `b0`'s triangle. A mutation replaces one of them with a
+/// shift the 2x2 viewport cannot see the triangle through.
+fn per_stage_ceiling_offsets() -> Vec<Vec<u8>> {
+    (0..6).map(|_| vec![0_u8; 16]).collect()
+}
+
+/// The fragment stage's six payloads: five slots of `32/255` and one of
+/// `64/255`, the widened increment's own sum (`224/255` on every channel).
+fn per_stage_ceiling_payloads() -> Vec<Vec<u8>> {
+    (0..6)
+        .map(|index| {
+            let value = if index == 5 {
+                64.0_f32 / 255.0
+            } else {
+                32.0_f32 / 255.0
+            };
+            [value; 4].into_iter().flat_map(f32::to_le_bytes).collect()
+        })
+        .collect()
+}
+
+/// The thirteen declarations the pair's contract states, canonical by
+/// construction: the vertex stage's seven ascending, then the fragment
+/// stage's six.
+fn per_stage_ceiling_declarations() -> Vec<StageBufferBinding> {
+    let declare = |stage: RenderPipelineStage, index: u32, max_bytes: u64| StageBufferBinding {
+        stage,
+        index,
+        access: BufferAccess::Read,
+        footprint: FootprintProof::Static { max_bytes },
+    };
+    // The vertex stage's `b0` carries the three `float2` positions (24 bytes);
+    // its six offsets are one `float4` each, exactly as the module loads them.
+    std::iter::once(declare(RenderPipelineStage::Vertex, 0, 24))
+        .chain((1..7).map(|index| declare(RenderPipelineStage::Vertex, index, 16)))
+        .chain((0..6).map(|index| declare(RenderPipelineStage::Fragment, index, 16)))
+        .collect()
+}
+
+/// The per-stage fixture's registrations: the declaring compute kernel and the
+/// translated pair, the vertex stage in the canonical namespace set 1 and the
+/// fragment stage in the translator's own set 0 (E-TX9's arrangement).
+fn per_stage_ceiling_fixture() -> Option<(
+    VulkanComputeProvider,
+    CompiledComputePipeline,
+    CompiledComputePipeline,
+)> {
+    let executor = executor()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_per_stage_ceiling_compute"))
+        .expect("the compute pipeline registers");
+    let vertex_library = device
+        .new_library_with_air(PER_STAGE_CEILING_VERTEX_AIR)
+        .expect("the per-stage vertex fixture loads");
+    let vertex_function = vertex_library
+        .function(PER_STAGE_CEILING_VERTEX_ENTRY)
+        .expect("the per-stage vertex entry exists");
+    let vertex = TranslatedRenderStage::translate_with_policy_and_layout(
+        RenderStage::Vertex,
+        &vertex_function,
+        executor.spirv_feature_policy(),
+        metal_api_vulkan::stage_buffer_namespace_layout(),
+    )
+    .expect("the per-stage vertex stage translates into the namespace set");
+    let fragment_library = device
+        .new_library_with_air(PER_STAGE_CEILING_FRAGMENT_AIR)
+        .expect("the per-stage fragment fixture loads");
+    let fragment_function = fragment_library
+        .function(PER_STAGE_CEILING_FRAGMENT_ENTRY)
+        .expect("the per-stage fragment entry exists");
+    let fragment = TranslatedRenderStage::translate_with_policy(
+        RenderStage::Fragment,
+        &fragment_function,
+        executor.spirv_feature_policy(),
+    )
+    .expect("the per-stage fragment stage translates");
+    eprintln!(
+        "per-stage ceiling reflection: vertex={:?} fragment={:?}",
+        vertex_slots(&vertex),
+        vertex_slots(&fragment)
+    );
+    let render = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: PER_STAGE_CEILING_VERTEX_ENTRY.to_owned(),
+                fragment_entry: PER_STAGE_CEILING_FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                stage_buffers: per_stage_ceiling_declarations(),
+                textures: Vec::new(),
+            },
+            vertex,
+            fragment,
+            logical_digest: digest(b"render_e2e_per_stage_ceiling"),
+        })
+        .expect("the thirteen-slot pair registers");
+    Some((provider, compute, render))
+}
+
+/// The reflected `(metal index, descriptor slot)` pairs one translated stage
+/// states, as the fixture's own reading of where its slots landed.
+fn vertex_slots(
+    stage: &TranslatedRenderStage,
+) -> Vec<(u32, Option<metal2vulkan::reflect::DescriptorLocation>)> {
+    stage
+        .reflection()
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::Buffer)
+        .map(|binding| (binding.metal_index, binding.descriptor))
+        .collect()
+}
+
+/// One render-bearing trace whose pass binds all thirteen declarations: the
+/// vertex stage's seven views and the fragment stage's six.
+fn per_stage_ceiling_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    positions: &[u8],
+    offsets: &[Vec<u8>],
+    payloads: &[Vec<u8>],
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.stage_buffers = std::iter::once(stage_buffer_view(
+        RenderPipelineStage::Vertex,
+        0,
+        ViewId::new(PER_STAGE_CEILING_VERTEX_VIEW_BASE),
+        AllocationId::new(PER_STAGE_CEILING_VERTEX_ALLOCATION_BASE),
+        positions,
+    ))
+    .chain(offsets.iter().enumerate().map(|(index, bytes)| {
+        stage_buffer_view(
+            RenderPipelineStage::Vertex,
+            u32::try_from(index).expect("six offsets") + 1,
+            ViewId::new(PER_STAGE_CEILING_VERTEX_VIEW_BASE + 1 + index as u64),
+            AllocationId::new(PER_STAGE_CEILING_VERTEX_ALLOCATION_BASE + 1 + index as u64),
+            bytes,
+        )
+    }))
+    .chain(payloads.iter().enumerate().map(|(index, bytes)| {
+        stage_buffer_view(
+            RenderPipelineStage::Fragment,
+            u32::try_from(index).expect("six payloads"),
+            ViewId::new(PER_STAGE_CEILING_FRAGMENT_VIEW_BASE + index as u64),
+            AllocationId::new(PER_STAGE_CEILING_FRAGMENT_ALLOCATION_BASE + index as u64),
+            bytes,
+        )
+    }))
+    .collect();
+    stage_buffer_trace_with_pass(provider, compute, render, pass)
+}
+
+/// Submit the per-stage trace and return the attachment's readback.
+fn per_stage_ceiling_readback(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    positions: &[u8],
+    offsets: &[Vec<u8>],
+    payloads: &[Vec<u8>],
+) -> Vec<u8> {
+    let (trace, resources) =
+        per_stage_ceiling_trace(provider, compute, render, positions, offsets, payloads);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the thirteen-slot trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    readback(&writebacks, ATTACHMENT_VIEW)
+}
+
+/// The per-stage ceiling's execution reading (E-SB2, `research/docs/23` §117).
+///
+/// Census v39 still reads 92 class exits under
+/// `render_provider_out_of_class_stage_buffer_shape`
+/// (`evidence/gate3-census-v39-2026-09-19/v39-summary.txt`), and the shape
+/// behind them is a pair that declares more than the old *list* bound between
+/// its two stages. This fixture is that shape: thirteen declarations, seven on
+/// the vertex stage and six on the fragment stage, each stage inside the
+/// contract's own ceiling.
+///
+/// Three readings are the three things the increment states: the pair enters
+/// the rail, submits and lands every texel of the 2x2 attachment as the
+/// fragment half's six payloads summed through the format's quantisation (a
+/// rail that dropped a declaration lands a different colour); the *vertex*
+/// half's bytes move the frame, so its seven declarations are bound bytes
+/// rather than declarations on paper; and the snapshot's own window is what
+/// admits the shape, with the list bound beside it being the pair's sum rather
+/// than the old single-list eight.
+#[test]
+fn a_per_stage_stage_buffer_shape_enters_the_rail_and_lands_its_bytes() {
+    let Some((provider, compute, render)) = per_stage_ceiling_fixture() else {
+        return;
+    };
+    let capabilities = provider.capabilities();
+    eprintln!(
+        "per-stage ceiling window: per_stage={} list={}",
+        capabilities.max_render_stage_buffers_per_stage, capabilities.max_render_stage_buffers
+    );
+    assert!(capabilities.declares_render_stage_buffer_per_stage_ceiling());
+    assert_eq!(
+        capabilities.max_render_stage_buffers_per_stage,
+        metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS as u32
+    );
+    assert_eq!(
+        capabilities.max_render_stage_buffers,
+        metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u32
+    );
+
+    let positions = per_stage_ceiling_positions();
+    let offsets = per_stage_ceiling_offsets();
+    let payloads = per_stage_ceiling_payloads();
+    let expected = [0xe0_u8; 4].repeat(4);
+    let frame = per_stage_ceiling_readback(
+        &provider, &compute, &render, &positions, &offsets, &payloads,
+    );
+    eprintln!("per-stage ceiling readback: {}", hex(&frame));
+    assert_eq!(
+        frame, expected,
+        "every texel is the six fragment payloads' sum (224/255) through the format's quantisation"
+    );
+
+    // The fragment half's last slot is really bound: with it zeroed the sum is
+    // five slots of 32/255 — 160/255 rather than the fixture's 224/255.
+    let mut moved_payloads = payloads.clone();
+    moved_payloads[5] = [0.0_f32; 4]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let dropped = per_stage_ceiling_readback(
+        &provider,
+        &compute,
+        &render,
+        &positions,
+        &offsets,
+        &moved_payloads,
+    );
+    eprintln!("per-stage ceiling fragment mutation: {}", hex(&dropped));
+    assert_eq!(dropped, [0xa0_u8; 4].repeat(4));
+    assert_ne!(dropped, frame);
+
+    // The vertex half's slots are bound bytes too: an offset that pushes the
+    // triangle past the viewport leaves the clear sentinel behind, so the
+    // seven declarations the contract states are read rather than dropped.
+    let mut shifted_offsets = offsets.clone();
+    shifted_offsets[5] = [2.0_f32, 0.0, 0.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let shifted = per_stage_ceiling_readback(
+        &provider,
+        &compute,
+        &render,
+        &positions,
+        &shifted_offsets,
+        &payloads,
+    );
+    eprintln!("per-stage ceiling vertex mutation: {}", hex(&shifted));
+    assert_eq!(
+        shifted,
+        CLEAR_SENTINEL.repeat(4),
+        "a vertex offset past the viewport leaves the draw outside every pixel centre"
+    );
+    assert_ne!(shifted, frame);
+}
+
+/// The per-stage ceiling's refusal (E-SB2, `research/docs/23` §117): the newer
+/// list bound is the *pair's* sum, so a single stage that names nine slots is
+/// still refused by name — the count rule never stopped being the stage's.
+#[test]
+fn a_stage_list_above_the_per_stage_ceiling_is_refused_by_name() {
+    let Some((provider, compute, render)) = per_stage_ceiling_fixture() else {
+        return;
+    };
+    let positions = per_stage_ceiling_positions();
+    let offsets = per_stage_ceiling_offsets();
+    let payloads = per_stage_ceiling_payloads();
+    let (mut trace, resources) = per_stage_ceiling_trace(
+        &provider, &compute, &render, &positions, &offsets, &payloads,
+    );
+    let ceiling = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS;
+    {
+        let wide = trace
+            .pipelines
+            .iter_mut()
+            .find(|pipeline| pipeline.pipeline_id == render.pipeline_id)
+            .expect("the render pipeline is in the trace");
+        wide.render = Some(RenderPipelineContract {
+            vertex_entry: PER_STAGE_CEILING_VERTEX_ENTRY.to_owned(),
+            fragment_entry: PER_STAGE_CEILING_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::None,
+            stage_buffers: (0..=u32::try_from(ceiling).expect("ceiling"))
+                .map(|index| StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                })
+                .collect(),
+            textures: Vec::new(),
+        });
+    }
+    let refusal = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect_err("nine fragment declarations cross the per-stage ceiling");
+    eprintln!(
+        "per-stage ceiling refusal: phase={:?} class={:?} slug={} fields={:?} detail={:?}",
+        refusal.phase, refusal.class, refusal.slug, refusal.fields, refusal.detail
+    );
+    assert_eq!(refusal.slug, "render_stage_buffer_limit");
+    assert_eq!(refusal.class, ProviderErrorClass::Capability);
+}
+
 /// R9i (E side): the present rail executes the reviewed stage-buffer pair.
 ///
 /// Both rails render the same two modules into their own target, and the

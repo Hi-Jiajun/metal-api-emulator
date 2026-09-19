@@ -326,6 +326,12 @@ impl NativeMetalProvider {
                 // stage-buffer trace instead of refusing it by name.
                 supports_render_stage_buffers: stage_buffer_bits.supports_render_stage_buffers,
                 max_render_stage_buffers: stage_buffer_bits.max_render_stage_buffers,
+                // The per-stage window stays undeclared on the native rail
+                // (`research/docs/23` §117, E-SB2): the reviewed modules bind
+                // one slot per stage, so the list bound is the whole rule and
+                // a wider pair is refused by name by core admission.
+                max_render_stage_buffers_per_stage: stage_buffer_bits
+                    .max_render_stage_buffers_per_stage,
                 // The folded shape's bit (`research/docs/23` §3.3, E-TX9):
                 // the reviewed pair binds its two stages at set 1 and set 2,
                 // so this snapshot declares the arrangement the pair's Apple

@@ -61,9 +61,16 @@ BUFFER_STORAGE_MODES = ("owned_bytes", "staged_lease", "borrowed_no_copy")
 # `StageBufferView`), and the bounds restate `metal_api_core`'s constants: the
 # count ceiling is the widened one (`research/docs/23` §108), the descriptor
 # floor Vulkan states for one set's storage buffers.
+# The count rule is the *stage's* own (`research/docs/23` §117, E-SB2): one
+# stage may declare at most `MAX_RENDER_STAGE_BUFFERS` slots, and the
+# pipeline-level list at most two stages' worth — the bound the wire's length
+# prefix states. A case is validated against both so a suite cannot declare a
+# shape the contract would refuse, and the comparator's message names which of
+# the two readings it crossed.
 STAGE_BUFFER_STAGES = ("vertex", "fragment")
 STAGE_BUFFER_ACCESSES = ("read", "write", "read_write")
 MAX_RENDER_STAGE_BUFFERS = 8
+MAX_RENDER_STAGE_BUFFER_DECLARATIONS = 2 * MAX_RENDER_STAGE_BUFFERS
 MAX_RENDER_STAGE_BUFFER_INDEX = 16
 # The invocation axes an affine footprint may stride over
 # (`metal_api_core::provider::RENDER_AFFINE_AXES`): `0` is the vertex index,
@@ -2305,8 +2312,14 @@ def _stage_buffer_section(case, declaring_case, declaring_images, where):
     entries = _list(case.get("stage_buffers", []), f"{where}.stage_buffers")
     if not entries:
         return [], {}, {}, set(), None
-    _require(len(entries) <= MAX_RENDER_STAGE_BUFFERS,
-             f"{where}: the reviewed stage-buffer ceiling is {MAX_RENDER_STAGE_BUFFERS} slots")
+    _require(len(entries) <= MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+             f"{where}: the reviewed stage-buffer list bound is "
+             f"{MAX_RENDER_STAGE_BUFFER_DECLARATIONS} slots")
+    for stage in STAGE_BUFFER_STAGES:
+        stage_slots = [entry for entry in entries if entry.get("stage") == stage]
+        _require(len(stage_slots) <= MAX_RENDER_STAGE_BUFFERS,
+                 f"{where}: the reviewed stage-buffer ceiling is "
+                 f"{MAX_RENDER_STAGE_BUFFERS} slots per stage")
     # The draw the declarations are proven against: the shape is the
     # `vertex_id` triangle, so the vertex axis is the draw's own vertex count
     # and the instance axis its instance count.

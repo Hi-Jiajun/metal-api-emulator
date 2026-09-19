@@ -2448,34 +2448,67 @@ pub const MAX_RENDER_SAMPLERS: usize = 16;
 /// descriptor slots nobody sized.
 pub const MAX_COMPUTE_TEXTURES: usize = 1;
 
-/// Stage buffer bindings a render pass may declare, across both stages
-/// (`research/docs/23` §3.3, v83; §108): eight, the descriptor-set floor
-/// Vulkan states for one set's storage buffers.
+/// Stage buffer bindings **one stage** of a render pass may declare
+/// (`research/docs/23` §3.3, v83; §108; §117 E-SB2). One number, and the
+/// bound belongs to the stage rather than to the pipeline-level list, because
+/// that is the axis Metal states: `[[buffer(n)]]` is indexed inside the
+/// stage's own namespace (`setVertexBuffer(_:offset:index:)` against
+/// `setFragmentBuffer(_:offset:index:)`), and the argument table a stage fills
+/// is the stage's own.
 ///
-/// The first increment stated four — one per binding the reviewed chain shape
-/// reads — and the deep tail that followed census v13 moved it: the R9o
-/// bucket key is the count itself (`stage_buffer_shape_gt4` = 334 with
-/// `duplicate` and `vertex_layout` both zero,
-/// `evidence/gate3-census-v13-2026-09-17/census_v13_faces.txt` §6), so every
-/// one of those class exits is a draw whose pipeline-level list declares more
-/// than four. Eight is also a *device* fact rather than this contract's
-/// invention: every admitted device guarantees
-/// `maxDescriptorSetStorageBuffers >= 8`, and a declaration is one descriptor
-/// in the set its own stage accounts for (set 1 for the vertex stage's
-/// bindings and set 2 for the fragment stage's on the reviewed arrangement,
-/// the module's own set for a translated stage), so a list of at most eight
-/// never asks one set for more descriptors than the platform promises —
-/// whichever way the stages split it. A ninth declaration is refused by name
-/// (`render_stage_buffer_limit`), and a *stage's* own count above this bound
-/// is not a shape this value states: the count cap is the pipeline-level
-/// list's. The index bound ([`MAX_RENDER_STAGE_BUFFER_INDEX`]) is a separate
-/// fact and does not move.
+/// Eight is the *set-level* fact the first widening rested on: every admitted
+/// device guarantees `maxDescriptorSetStorageBuffers >= min(24, n ×
+/// maxPerStageDescriptorStorageBuffers)`, which is eight for a two-stage
+/// pipeline, and one stage's declarations are one descriptor each in the set
+/// its stage accounts for (set 1 for the vertex stage and set 2 for the
+/// fragment stage on the reviewed arrangement, the module's own set for a
+/// translated stage). The number is therefore a *review ceiling* in the same
+/// sense the render rails' reviewed attachment ceiling is, not a per-stage
+/// device fact: the same table's per-stage floor is four, so a rail's own
+/// per-stage window is
+/// the smaller of this ceiling and its device's
+/// `maxPerStageDescriptorStorageBuffers`
+/// ([`ProviderCapabilities::max_render_stage_buffers_per_stage`]), and a
+/// declaration past that window is refused by name
+/// (`render_stage_buffer_limit`) rather than executed against a descriptor
+/// slot the device never promised.
+///
+/// The first increment stated four *across both stages* — one per binding the
+/// reviewed chain shape reads — and the deep tail that followed census v13
+/// moved it: the R9o bucket key is the count itself
+/// (`stage_buffer_shape_gt4` = 334 with `duplicate` and `vertex_layout` both
+/// zero, `evidence/gate3-census-v13-2026-09-17/census_v13_faces.txt` §6), so
+/// every one of those class exits is a draw whose pipeline-level list declares
+/// more than four. Census v39's latest reading of the same bucket is 92 rows
+/// (`evidence/gate3-census-v39-2026-09-19/v39-summary.txt`), and the rows that
+/// survive eight are the shapes this per-stage bound answers: a pair whose two
+/// stages declare thirteen slots between them is two lists of seven and six,
+/// each of which is a list one stage may carry.
+///
+/// The bound on the *pipeline-level* list is therefore a consequence rather
+/// than a second ceiling ([`MAX_RENDER_STAGE_BUFFER_DECLARATIONS`]). The index
+/// bound ([`MAX_RENDER_STAGE_BUFFER_INDEX`]) is a separate fact and does not
+/// move.
 ///
 /// A provider's `ProviderCapabilities::max_render_stage_buffers` stays
 /// independent of this value: the contract admits the shape, while each rail
 /// declares how many of those bindings it can execute today, and a rail whose
 /// window is narrower refuses the rest by name instead of dropping a binding.
 pub const MAX_RENDER_STAGE_BUFFERS: usize = 8;
+
+/// Stage buffer declarations one render *pass* may carry across both stages
+/// (`research/docs/23` §3.3, §117 E-SB2): two stages' worth of
+/// [`MAX_RENDER_STAGE_BUFFERS`].
+///
+/// This is the pipeline-level list's bound and it is derived, not chosen: a
+/// render pipeline has exactly two stages, each of which may carry at most
+/// [`MAX_RENDER_STAGE_BUFFERS`] declarations, so a longer list necessarily
+/// names one stage twice over. It exists as its own value because the wire's
+/// declaration block is a length prefix read before any stage is known
+/// (`crates/metal-api-ipc/src/command_codec.rs`), and a decoder's bound on
+/// such a prefix has to be the widest list the contract can state rather than
+/// a second, drifting number.
+pub const MAX_RENDER_STAGE_BUFFER_DECLARATIONS: usize = MAX_RENDER_STAGE_BUFFERS * 2;
 
 /// The invocation indices a render pass's affine stage buffer footprint may
 /// name (`research/docs/23` §3.3, v86).
@@ -4827,11 +4860,33 @@ impl RenderPassDescriptor {
         // to be one the trace declares. Whether the pipeline declares the slot
         // is the pair rule `validate_against` holds; this walk answers only
         // what a pass can answer on its own.
-        if self.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+        // The count rule is the *stage's* own (`research/docs/23` §117,
+        // E-SB2): Metal indexes `[[buffer(n)]]` inside the stage's namespace,
+        // so a pair of stages carries two lists and neither one may pass
+        // [`MAX_RENDER_STAGE_BUFFERS`]. The pipeline-level list's own bound
+        // ([`MAX_RENDER_STAGE_BUFFER_DECLARATIONS`]) follows from the pair and
+        // is stated first so a list longer than any two stages could hold is
+        // refused as one list rather than as a stage's arithmetic.
+        if self.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
             return Err(ContractError::RenderStageBufferLimitExceeded {
+                stage: None,
                 requested: self.stage_buffers.len(),
-                maximum: MAX_RENDER_STAGE_BUFFERS,
+                maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
             });
+        }
+        for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
+            let count = self
+                .stage_buffers
+                .iter()
+                .filter(|bound| bound.stage == stage)
+                .count();
+            if count > MAX_RENDER_STAGE_BUFFERS {
+                return Err(ContractError::RenderStageBufferLimitExceeded {
+                    stage: Some(stage),
+                    requested: count,
+                    maximum: MAX_RENDER_STAGE_BUFFERS,
+                });
+            }
         }
         let mut stage_slots = BTreeMap::new();
         let mut previous_stage_slot = None;
@@ -5800,7 +5855,10 @@ fn validate_render_texture_declarations(
 /// (`research/docs/23` §3.3, v83).
 ///
 /// Every rule is a fact the declarations and the layout alone can answer: the
-/// count stays inside the first increment's cap, the list is canonical
+/// count is the *stage's* own and stays inside [`MAX_RENDER_STAGE_BUFFERS`]
+/// (its complement is the pipeline-level list bound,
+/// [`MAX_RENDER_STAGE_BUFFER_DECLARATIONS`]; `research/docs/23` §117 E-SB2),
+/// the list is canonical
 /// (vertex bindings before fragment bindings, ascending inside each stage)
 /// with no slot named twice, every binding is read with a static footprint,
 /// and no vertex-stage binding occupies an index a
@@ -5810,11 +5868,25 @@ fn validate_stage_buffer_bindings(
     bindings: &[StageBufferBinding],
     layout: &VertexLayout,
 ) -> Result<(), ContractError> {
-    if bindings.len() > MAX_RENDER_STAGE_BUFFERS {
+    if bindings.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
         return Err(ContractError::RenderStageBufferLimitExceeded {
+            stage: None,
             requested: bindings.len(),
-            maximum: MAX_RENDER_STAGE_BUFFERS,
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
         });
+    }
+    for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
+        let count = bindings
+            .iter()
+            .filter(|binding| binding.stage == stage)
+            .count();
+        if count > MAX_RENDER_STAGE_BUFFERS {
+            return Err(ContractError::RenderStageBufferLimitExceeded {
+                stage: Some(stage),
+                requested: count,
+                maximum: MAX_RENDER_STAGE_BUFFERS,
+            });
+        }
     }
     let stream_indices = layout.buffers().len();
     let mut previous: Option<(u8, u32)> = None;
@@ -9754,11 +9826,34 @@ pub struct ProviderCapabilities {
     /// records the boundary in `research/docs/23` §83 — while the Vulkan rail
     /// publishes the shape it executes.
     pub supports_render_stage_buffers: bool,
-    /// Stage buffer bindings one render pass may declare. `0` means the
-    /// snapshot cannot execute the shape at all; the field stays at that
-    /// default for a snapshot whose bit above is false, so a caller reading
-    /// the limit without checking the bit cannot read one as an admission.
+    /// Stage buffer bindings one render *pass* may declare across both stages:
+    /// the pipeline-level list's bound (`research/docs/23` §3.3, §108). `0`
+    /// means the snapshot cannot execute the shape at all; the field stays at
+    /// that default for a snapshot whose bit above is false, so a caller
+    /// reading the limit without checking the bit cannot read one as an
+    /// admission.
     pub max_render_stage_buffers: u32,
+    /// Stage buffer bindings **one stage** of a render pass may declare
+    /// (`research/docs/23` §3.3, §117 E-SB2), or `0` for a snapshot that
+    /// states no per-stage window.
+    ///
+    /// The pair of fields is the shape's two axes: the list bound above is
+    /// what a *pass* carries, this one is what a *stage* carries, and a
+    /// snapshot that leaves this at `0` keeps the older reading — the list
+    /// bound applies to the whole list, which is the stricter rule whenever
+    /// the list bound is at most twice this window. That is exactly the
+    /// direction the native rail keeps: its reviewed modules bind one slot per
+    /// stage, so it declares no per-stage window and a list past its own bound
+    /// is refused by name.
+    ///
+    /// The Vulkan rail derives the number from the device rather than copying
+    /// the contract's ceiling: its own `capabilities_from_limits` reports
+    /// `min(MAX_RENDER_STAGE_BUFFERS, maxPerStageDescriptorStorageBuffers)` and
+    /// doubles it for the list bound, so a device whose per-stage descriptor
+    /// window is four declares four per stage and eight in the list — the same
+    /// admission its own pipeline layout can carry — instead of a number the
+    /// platform never promised.
+    pub max_render_stage_buffers_per_stage: u32,
     /// Whether this snapshot executes the *folded* stage-buffer shape: one
     /// render pass whose two stages each read a `[[buffer(n)]]` argument of
     /// the same Metal index, with different bytes behind them
@@ -10021,6 +10116,20 @@ impl ProviderCapabilities {
     /// payload and dropping the declaration on the wire.
     pub fn declares_render_stage_buffer_namespace_split(&self) -> bool {
         self.supports_render_stage_buffer_namespace_split
+    }
+
+    /// Whether this snapshot states a *per-stage* stage-buffer window
+    /// (`research/docs/23` §3.3, §117 E-SB2).
+    ///
+    /// A snapshot that states one admits a list whose stages are each inside
+    /// [`Self::max_render_stage_buffers_per_stage`] and whose total stays
+    /// inside [`Self::max_render_stage_buffers`]; a snapshot that leaves the
+    /// field at `0` keeps the older reading, where the list bound applies to
+    /// the whole list. The predicate is the field itself, so the capability
+    /// frame writes the block exactly when the snapshot has something to say
+    /// and a consumer asks the question in one place.
+    pub fn declares_render_stage_buffer_per_stage_ceiling(&self) -> bool {
+        self.max_render_stage_buffers_per_stage != 0
     }
 
     /// Whether any present bit differs from its default.
@@ -10808,6 +10917,33 @@ impl ProviderCapabilities {
                         "maximum",
                         FieldValue::Unsigned(self.max_render_stage_buffers as u64),
                     ));
+            }
+            // The per-stage window is the second axis of the same shape
+            // (`research/docs/23` §117, E-SB2). It is asked only when the
+            // snapshot states one: a snapshot that leaves the field at `0`
+            // keeps the pre-E-SB2 reading, where the list bound above is the
+            // whole rule — which is what the native rail's reviewed pair
+            // declares, and what makes a thirteen-slot pair refused by name
+            // there instead of half-admitted.
+            if self.declares_render_stage_buffer_per_stage_ceiling() {
+                for stage in [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment] {
+                    let count = pass
+                        .stage_buffers
+                        .iter()
+                        .filter(|bound| bound.stage == stage)
+                        .count();
+                    if count > self.max_render_stage_buffers_per_stage as usize {
+                        return Err(capability_error("render_stage_buffer_limit")
+                            .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+                            .with_field("requested", FieldValue::Unsigned(count as u64))
+                            .with_field(
+                                "maximum",
+                                FieldValue::Unsigned(u64::from(
+                                    self.max_render_stage_buffers_per_stage,
+                                )),
+                            ));
+                    }
+                }
             }
             for stage in &pass.stage_buffers {
                 let mode = match &stage.view.source {
@@ -13484,9 +13620,15 @@ pub enum ContractError {
     // well-formed request; the missing, undeclared, mismatched and
     // conflicting slots are caller-fixable structure, and the pair rules name
     // the stage as well as the slot so a fix needs no second lookup.
-    /// A render pass or pipeline declares more stage buffer bindings than
-    /// [`MAX_RENDER_STAGE_BUFFERS`].
+    /// One stage of a render pass or pipeline declares more stage buffer
+    /// bindings than [`MAX_RENDER_STAGE_BUFFERS`], or the pipeline-level list
+    /// declares more than [`MAX_RENDER_STAGE_BUFFER_DECLARATIONS`].
+    ///
+    /// `stage` names the stage whose own list crossed the bound
+    /// (`research/docs/23` §117 E-SB2); it is `None` for the pipeline-level
+    /// list, which is the arm the wire's length prefix is refused on.
     RenderStageBufferLimitExceeded {
+        stage: Option<RenderPipelineStage>,
         requested: usize,
         maximum: usize,
     },
@@ -14382,12 +14524,20 @@ impl fmt::Display for ContractError {
                 "texture {binding} is declared Fetched, a read the render face executes; this face's narrow class reads through a sampler or writes a storage image"
             ),
             Self::RenderStageBufferLimitExceeded {
+                stage,
                 requested,
                 maximum,
-            } => write!(
-                formatter,
-                "render pass declares {requested} stage buffer bindings, above the contract maximum {maximum}"
-            ),
+            } => match stage {
+                Some(stage) => write!(
+                    formatter,
+                    "render pass declares {requested} {} stage buffer bindings, above the contract maximum {maximum} per stage",
+                    stage.name()
+                ),
+                None => write!(
+                    formatter,
+                    "render pass declares {requested} stage buffer bindings across its stages, above the contract maximum {maximum}"
+                ),
+            },
             Self::RenderStageBufferIndexExceeded {
                 stage,
                 index,
@@ -15850,6 +16000,7 @@ mod tests {
             supports_render_kept_frame_landing: false,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
             supports_compute_texture_sampling: false,
             max_compute_textures: 0,
@@ -21525,6 +21676,7 @@ mod tests {
                 .expect("the render pass")
                 .validate(),
             Err(ContractError::RenderStageBufferLimitExceeded {
+                stage: Some(RenderPipelineStage::Fragment),
                 requested: MAX_RENDER_STAGE_BUFFERS + 1,
                 maximum: MAX_RENDER_STAGE_BUFFERS,
             })
@@ -21753,6 +21905,101 @@ mod tests {
         );
     }
 
+    /// The per-stage stage-buffer window (`research/docs/23` §117, E-SB2).
+    ///
+    /// Census v39 still names the shape this increment answers: 92 class exits
+    /// under `render_provider_out_of_class_stage_buffer_shape`
+    /// (`evidence/gate3-census-v39-2026-09-19/v39-summary.txt`). The pair below
+    /// is that shape's representative — thirteen declarations, seven on the
+    /// vertex stage and six on the fragment stage — and the three readings are
+    /// the three rules the increment separates: the contract's own structural
+    /// bound (a *stage's* list, two stages' worth of list), the list bound a
+    /// snapshot that states no per-stage window applies, and the device window
+    /// a snapshot that states one applies, refused by name with the stage and
+    /// both numbers on the refusal.
+    #[test]
+    fn a_per_stage_window_narrows_the_stage_buffer_shape_a_snapshot_admits() {
+        let mut widened = stage_buffer_trace();
+        {
+            let contract = widened.pipelines[0]
+                .render
+                .as_mut()
+                .expect("the fixture declares the render half");
+            contract.stage_buffers = (0..7)
+                .map(|index| StageBufferBinding {
+                    stage: RenderPipelineStage::Vertex,
+                    index,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                })
+                .chain((0..6).map(|index| StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                }))
+                .collect();
+            let pass = render_entry(&mut widened);
+            pass.stage_buffers = (0..7)
+                .map(|index| StageBufferView {
+                    stage: RenderPipelineStage::Vertex,
+                    view: stream_view(100 + u64::from(index), index, 200 + u64::from(index), 16),
+                })
+                .chain((0..6).map(|index| StageBufferView {
+                    stage: RenderPipelineStage::Fragment,
+                    view: stream_view(120 + u64::from(index), index, 220 + u64::from(index), 16),
+                }))
+                .collect();
+        }
+        // The contract states the shape: each stage is inside its own ceiling
+        // and the pair is inside the list's.
+        widened
+            .passes
+            .last()
+            .and_then(TracePass::as_render)
+            .expect("the render pass")
+            .validate()
+            .expect("thirteen declarations split seven and six are a shape the contract states");
+
+        // A snapshot that states the *list* bound and no per-stage window is
+        // the older reading: sixteen admits the thirteen.
+        let mut list_only = stage_buffer_capabilities();
+        list_only.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u32;
+        assert!(!list_only.declares_render_stage_buffer_per_stage_ceiling());
+        list_only
+            .admit(&widened, &landing_resources())
+            .expect("the list bound admits the pair when no per-stage window is stated");
+
+        // A snapshot whose device states a six-slot window refuses the
+        // seven-slot vertex list by name, with the stage and both numbers.
+        let mut narrow = list_only.clone();
+        narrow.max_render_stage_buffers_per_stage = 6;
+        assert!(narrow.declares_render_stage_buffer_per_stage_ceiling());
+        let refusal = narrow
+            .admit(&widened, &landing_resources())
+            .expect_err("seven vertex slots over a six-slot per-stage window");
+        assert_eq!(refusal.slug, "render_stage_buffer_limit");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("stage"),
+            Some(&FieldValue::Text("vertex".to_owned()))
+        );
+        assert_eq!(
+            refusal.fields.get("requested"),
+            Some(&FieldValue::Unsigned(7))
+        );
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(6))
+        );
+
+        // The window that admits both lists admits the pair, so the refusal
+        // above is the window's own reading and not the thirteen slots' count.
+        let mut wide = list_only.clone();
+        wide.max_render_stage_buffers_per_stage = 7;
+        wide.admit(&widened, &landing_resources())
+            .expect("a seven-slot window admits the seven-slot list");
+    }
     /// The affine footprint arm (`research/docs/23` §3.3, v86): the declaration
     /// states the reflected `constant + stride * index` access, and the draw's
     /// own invocation counts are what turn it into a byte extent.

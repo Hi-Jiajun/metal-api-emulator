@@ -1445,8 +1445,8 @@ mod tests {
         TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-        MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_BUFFERS,
-        PROVIDER_SCHEMA_VERSION,
+        MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+        MAX_RENDER_TEXTURES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2218,8 +2218,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             refused,
-            CodecError::RenderStageBufferCount { count, maximum }
-                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
+            CodecError::RenderStageBufferCount { stage: Some(RenderPipelineStage::Vertex), count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFERS + 1
+                    && maximum == MAX_RENDER_STAGE_BUFFERS
         ));
         // The decoder refuses the same count by name instead of reading one
         // tuple more than the contract's ceiling states.
@@ -2233,14 +2234,18 @@ mod tests {
             .position(|window| window == STAGE_BUFFER_DECLARATION_BLOCK)
             .expect("the declaration block is on the wire");
         let mut patched = frame.clone();
-        // One above the contract's own ceiling (`research/docs/23` §3.3,
-        // §108): the count byte is refused before a single tuple is read, so
-        // the patched frame needs no matching block behind it.
-        patched[at] = u8::try_from(MAX_RENDER_STAGE_BUFFERS + 1).unwrap();
+        // One above the pipeline-level list bound (`research/docs/23` §3.3,
+        // §108; §117 E-SB2): the count byte is refused before a single tuple is
+        // read, so the patched frame needs no matching block behind it. The
+        // list bound is the pair's sum, so a ninth *stage* declaration is a
+        // shape the wire carries and the contract refuses by stage instead
+        // (`a_stage_buffer_stage_past_the_ceiling_is_refused_by_stage`).
+        patched[at] = u8::try_from(MAX_RENDER_STAGE_BUFFER_DECLARATIONS + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched).unwrap_err(),
-            CodecError::RenderStageBufferCount { count, maximum }
-                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
+            CodecError::RenderStageBufferCount { stage: None, count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFER_DECLARATIONS + 1
+                    && maximum == MAX_RENDER_STAGE_BUFFER_DECLARATIONS
         ));
         eprintln!("pipeline declaration count refused: {refused}");
     }
@@ -2681,13 +2686,14 @@ mod tests {
         .unwrap();
         let position = stage_buffer_head_at(&frame);
         let mut patched = frame.clone();
-        // One above the contract's own ceiling (`research/docs/23` §3.3,
-        // §108): the count byte is refused before a single view is read.
-        patched[position + 3] = u8::try_from(MAX_RENDER_STAGE_BUFFERS + 1).unwrap();
+        // One above the pass's list bound (`research/docs/23` §3.3, §108; §117
+        // E-SB2): the count byte is refused before a single view is read.
+        patched[position + 3] = u8::try_from(MAX_RENDER_STAGE_BUFFER_DECLARATIONS + 1).unwrap();
         assert!(matches!(
             CommandCodec::decode_request(&patched).unwrap_err(),
-            CodecError::RenderStageBufferCount { count, maximum }
-                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
+            CodecError::RenderStageBufferCount { stage: None, count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFER_DECLARATIONS + 1
+                    && maximum == MAX_RENDER_STAGE_BUFFER_DECLARATIONS
         ));
         // The encoder refuses the same protocol bound instead of writing a
         // frame the decoder would reject.
@@ -2712,7 +2718,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             refused,
-            CodecError::RenderStageBufferCount { count, maximum }
+            CodecError::RenderStageBufferCount { stage: Some(RenderPipelineStage::Fragment), count, maximum }
                 if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
         ));
         eprintln!("stage buffer count refusals: {refused}");
@@ -4761,6 +4767,71 @@ mod tests {
         ));
     }
 
+    /// The per-stage stage-buffer window travels in the escape family's
+    /// *seventh* block (`research/docs/23` §3.3, §117 E-SB2).
+    ///
+    /// It is the family's first section that carries a number rather than a
+    /// bool: the window is the provider's own answer — the contract's ceiling
+    /// clamped by the device's `maxPerStageDescriptorStorageBuffers` — so a
+    /// consumer gating a draw on this face reads the value instead of a bit.
+    /// A frame that ends before the section reads the older and *stricter*
+    /// rule (the list bound applies to the whole list), which is what every
+    /// pre-E-SB2 snapshot meant by [`MAX_RENDER_STAGE_BUFFERS`], so the
+    /// absent-section direction is fail-closed and the frames keep their bytes
+    /// everywhere before it.
+    #[test]
+    fn the_per_stage_stage_buffer_window_travels_in_its_own_extended_block() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u32;
+        let without = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+
+        capabilities.max_render_stage_buffers_per_stage = MAX_RENDER_STAGE_BUFFERS as u32;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // One escape byte, the family's seventh tag and one big-endian `u32`.
+        let block = [0x00, 0x07, 0x00, 0x00, 0x00, 0x08];
+        assert_eq!(
+            &frame[frame.len() - block.len()..],
+            &block,
+            "the per-stage window's block is the tail's last section"
+        );
+        assert_eq!(frame.len(), without.len() + block.len());
+        assert_eq!(
+            &frame[FRAME_HEADER..frame.len() - block.len()],
+            &without[FRAME_HEADER..],
+            "the sections before it keep their bytes"
+        );
+        // The frame without the section is the pre-E-SB2 reading: the window
+        // stays `0`, which is the "the list bound is the whole rule" arm, and
+        // the value is what the section's payload carries rather than a second
+        // presence flag.
+        let decoded = CommandCodec::decode_response(&without).unwrap();
+        let CommandResponse::Capabilities { capabilities, .. } = decoded else {
+            panic!("the response is a capability snapshot");
+        };
+        assert_eq!(capabilities.max_render_stage_buffers_per_stage, 0);
+        assert!(!capabilities.declares_render_stage_buffer_per_stage_ceiling());
+        eprintln!(
+            "per-stage stage-buffer window frame: len={} without={} block={block:02x?}",
+            frame.len(),
+            without.len()
+        );
+    }
+
     /// The gathered-extent shape's bit travels in the escape family's *second*
     /// block (`research/docs/23` §3.3, E-TX10).
     ///
@@ -5548,19 +5619,20 @@ mod tests {
         );
         assert_eq!(CommandCodec::decode_response(&prior).unwrap(), expected);
 
-        // The family's tags are a closed set and `0x07` is the next tag the
+        // The family's tags are a closed set and `0x08` is the next tag the
         // family has not assigned: a byte no version of the walk may read as a
         // section is a typed refusal. (`0x04` was this probe's value until
         // E-TX12 assigned it to the gathered extent's no-copy block, `0x05`
-        // until E-TX13 assigned it to the attachment landing view, and `0x06`
-        // until E-TX14 assigned it to the kept-frame landing entry — exactly
-        // the drift the closed set exists to make visible.)
+        // until E-TX13 assigned it to the attachment landing view, `0x06`
+        // until E-TX14 assigned it to the kept-frame landing entry, and `0x07`
+        // until E-SB2 assigned it to the stage buffer per-stage window —
+        // exactly the drift the closed set exists to make visible.)
         let mut unknown_tag = frame.clone();
         let tag_at = unknown_tag.len() - 2;
-        unknown_tag[tag_at] = 0x07;
+        unknown_tag[tag_at] = 0x08;
         assert!(matches!(
             CommandCodec::decode_response(&unknown_tag).unwrap_err(),
-            CodecError::UnknownCapabilityTail(0x07)
+            CodecError::UnknownCapabilityTail(0x08)
         ));
     }
 
@@ -6708,6 +6780,7 @@ mod tests {
                     supports_render_kept_frame_landing: false,
                     supports_render_stage_buffers: false,
                     max_render_stage_buffers: 0,
+                    max_render_stage_buffers_per_stage: 0,
                     supports_render_stage_buffer_namespace_split: false,
                     max_passes: 2,
                     supports_threads_exact: true,
@@ -7093,6 +7166,7 @@ mod tests {
             supports_render_kept_frame_landing: false,
             supports_render_stage_buffers: false,
             max_render_stage_buffers: 0,
+            max_render_stage_buffers_per_stage: 0,
             supports_render_stage_buffer_namespace_split: false,
             max_passes: 1,
             supports_threads_exact: true,

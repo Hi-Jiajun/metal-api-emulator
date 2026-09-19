@@ -52,6 +52,47 @@ pub(crate) fn attachment_dimension_window(limits: &vk::PhysicalDeviceLimits) -> 
     ]
 }
 
+/// The stage-buffer window one device states (`research/docs/23` §3.3, §117
+/// E-SB2).
+///
+/// The contract's ceiling ([`MAX_RENDER_STAGE_BUFFERS`]) is a *review* bound —
+/// it is the set-level floor Vulkan states for a two-stage pipeline's storage
+/// buffers — while the number a stage can actually carry is the device's own:
+/// the spec's per-stage floor for storage buffers is four, and a device is free
+/// to report exactly that. So the rail declares the smaller of the two per
+/// stage, the pair's sum as the list bound, and the device's per-set window
+/// beside them for the arrangement check [`crate::render`] runs before it
+/// builds a descriptor set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StageBufferWindow {
+    /// Stage buffer declarations one *stage* may carry.
+    pub(crate) per_stage: u32,
+    /// Stage buffer declarations one *pass* may carry across both stages.
+    pub(crate) list: u32,
+    /// Storage-buffer descriptors one descriptor *set* may hold. The reviewed
+    /// arrangement gives each stage its own set, so a stage's list only has to
+    /// fit this window; a translated pair whose two stages share one set has to
+    /// fit both lists in it, which is what [`crate::render`] checks per set.
+    pub(crate) per_set: u32,
+}
+
+/// The window `research/docs/23` §117 states from one device's limits.
+///
+/// `per_stage` is `min(MAX_RENDER_STAGE_BUFFERS, maxPerStageDescriptorStorageBuffers)`;
+/// the list bound is two stages' worth of it, because a render pass has exactly
+/// two stages. Both numbers are read from the selected device rather than
+/// restated, so a narrow device declares a narrow window instead of one it
+/// would have to refuse by name at pipeline-layout time.
+pub(crate) fn stage_buffer_window(limits: &vk::PhysicalDeviceLimits) -> StageBufferWindow {
+    let per_stage =
+        (MAX_RENDER_STAGE_BUFFERS as u32).min(limits.max_per_stage_descriptor_storage_buffers);
+    StageBufferWindow {
+        per_stage,
+        list: per_stage.saturating_mul(2),
+        per_set: limits.max_descriptor_set_storage_buffers,
+    }
+}
+
 /// The largest instance count the instancing increment executes
 /// (`research/docs/23` §3.3, v31).
 ///
@@ -293,7 +334,14 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // footprint, indices below the contract bound — so a wider request is
         // refused by core admission rather than silently narrowed.
         supports_render_stage_buffers: true,
-        max_render_stage_buffers: MAX_RENDER_STAGE_BUFFERS as u32,
+        // The window is the device's own answer, clamped by the review ceiling
+        // (`research/docs/23` §117, E-SB2): a stage carries at most
+        // `min(MAX_RENDER_STAGE_BUFFERS, maxPerStageDescriptorStorageBuffers)`
+        // declarations, a pass at most twice that, and the set each stage's
+        // bindings land in at most the device's
+        // `maxDescriptorSetStorageBuffers` (`stage_buffer_window`).
+        max_render_stage_buffers: stage_buffer_window(limits).list,
+        max_render_stage_buffers_per_stage: stage_buffer_window(limits).per_stage,
         // The folded shape is executed (`research/docs/23` §3.3, E-TX9): the
         // rail publishes one canonical arrangement for it
         // ([`metal_api_vulkan::stage_buffer_namespace_layout`], the vertex
@@ -856,6 +904,83 @@ mod tests {
         ));
     }
 
+    /// The per-stage stage-buffer window is the device's own answer
+    /// (`research/docs/23` §117, E-SB2): the review ceiling clamped by
+    /// `maxPerStageDescriptorStorageBuffers`, the pair's sum as the list bound,
+    /// and the device's per-set window beside them. A device at the spec's
+    /// four-slot per-stage floor declares four rather than the review's eight —
+    /// the number a pipeline layout can actually carry — and a device whose
+    /// per-stage window is wider than the review's is capped by the review.
+    #[test]
+    fn the_stage_buffer_window_is_the_ceiling_clamped_by_the_device() {
+        let core_floor = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_storage_buffers: 4,
+            max_descriptor_set_storage_buffers: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            stage_buffer_window(&core_floor),
+            StageBufferWindow {
+                per_stage: 4,
+                list: 8,
+                per_set: 8,
+            },
+            "a device at the core per-stage floor declares four, not the review's eight"
+        );
+
+        let lavapipe = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_storage_buffers: 1_015_808,
+            max_descriptor_set_storage_buffers: 1_015_808,
+            ..Default::default()
+        };
+        assert_eq!(
+            stage_buffer_window(&lavapipe),
+            StageBufferWindow {
+                per_stage: MAX_RENDER_STAGE_BUFFERS as u32,
+                list: metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u32,
+                per_set: 1_015_808,
+            },
+            "the review ceiling caps a wider device at eight per stage and sixteen in the list"
+        );
+
+        let between = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_storage_buffers: 6,
+            max_descriptor_set_storage_buffers: 16,
+            ..Default::default()
+        };
+        assert_eq!(
+            stage_buffer_window(&between),
+            StageBufferWindow {
+                per_stage: 6,
+                list: 12,
+                per_set: 16,
+            },
+            "a device between the floor and the ceiling states its own per-stage number"
+        );
+    }
+
+    /// The mapped capability snapshot carries the window the helper states, so
+    /// a consumer reads the same numbers the rail enforces.
+    #[test]
+    fn the_stage_buffer_capability_carries_the_device_window() {
+        let limits = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_storage_buffers: 10,
+            max_descriptor_set_storage_buffers: 12,
+            ..Default::default()
+        };
+        let capabilities = capabilities_from_limits(&limits);
+        assert!(capabilities.supports_render_stage_buffers);
+        assert_eq!(
+            capabilities.max_render_stage_buffers_per_stage,
+            MAX_RENDER_STAGE_BUFFERS as u32
+        );
+        assert_eq!(
+            capabilities.max_render_stage_buffers,
+            metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u32
+        );
+        assert!(capabilities.declares_render_stage_buffer_per_stage_ceiling());
+    }
+
     #[test]
     fn capabilities_mapping_uses_the_tightest_descriptor_limit() {
         let limits = vk::PhysicalDeviceLimits {
@@ -915,10 +1040,21 @@ mod tests {
         // the shape bit is declared beside them because this rail arranges the
         // two stages' buffers in different descriptor slots.
         assert!(capabilities.supports_render_stage_buffers);
+        // The stage-buffer window is the device's own answer (`research/docs/23`
+        // §117, E-SB2): this snapshot's device states twelve per-stage and ten
+        // per-set storage buffers, so the review ceiling caps the per-stage
+        // window at eight and the list bound at the pair's sixteen — a wider
+        // list than the eight this snapshot used to state, which is exactly the
+        // shape the increment admits.
         assert_eq!(
-            capabilities.max_render_stage_buffers,
+            capabilities.max_render_stage_buffers_per_stage,
             MAX_RENDER_STAGE_BUFFERS as u32
         );
+        assert_eq!(
+            capabilities.max_render_stage_buffers,
+            metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS as u32
+        );
+        assert!(capabilities.declares_render_stage_buffer_per_stage_ceiling());
         assert!(capabilities.supports_render_stage_buffer_namespace_split);
         assert!(capabilities.declares_render_stage_buffer_namespace_split());
         // The gathered extent (`research/docs/23` §3.3, E-TX10): the three

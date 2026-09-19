@@ -2560,8 +2560,18 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     // compute case.
     case "compute-buffer-v41":
         expectedIDs = ["render_declaring_landing_view"]
+    // The per-stage stage-buffer ceiling (`research/docs/23` §117, E-SB2): the
+    // same declaring pass as v34 — the reviewed witness-free copy kernel over
+    // the 2x2 attachment's own sixteen-byte view — beside the render case whose
+    // two stages declare thirteen `[[buffer(n)]]` slots between them. That
+    // render case names the two Vulkan rails alone (this rail's reviewed
+    // modules bind one slot per stage, so it declares no per-stage window and
+    // refuses the pair by name), so this oracle validates and executes the
+    // declaring pass as an ordinary compute case.
+    case "compute-buffer-v42":
+        expectedIDs = ["render_declaring_stage_buffer_per_stage"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v41 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v42 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
