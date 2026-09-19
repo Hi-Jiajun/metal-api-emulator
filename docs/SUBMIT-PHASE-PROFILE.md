@@ -31,6 +31,15 @@ never one line per draw:
 
 ```text
 PHASE submit n=256 total_us=... admit_us=... plan_us=... pool_us=... resource_build_us=... record_us=... queue_submit_us=... fence_wait_us=... fence_wait_idle_n=... fence_wait_idle_us=... fence_wait_blocked_n=... fence_wait_blocked_us=... fence_wait_timeout_n=... read_updates_us=... render_total_us=... render_setup_us=... render_record_us=... render_submit_us=... render_wait_us=... render_wait_idle_n=... render_wait_idle_us=... render_wait_blocked_n=... render_wait_blocked_us=... render_wait_timeout_n=... render_readback_us=... writebacks_us=... settle_us=... fence_wait_skipped_n=... plan_settle_us=... render_us=...
+
+PHASE submit n=256 ... readback_rect_n=... readback_rect_bytes=...
+readback_rect_extent_bytes=... readback_full_n=... readback_full_bytes=...
+readback_switch_n=... readback_shape_n=... readback_bounds_n=...
+readback_whole_n=... setup_admits_us=... setup_attachments_us=...
+setup_depth_stencil_us=... setup_render_pass_us=... setup_textures_us=...
+setup_stage_buffers_us=... setup_pipeline_us=... setup_readbacks_us=...
+setup_inputs_us=... setup_command_pool_us=... reuse_hit_n=... reuse_miss_n=...
+reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=...
 ```
 
 Every µs field is a **sum over that line's own window**, not a mean, with three
@@ -74,6 +83,33 @@ have their own setup and readback).
 | `settle` | terminal observation, completion-record insert, health synchronisation |
 | `plan_settle` | the aggregate `plan + pool + settle` |
 | `render` | the aggregate `render_setup + render_record + render_submit + render_wait + render_readback` |
+| `setup_admits` | inside `render_setup`: the admissions the rail re-runs on the request |
+| `setup_attachments` | inside `render_setup`: the colour attachments' images, or the resident targets a pass borrows |
+| `setup_depth_stencil` | inside `render_setup`: the depth/stencil surface, its resolve target and the readbacks that face lands in |
+| `setup_render_pass` | inside `render_setup`: the render pass, the seed render pass and both framebuffers |
+| `setup_textures` | inside `render_setup`: the sampled textures, their uploads, samplers and descriptor set |
+| `setup_stage_buffers` | inside `render_setup`: the stage buffers, their sets and the layouts those sets occupy |
+| `setup_pipeline` | inside `render_setup`: the two shader modules, the pipeline layout and the graphics pipeline |
+| `setup_readbacks` | inside `render_setup`: the readback plan and the stored attachments' destinations |
+| `setup_inputs` | inside `render_setup`: the caller-held streams, the previous-byte buffers and the indirect commands |
+| `setup_command_pool` | inside `render_setup`: the command pool and its command buffer |
+
+The ten `setup_*` fields are the one nested split in the line: they divide
+`render_setup` itself, so `sum(setup_*) <= render_setup_us` and the difference is
+the seam between those regions — the plan of the whole setup, which stays
+charged to the bar that encloses them. A round that reads them can say *which*
+part of a pass's assembly a change moved, which is what the render-setup reuse
+increment (`docs/RENDER-SETUP-REUSE.md`) needed and what the bar alone could not
+answer.
+
+The `reuse_*` fields are counts, not times, and they partition every offscreen
+pass that reached the shape cache: `reuse_hit_n` passes were served the shader
+modules, pipeline layout and pipeline a pass of the same shape built before,
+`reuse_miss_n` built their own and cached them, `reuse_mismatch_n` were refused
+by the full comparison after a digest collision, `reuse_unkeyed_n` could not
+state an exact key at all (and so were never looked up or cached), and
+`reuse_disabled_n` ran with `METAL_API_VULKAN_RENDER_SETUP_CACHE=0`. A reading
+with `reuse_hit_n=0` is only meaningful beside the other four.
 
 `plan_settle` is printed as one field because it is the answer to a question
 about the *rail* rather than about the device: of the CPU time a submission
