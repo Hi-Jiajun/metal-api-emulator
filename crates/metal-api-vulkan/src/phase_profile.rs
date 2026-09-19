@@ -42,6 +42,8 @@
 //!   reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=...
 //!   pool_hit_n=... pool_miss_n=... pool_disabled_n=... pool_return_n=...
 //!   pool_drop_n=...
+//!   import_hit_n=... import_miss_n=... import_disabled_n=... import_return_n=...
+//!   import_drop_n=...
 //!   render_offscreen_n=... render_present_n=...
 //!   ```
 //!
@@ -520,6 +522,31 @@ pub(crate) fn note_texture_pool(outcome: crate::render_texture_pool::PoolOutcome
     });
 }
 
+/// Count one sampled declaration's use of the pooled owner-window import
+/// (`crate::render_import_pool`) for the emitting thread's window.
+///
+/// The five outcomes partition every declaration that reaches the mechanism:
+/// the pool held this window's import and handed it over, it held none and the
+/// declaration imported the range itself, the switch was off, or a completed
+/// pass handed an import back and the pool kept it (or destroyed it instead).
+#[inline]
+pub(crate) fn note_import_pool(outcome: crate::render_import_pool::ImportOutcome) {
+    if !enabled() {
+        return;
+    }
+    use crate::render_import_pool::ImportOutcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            ImportOutcome::Hit => local.import_hit_n += 1,
+            ImportOutcome::Miss => local.import_miss_n += 1,
+            ImportOutcome::Disabled => local.import_disabled_n += 1,
+            ImportOutcome::Returned => local.import_return_n += 1,
+            ImportOutcome::Dropped => local.import_drop_n += 1,
+        }
+    });
+}
+
 /// Which shape one executed render pass had: the offscreen rail the five
 /// `render_*` children were placed for, or the present rail, whose own setup,
 /// recording and readback are the residual's [`Phase::RenderPresent`].
@@ -577,6 +604,13 @@ struct Local {
     pool_disabled_n: u64,
     pool_return_n: u64,
     pool_drop_n: u64,
+    /// The sampled declarations this window's passes made, by what
+    /// `crate::render_import_pool` answered.
+    import_hit_n: u64,
+    import_miss_n: u64,
+    import_disabled_n: u64,
+    import_return_n: u64,
+    import_drop_n: u64,
     /// The render passes this window's submissions executed, by shape. The two
     /// do not share a cost shape, so a bar reading has to name its population.
     render_offscreen_n: u64,
@@ -610,6 +644,11 @@ impl Default for Local {
             pool_disabled_n: 0,
             pool_return_n: 0,
             pool_drop_n: 0,
+            import_hit_n: 0,
+            import_miss_n: 0,
+            import_disabled_n: 0,
+            import_return_n: 0,
+            import_drop_n: 0,
             render_offscreen_n: 0,
             render_present_n: 0,
         }
@@ -707,6 +746,11 @@ impl Local {
         let pool_disabled_n = std::mem::take(&mut self.pool_disabled_n);
         let pool_return_n = std::mem::take(&mut self.pool_return_n);
         let pool_drop_n = std::mem::take(&mut self.pool_drop_n);
+        let import_hit_n = std::mem::take(&mut self.import_hit_n);
+        let import_miss_n = std::mem::take(&mut self.import_miss_n);
+        let import_disabled_n = std::mem::take(&mut self.import_disabled_n);
+        let import_return_n = std::mem::take(&mut self.import_return_n);
+        let import_drop_n = std::mem::take(&mut self.import_drop_n);
         let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
         let render_present_n = std::mem::take(&mut self.render_present_n);
         self.window = 0;
@@ -727,6 +771,9 @@ impl Local {
              reuse_disabled_n={reuse_disabled_n} pool_hit_n={pool_hit_n} \
              pool_miss_n={pool_miss_n} pool_disabled_n={pool_disabled_n} \
              pool_return_n={pool_return_n} pool_drop_n={pool_drop_n} \
+             import_hit_n={import_hit_n} import_miss_n={import_miss_n} \
+             import_disabled_n={import_disabled_n} import_return_n={import_return_n} \
+             import_drop_n={import_drop_n} \
              render_offscreen_n={render_offscreen_n} \
              render_present_n={render_present_n}",
             readback.rect_n,

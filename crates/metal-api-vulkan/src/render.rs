@@ -10049,6 +10049,9 @@ fn execute_offscreen_render_with_retains(
             // The sampled textures' pooled backing retires with the same
             // fence (`crate::render_texture_pool`).
             objects.release_pooled_textures();
+            // The owner-window imports retire with the same fence
+            // (`crate::render_import_pool`).
+            objects.release_imported_windows();
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -10776,6 +10779,9 @@ pub(crate) fn execute_present_render<'a>(
             // backing back through the same fence
             // (`crate::render_texture_pool`).
             objects.release_pooled_textures();
+            // The owner-window imports retire with the same fence
+            // (`crate::render_import_pool`).
+            objects.release_imported_windows();
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -11049,6 +11055,19 @@ struct SampledTextureObjects {
     /// The owner-window buffer a no-copy texture is copied out of, or `None`
     /// for the two uploaded arms.
     copy_source: Option<(vk::Buffer, vk::DeviceMemory)>,
+    /// The owner window's import this texture holds, keyed by its own range
+    /// (`crate::render_import_pool`), or `None` for a declaration whose source
+    /// is not a borrowed window and for a declaration that ran with the switch
+    /// off. `Some` means the buffer and its imported memory are given back to
+    /// the pool when the pass is destroyed instead of being released, which is
+    /// what makes the next declaration of the same window pay no
+    /// `vkAllocateMemory` over the owner's pages.
+    imported: Option<crate::render_import_pool::ImportKey>,
+    /// The requirement the device stated for that window when it was imported,
+    /// which is what the lease's capacity check is re-made against on a hit
+    /// (`crate::render_import_pool::Imported::requirements_size`). Zero for
+    /// every declaration that holds no import.
+    import_requirements: u64,
     /// The colour attachment this texture is a pass-entry snapshot of, or
     /// `None` for every other arm (`research/docs/23` §118, E-TX15). `Some`
     /// means the image starts `UNDEFINED` and is filled by the pre-pass
@@ -13391,23 +13410,34 @@ impl<'a> OffscreenObjects<'a> {
             };
             // The imported buffer's lifetime is the pass's: the copy reads it
             // until the fence signals, so it is destroyed with the image.
+            // An import the pool served (or an import this pass made itself,
+            // which the pass may hand back) is recorded beside the handles so
+            // the teardown can return it instead of releasing it
+            // (`crate::render_import_pool`).
+            let mut import_key = None;
+            let mut import_requirements = 0;
             let copy_source = match &texture.source {
                 RenderInputSource::Borrowed { window, .. } => {
                     // The import is its own region of `setup_textures`: it is
                     // the one arm that allocates a buffer *and* a memory object
                     // per declaration per pass, and no pooled or cached path
-                    // covers it today (`crate::phase_profile`).
+                    // covered it before `crate::render_import_pool` did
+                    // (`crate::phase_profile`).
                     let _import = crate::phase_profile::Bar::enter(
                         crate::phase_profile::Phase::TextureImport,
                     );
-                    let imported = self.import_host_pointer_buffer(
+                    let imported = self.import_owner_window(
                         window,
                         vk::BufferUsageFlags::TRANSFER_SRC,
                         "render texture",
                     );
                     drop(_import);
                     match imported {
-                        Ok(source) => Some(source),
+                        Ok((imported, key)) => {
+                            import_key = Some(key);
+                            import_requirements = imported.requirements_size;
+                            Some((imported.buffer, imported.memory))
+                        }
                         Err(error) => {
                             unsafe {
                                 self.context.device.destroy_image(image, None);
@@ -13553,6 +13583,8 @@ impl<'a> OffscreenObjects<'a> {
                 snapshot_from,
                 slot: texture.slot,
                 pooled: pooled_key,
+                imported: import_key,
+                import_requirements,
                 entry_layout,
                 requirements,
             });
@@ -14575,6 +14607,38 @@ impl<'a> OffscreenObjects<'a> {
         }
     }
 
+    /// Hand the owner-window imports back to the pool once this pass's work has
+    /// retired on the device.
+    ///
+    /// Called after the fence, beside [`Self::release_reusable`] and
+    /// [`Self::release_pooled_textures`] and for the same reason: no command
+    /// buffer is still reading the owner's pages, so the next declaration of
+    /// the same window may take the import and skip the driver's own
+    /// `vkAllocateMemory` over that range (`crate::render_import_pool`). The
+    /// pass's own teardown then has nothing to release for these fields —
+    /// `copy_source` and the key are both taken here — while a declaration the
+    /// pool did not serve (the switch was off, or the range does not fit the
+    /// cap) keeps its objects and releases them exactly as it always did.
+    fn release_imported_windows(&mut self) {
+        for texture in &mut self.textures {
+            let Some(key) = texture.imported.take() else {
+                continue;
+            };
+            let Some((buffer, memory)) = texture.copy_source.take() else {
+                continue;
+            };
+            let outcome = self.context.give_render_import_back(
+                key,
+                crate::render_import_pool::Imported {
+                    buffer,
+                    memory,
+                    requirements_size: texture.import_requirements,
+                },
+            );
+            crate::phase_profile::note_import_pool(outcome);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_pipeline(
         &mut self,
@@ -15031,9 +15095,9 @@ impl<'a> OffscreenObjects<'a> {
                 bytes,
                 name,
             ),
-            RenderInputSource::Borrowed { window, .. } => {
-                self.import_host_pointer_buffer(window, usage, name)
-            }
+            RenderInputSource::Borrowed { window, .. } => self
+                .import_host_pointer_buffer(window, usage, name)
+                .map(|(buffer, memory, _requirements_size)| (buffer, memory)),
             // The pass-entry snapshot arm is a *texture* source
             // (`research/docs/23` §118, E-TX15): its bytes live in the
             // attachment image the device copies before the pass opens, so a
@@ -15068,7 +15132,7 @@ impl<'a> OffscreenObjects<'a> {
         window: &BorrowedView,
         usage: vk::BufferUsageFlags,
         name: &'static str,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), ProviderError> {
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, u64), ProviderError> {
         let Some(host) = self.context.external_memory_host.as_ref() else {
             // Resolution asked the same question before this point; the second
             // line of defence keeps a directly-constructed request fail-closed
@@ -15159,7 +15223,57 @@ impl<'a> OffscreenObjects<'a> {
                 &error.to_string(),
             ));
         }
-        Ok((buffer, memory))
+        Ok((buffer, memory, requirements.size))
+    }
+
+    /// The import one sampled declaration's borrowed window needs: the pool's
+    /// own copy of the same range when it holds one, or the fresh import
+    /// otherwise (`crate::render_import_pool`).
+    ///
+    /// The key is the range and the usage the *driver* is handed, so a hit is
+    /// the same import the fresh path would have made — the same buffer over
+    /// the owner's same pages, and the same memory object. The lease's capacity
+    /// check is re-made on a hit against the requirement the entry carries, so
+    /// a pooled import cannot bind a window the fresh path would have refused.
+    fn import_owner_window(
+        &self,
+        window: &BorrowedView,
+        usage: vk::BufferUsageFlags,
+        name: &'static str,
+    ) -> Result<
+        (
+            crate::render_import_pool::Imported,
+            crate::render_import_pool::ImportKey,
+        ),
+        ProviderError,
+    > {
+        let key = crate::render_import_pool::ImportKey::new(window.pointer, window.len, usage);
+        let (pooled, outcome) = self.context.take_render_import(key);
+        crate::phase_profile::note_import_pool(outcome);
+        if let Some(imported) = pooled {
+            let capacity = u64::try_from(window.capacity).unwrap_or(u64::MAX);
+            if imported.requirements_size > capacity {
+                imported.destroy(&self.context.device);
+                return Err(execution_refusal(
+                    &format!("import {name} host memory"),
+                    &format!(
+                        "one buffer needs {} imported bytes but the lease reserves {}",
+                        imported.requirements_size, window.capacity
+                    ),
+                ));
+            }
+            return Ok((imported, key));
+        }
+        let (buffer, memory, requirements_size) =
+            self.import_host_pointer_buffer(window, usage, name)?;
+        Ok((
+            crate::render_import_pool::Imported {
+                buffer,
+                memory,
+                requirements_size,
+            },
+            key,
+        ))
     }
 
     /// Provide the transfer source an attachment's previous contents leave for

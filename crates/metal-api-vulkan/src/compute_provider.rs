@@ -4,8 +4,9 @@
 use crate::{
     execute_pool_sequence_with_status, render, Binding, BoundDispatch, FloatControls2Support,
     LandingTarget, LandingUpdate, PendingExecution, PoolBinding, PoolKey, PoolKind,
-    RenderSetupReuseCounts, RenderTexturePoolCounts, SequenceTail, SpirvFeaturePolicy,
-    TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
+    RenderImportPoolCounts, RenderSetupReuseCounts, RenderTexturePoolCounts, SequenceTail,
+    SpirvFeaturePolicy, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -2657,6 +2658,50 @@ impl VulkanComputeProvider {
         self.lock_executor()
             .expect("executor lock poisoned")
             .clear_render_texture_pool();
+    }
+
+    /// What the pooled owner-window imports have seen
+    /// (`crate::render_import_pool`): how many sampled declarations the pool
+    /// served and how many imported their own window, how many were asked while
+    /// the switch was off, and how many imports the pool kept, evicted or
+    /// dropped.
+    #[doc(hidden)]
+    pub fn render_import_pool_counts(&self) -> RenderImportPoolCounts {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .render_import_pool_counts()
+    }
+
+    /// Whether the pooled owner-window import is on for this provider: the
+    /// environment's answer unless a caller stated its own.
+    #[doc(hidden)]
+    pub fn render_import_pool_enabled(&self) -> bool {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .render_import_pool_enabled()
+    }
+
+    /// Turn the pooled owner-window import on or off for this provider.
+    ///
+    /// The process environment states the default
+    /// (`METAL_API_VULKAN_RENDER_IMPORT_POOL=0` turns it off); this is what a
+    /// test's own arms and a build without the environment state, so both arms
+    /// of a comparison can run against one device in one process. Switching it
+    /// off destroys what it held.
+    #[doc(hidden)]
+    pub fn set_render_import_pool(&self, enabled: bool) {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .set_render_import_pool(enabled);
+    }
+
+    /// Drop every pooled import: the contract surface they were built from
+    /// moved.
+    #[doc(hidden)]
+    pub fn invalidate_render_import_pool(&self) {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .clear_render_import_pool();
     }
 
     fn retire(&self, pending: PendingExecution) {
