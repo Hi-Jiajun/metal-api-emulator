@@ -1044,6 +1044,17 @@ pub(crate) struct RenderCapabilityBits {
     /// colour format list's *exact* shape (`reviewed_module`), so the shape
     /// matches no arm and is refused by name.
     pub(crate) supports_render_fragment_output_superset: bool,
+    /// The 16-bit shader capability pair (2026-09-20, census v48's LPF
+    /// pipeline). Always `false` here, and it is this rail's own answer rather
+    /// than a missing Apple-side reading: the reviewed modules are MSL text
+    /// this rail authored, none of them narrows a float to `half` and reads its
+    /// bits back, and this rail has no translation front end at all — a module
+    /// whose *SPIR-V* declares `Float16`/`Int16` is a module no `ReviewedModule`
+    /// arm was written for, so a registration that names one is refused by name
+    /// (`native_render_source_not_reviewed`). Declaring the bit would promise a
+    /// shape this rail's module table refuses, so the snapshot keeps the
+    /// contract's fail-closed default.
+    pub(crate) supports_render_half_capabilities: bool,
     /// Render-sampler bits, declared next to the render bits for the same
     /// reason: the snapshot and the rail cannot disagree about what this
     /// provider samples (`research/docs/23` §3.3, v70). The three fields come
@@ -1164,6 +1175,12 @@ pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityB
         // the bit would promise a shape this rail's module table refuses, so it
         // keeps the contract's fail-closed default.
         supports_render_fragment_output_superset: false,
+        // The 16-bit shader capability pair keeps the same fail-closed default
+        // (2026-09-20, census v48's LPF pipeline), and for the same kind of
+        // reason: this rail executes MSL modules it authored, none of which
+        // narrows a float to `half`, and it has no SPIR-V front end that could
+        // read a translated module's `OpCapability Float16`/`Int16` at all.
+        supports_render_half_capabilities: false,
         supports_render_texture_sampling: render_texture.supports_render_texture_sampling,
         max_render_textures: render_texture.max_render_textures,
         // The window is the bits' own field rather than a literal here
@@ -10980,6 +10997,11 @@ mod tests {
             max_attachment_dimension: bits.max_attachment_dimension,
             supported_color_formats: bits.supported_color_formats.clone(),
             supports_render_fragment_output_superset: bits.supports_render_fragment_output_superset,
+            // The 16-bit shader capability pair keeps the rail's own
+            // fail-closed answer (2026-09-20, census v48's LPF pipeline): no
+            // reviewed MSL module narrows a float to `half`, so the pair this
+            // face names has no module behind it here.
+            supports_render_half_capabilities: bits.supports_render_half_capabilities,
             max_vertex_buffers: vertex.max_vertex_buffers,
             supported_vertex_formats: vertex.supported_vertex_formats.clone(),
             supported_index_formats: vertex.supported_index_formats.clone(),
@@ -12038,6 +12060,15 @@ mod tests {
         // at the contract's fail-closed default beside the three fields above.
         assert!(!bits.supports_render_fragment_output_superset);
         assert!(!capabilities(&bits).declares_render_fragment_output_superset_support());
+
+        // The 16-bit shader capability pair is this rail's own boundary too
+        // (2026-09-20, census v48's LPF pipeline): the reviewed MSL modules are
+        // the rail's own text and none of them narrows a float to `half`, so a
+        // module that declares `OpCapability Float16`/`Int16` is outside this
+        // rail's reviewed set and struck out here — and the snapshot's own bit
+        // is what a consumer reads before it hands this provider such a module.
+        assert!(!bits.supports_render_half_capabilities);
+        assert!(!capabilities(&bits).declares_render_half_capabilities());
 
         let (trace, resources) = milestone_trace(LoadOp::Clear(sentinel()));
         capabilities(&bits)

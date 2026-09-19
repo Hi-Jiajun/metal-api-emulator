@@ -10181,6 +10181,28 @@ pub struct ProviderCapabilities {
     /// layout and the colour format list's exact shape and therefore refuses a
     /// module that stores a location the pass does not attach.
     pub supports_render_fragment_output_superset: bool,
+    /// Whether this snapshot's SPIR-V subset contains the two 16-bit shader
+    /// capabilities the translator emits for a module that narrows a float to
+    /// `half` and then reads its bits (2026-09-20, census v48's LPF pipeline):
+    /// `OpCapability Float16` and `OpCapability Int16`.
+    ///
+    /// The face is a *device* answer rather than a rail's own limit: Vulkan
+    /// admits a module that declares `Float16`/`Int16` exactly when the device
+    /// enabled `shaderFloat16` and `shaderInt16`, so the snapshot publishes the
+    /// conjunction the device creation enabled (`metal-api-vulkan`'s
+    /// `HalfShaderSupport`), and the provider re-asks the same reading at
+    /// registration (`render.rs::validate_module_capabilities`).
+    ///
+    /// It is one bit rather than one bit per capability because the module that
+    /// needs this face declares **both** — the pair is what the translator
+    /// emits together — and a device that reports one of the two cannot answer
+    /// for that module: the fail-closed reading of a frame that leaves the
+    /// section out is "this snapshot contains neither", which is exactly the
+    /// phase-1 refusal a device without the features gives. It MUST NOT be read
+    /// as "any module whose SPIR-V names a 16-bit type is executed": every
+    /// other capability keeps the refusal it had, and the two features
+    /// themselves are what the module's translation is checked against.
+    pub supports_render_half_capabilities: bool,
     /// Whether this snapshot executes a *layout-free* non-indexed draw whose
     /// count is above the milestone's three vertices (2026-09-19, census v45's
     /// `vertex_span` bucket). Defaults to `false`: a pass whose pipeline
@@ -10768,6 +10790,28 @@ impl ProviderCapabilities {
     /// the default "refuse a list the module does not fill" answer.
     pub fn declares_render_fragment_output_superset_support(&self) -> bool {
         self.supports_render_fragment_output_superset
+    }
+
+    /// Whether this snapshot's SPIR-V subset contains the 16-bit shader
+    /// capability pair (2026-09-20, census v48's LPF pipeline).
+    ///
+    /// The bit has no companion limit, so the predicate is the field itself:
+    /// it exists so the question is asked in the same place a consumer asks
+    /// every other "did this snapshot declare the shape" question, instead of
+    /// one call site reading the field and another comparing the rest of the
+    /// snapshot against its defaults. The capability frame writes the bit as
+    /// the tail's second family's own next block, so this predicate is also
+    /// what keeps a snapshot that declares *only* this bit from falling back to
+    /// the legacy payload and dropping the declaration on the wire.
+    ///
+    /// Like the superset fragment interface's predicate beside it, this one is
+    /// deliberately *not* part of [`Self::declares_render_support`]: the
+    /// attachment-side fields that predicate reads keep their own readings, and
+    /// a snapshot that never spoke about these capabilities keeps the
+    /// fail-closed "a module that declares them is not inside this subset"
+    /// answer.
+    pub fn declares_render_half_capabilities(&self) -> bool {
+        self.supports_render_half_capabilities
     }
 
     /// Whether this snapshot executes a layout-free non-indexed draw whose
@@ -17345,6 +17389,7 @@ mod tests {
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
             supports_render_fragment_output_superset: false,
+            supports_render_half_capabilities: false,
             supports_render_vertex_count_above_triangle: false,
             supports_render_instancing: false,
             max_render_instances: 0,
@@ -22954,6 +22999,25 @@ mod tests {
         let default = render_capabilities();
         assert!(!default.supports_render_fragment_output_superset);
         assert!(!default.declares_render_fragment_output_superset_support());
+
+        // The 16-bit shader capability pair (2026-09-20, census v48's LPF
+        // pipeline) is the same shape of reading: a snapshot that never spoke
+        // about it must be read as "a module that declares `Float16`/`Int16` is
+        // not inside this subset", the bit defaults to `false`, and setting the
+        // bit is the only way to flip either answer. The pair is *not* one of
+        // the attachment-side fields either: a device that enables both features
+        // changes what a module may declare, not what a pass may attach.
+        assert!(!default.supports_render_half_capabilities);
+        assert!(!default.declares_render_half_capabilities());
+
+        let mut half = default.clone();
+        half.supports_render_half_capabilities = true;
+        assert!(half.declares_render_half_capabilities());
+        assert_eq!(half.max_color_attachments, default.max_color_attachments);
+        assert_eq!(
+            half.supported_color_formats,
+            default.supported_color_formats
+        );
 
         let mut declared = default.clone();
         declared.supports_render_fragment_output_superset = true;

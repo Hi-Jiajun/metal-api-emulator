@@ -934,6 +934,32 @@ const CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL: u8 = 0x0E;
 /// new consumer reading an old frame keeps the same one.
 const CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL: u8 = 0x0F;
 
+/// Tag, inside the tail's second family, of the 16-bit shader capability pair's
+/// block (2026-09-20, census v48's LPF pipeline).
+///
+/// The section follows the per-stage sampled-texture window's block and carries
+/// one bool: whether this snapshot's SPIR-V subset contains the capability pair
+/// the translator emits for a module that narrows a float to `half` and reads
+/// its bits back — `OpCapability Float16` and `OpCapability Int16`
+/// ([`ProviderCapabilities::supports_render_half_capabilities`]).
+///
+/// It carries one bool rather than one bit per capability for the reason the
+/// field's own documentation states: the module that needs the face declares
+/// **both**, and a device that reports one of the two features cannot answer
+/// for it, so the conjunction is the whole of what a consumer can act on. The
+/// two readings the backend derives it from (`shaderFloat16`, `shaderInt16`)
+/// stay apart where they are taken, one policy bit each, because the gate
+/// checks each `OpCapability` on its own.
+///
+/// The absent section is the older reading, and it is the fail-closed one: a
+/// frame that ends before it means "this snapshot contains neither
+/// capability", which is exactly what every pre-increment snapshot meant and
+/// exactly the phase-1 refusal a device without the features gives. That is why
+/// the section is the family's next tag rather than a widening of an existing
+/// block's payload, and why a snapshot that does not declare the pair writes
+/// nothing here.
+const CAPABILITY_RENDER_HALF_CAPABILITIES_TAIL: u8 = 0x10;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -1225,6 +1251,13 @@ impl CommandCodec {
                     // payload, or its declaration would be dropped on the wire
                     // and every consumer would keep refusing the shape by name.
                     || capabilities.declares_render_fragment_output_superset_support()
+                    // The 16-bit shader capability pair is a face of its own
+                    // (2026-09-20, census v48's LPF pipeline): a snapshot that
+                    // declares only it still has to write the extended
+                    // payload, or the declaration would be dropped on the wire
+                    // and every consumer would keep its own refusal by name for
+                    // a module the provider's subset does contain.
+                    || capabilities.declares_render_half_capabilities()
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -6349,6 +6382,12 @@ fn put_capabilities(
         // reads by position before the family's escape, or its window would be
         // dropped on the wire.
         || capabilities.declares_render_texture_per_stage_ceiling()
+        // The 16-bit shader capability pair joins the same guard for the same
+        // reason (2026-09-20, census v48's LPF pipeline): a snapshot whose only
+        // statement is this bit still has to write the heap/ICB half the
+        // decoder reads by position before the family's escape, or the
+        // declaration would be dropped on the wire.
+        || capabilities.declares_render_half_capabilities()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -6685,6 +6724,20 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL);
             encoder.u32(capabilities.max_render_textures_per_stage);
         }
+        // The 16-bit shader capability pair is the family's next tag and
+        // follows the per-stage window's block (2026-09-20, census v48's LPF
+        // pipeline). It carries one bool for the reason the constant above
+        // states — the question is "does this snapshot's SPIR-V subset contain
+        // the `Float16`/`Int16` pair", not "which of the two does it contain" —
+        // and a snapshot that does not declare the pair writes nothing here,
+        // so the decoder reads the missing section as `false`: the reading
+        // every pre-increment frame has, where a module that declares the pair
+        // is a module this provider's subset does not contain.
+        if capabilities.declares_render_half_capabilities() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_HALF_CAPABILITIES_TAIL);
+            encoder.bool(capabilities.supports_render_half_capabilities);
+        }
     }
     Ok(())
 }
@@ -6794,6 +6847,13 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // and reflected colour locations disagree would be refused by name
         // rather than executed against a module one side did not state.
         supports_render_fragment_output_superset: false,
+        // The 16-bit shader capability pair (2026-09-20, census v48's LPF
+        // pipeline) is the family's next block after the superset fragment
+        // interface: a legacy payload cannot carry it either, so it reads the
+        // fail-closed default — a module that declares `OpCapability
+        // Float16`/`Int16` is not inside this snapshot's SPIR-V subset, and a
+        // consumer keeps its own refusal by name for it.
+        supports_render_half_capabilities: false,
         max_passes,
         supports_threads_exact,
         supports_threadgroups,
@@ -6925,6 +6985,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_TEXTURE_DIMENSION_3D_TAIL => {}
             CAPABILITY_RENDER_FRAGMENT_OUTPUT_SUPERSET_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {}
+            CAPABILITY_RENDER_HALF_CAPABILITIES_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -6977,6 +7038,9 @@ fn decode_capability_extended_tail(
             }
             CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {
                 capabilities.max_render_textures_per_stage = decoder.u32()?;
+            }
+            CAPABILITY_RENDER_HALF_CAPABILITIES_TAIL => {
+                capabilities.supports_render_half_capabilities = decoder.bool()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

@@ -414,6 +414,14 @@ impl NativeMetalProvider {
                 // fail-closed default the contract starts from.
                 supports_render_fragment_output_superset: render_bits
                     .supports_render_fragment_output_superset,
+                // The 16-bit shader capability pair keeps the same fail-closed
+                // default as the superset interface above (2026-09-20, census
+                // v48's LPF pipeline), and for a reason of the same kind: this
+                // rail's reviewed MSL modules are the rail's own text and none
+                // of them narrows a float to `half`, so the shape matches no
+                // module and a registration that states it is refused by name
+                // (`render::native_render_source_not_reviewed`).
+                supports_render_half_capabilities: render_bits.supports_render_half_capabilities,
                 // Vertex input is executed by this rail as of the vertex-input
                 // increment: a pass that binds streams is translated into an
                 // `MTLVertexDescriptor` plus `setVertexBuffer` /
