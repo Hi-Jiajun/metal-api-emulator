@@ -1281,9 +1281,10 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// guest's own channel order is what the fragment stage reads.
     pub format: vk::Format,
     /// Tightly packed bytes one texel of those bytes occupies
-    /// (`research/docs/23` §113): four for the two four-component byte orders,
-    /// one and two for the narrow lanes. The upload derives its row pitch from
-    /// this, because a narrow surface's rows are not `width * 4` bytes apart
+    /// (`research/docs/23` §113/§107): four for the two four-component byte
+    /// orders, one and two for the narrow lanes, eight for the half-float
+    /// lane. The upload derives its row pitch from this, because a surface
+    /// whose texel is not four bytes wide is not `width * 4` bytes a row apart
     /// and the pre-v113 spelling would land every row after the first inside
     /// the previous one.
     pub texel_bytes: u64,
@@ -1308,7 +1309,8 @@ struct RenderTextureImage {
     width: u32,
     height: u32,
     /// Tightly packed bytes one texel occupies: four for the two
-    /// four-component byte orders, one and two for the narrow lanes.
+    /// four-component byte orders, one and two for the narrow lanes, eight for
+    /// the half-float lane.
     texel_bytes: u64,
 }
 
@@ -2721,9 +2723,10 @@ fn translated_texture_pairs(
                 .with_field("binding", index)
                 .with_field("format", FieldValue::Text(format!("{:?}", declared.format)))
                 .with_detail(
-                    "the render sampler uploads and reads an 8-bit unorm surface — the two \
-                     four-component byte orders (`rgba8_unorm`/`bgra8_unorm`) or the narrow \
-                     `r8_unorm`/`rg8_unorm` lanes — and refuses every other format by name",
+                    "the render sampler uploads and reads the lanes the provider's own frame \
+                     lists — the two four-component byte orders (`rgba8_unorm`/`bgra8_unorm`), \
+                     the narrow `r8_unorm`/`rg8_unorm` lanes and the eight-byte half-float \
+                     `rgba16_float` lane — and refuses every other format by name",
                 ));
         }
         // Whether the module samples this texture or texel-fetches it is the
@@ -5372,11 +5375,13 @@ fn resolve_render_textures<'a>(
                 .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
                 .with_detail(
-                    "the reviewed sampling module reads one 8-bit unorm surface in either \
-                     four-component byte order (`rgba8_unorm`/`bgra8_unorm`) or in the narrow \
-                     `r8_unorm`/`rg8_unorm` lanes; which byte holds which channel is the \
-                     view's own format fact, and a narrow format's missing channels are the \
-                     API's own fill (zero, and one for alpha)",
+                    "the reviewed sampling module reads the lanes the provider's own frame lists \
+                     — either four-component 8-bit byte order (`rgba8_unorm`/`bgra8_unorm`), the \
+                     narrow `r8_unorm`/`rg8_unorm` lanes, or the eight-byte half-float \
+                     `rgba16_float` lane; which byte holds which channel is the view's own \
+                     format fact, a narrow format's missing channels are the API's own fill \
+                     (zero, and one for alpha), and the wide lane's texels are four half \
+                     components rather than four 8-bit bytes",
                 ));
         }
         if view.texture_type != TextureType::D2
@@ -7524,28 +7529,35 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
 /// The `VkFormat` a sampled render texture's own `TextureFormat` names
 /// (`research/docs/23` §3.3, §107, §113).
 ///
-/// The four admitted formats are two four-byte 8-bit UNORM byte orders plus
-/// the one- and two-byte narrow lanes. The first pair is what the census's
-/// BGRA8 binds state (`evidence/gate3-census-v13-2026-09-17/`): the guest
-/// view's `B8G8R8A8_UNORM` texels are uploaded into the image the *name*
-/// selects, so the fragment stage reads the channels the guest's own view
-/// states and no component mapping is needed — [`crate::create_color_image_view`]
-/// leaves the descriptor's mapping at Vulkan's identity default. The narrow
-/// pair is the same rule one and two bytes wide
-/// (`evidence/gate3-census-v25b-2026-09-18/`): `VK_FORMAT_R8_UNORM` and
-/// `VK_FORMAT_R8G8_UNORM` carry the texel's own bytes, and Vulkan's sampling
-/// rule fills the channels the format lacks (zero for green/blue, one for
-/// alpha), which is what the fixture's expectation is derived from. A format
-/// outside the window is refused with the view's own name rather than uploaded
-/// under another.
+/// The five admitted formats are two four-byte 8-bit UNORM byte orders, the
+/// one- and two-byte narrow lanes, and the eight-byte half-float lane. The
+/// first pair is what the census's BGRA8 binds state
+/// (`evidence/gate3-census-v13-2026-09-17/`): the guest view's
+/// `B8G8R8A8_UNORM` texels are uploaded into the image the *name* selects, so
+/// the fragment stage reads the channels the guest's own view states and no
+/// component mapping is needed — [`crate::create_color_image_view`] leaves the
+/// descriptor's mapping at Vulkan's identity default. The narrow pair is the
+/// same rule one and two bytes wide (`evidence/gate3-census-v25b-2026-09-18/`):
+/// `VK_FORMAT_R8_UNORM` and `VK_FORMAT_R8G8_UNORM` carry the texel's own
+/// bytes, and Vulkan's sampling rule fills the channels the format lacks (zero
+/// for green/blue, one for alpha), which is what the fixture's expectation is
+/// derived from. The eight-byte lane is the width the last widening opened
+/// (`evidence/gate3-census-v44-2026-09-19/`): a `256x1`
+/// `R16G16B16A16_SFLOAT` guest view is uploaded as the four half-float
+/// components its own name states, so the sample carries the format's extended
+/// range (a value above one is a legal texel, and the 8-bit attachment it lands
+/// in is where the conversion's clamp is observable). A format outside the
+/// window is refused with the view's own name rather than uploaded under
+/// another.
 pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Format, ProviderError> {
     if !TextureFormat::RENDER_SAMPLED.contains(&format) {
         return Err(capability_refusal("render_texture_format_unsupported")
             .with_field("format", FieldValue::Text(format!("{format:?}")))
             .with_detail(
-                "the render sampler uploads and reads an 8-bit unorm surface — the two \
-                 four-component byte orders (`rgba8_unorm`/`bgra8_unorm`) or the narrow \
-                 `r8_unorm`/`rg8_unorm` lanes — and refuses every other format by name",
+                "the render sampler uploads and reads the lanes the provider's own frame lists \
+                 — the two four-component byte orders (`rgba8_unorm`/`bgra8_unorm`), the narrow \
+                 `r8_unorm`/`rg8_unorm` lanes and the eight-byte half-float `rgba16_float` lane \
+                 — and refuses every other format by name",
             ));
     }
     Ok(match format {
@@ -7553,11 +7565,14 @@ pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Form
         TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
         TextureFormat::R8Unorm => vk::Format::R8_UNORM,
         TextureFormat::R8G8Unorm => vk::Format::R8G8_UNORM,
+        // The eight-byte lane (`research/docs/23` §107, census v44's
+        // `texture_bind` bucket): the uploaded image and the sampled view are
+        // the half-float format the guest's own view names, so the sample
+        // carries the extended range and no byte-order question exists.
+        TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         // Refused above; the arm keeps the match exhaustive so a widened
         // contract format forces a decision here.
-        TextureFormat::R32Uint | TextureFormat::R32Float | TextureFormat::Rgba16Float => {
-            vk::Format::UNDEFINED
-        }
+        TextureFormat::R32Uint | TextureFormat::R32Float => vk::Format::UNDEFINED,
     })
 }
 
@@ -16491,16 +16506,17 @@ mod tests {
             vk::Format::B8G8R8A8_UNORM.as_raw()
         );
 
-        // A format outside the window — here the eight-byte `rgba16_float` texel
-        // the contract states for the attachment bridge — is refused by name,
+        // A format outside the window — here the single-component `r32_float`
+        // texel, the lane no sampled widening has admitted (`rgba16_float`
+        // joined the window with the eight-byte lane) — is refused by name,
         // with the declaration's own format in the fields.
         let mut other_format = sampled_pass(4);
         let mut view = sampled_texture_view(4, 4);
-        view.format = TextureFormat::Rgba16Float;
-        view.source = TextureSource::OwnedBytes(vec![0x5a; 4 * 4 * 8]);
+        view.format = TextureFormat::R32Float;
+        view.source = TextureSource::OwnedBytes(vec![0x5a; 4 * 4 * 4]);
         other_format.textures = vec![view];
         let mut wide_stages = reviewed_sampled_stages();
-        wide_stages.contract.textures[0].format = TextureFormat::Rgba16Float;
+        wide_stages.contract.textures[0].format = TextureFormat::R32Float;
         let refused = match prepare_render_request(
             &wide_stages,
             &other_format,

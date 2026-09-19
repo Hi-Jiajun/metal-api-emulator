@@ -4527,12 +4527,15 @@ impl FragmentTextureDefinition {
     }
 
     /// The `TextureFormat` this declaration names (`research/docs/23` §3.3,
-    /// §107, §113): the render sampler's four admitted lanes — the two
-    /// four-byte 8-bit UNORM byte orders and the two narrow formats. Which byte
-    /// holds which channel is the format's own fact, so the declared name
+    /// §107, §113): the four lanes the reviewed sampling *fixtures* spell — the
+    /// two four-byte 8-bit UNORM byte orders and the two narrow formats. Which
+    /// byte holds which channel is the format's own fact, so the declared name
     /// travels into the trace and the object rail's texture handle rather than
     /// being normalised to one of them; a narrow format's missing channels are
-    /// the API's own fill rather than a byte of its source.
+    /// the API's own fill rather than a byte of its source. The rails' window
+    /// also carries the eight-byte `rgba16_float` lane (2026-09-19); it has no
+    /// comparator expectation rule, so a suite that named it is refused by the
+    /// comparator rather than captured under a derivation nobody wrote.
     fn format(&self) -> Result<TextureFormat> {
         match self.format.as_str() {
             "rgba8_unorm" => Ok(TextureFormat::Rgba8Unorm),
@@ -4540,9 +4543,10 @@ impl FragmentTextureDefinition {
             "r8_unorm" => Ok(TextureFormat::R8Unorm),
             "rg8_unorm" => Ok(TextureFormat::R8G8Unorm),
             other => Err(format!(
-                "the reviewed sampling stage reads one 8-bit unorm surface, in either \
+                "the reviewed sampling fixtures read one 8-bit unorm surface, in either \
                  four-component byte order (rgba8_unorm/bgra8_unorm) or in the narrow \
-                 r8_unorm/rg8_unorm lanes, not {other:?}"
+                 r8_unorm/rg8_unorm lanes — the eight-byte rgba16_float lane has no \
+                 comparator expectation rule — not {other:?}"
             )
             .into()),
         }

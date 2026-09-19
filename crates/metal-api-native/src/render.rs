@@ -1246,16 +1246,17 @@ pub(crate) const MAX_RENDER_TEXTURES: u32 = metal_api_core::provider::MAX_RENDER
 /// The texture formats this rail's reviewed sampling table names: one
 /// `rgba8_unorm` texel.
 ///
-/// The Vulkan rail widened the same table to the two 8-bit four-component
-/// byte orders the contract's [`TextureFormat::RENDER_SAMPLED`] names
-/// (`research/docs/23` §107, the census's BGRA8 binds). This rail's table stays
-/// at the one format its review covers, so a `bgra8_unorm` sampled texture is
-/// refused here by name at admission (`render_texture_format_unsupported`)
-/// instead of being executed as an unmeasured claim. The reviewed MSL sibling
-/// samples a `texture2d<float>` — the pixel format is the plan's own fact — so
-/// an `MTLPixelFormat::BGRA8Unorm` texture would be the mechanical widening,
-/// and the Apple-side self-test reading is what would have to land with it,
-/// exactly as the present/stage-buffer flips state.
+/// The Vulkan rail widened the same table to every lane the contract's
+/// [`TextureFormat::RENDER_SAMPLED`] names beyond the first: the second 8-bit
+/// byte order, the narrow lanes and the eight-byte half-float lane
+/// (`research/docs/23` §107/§113). This rail's table stays at the one format
+/// its review covers, so a `bgra8_unorm`, `r8_unorm`, `rg8_unorm` or
+/// `rgba16_float` sampled texture is refused here by name at admission
+/// (`render_texture_format_unsupported`) instead of being executed as an
+/// unmeasured claim. The reviewed MSL sibling samples a `texture2d<float>` —
+/// the pixel format is the plan's own fact — so the mechanical widening would
+/// be the pixel format's own name, and the Apple-side self-test reading is what
+/// would have to land with it, exactly as the present/stage-buffer flips state.
 pub(crate) const SUPPORTED_RENDER_TEXTURE_FORMATS: [TextureFormat; 1] = [TextureFormat::Rgba8Unorm];
 
 /// The present bits this provider declares as of the present-track flip.
@@ -8808,20 +8809,25 @@ mod tests {
         assert_eq!(error.slug, "render_texture_source_unsupported");
     }
 
-    /// The narrow lanes are the *other* rail's widening and stay refused here
-    /// (`research/docs/23` §113).
+    /// The lanes the *other* rail widened are outside this one and stay refused
+    /// here (`research/docs/23` §113/§107).
     ///
-    /// Metal can express both formats (`.r8Unorm` / `.rg8Unorm`), but this rail
-    /// executes its reviewed MSL module and declares exactly the formats that
-    /// review covers; a snapshot that listed a format it refuses would be a
-    /// claim without a reading. So both narrow formats keep the format
-    /// refusal, with the same slug and the same fields as every other
-    /// unadmitted format, and the refusal happens before the first Metal
-    /// object exists (the plan step is where it lands).
+    /// Metal can express all three formats (`.r8Unorm` / `.rg8Unorm` /
+    /// `.rgba16Float`), but this rail executes its reviewed MSL module and
+    /// declares exactly the formats that review covers; a snapshot that listed
+    /// a format it refuses would be a claim without a reading. So every lane
+    /// beyond the reviewed `rgba8_unorm` texel keeps the format refusal, with
+    /// the same slug and the same fields as every other unadmitted format, and
+    /// the refusal happens before the first Metal object exists (the plan step
+    /// is where it lands).
     #[test]
-    fn the_narrow_sampled_formats_stay_refused_by_name() {
+    fn the_formats_the_reviewed_module_does_not_read_stay_refused_by_name() {
         let sampled = sampled_pipeline();
-        for format in [TextureFormat::R8Unorm, TextureFormat::R8G8Unorm] {
+        for format in [
+            TextureFormat::R8Unorm,
+            TextureFormat::R8G8Unorm,
+            TextureFormat::Rgba16Float,
+        ] {
             let mut pass = sampled_pass(4);
             let mut view = sampled_texture_view(4);
             view.format = format;
@@ -9068,14 +9074,19 @@ mod tests {
             bits.supported_render_texture_formats,
             vec![TextureFormat::Rgba8Unorm]
         );
-        // The narrow lanes belong to the other rail (`research/docs/23` §113):
-        // Metal can express `.r8Unorm` / `.rg8Unorm`, but this rail's table is
-        // the reviewed MSL module's window, so a snapshot that listed either
-        // one would claim a shape whose Apple-side reading does not exist yet.
-        for narrow in [TextureFormat::R8Unorm, TextureFormat::R8G8Unorm] {
+        // The narrow lanes and the eight-byte half-float lane belong to the
+        // other rail (`research/docs/23` §113/§107): Metal can express
+        // `.r8Unorm` / `.rg8Unorm` / `.rgba16Float`, but this rail's table is
+        // the reviewed MSL module's window, so a snapshot that listed any of
+        // them would claim a shape whose Apple-side reading does not exist yet.
+        for wider in [
+            TextureFormat::R8Unorm,
+            TextureFormat::R8G8Unorm,
+            TextureFormat::Rgba16Float,
+        ] {
             assert!(
-                !bits.supported_render_texture_formats.contains(&narrow),
-                "{narrow:?} belongs to the widened rail, not this one"
+                !bits.supported_render_texture_formats.contains(&wider),
+                "{wider:?} belongs to the widened rail, not this one"
             );
         }
         // The gathered extent is this rail's own boundary rather than a

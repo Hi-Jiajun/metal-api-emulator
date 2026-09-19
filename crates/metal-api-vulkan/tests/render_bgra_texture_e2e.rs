@@ -702,25 +702,26 @@ fn the_shapes_beside_the_window_keep_their_named_refusals() {
         "bgra texture",
     );
 
-    // Another format: the eight-byte `rgba16_float` texel the contract states
-    // for the attachment bridge. The registration's own format walk refuses it
-    // before any device object exists — the declaration names a format this
-    // rail does not upload — and the fields name the binding and the format.
+    // Another format: the single-component `r32_float` texel, the lane the
+    // window never widened to (`rgba16_float` joined it with the eight-byte
+    // lane). The registration's own format walk refuses it before any device
+    // object exists — the declaration names a format this rail does not
+    // upload — and the fields name the binding and the format.
     let (vertex, fragment) = translated_pair(&executor, FRAGMENT_AIR, FRAGMENT_ENTRY);
     let refused = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
-            contract: contract(TextureFormat::Rgba16Float),
+            contract: contract(TextureFormat::R32Float),
             vertex,
             fragment,
             logical_digest: digest(b"wide texture"),
         })
-        .expect_err("the rail names two byte orders and no other sampled format");
+        .expect_err("the rail names the sampled lanes and no other format");
     eprintln!("wide format refused: {refused:?}");
     assert_eq!(refused.slug, "render_texture_format_unsupported");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
     assert_eq!(
         refused.fields.get("format"),
-        Some(&FieldValue::Text("Rgba16Float".to_owned()))
+        Some(&FieldValue::Text("R32Float".to_owned()))
     );
     assert_eq!(
         refused.fields.get("binding"),

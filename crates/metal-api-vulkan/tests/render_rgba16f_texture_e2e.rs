@@ -1,41 +1,42 @@
-//! The render sampler's narrow channel lanes (`research/docs/23` §3.3, §113),
-//! the shape census v25b/v26 named as a contract-level door: a draw whose
-//! `[[texture(0)]]` bind is an `R8_UNORM` guest view.
+//! The render sampler's eight-byte half-float lane (`research/docs/23` §3.3,
+//! §107), the shape census v44's `texture_bind` bucket named as the last
+//! contract-level door: a draw whose `[[texture(3)]]` bind is a
+//! `R16G16B16A16_SFLOAT` guest view.
 //!
-//! The census sentence (`evidence/gate3-census-v25b-2026-09-18/`, the
-//! `texture_bind` bucket) states the canonical pass's texture as one
-//! single-sample, non-arrayed 2D view with one descriptor and an identity
-//! channel mapping, while the bind is one `R8_UNORM` texel — the same
-//! *sampled-format* question one byte wide instead of four. This test is the
-//! Vulkan rail's executable half of the widening, and it is deliberately
-//! sharper than "the frame changed":
+//! The census sentence (`evidence/gate3-census-v44-2026-09-19/`, 285 records,
+//! every one of them a `256x1` view) states the canonical pass's texture as one
+//! single-sample, non-arrayed 2D view with one descriptor, an identity channel
+//! mapping and one of the provider's own frame's texel formats, while the bind
+//! is eight bytes a texel. This test is the Vulkan rail's executable half of
+//! the widening, and it is deliberately sharper than "the frame changed":
 //!
 //! * the fragment stage reads one whole channel of each of four texels, so a
-//!   texture whose sixteen single-byte texels are all different makes every
-//!   channel of the frame falsifiable at once — red is texel (0,0)'s byte and
-//!   green/blue are the *fill* channels the format does not carry, which a
-//!   rail that logged the byte into the wrong lane would land elsewhere;
+//!   4x4 texture whose sixteen texels carry four chosen values makes every
+//!   channel of the frame falsifiable at once;
+//! * the values are half floats rather than bytes: red is **2.5**, which the
+//!   8-bit attachment clamps to `0xff`, while the first byte of that half's own
+//!   encoding is `0x00` — a rail that uploaded the texel as four bytes, or read
+//!   its leading byte as a normalised one, lands a different frame;
+//! * blue is **-0.5**, the same falsifier in the other direction (clamped to
+//!   `0x00` while its leading byte is `0xb8`);
 //! * the trace rail and the object rail over one provider land that frame byte
 //!   for byte;
-//! * another texture moves the frame, so the reading measures the upload rather
-//!   than the run;
-//! * the `rgba8_unorm` sibling of the *same* geometry lands the same red byte
-//!   with its own three channels beside it, so the narrow lane is the same
-//!   texel vocabulary rather than a second colour space;
-//! * and the eight-byte format the render sampler still does not admit keeps
-//!   its named refusal.
+//! * another texture moves every sampled channel, so the reading measures the
+//!   upload rather than the run;
+//! * and the capability frame the consumer reads is asserted to carry the lane,
+//!   so the widening the class gate answers from is the one this rail executes.
 
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
     ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
-    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue, LoadOp,
-    OperationId, PipelineId, ProviderError, ProviderErrorClass, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SamplerAddressMode,
-    SamplerFilter, SamplerPolicy, SemanticDigest, StoreOp, TextureAccess, TextureBindingContract,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexLayout, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, LoadOp, OperationId,
+    PipelineId, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest,
+    StoreOp, TextureAccess, TextureBindingContract, TextureFormat, TextureSource, TextureType,
+    TextureView, TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
-use metal_api_core::{provider_api as objects, ComputeExecutor, Device};
+use metal_api_core::provider_api as objects;
+use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
     RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage, VulkanComputeProvider,
     VulkanExecutor,
@@ -53,20 +54,20 @@ const VERTEX_ENTRY: &str = "render_fullscreen_triangle";
 const COPY_WORD_AIR: &str =
     include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word.ll");
 
-/// The same fragment stage the byte-order increment reads through: it samples
-/// four texels of its own texture and returns one *whole channel* of each
+/// The same fragment stage the other lane tests read through: it samples four
+/// texels of its own texture and returns one *whole channel* of each
 /// (`red = (0,0).x`, `green = (1,0).y`, `blue = (0,1).z`, `alpha = (1,1).w`).
-/// The narrow lane's reading uses the first three of those to show what the
-/// format carries and what the API fills.
+/// The format is the bind's own fact, so the same reviewed module reads an
+/// `r8_unorm` byte, an `rgba8_unorm` texel and this eight-byte one.
 const FRAGMENT_ENTRY: &str = "render_sample_texture_2d_bgra_channels";
 const FRAGMENT_AIR: &str = include_str!("fixtures/render_sample_texture_2d_bgra_channels.frag.ll");
 
-const ATTACHMENT_VIEW: ViewId = ViewId::new(940);
-const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(941);
-const SCRATCH_VIEW: ViewId = ViewId::new(942);
-const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(943);
-const TEXTURE_VIEW: ViewId = ViewId::new(944);
-const TEXTURE_ALLOCATION: AllocationId = AllocationId::new(945);
+const ATTACHMENT_VIEW: ViewId = ViewId::new(950);
+const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(951);
+const SCRATCH_VIEW: ViewId = ViewId::new(952);
+const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(953);
+const TEXTURE_VIEW: ViewId = ViewId::new(954);
+const TEXTURE_ALLOCATION: AllocationId = AllocationId::new(955);
 
 /// 4x4, the extent of both the attachment and the sampled texture: the rail's
 /// window requires the two to agree, and every sample stands on a texel centre.
@@ -81,51 +82,93 @@ const MODULE_SAMPLER: SamplerPolicy = SamplerPolicy {
     address: SamplerAddressMode::ClampToEdge,
 };
 
-/// Which bytes the fixture's sixteen narrow texels carry: one pattern whose
-/// every texel is distinct, and a second that moves them all.
+/// Which values the fixture's 4x4 texture carries, and what the attachment
+/// lands for them.
+///
+/// One texel is eight bytes of four half floats, so a pattern is stated as the
+/// four values the fragment stage *reads* plus the value every other channel of
+/// the texture carries. The half encodings and the expected 8-bit bytes are
+/// written out beside the values: the fixture's expectation is the API's own
+/// conversion of the half's exact value, and each byte below is that conversion
+/// (`round(clamp(value, 0, 1) * 255)`, ties to even) with no tie in the set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Pattern {
-    /// Texel `(i, j)` is the byte `0x10 * (1 + i + 4 * j)`, so no two texels of
-    /// the 4x4 surface share a value and every sampled channel is
-    /// distinguishable from every fill channel.
+    /// red 2.5, green 0.6, blue -0.5, alpha 0.25; every other channel 0.8.
     Primary,
-    /// The same shape one step up: `0x20 + 0x10 * (i + 4 * j)`.
+    /// The same shape one step elsewhere: red 0.9, green 0.4, blue 1.5,
+    /// alpha 0.0.
     Moved,
 }
 
 impl Pattern {
-    /// The byte one texel of the 4x4 surface carries under this pattern.
-    fn byte(self, i: u32, j: u32) -> u8 {
+    /// The four values the fragment stage's four samples reach, in the order
+    /// they reach it: red, green, blue, alpha.
+    fn sampled(self) -> [f32; 4] {
         match self {
-            Self::Primary => (0x10 * (1 + i + 4 * j)) as u8,
-            Self::Moved => (0x20 + 0x10 * (i + 4 * j)) as u8,
+            Self::Primary => [2.5, 0.6, -0.5, 0.25],
+            Self::Moved => [0.9, 0.4, 1.5, 0.0],
+        }
+    }
+
+    /// The half-float bytes of [`Self::sampled`], as
+    /// `VK_FORMAT_R16G16B16A16_SFLOAT` spells them (IEEE 754 binary16, little
+    /// endian in memory). Written out rather than computed because the standard
+    /// library has no stable `f16`; the assertion beside them pins each pair to
+    /// the value it encodes.
+    fn sampled_half(self) -> [[u8; 2]; 4] {
+        match self {
+            // 2.5 = 0x4100, 0.6 = 0x38cd, -0.5 = 0xb800, 0.25 = 0x3400.
+            Self::Primary => [[0x00, 0x41], [0xcd, 0x38], [0x00, 0xb8], [0x00, 0x34]],
+            // 0.9 = 0x3b33, 0.4 = 0x3666, 1.5 = 0x3e00, 0.0 = 0x0000.
+            Self::Moved => [[0x33, 0x3b], [0x66, 0x36], [0x00, 0x3e], [0x00, 0x00]],
+        }
+    }
+
+    /// The channel value every texel carries where the fragment stage does not
+    /// read it: 0.8, whose 8-bit conversion (`0xcc`) is distinct from all four
+    /// sampled lanes of either pattern, so a channel or texel mix-up cannot
+    /// land the same frame.
+    fn fill(self) -> f32 {
+        0.8
+    }
+
+    /// The frame the attachment lands: the four sampled values' own 8-bit
+    /// conversion, in the attachment's channel order.
+    fn expected(self) -> [u8; 4] {
+        match self {
+            // 2.5 clamps to 1.0 = 0xff; 0.6 = 153 = 0x99; -0.5 clamps to 0.0 =
+            // 0x00; 0.25 = 64 = 0x40.
+            Self::Primary => [0xff, 0x99, 0x00, 0x40],
+            // 0.9 = 229 = 0xe5; 0.4 = 102 = 0x66; 1.5 clamps to 1.0 = 0xff;
+            // 0.0 = 0x00.
+            Self::Moved => [0xe5, 0x66, 0xff, 0x00],
         }
     }
 }
 
-/// The frame a `r8_unorm` texture lands under one pattern: red is texel (0,0)'s
-/// own byte, while green and blue are the channels the format does not carry —
-/// Vulkan's sampling rule fills them with zero — and alpha is the same rule's
-/// one. Every fragment samples the same four texels, so the whole attachment
-/// carries this one colour.
-fn expected_frame(pattern: Pattern) -> [u8; 4] {
-    [pattern.byte(0, 0), 0x00, 0x00, 0xff]
-}
-
 /// The 4x4 texture the fixture samples, in the memory layout the view names:
-/// one tightly packed byte per texel for `r8_unorm`, four for `rgba8_unorm`.
-fn texture_bytes(format: TextureFormat, pattern: Pattern) -> Vec<u8> {
-    let mut bytes =
-        Vec::with_capacity((EXTENT * EXTENT) as usize * format.bytes_per_texel() as usize);
+/// four half floats per texel, sixteen texels, tightly packed. The four texels
+/// the fragment stage reads are `(0,0).x`, `(1,0).y`, `(0,1).z` and `(1,1).w`;
+/// every other channel carries the pattern's fill value.
+fn texture_bytes(pattern: Pattern) -> Vec<u8> {
+    let half = pattern.sampled_half();
+    let fill = pattern.fill();
+    // 0.8 = 0x3a66.
+    let fill_half: [u8; 2] = [0x66, 0x3a];
+    assert_eq!(fill, 0.8, "the fill's own encoding below is 0.8's");
+    let mut bytes = Vec::with_capacity((EXTENT * EXTENT) as usize * 8);
     for j in 0..EXTENT {
         for i in 0..EXTENT {
-            let byte = pattern.byte(i, j);
-            match format {
-                TextureFormat::R8Unorm => bytes.push(byte),
-                TextureFormat::Rgba8Unorm => bytes.extend_from_slice(&[byte, 0x00, 0x00, 0xff]),
-                other => {
-                    panic!("the fixture's textures are one and four byte texels; not {other:?}")
-                }
+            let mut texel = [fill_half, fill_half, fill_half, fill_half];
+            match (i, j) {
+                (0, 0) => texel[0] = half[0],
+                (1, 0) => texel[1] = half[1],
+                (0, 1) => texel[2] = half[2],
+                (1, 1) => texel[3] = half[3],
+                _ => {}
+            }
+            for channel in texel {
+                bytes.extend_from_slice(&channel);
             }
         }
     }
@@ -194,7 +237,7 @@ fn compile_declaring_kernel(
         .function("copy_word")
         .expect("the fixture entry exists");
     provider
-        .compile_pipeline(&function, digest(b"narrow-texture-compute"))
+        .compile_pipeline(&function, digest(b"rgba16f-texture-compute"))
         .expect("the compute pipeline registers")
 }
 
@@ -225,7 +268,7 @@ fn sampled_texture_view(format: TextureFormat, pattern: Pattern) -> TextureView 
         array_length: 1,
         sample_count: 1,
         access: TextureAccess::Sampled,
-        source: TextureSource::OwnedBytes(texture_bytes(format, pattern)),
+        source: TextureSource::OwnedBytes(texture_bytes(pattern)),
     }
 }
 
@@ -346,7 +389,7 @@ fn trace_readback(
     compute: &CompiledComputePipeline,
     render: &CompiledComputePipeline,
     texture: TextureView,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<Vec<u8>, metal_api_core::provider::ProviderError> {
     let (trace, resources) = trace_for(provider, compute, render, vec![texture]);
     let admitted = provider
         .capabilities()
@@ -399,7 +442,7 @@ fn object_readback(
             format,
             u64::from(EXTENT),
             u64::from(EXTENT),
-            texture_bytes(format, pattern),
+            texture_bytes(pattern),
         )
         .expect("the sampled texture is declared");
     let command = device.new_command_queue().command_buffer();
@@ -407,7 +450,7 @@ fn object_readback(
         let declaring = device
             .compile_pipeline(PipelineCompileRequest {
                 entry_name: "copy_word".to_owned(),
-                logical_digest: digest(b"narrow-texture-object-declaring"),
+                logical_digest: digest(b"rgba16f-texture-object-declaring"),
                 source: ShaderSource::SanitizedLl(COPY_WORD_AIR.to_owned()),
             })
             .expect("the declaring kernel registers");
@@ -499,46 +542,77 @@ fn register(
         .expect("the sampled declaration registers")
 }
 
-/// Reading 1 (`research/docs/23` §113): the R8 bind enters the provider, the
-/// trace rail and the object rail land byte-identical frames, and the frame is
-/// the narrow texel's own byte in red with the format's fill in the other three
-/// lanes.
+/// Reading 1 (`research/docs/23` §107): the eight-byte bind enters the
+/// provider, the trace rail and the object rail land byte-identical frames, and
+/// the frame is the four half floats' own conversion — the two values outside
+/// the 8-bit range prove the texels were read as floats and not as bytes.
 #[test]
-fn the_r8_bind_executes_and_the_two_rails_land_the_same_frame() {
+fn the_rgba16_float_bind_executes_and_the_two_rails_land_the_same_frame() {
     let Some((executor, provider)) = executor_and_provider() else {
         return;
     };
+    // The frame the consumer's own class gate reads must carry the lane: the
+    // widening is answered from *this* list, not from a second table.
+    assert!(
+        provider
+            .capabilities()
+            .supported_render_texture_formats
+            .contains(&TextureFormat::Rgba16Float),
+        "the provider's capability frame states the eight-byte lane"
+    );
     let compute = compile_declaring_kernel(&provider, &executor);
-    let narrow = register(&provider, &executor, TextureFormat::R8Unorm, "r8 texture");
+    let wide = register(
+        &provider,
+        &executor,
+        TextureFormat::Rgba16Float,
+        "rgba16f texture",
+    );
 
-    let expected = expected_frame(Pattern::Primary);
-    let uploaded = texture_bytes(TextureFormat::R8Unorm, Pattern::Primary);
+    // The fixture's own bytes are the values the expectation derives from, and
+    // the two out-of-range values' leading bytes are the falsifier: red 2.5
+    // encodes as `00 41`, so a rail that read a texel's first byte as a
+    // normalised component would land `0x00` where the frame must carry `0xff`.
+    assert_eq!(
+        Pattern::Primary.sampled_half(),
+        [[0x00, 0x41], [0xcd, 0x38], [0x00, 0xb8], [0x00, 0x34]],
+        "the half encodings are the values beside them"
+    );
+    assert_eq!(Pattern::Primary.sampled()[0], 2.5);
+    assert_eq!(Pattern::Primary.sampled()[2], -0.5);
+
+    let expected = Pattern::Primary.expected();
+    let uploaded = texture_bytes(Pattern::Primary);
     eprintln!(
-        "r8 upload: {} bytes, texel (0,0) {}, texel (1,0) {}; expected frame {}",
+        "rgba16f upload: {} bytes, texel (0,0) {}, texel (0,1) {}; expected frame {}",
         uploaded.len(),
-        uploaded[0],
-        uploaded[1],
+        hex(&uploaded[0..8]),
+        hex(&uploaded[32..40]),
         hex(&expected)
     );
-    assert_eq!(uploaded.len(), (EXTENT * EXTENT) as usize);
     assert_eq!(
-        uploaded[4],
-        Pattern::Primary.byte(0, 1),
-        "the upload is tightly packed, one byte per texel"
+        uploaded.len(),
+        (EXTENT * EXTENT) as usize * 8,
+        "the upload is tightly packed, eight bytes per texel"
     );
-    assert_ne!(
-        uploaded[0], 0x00,
-        "the red lane has to carry a value the fill lanes do not"
+    assert_eq!(
+        &uploaded[32..40],
+        &[0x66, 0x3a, 0x66, 0x3a, 0x00, 0xb8, 0x66, 0x3a],
+        "texel (0,1) carries the fill in its first two channels and the sampled blue beside them"
     );
 
     let trace = trace_readback(
         &provider,
         &compute,
-        &narrow,
-        sampled_texture_view(TextureFormat::R8Unorm, Pattern::Primary),
+        &wide,
+        sampled_texture_view(TextureFormat::Rgba16Float, Pattern::Primary),
     )
-    .expect("the R8 bind executes");
-    let objects = object_readback(&provider, &narrow, TextureFormat::R8Unorm, Pattern::Primary);
+    .expect("the rgba16_float bind executes");
+    let objects = object_readback(
+        &provider,
+        &wide,
+        TextureFormat::Rgba16Float,
+        Pattern::Primary,
+    );
     eprintln!(
         "frames: trace {} object {} (expected {})",
         hex(&trace),
@@ -558,36 +632,46 @@ fn the_r8_bind_executes_and_the_two_rails_land_the_same_frame() {
         hex(&objects)
     );
     assert_eq!(trace, objects, "the two rails land one frame");
+    assert_ne!(
+        uniform_texel(&trace)[0],
+        uploaded[0],
+        "the red lane is the half's converted value, not the texel's first byte"
+    );
 }
 
-/// Reading 2 (`research/docs/23` §113): another texture moves the frame, so the
-/// reading is the upload and not the run — the fill lanes cannot move, because
-/// nothing in the source states them.
+/// Reading 2 (`research/docs/23` §107): another texture moves every sampled
+/// channel, so the reading is the upload and not the run.
 #[test]
-fn another_narrow_texture_moves_the_frame() {
+fn another_rgba16_float_texture_moves_the_frame() {
     let Some((executor, provider)) = executor_and_provider() else {
         return;
     };
     let compute = compile_declaring_kernel(&provider, &executor);
-    let narrow = register(&provider, &executor, TextureFormat::R8Unorm, "r8 texture");
+    let wide = register(
+        &provider,
+        &executor,
+        TextureFormat::Rgba16Float,
+        "rgba16f texture",
+    );
 
     let primary = trace_readback(
         &provider,
         &compute,
-        &narrow,
-        sampled_texture_view(TextureFormat::R8Unorm, Pattern::Primary),
+        &wide,
+        sampled_texture_view(TextureFormat::Rgba16Float, Pattern::Primary),
     )
     .expect("the primary texture executes");
     let moved = trace_readback(
         &provider,
         &compute,
-        &narrow,
-        sampled_texture_view(TextureFormat::R8Unorm, Pattern::Moved),
+        &wide,
+        sampled_texture_view(TextureFormat::Rgba16Float, Pattern::Moved),
     )
     .expect("the moved texture executes");
-    let moved_objects = object_readback(&provider, &narrow, TextureFormat::R8Unorm, Pattern::Moved);
+    let moved_objects =
+        object_readback(&provider, &wide, TextureFormat::Rgba16Float, Pattern::Moved);
 
-    let expected_moved = expected_frame(Pattern::Moved);
+    let expected_moved = Pattern::Moved.expected();
     eprintln!(
         "moved frames: trace {} object {} (expected {})",
         hex(&moved),
@@ -613,97 +697,5 @@ fn another_narrow_texture_moves_the_frame() {
         "the moved texture has to move the frame: {} vs {}",
         hex(&primary),
         hex(&moved)
-    );
-}
-
-/// Reading 3 (`research/docs/23` §113): the lane is the same sampled-texel
-/// vocabulary as the four-component formats — the `rgba8_unorm` sibling of the
-/// same geometry lands the same red byte, with its own three channels beside it
-/// — while the format the render sampler still refuses keeps its named refusal.
-#[test]
-fn the_narrow_lane_sits_beside_the_four_component_sibling() {
-    let Some((executor, provider)) = executor_and_provider() else {
-        return;
-    };
-    let compute = compile_declaring_kernel(&provider, &executor);
-    let narrow = register(&provider, &executor, TextureFormat::R8Unorm, "r8 texture");
-    let wide = register(
-        &provider,
-        &executor,
-        TextureFormat::Rgba8Unorm,
-        "rgba sibling",
-    );
-
-    let narrow_frame = trace_readback(
-        &provider,
-        &compute,
-        &narrow,
-        sampled_texture_view(TextureFormat::R8Unorm, Pattern::Primary),
-    )
-    .expect("the R8 bind executes");
-    let sibling_frame = trace_readback(
-        &provider,
-        &compute,
-        &wide,
-        sampled_texture_view(TextureFormat::Rgba8Unorm, Pattern::Primary),
-    )
-    .expect("the rgba8 sibling executes");
-    eprintln!(
-        "narrow {} sibling {}",
-        hex(&narrow_frame),
-        hex(&sibling_frame)
-    );
-    // Both stages read texel (0,0)'s red at their first sample, so the two
-    // frames share that byte; the sibling's other three lanes come from its own
-    // texture bytes while the narrow one's are the format's fill. Only the
-    // first three samples reach a lane this fixture writes — its fourth sample
-    // reads the alpha lane, which a narrow format's rule pins at one — so the
-    // narrow frame's three visible lanes are the byte and the two zero fills.
-    let narrow_colour = uniform_texel(&narrow_frame);
-    let sibling_colour = uniform_texel(&sibling_frame);
-    eprintln!(
-        "narrow colour {} sibling colour {}",
-        hex(&narrow_colour),
-        hex(&sibling_colour)
-    );
-    assert_eq!(
-        narrow_colour[0], sibling_colour[0],
-        "the red lane of the two frames is one texel's red byte"
-    );
-    assert_eq!(
-        narrow_colour[1..3],
-        [0x00, 0x00],
-        "the narrow frame's fill lanes are the format's own zero rule"
-    );
-    assert_eq!(
-        sibling_colour[1..3],
-        [0x00, 0x00],
-        "the sibling's own texture bytes carry the same three lanes here"
-    );
-
-    // A lane outside the window: the single-component `r32_float` texel —
-    // `rgba16_float` joined the window with the eight-byte lane, so the
-    // outside format this probe pins moved to the width the sampler never
-    // reads. The registration's own format walk refuses it before any device
-    // object exists, and the fields name the binding and the format.
-    let (vertex, fragment) = translated_pair(&executor, FRAGMENT_AIR, FRAGMENT_ENTRY);
-    let refused = provider
-        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
-            contract: contract(TextureFormat::R32Float),
-            vertex,
-            fragment,
-            logical_digest: digest(b"wide texture"),
-        })
-        .expect_err("the rail admits the sampled lanes and no other format");
-    eprintln!("wide format refused: {refused:?}");
-    assert_eq!(refused.slug, "render_texture_format_unsupported");
-    assert_eq!(refused.class, ProviderErrorClass::Capability);
-    assert_eq!(
-        refused.fields.get("format"),
-        Some(&FieldValue::Text("R32Float".to_owned()))
-    );
-    assert_eq!(
-        refused.fields.get("binding"),
-        Some(&FieldValue::Unsigned(0))
     );
 }

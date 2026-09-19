@@ -108,11 +108,12 @@ class RenderSamplerSuiteTests(unittest.TestCase):
     def test_a_texture_of_another_format_is_refused(self):
         def mutate(case):
             # `bgra8_unorm` is the widened window's second layout
-            # (`research/docs/23` §107, `test_suite_v33.py`); the format outside
-            # it is the eight-byte `rgba16_float` texel — the narrow lanes are
-            # admitted too (`research/docs/23` §113), so the refusal this pins is
-            # the *width* one rather than the four-component window.
-            case["fragment_textures"][0]["format"] = "rgba16_float"
+            # (`research/docs/23` §107, `test_suite_v33.py`) and the narrow lanes
+            # are admitted with it (§113); `rgba16_float` joined them with the
+            # eight-byte lane (2026-09-19), so the format this probe pins as
+            # *outside* the window moves to the single-component `r32_float`
+            # texel, which no sampled-lane widening has admitted.
+            case["fragment_textures"][0]["format"] = "r32_float"
         self.refused(mutate, "one 8-bit unorm surface")
 
     def test_the_shape_carries_no_other_state(self):
