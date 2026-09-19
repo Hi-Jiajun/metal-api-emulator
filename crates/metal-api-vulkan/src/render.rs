@@ -2798,6 +2798,15 @@ fn translated_texture_pairs(
     }
     let mut pairs = Vec::new();
     let mut static_read = 0_usize;
+    // Which of the weighed AIR static samplers some declaration ends up bound
+    // to (2026-09-20, the sampled-sampler-reuse arm): a module may well sample
+    // *several* textures through one `constexpr sampler` — the state is a
+    // value the frontend reuses, not a slot the module spends once — so the
+    // two lists no longer pair one-to-one. What the rail still holds is the
+    // other direction: an AIR sampler the module reads through that no
+    // declaration names is a state nothing binds, and that is refused by name
+    // below rather than left unbound.
+    let mut used_static = vec![false; static_samplers.len()];
     for binding in &reflection.bindings {
         if binding.kind != ResourceKind::Texture {
             continue;
@@ -3030,10 +3039,16 @@ fn translated_texture_pairs(
         // statement (`research/docs/23` §3.3, v100/v102), and the module has to
         // back it: a declaration naming a static state pairs with the module's
         // own AIR sampler, and one naming a runtime index pairs with the
-        // module's `[[sampler(n)]]` argument. The static halves therefore pair
-        // positionally — one AIR sampler per static sample, the rule C1b states
-        // — while the runtime halves pair by the Metal index the declaration
-        // names.
+        // module's `[[sampler(n)]]` argument. The runtime halves pair by the
+        // Metal index the declaration names; the static halves pair by the
+        // descriptor the module's *own* `OpSampledImage` names (2026-09-20, the
+        // sampled-sampler-reuse arm), and keep the positional rule C1b states —
+        // one AIR sampler per static sample, in the reflection's own order —
+        // where the module's own sites name *nothing* for the texture, which is
+        // exactly the reading the runtime's class gate takes over the same
+        // words. The positional rule may not claim a texture whose own sites
+        // name a sampler: it spends one AIR sampler per texture it reaches, and
+        // a texture the module pairs by name would spend the state of another.
         let sampler = if let Some(sampler_binding) = declared.runtime_sampler {
             let Some(runtime) = runtime_samplers.iter().find(|runtime| {
                 matches!(
@@ -3058,6 +3073,48 @@ fn translated_texture_pairs(
                     ));
             };
             *runtime
+        // The module's own statement first (2026-09-20): the sampler descriptor
+        // this texture's sites name.
+        } else if let Some(named) = descriptor_reads
+            .as_ref()
+            .and_then(|reads| reads.image_samplers.as_ref())
+            .and_then(|pairs| pairs.get(&(descriptor.set, descriptor.binding)))
+            .copied()
+        {
+            // A descriptor the module names is one of the weighed AIR static
+            // samplers, or it is some other form the declaration cannot state
+            // through them.
+            match static_slots.iter().position(|slot| *slot == named.1) {
+                // The declaration repeats the state the module's own AIR
+                // sampler carries: this is the pair, and the descriptor is
+                // bound to as many textures as name it.
+                Some(slot) if declared.sampler == Some(static_samplers[slot]) => {
+                    used_static[slot] = true;
+                    TranslatedSampler::Module {
+                        descriptor: static_slots[slot],
+                        policy: static_samplers[slot],
+                    }
+                }
+                // The module reads this texture through a *static* descriptor
+                // whose state the declaration does not repeat.
+                Some(slot) => {
+                    return Err(texture_sampler_refusal(
+                        declared.metal_binding,
+                        declared.sampler,
+                        Some(static_samplers[slot]),
+                    ));
+                }
+                // The module reads this texture through a descriptor that is
+                // not one of its AIR static samplers — a runtime
+                // `[[sampler(n)]]` argument, say — so a declaration stating the
+                // static arm disagrees with the module.
+                None => {
+                    return Err(mismatch(
+                        "the module samples a texture through a sampler descriptor that is not \
+                         one of its AIR static samplers",
+                    ));
+                }
+            }
         } else {
             let Some(policy) = static_samplers.get(static_read).copied() else {
                 return Err(mismatch(
@@ -3076,6 +3133,7 @@ fn translated_texture_pairs(
                     "the module samples a texture without a sampler descriptor",
                 ));
             };
+            used_static[static_read] = true;
             static_read += 1;
             TranslatedSampler::Module { descriptor, policy }
         };
@@ -3101,15 +3159,29 @@ fn translated_texture_pairs(
                 ));
         }
     }
-    if static_samplers.len() != static_read {
+    // The AIR static half's other direction (2026-09-20, the
+    // sampled-sampler-reuse arm): a state the module's own instructions read
+    // through that no declaration ends up bound to is a sampler the pass would
+    // create and never bind, so it is refused by name. The count identity this
+    // rule used to state — one AIR sampler per static sample — is what a module
+    // that reuses one `constexpr sampler` across several textures falsifies;
+    // what survives of it is the direction above, over the samplers the module
+    // actually reads through.
+    if used_static.iter().any(|used| !used) {
         return Err(reflection_mismatch_refusal(stage, entry)
             .with_field("field", FieldValue::Text("textures".to_owned()))
             .with_field(
                 "samplers",
                 FieldValue::Unsigned(static_samplers.len() as u64),
             )
-            .with_field("textures", FieldValue::Unsigned(static_read as u64))
-            .with_detail("this rail pairs one AIR static sampler with one sampled texture"));
+            .with_field(
+                "textures",
+                FieldValue::Unsigned(used_static.iter().filter(|used| **used).count() as u64),
+            )
+            .with_detail(
+                "every AIR static sampler the module's own instructions read through has to be \
+                 one a sampled texture declaration names",
+            ));
     }
     // The other direction of the runtime half: every sampler argument the
     // module binds has to be one a declaration pairs with. A module that binds
@@ -3952,6 +4024,13 @@ fn union_sources(
 
 /// What one module's own instructions state about the decorated descriptors it
 /// reads (`research/docs/23` §3.3, v105; E-RS5/v118).
+///
+/// How many producers one sample-site operand may stand behind before the
+/// pairing walk refuses to follow it — the same bound the runtime's own
+/// `descriptor_binding` states (`reims-vgpu`'s `DESCRIPTOR_CHAIN_LIMIT`), kept
+/// equal so the two rails answer one pairing over one module.
+const DESCRIPTOR_CHAIN_LIMIT: usize = 8;
+
 struct DescriptorReads {
     /// The use each decorated descriptor slot's *image* gets, exactly as
     /// [`DescriptorImageUse`] classifies it.
@@ -3964,6 +4043,24 @@ struct DescriptorReads {
     /// every AIR static sampler by name rather than bypassing one the module
     /// might read through.
     samplers: Option<std::collections::BTreeSet<(u32, u32)>>,
+    /// Which sampler descriptor each image descriptor is sampled through, as
+    /// the module's own `OpSampledImage` instructions state it (2026-09-20,
+    /// the sampled-sampler-reuse arm; `research/docs/23` §3.3's pairing rule).
+    ///
+    /// This is the pairing itself rather than the set above: one entry per
+    /// image slot, naming the sampler slot beside it in the same instruction.
+    /// `None` is the whole walk's answer when it cannot state the pairing —
+    /// an `OpSampledImage` whose image or sampler operand it cannot attach to
+    /// a decorated slot, or one image named beside two different samplers —
+    /// and the caller then keeps the positional rule it has always applied.
+    /// A texture this map *does* name is one the positional rule may not claim:
+    /// that rule spends one AIR static sampler per texture it reaches, so a
+    /// texture the module pairs by name would otherwise spend another texture's
+    /// state — the mixed stage's runtime-sampled `[[texture(1)]]` is the shape
+    /// that shows up as a shifted refusal the moment both rules run side by
+    /// side (`render_sampler_family_e2e`'s
+    /// `the_mixed_stage_still_answers_each_disagreement_by_name`).
+    image_samplers: Option<BTreeMap<(u32, u32), (u32, u32)>>,
 }
 
 /// The use each decorated descriptor slot's image gets in one module, and the
@@ -4310,6 +4407,46 @@ fn descriptor_reads(module: &[u8]) -> Option<DescriptorReads> {
     // by name.
     let mut sampler_reads = std::collections::BTreeSet::<(u32, u32)>::new();
     let mut samplers_decidable = true;
+    // The pairing half beside the set above (2026-09-20, the
+    // sampled-sampler-reuse arm): which sampler slot each image slot's own
+    // sites name. Built over the same instructions, and answered by *exactly*
+    // the rule the runtime's own `sampled_image_pairs` applies over the same
+    // words: the one producer chain an operand stands behind is the last
+    // `OpLoad`/`OpCopyObject` that defined it — not the fixpoint above, which
+    // resolves a `select` or a function argument as well — one image read
+    // through one sampler, and an operand this walk cannot attach to one
+    // decorated slot leaving the whole pairing unstated. The two rails state
+    // this pairing beside each other (the class gate declares the state, the
+    // registration holds the declaration to it), so a wider reading here would
+    // refuse a declaration the runtime's own walk stated positionally.
+    let mut image_samplers = BTreeMap::<(u32, u32), (u32, u32)>::new();
+    let mut pairing_decidable = true;
+    let mut single_sources = BTreeMap::<u32, u32>::new();
+    for (opcode, operands) in &instructions {
+        if (*opcode == spirv::Op::Load as u32 || *opcode == spirv::Op::CopyObject as u32)
+            && operands.len() >= 3
+        {
+            single_sources.insert(operands[1], operands[2]);
+        }
+    }
+    // The one decorated slot an operand's producer chain ends in, or `None`
+    // when the chain leaves the module's own instructions (the runtime's
+    // `descriptor_binding` bounded the same way, and with the same limit).
+    let sole_slot = |mut value: u32| -> Option<(u32, u32)> {
+        for _ in 0..DESCRIPTOR_CHAIN_LIMIT {
+            if let Some((Some(set), Some(binding))) = decorations.get(&value).copied() {
+                let mut slots = variable_slots.get(&value)?.iter().copied();
+                let first = slots.next()?;
+                return slots
+                    .next()
+                    .is_none()
+                    .then_some(first)
+                    .filter(|slot| *slot == (set, binding));
+            }
+            value = *single_sources.get(&value)?;
+        }
+        None
+    };
     for (opcode, operands) in &instructions {
         if *opcode == spirv::Op::SampledImage as u32 {
             let mut attributed = false;
@@ -4323,6 +4460,27 @@ fn descriptor_reads(module: &[u8]) -> Option<DescriptorReads> {
                 }
             }
             samplers_decidable &= attributed;
+            match (
+                operands.get(2).copied().and_then(sole_slot),
+                operands.get(3).copied().and_then(sole_slot),
+            ) {
+                (Some(image), Some(sampler)) => match image_samplers.entry(image) {
+                    // One image read through two samplers has no single
+                    // pairing the contract can state, so the whole walk
+                    // answers `None` and the caller keeps the positional
+                    // rule.
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if *entry.get() != sampler =>
+                    {
+                        pairing_decidable = false;
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(sampler);
+                    }
+                },
+                _ => pairing_decidable = false,
+            }
         }
         let (image, use_) = if *opcode == spirv::Op::SampledImage as u32 && operands.len() >= 3 {
             (operands[2], DescriptorImageUse::Sampled)
@@ -4354,6 +4512,7 @@ fn descriptor_reads(module: &[u8]) -> Option<DescriptorReads> {
     Some(DescriptorReads {
         images: uses,
         samplers: samplers_decidable.then_some(sampler_reads),
+        image_samplers: pairing_decidable.then_some(image_samplers),
     })
 }
 
