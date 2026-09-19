@@ -35,8 +35,11 @@
 //!   setup_admits_us=... setup_attachments_us=... setup_depth_stencil_us=...
 //!   setup_render_pass_us=... setup_textures_us=... setup_stage_buffers_us=...
 //!   setup_pipeline_us=... setup_readbacks_us=... setup_inputs_us=...
-//!   setup_command_pool_us=... reuse_hit_n=... reuse_miss_n=...
+//!   setup_command_pool_us=... texture_backing_us=... texture_upload_us=...
+//!   reuse_hit_n=... reuse_miss_n=...
 //!   reuse_mismatch_n=... reuse_unkeyed_n=... reuse_disabled_n=...
+//!   pool_hit_n=... pool_miss_n=... pool_disabled_n=... pool_return_n=...
+//!   pool_drop_n=...
 //!   ```
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
@@ -182,9 +185,23 @@ pub(crate) enum Phase {
     /// Inside `render_setup`: the command pool and the command buffer
     /// allocated from it.
     SetupCommandPool,
+    /// Inside `setup_textures`: the backing one sampled declaration's image
+    /// needs — `vkCreateImage`, `vkAllocateMemory` and `vkBindImageMemory`, or
+    /// nothing at all when `crate::render_texture_pool` hands one back.
+    ///
+    /// This bar and [`Phase::TextureUpload`] are *nested* inside
+    /// [`Phase::SetupTextures`] rather than beside it: they divide that bar's
+    /// own region, so they must never be added to the disjoint sum a reading
+    /// checks (`docs/TEXTURE-BACKING-POOL.md`).
+    TextureBacking,
+    /// Inside `setup_textures`: the texels' own trip into the backing — the
+    /// byte arms' `vkMapMemory`, copy and `vkUnmapMemory`. The no-copy and
+    /// pass-entry-snapshot arms write nothing here, because their bytes never
+    /// exist on the host.
+    TextureUpload,
 }
 
-const PHASE_COUNT: usize = Phase::SetupCommandPool as usize + 1;
+const PHASE_COUNT: usize = Phase::TextureUpload as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -215,6 +232,8 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "setup_readbacks",
     "setup_inputs",
     "setup_command_pool",
+    "texture_backing",
+    "texture_upload",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -348,6 +367,33 @@ pub(crate) fn note_reuse(outcome: crate::render_setup_reuse::Outcome) {
     });
 }
 
+/// Count one sampled declaration's use of the pooled backing
+/// (`crate::render_texture_pool`) for the emitting thread's window.
+///
+/// The four outcomes partition every declaration that reaches the mechanism:
+/// the pool held a backing of its shape and handed it over, it held none and
+/// the declaration built its own, the switch was off, or a pass handed a
+/// backing back and the pool destroyed it instead of holding it (the switch
+/// went off mid-pass, or the shape does not fit the cap). A round that reads
+/// `pool_hit_n=0` can tell which of the others it is looking at.
+#[inline]
+pub(crate) fn note_texture_pool(outcome: crate::render_texture_pool::PoolOutcome) {
+    if !enabled() {
+        return;
+    }
+    use crate::render_texture_pool::PoolOutcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            PoolOutcome::Hit => local.pool_hit_n += 1,
+            PoolOutcome::Miss => local.pool_miss_n += 1,
+            PoolOutcome::Disabled => local.pool_disabled_n += 1,
+            PoolOutcome::Returned => local.pool_return_n += 1,
+            PoolOutcome::Dropped => local.pool_drop_n += 1,
+        }
+    });
+}
+
 /// One thread's window of the profile.
 #[derive(Default)]
 struct Local {
@@ -371,6 +417,13 @@ struct Local {
     reuse_mismatch_n: u64,
     reuse_unkeyed_n: u64,
     reuse_disabled_n: u64,
+    /// The sampled declarations this window's passes made, by what
+    /// `crate::render_texture_pool` answered.
+    pool_hit_n: u64,
+    pool_miss_n: u64,
+    pool_disabled_n: u64,
+    pool_return_n: u64,
+    pool_drop_n: u64,
 }
 
 impl Local {
@@ -451,6 +504,11 @@ impl Local {
         let reuse_mismatch_n = std::mem::take(&mut self.reuse_mismatch_n);
         let reuse_unkeyed_n = std::mem::take(&mut self.reuse_unkeyed_n);
         let reuse_disabled_n = std::mem::take(&mut self.reuse_disabled_n);
+        let pool_hit_n = std::mem::take(&mut self.pool_hit_n);
+        let pool_miss_n = std::mem::take(&mut self.pool_miss_n);
+        let pool_disabled_n = std::mem::take(&mut self.pool_disabled_n);
+        let pool_return_n = std::mem::take(&mut self.pool_return_n);
+        let pool_drop_n = std::mem::take(&mut self.pool_drop_n);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
@@ -462,7 +520,9 @@ impl Local {
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
              reuse_hit_n={reuse_hit_n} reuse_miss_n={reuse_miss_n} \
              reuse_mismatch_n={reuse_mismatch_n} reuse_unkeyed_n={reuse_unkeyed_n} \
-             reuse_disabled_n={reuse_disabled_n}",
+             reuse_disabled_n={reuse_disabled_n} pool_hit_n={pool_hit_n} \
+             pool_miss_n={pool_miss_n} pool_disabled_n={pool_disabled_n} \
+             pool_return_n={pool_return_n} pool_drop_n={pool_drop_n}",
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
