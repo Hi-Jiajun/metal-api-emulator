@@ -1206,6 +1206,74 @@ pub(crate) fn note_render_batch(passes: u64) {
     });
 }
 
+/// Count one trace the run rail stated: a plan of two or more render passes
+/// (`REIMS_VGPU_RENDER_BATCH`), and how many passes it carried.
+///
+/// This is the population the three readings beside [`note_render_batch`]
+/// divide, and it is what makes `render_batch_n == 0` readable: a round whose
+/// run rail assembled runs while this counter is zero never handed the provider
+/// a trace with two passes in it, which is a fact about the *owner's* assembly
+/// rather than about a predicate here.
+#[inline]
+pub(crate) fn note_render_batch_trace(passes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.render_batch_traces_n += 1;
+        local.render_batch_traces_passes += passes;
+    });
+}
+
+/// Count one run this provider opened — a pass whose frame stays in the
+/// identity's image, so the pass after it may load it inside the same scope.
+///
+/// An opened run of one member executes the per-pass path, so this counter is
+/// larger than [`note_render_batch`]'s by exactly the openings no successor
+/// continued.
+#[inline]
+pub(crate) fn note_render_batch_open() {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| local.borrow_mut().render_batch_open_n += 1);
+}
+
+/// Count one pass in a stated run's trace that could not open a run at all, and
+/// whether the fact that stopped it was its own frame
+/// (`frame_not_kept`: the pass's frame does not stay in the identity's image).
+#[inline]
+pub(crate) fn note_render_batch_refusal(frame_not_kept: bool) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.render_batch_refused_n += 1;
+        if frame_not_kept {
+            local.render_batch_refused_frame_n += 1;
+        }
+    });
+}
+
+/// Count one pass that did not continue the run open before it, and whether the
+/// fact that stopped it was its own load (`load`: the pass does not open from
+/// the image its predecessor kept).
+#[inline]
+pub(crate) fn note_render_batch_break(load: bool) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.render_batch_broken_n += 1;
+        if load {
+            local.render_batch_broken_load_n += 1;
+        }
+    });
+}
+
 /// One thread's window of the profile.
 struct Local {
     ns: [u64; PHASE_COUNT],
@@ -1287,6 +1355,26 @@ struct Local {
     render_batch_passes_3_4: u64,
     render_batch_passes_5_8: u64,
     render_batch_passes_gt8: u64,
+    /// The *traces* the run rail stated (`render_batch_traces_n` plans of two or
+    /// more render passes, carrying `render_batch_traces_passes` passes), and
+    /// what became of their runs: how many opened (`render_batch_open_n`), how
+    /// many passes could not open one at all (`render_batch_refused_n`, of which
+    /// `_frame_n` did not keep their frame in the identity's image), and how many
+    /// passes did not continue an open run (`render_batch_broken_n`, of which
+    /// `_load_n` did not open from that image).
+    ///
+    /// The three divide the same population and their sum is a reading, not a
+    /// taxonomy: a trace whose second pass does not continue the first counts one
+    /// open and one break, and only `render_batch_n` above counts a run that was
+    /// actually carried as one submission scope (a run of one member executes
+    /// the per-pass path by construction, so it is not counted there).
+    render_batch_traces_n: u64,
+    render_batch_traces_passes: u64,
+    render_batch_open_n: u64,
+    render_batch_refused_n: u64,
+    render_batch_refused_frame_n: u64,
+    render_batch_broken_n: u64,
+    render_batch_broken_load_n: u64,
     /// The kept frames this window's landing-only entries delivered, and the
     /// bytes the owner's pages received.
     landing_n: u64,
@@ -1374,6 +1462,13 @@ impl Default for Local {
             render_batch_passes_3_4: 0,
             render_batch_passes_5_8: 0,
             render_batch_passes_gt8: 0,
+            render_batch_traces_n: 0,
+            render_batch_traces_passes: 0,
+            render_batch_open_n: 0,
+            render_batch_refused_n: 0,
+            render_batch_refused_frame_n: 0,
+            render_batch_broken_n: 0,
+            render_batch_broken_load_n: 0,
             landing_n: 0,
             landing_bytes: 0,
             staging_cached_n: 0,
@@ -1559,6 +1654,13 @@ impl Local {
         let render_batch_passes_3_4 = std::mem::take(&mut self.render_batch_passes_3_4);
         let render_batch_passes_5_8 = std::mem::take(&mut self.render_batch_passes_5_8);
         let render_batch_passes_gt8 = std::mem::take(&mut self.render_batch_passes_gt8);
+        let render_batch_traces_n = std::mem::take(&mut self.render_batch_traces_n);
+        let render_batch_traces_passes = std::mem::take(&mut self.render_batch_traces_passes);
+        let render_batch_open_n = std::mem::take(&mut self.render_batch_open_n);
+        let render_batch_refused_n = std::mem::take(&mut self.render_batch_refused_n);
+        let render_batch_refused_frame_n = std::mem::take(&mut self.render_batch_refused_frame_n);
+        let render_batch_broken_n = std::mem::take(&mut self.render_batch_broken_n);
+        let render_batch_broken_load_n = std::mem::take(&mut self.render_batch_broken_load_n);
         let landing_n = std::mem::take(&mut self.landing_n);
         let landing_bytes = std::mem::take(&mut self.landing_bytes);
         let staging_cached_n = std::mem::take(&mut self.staging_cached_n);
@@ -1638,6 +1740,13 @@ impl Local {
              render_batch_passes_3_4={render_batch_passes_3_4} \
              render_batch_passes_5_8={render_batch_passes_5_8} \
              render_batch_passes_gt8={render_batch_passes_gt8} \
+             render_batch_traces_n={render_batch_traces_n} \
+             render_batch_traces_passes={render_batch_traces_passes} \
+             render_batch_open_n={render_batch_open_n} \
+             render_batch_refused_n={render_batch_refused_n} \
+             render_batch_refused_frame_n={render_batch_refused_frame_n} \
+             render_batch_broken_n={render_batch_broken_n} \
+             render_batch_broken_load_n={render_batch_broken_load_n} \
              landing_n={landing_n} landing_bytes={landing_bytes} \
              staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \

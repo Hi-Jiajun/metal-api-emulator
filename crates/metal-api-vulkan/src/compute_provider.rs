@@ -21,7 +21,7 @@ use metal_api_core::provider::{
     ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
     ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, StoreOp, SubmissionId, TerminalState, TextureSource, TracePass,
+    StagedLease, StorageMode, SubmissionId, TerminalState, TextureSource, TracePass,
     ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
@@ -463,24 +463,94 @@ struct ResolvedOffscreenPass<'a> {
     stencil_view: Option<&'a BufferView>,
 }
 
-/// Whether one offscreen pass may *open* a run of passes a single submission
+/// Whether one colour attachment's stored frame **stays in the provider's own
+/// image** under the attachment's own `(allocation, view)` identity — the fact
+/// the pass after it states when it opens from that image with
+/// [`LoadOp::Resident`].
+///
+/// The store arm alone cannot state it. A pass that names the provider's target
+/// on *either* side renders into that image and stores its writes into it: the
+/// rail attaches the resident target for both resident arms and its store
+/// action is `STORE` for both (`render::attach_resident_target`), and the two
+/// arms disagree only about whether the bytes are *also* published — the
+/// resident store keeps them, the publishing store keeps them and answers the
+/// caller with them. So
+///
+/// * `StoreOp::Resident` keeps the frame and publishes nothing;
+/// * `StoreOp::Store`, `StoreOp::Borrowed` and `StoreOp::BorrowedLanding` keep
+///   the frame as well, and publish (or land) it beside;
+///
+/// while a pass whose load is a `Clear`, the caller's bytes or the guest's own
+/// pages *and* whose store is not `Resident` renders into a per-pass image: the
+/// bytes land wherever that store says and the identity's image is left holding
+/// what it held before. **That** is the shape a run may not carry — the pass
+/// after it would load an image this pass never wrote (`G3-B/B-1`).
+fn keeps_its_frame(attachment: &RenderAttachment) -> bool {
+    attachment.declares_resident_target()
+}
+
+/// Why one offscreen pass may not *open* a run of passes a single submission
 /// can carry (`REIMS_VGPU_RENDER_BATCH`).
 ///
-/// The head of a run is a pass that keeps its frame: every colour attachment
-/// stores into the provider's own image (`StoreOp::Resident`), so the pass
-/// after it may load those bytes without their ever leaving the device. A trace
-/// that carries an indirect replay is never a run — the replay states exactly
-/// one render pass — and neither is a pass that samples a view the trace's own
-/// earlier passes produced, because those bytes only exist once the producing
-/// pass's readback has run, which is exactly what a batch defers past its fence.
-fn offscreen_batch_candidate(pass: &RenderPassDescriptor, trace: &ComputeTrace) -> bool {
-    trace.indirect.is_none()
-        && pass.present.is_none()
-        && !samples_trace_production(pass)
-        && pass
-            .color_attachments
-            .iter()
-            .all(|attachment| attachment.store == StoreOp::Resident)
+/// Named rather than boolean so a round can read which population stayed on the
+/// per-pass path instead of only how many passes did: the counters that charge
+/// it are `render_batch_refused_n` and `render_batch_refused_frame_n`
+/// (`crate::phase_profile`), and `FrameNotKept` is the one this increment's
+/// predicate moved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchRefusal {
+    /// The pass's own frame does not stay in the identity's image
+    /// ([`keeps_its_frame`]): a trace that carried the pass after it would load
+    /// an image the pass never wrote.
+    FrameNotKept,
+    /// A present tail, an indirect replay, or a view this trace's own earlier
+    /// passes produced. Each of those is a shape a run may not carry: an
+    /// indirect replay states exactly one render pass, and a trace-owned
+    /// production's bytes only exist once the producing pass's readback has run,
+    /// which is exactly what a batch defers past its fence.
+    Other,
+}
+
+/// The head's refusal, or `None` when this pass may open a run.
+///
+/// The run's **last** member is the record that publishes: it loads the image
+/// the member before it kept and states the store arm its caller reads the
+/// frame from. Every member before it — the head included — must keep its own
+/// frame in that image, because the member after it opens from that image and
+/// nothing else carries the bytes between two passes of one submission.
+fn offscreen_batch_refusal(
+    pass: &RenderPassDescriptor,
+    trace: &ComputeTrace,
+) -> Option<BatchRefusal> {
+    if trace.indirect.is_some() || pass.present.is_some() || samples_trace_production(pass) {
+        return Some(BatchRefusal::Other);
+    }
+    if pass.color_attachments.iter().all(keeps_its_frame) {
+        None
+    } else {
+        Some(BatchRefusal::FrameNotKept)
+    }
+}
+
+/// Why the pass after a run's last member does not continue it
+/// (`REIMS_VGPU_RENDER_BATCH`), named for the same reason [`BatchRefusal`] is:
+/// the counters that charge it are `render_batch_broken_n` and
+/// `render_batch_broken_load_n` (`crate::phase_profile`), and the two halves of
+/// the chain fail for different reasons a round has to be able to tell apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchBreak {
+    /// The run's last member does not keep its frame in the identity's image
+    /// ([`keeps_its_frame`]), so the pass after it has nothing to load.
+    FrameNotKept,
+    /// The pass after it does not open from that image
+    /// ([`LoadOp::Resident`]): it begins from the caller's bytes, the guest's
+    /// own pages or a clear, and one submission may not carry a pass whose
+    /// previous contents are not the image the member before it wrote.
+    Load,
+    /// A present tail, a view this trace's own earlier passes produced, another
+    /// attachment count, or a pair, format or extent that is not the member's
+    /// own.
+    Other,
 }
 
 /// Whether a pass samples a view the trace's own earlier passes produced
@@ -489,6 +559,49 @@ fn samples_trace_production(pass: &RenderPassDescriptor) -> bool {
     pass.textures
         .iter()
         .any(|texture| matches!(texture.source, TextureSource::TraceView))
+}
+
+/// Whether `next` continues a run whose last member is `previous`: every colour
+/// attachment of the new pass opens from the provider's own image, and names
+/// exactly the identity the member before it stored into, for the same format
+/// and extent, in the same location order.
+///
+/// The two halves are checked in the order [`BatchBreak`] names them, so a
+/// census reads the fact that *stopped* the run rather than the first of two
+/// facts that would have: the member's own frame first — a run whose member
+/// kept nothing has nothing for a successor to continue — and the successor's
+/// load second.
+fn continues_run(
+    previous: &RenderPassDescriptor,
+    next: &RenderPassDescriptor,
+) -> Result<(), BatchBreak> {
+    if next.present.is_some()
+        || samples_trace_production(next)
+        || next.color_attachments.len() != previous.color_attachments.len()
+    {
+        return Err(BatchBreak::Other);
+    }
+    for (next, previous) in next
+        .color_attachments
+        .iter()
+        .zip(&previous.color_attachments)
+    {
+        if !keeps_its_frame(previous) {
+            return Err(BatchBreak::FrameNotKept);
+        }
+        if next.load != LoadOp::Resident {
+            return Err(BatchBreak::Load);
+        }
+        if next.allocation_id != previous.allocation_id
+            || next.view_id != previous.view_id
+            || next.format != previous.format
+            || next.width != previous.width
+            || next.height != previous.height
+        {
+            return Err(BatchBreak::Other);
+        }
+    }
+    Ok(())
 }
 
 /// The offscreen passes resolved so far that may run inside one submission
@@ -530,29 +643,19 @@ impl<'p, 'a> OffscreenRun<'p, 'a> {
     /// attachment of the new pass loads the provider's own image and names
     /// exactly the identity the member before it stored into, for the same
     /// format and extent, in the same location order.
-    fn continues(&self, next: &RenderPassDescriptor) -> bool {
+    ///
+    /// The member before it has to *keep* that frame ([`keeps_its_frame`]) —
+    /// not merely store it through one arm: a member that publishes or lands its
+    /// frame keeps it in the image as well, and a member that neither keeps nor
+    /// names the image leaves the successor loading bytes it never wrote.
+    /// [`BatchBreak`] names which of the two halves refused, so the census can
+    /// tell "the run's members do not keep their frames" from "the run's
+    /// successor does not open from them".
+    fn continues(&self, next: &RenderPassDescriptor) -> Result<(), BatchBreak> {
         let Some(last) = self.members.last() else {
-            return false;
+            return Err(BatchBreak::Other);
         };
-        let previous = last.pass;
-        if next.present.is_some()
-            || samples_trace_production(next)
-            || next.color_attachments.len() != previous.color_attachments.len()
-        {
-            return false;
-        }
-        next.color_attachments
-            .iter()
-            .zip(&previous.color_attachments)
-            .all(|(next, previous)| {
-                previous.store == StoreOp::Resident
-                    && next.load == LoadOp::Resident
-                    && next.allocation_id == previous.allocation_id
-                    && next.view_id == previous.view_id
-                    && next.format == previous.format
-                    && next.width == previous.width
-                    && next.height == previous.height
-            })
+        continues_run(last.pass, next)
     }
 
     /// Claim the identities the run's last member will define, before the next
@@ -2012,6 +2115,25 @@ impl VulkanComputeProvider {
         // flushes it first, so the pre-batch path is the same path with a run
         // that is always empty.
         let mut run = OffscreenRun::new(self);
+        // Whether this trace is a *run*'s own trace: two or more render passes
+        // in one plan is the shape the run rail assembles, and it is the
+        // population the three readings beside `render_batch_n` divide
+        // (`crate::phase_profile`). A trace that stated a run whose passes the
+        // per-pass path still executed is a wiring answer, while a lone pass is
+        // not a run at all — so the counters below charge only the first.
+        let carried_passes = if render::render_batch_requested() {
+            plan.iter()
+                .filter(|entry| matches!(entry, PlannedRenderEntry::Pass(_)))
+                .count()
+        } else {
+            0
+        };
+        let states_a_run = carried_passes >= 2;
+        if states_a_run {
+            crate::phase_profile::note_render_batch_trace(
+                u64::try_from(carried_passes).unwrap_or(u64::MAX),
+            );
+        }
         for planned in plan {
             // A landing-only entry takes its own step in the render group's
             // order (`research/docs/23` §115 之后的增量，E-TX14/R4b): the kept
@@ -2189,14 +2311,33 @@ impl VulkanComputeProvider {
                 // states: the run's middle members keep their frames and its
                 // last one publishes, and `continues` is what decides which of
                 // those this pass is.
-                if run.continues(&planned.pass) {
-                    // The earlier members are one submission with this one, so
-                    // they have not run yet: the identity this pass loads is
-                    // claimed before it resolves.
-                    run.claim_next()?;
-                    run.members
-                        .push(self.resolve_offscreen_pass(planned, pool, host_readback)?);
-                    continue;
+                match run.continues(&planned.pass) {
+                    Ok(()) => {
+                        // The earlier members are one submission with this one,
+                        // so they have not run yet: the identity this pass
+                        // loads is claimed before it resolves.
+                        run.claim_next()?;
+                        run.members.push(self.resolve_offscreen_pass(
+                            planned,
+                            pool,
+                            host_readback,
+                        )?);
+                        continue;
+                    }
+                    // An open run this pass does not continue: the run ends
+                    // where the chain breaks, and the census reads the half
+                    // that broke (`render_batch_broken_*`). Counted only for
+                    // the traces the run rail itself stated, so the reading
+                    // divides the population the switch is about rather than
+                    // every lone pass the plan carries.
+                    Err(break_kind) => {
+                        if states_a_run && !run.members.is_empty() {
+                            crate::phase_profile::note_render_batch_break(matches!(
+                                break_kind,
+                                BatchBreak::Load
+                            ));
+                        }
+                    }
                 }
                 run.flush(
                     trace,
@@ -2207,10 +2348,26 @@ impl VulkanComputeProvider {
                 )?;
                 // The pass that *opens* a run keeps its frame for the pass
                 // after it; one that does not runs the pre-batch way below.
-                if offscreen_batch_candidate(&planned.pass, trace) {
-                    run.members
-                        .push(self.resolve_offscreen_pass(planned, pool, host_readback)?);
-                    continue;
+                match offscreen_batch_refusal(&planned.pass, trace) {
+                    None => {
+                        if states_a_run {
+                            crate::phase_profile::note_render_batch_open();
+                        }
+                        run.members.push(self.resolve_offscreen_pass(
+                            planned,
+                            pool,
+                            host_readback,
+                        )?);
+                        continue;
+                    }
+                    Some(refusal) => {
+                        if states_a_run {
+                            crate::phase_profile::note_render_batch_refusal(matches!(
+                                refusal,
+                                BatchRefusal::FrameNotKept
+                            ));
+                        }
+                    }
                 }
             }
             run.flush(
@@ -5232,6 +5389,119 @@ mod tests {
         assert_eq!(
             attach_token(after, token).completion,
             CompletionDisposition::SubmittedUnknown { token: Some(token) }
+        );
+    }
+
+    /// One pass of the run rail's shape (`REIMS_VGPU_RENDER_BATCH`), with the
+    /// two arms under test stated explicitly.
+    fn batch_pass(view: u64, load: LoadOp, store: StoreOp) -> RenderPassDescriptor {
+        let mut pass = ordering_render_pass(view);
+        pass.color_attachments[0].load = load;
+        pass.color_attachments[0].store = store;
+        pass
+    }
+
+    /// A run's head has to keep its frame in the identity's own image — and that
+    /// is the *only* thing its store arm has to do.
+    ///
+    /// The increment's own head keeps its frame and publishes nothing
+    /// (`StoreOp::Resident`). A head that publishes as well (`StoreOp::Store`
+    /// beside `LoadOp::Resident`) keeps it too: the rail attaches the identity's
+    /// image whenever the pass names it on either side, and its store action is
+    /// `STORE` for both resident arms — the two disagree only about whether the
+    /// bytes are *also* published. A head that publishes while keeping *nothing*
+    /// (`LoadOp::Clear` beside `StoreOp::Store`, or beside the owner-window
+    /// landing arm) renders into a per-pass image: the identity's image is left
+    /// holding what it held before, and the pass after it would load bytes this
+    /// head never wrote.
+    #[test]
+    fn a_batch_head_may_publish_only_while_its_frame_stays_in_the_image() {
+        let trace = ordering_trace(Vec::new());
+        let refusal = |pass: &RenderPassDescriptor| offscreen_batch_refusal(pass, &trace);
+        let clear = || LoadOp::Clear(ClearColor::new([0xfe; 4]));
+
+        assert_eq!(
+            refusal(&batch_pass(971, clear(), StoreOp::Resident)),
+            None,
+            "the keeping head opens a run"
+        );
+        assert_eq!(
+            refusal(&batch_pass(971, LoadOp::Resident, StoreOp::Store)),
+            None,
+            "a head that keeps its frame and publishes it opens a run too: the \
+             frame is in the image the pass after it loads"
+        );
+        assert_eq!(
+            refusal(&batch_pass(971, clear(), StoreOp::Store)),
+            Some(BatchRefusal::FrameNotKept),
+            "a head whose load is a clear and whose store is the caller's own \
+             renders into a per-pass image, so it opens no run"
+        );
+        assert_eq!(
+            refusal(&batch_pass(971, clear(), StoreOp::Borrowed)),
+            Some(BatchRefusal::FrameNotKept),
+            "the owner-window landing arm is the same shape one arm over: the \
+             frame lands in the window and the image keeps nothing"
+        );
+    }
+
+    /// The pass after a run's last member has to open from the image that member
+    /// kept, and the member has to have kept it.
+    ///
+    /// The reading this increment moved is the first half: a member that
+    /// publishes its frame (`StoreOp::Store` beside a resident load) keeps it in
+    /// the image just as the pure `Resident` arm does, so the pass after it may
+    /// continue the run. A member that kept nothing, and a successor that opens
+    /// from anything but that image (`LoadOp::Load` — the caller's bytes — or a
+    /// `Clear`), both end the run where they stand.
+    #[test]
+    fn a_run_continues_while_its_members_keep_the_frame_and_their_successor_loads_it() {
+        let resident = || LoadOp::Resident;
+        let clear = || LoadOp::Clear(ClearColor::new([0xfe; 4]));
+
+        assert_eq!(
+            continues_run(
+                &batch_pass(971, clear(), StoreOp::Resident),
+                &batch_pass(971, resident(), StoreOp::Store)
+            ),
+            Ok(()),
+            "the keeping head's frame is what its successor loads"
+        );
+        assert_eq!(
+            continues_run(
+                &batch_pass(971, resident(), StoreOp::Store),
+                &batch_pass(971, resident(), StoreOp::Store)
+            ),
+            Ok(()),
+            "a member that publishes and keeps its frame hands it on: the image \
+             holds the writes either way, and who the bytes are published to is \
+             the caller's own statement"
+        );
+        assert_eq!(
+            continues_run(
+                &batch_pass(971, clear(), StoreOp::Store),
+                &batch_pass(971, resident(), StoreOp::Store)
+            ),
+            Err(BatchBreak::FrameNotKept),
+            "a member that kept nothing leaves its successor no image to load"
+        );
+        assert_eq!(
+            continues_run(
+                &batch_pass(971, clear(), StoreOp::Resident),
+                &batch_pass(971, LoadOp::Load, StoreOp::Store)
+            ),
+            Err(BatchBreak::Load),
+            "a successor that opens from the caller's bytes is no member of the \
+             run: one submission may not carry a pass whose previous contents \
+             are not the image the member before it wrote"
+        );
+        assert_eq!(
+            continues_run(
+                &batch_pass(971, clear(), StoreOp::Resident),
+                &batch_pass(972, resident(), StoreOp::Store)
+            ),
+            Err(BatchBreak::Other),
+            "one submission states one image"
         );
     }
 }
