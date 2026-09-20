@@ -17,7 +17,7 @@
 //! | source | what the binding holds | can it be borrowed? |
 //! |---|---|---|
 //! | the trace's snapshot (`BufferSource::OwnedBytes`) | `Vec::clone` of the view's bytes | **yes** — the serial resource pool holds the same bytes for the whole call |
-//! | a staged lease (`BufferSource::StagedLease`) | a fresh `Vec` copied out of the staging registry's lock | no: the registry's bytes live behind a mutex the upload does not hold |
+//! | a staged lease (`BufferSource::StagedLease`) | a fresh `Vec` copied out of the staging registry's lock | not as a reference — the registry's bytes live behind a mutex the upload does not hold; the eighth cut (`crate::staging_borrow`) lends a handle on them instead, which removes the same copy |
 //! | gathered guest runs (`BufferSource::GuestRuns`) | a fresh `Vec` the gather just built | no: the gather is what produces them |
 //!
 //! This module's mechanism is the first row: hand the binding a borrow of the

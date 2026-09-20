@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
@@ -8028,9 +8028,81 @@ impl StagedLease {
 /// The registry owns copied bytes, not owner memory. Import refuses a duplicate
 /// identity, and [`LeaseRegistry::view_bytes`] refuses a lease whose reservation
 /// does not match the admitted resource snapshot.
+///
+/// Each import is held by handle ([`Arc`]) rather than by value so a window can
+/// be handed out **without copying it** ([`LeaseWindowBytes`]): a plain
+/// reference out of the registry cannot be, because it would have to be held
+/// across the lock that guards the map, and that lock is taken again by the
+/// release the same submission's completion runs and by every other thread's
+/// import. The handle is the same bytes rather than a copy of them, which is
+/// what `metal-api-vulkan`'s `crate::staging_borrow` lends a binding.
 #[derive(Debug, Default)]
 pub struct LeaseRegistry {
-    leases: Mutex<BTreeMap<LeaseId, StagedLease>>,
+    leases: Mutex<BTreeMap<LeaseId, Arc<StagedLease>>>,
+}
+
+/// One window of one staged lease's bytes, held by handle: the bytes are the
+/// registry's own, and this value keeps them alive for as long as it lives —
+/// exactly as long as the `Vec` a copy would have kept alive, and no longer.
+///
+/// Building one copies nothing. The reservation, the epoch and the bounds are
+/// checked by the registry before it is handed out ([`LeaseRegistry::view_window`] /
+/// [`LeaseRegistry::texture_window`]), and the window it names is inside the
+/// reservation, so a reader sees the same bytes a [`LeaseRegistry::view_bytes`]
+/// copy of the same view would carry.
+#[derive(Clone, Debug)]
+pub struct LeaseWindowBytes {
+    lease: Arc<StagedLease>,
+    offset: usize,
+    length: usize,
+}
+
+impl LeaseWindowBytes {
+    /// The window's bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.lease.bytes[self.offset..self.offset + self.length]
+    }
+
+    /// The window's length in bytes.
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Whether the window is empty. A lease window never is (a zero-length
+    /// reservation is refused at import), but the pair comes with [`Self::len`].
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// A copy of the window's bytes, byte for byte the `Vec`
+    /// [`LeaseRegistry::view_bytes`] answers with.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
+
+    /// The lease the window was cut from.
+    pub fn lease_id(&self) -> LeaseId {
+        self.lease.reservation.lease.lease_id
+    }
+
+    /// The reservation the window was checked against.
+    pub fn reservation(&self) -> LeaseReservation {
+        self.lease.reservation
+    }
+}
+
+impl std::ops::Deref for LeaseWindowBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for LeaseWindowBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
 }
 
 impl LeaseRegistry {
@@ -8061,7 +8133,10 @@ impl LeaseRegistry {
                 ProviderErrorClass::Args,
             ));
         }
-        leases.insert(lease_id, staged);
+        // The import is held by handle so a window can be handed out without a
+        // copy ([`LeaseWindowBytes`]); `Arc::new` moves the `Vec`'s header and
+        // leaves the bytes where they are.
+        leases.insert(lease_id, Arc::new(staged));
         Ok(())
     }
 
@@ -8082,6 +8157,11 @@ impl LeaseRegistry {
     ///
     /// The admitted snapshot is authoritative: the staged reservation must
     /// match it exactly, and the view must fall inside it.
+    ///
+    /// This is the **copying** entry point: it answers with a fresh `Vec`, the
+    /// shape every caller used before the window handle existed. A caller that
+    /// only needs to read the window takes [`Self::view_window`] instead and
+    /// copies nothing.
     pub fn view_bytes(
         &self,
         lease_id: LeaseId,
@@ -8089,6 +8169,24 @@ impl LeaseRegistry {
         device_epoch: DeviceEpoch,
         resources: &ResourceTableSnapshot,
     ) -> Result<Vec<u8>, ProviderError> {
+        Ok(self
+            .view_window(lease_id, view, device_epoch, resources)?
+            .to_vec())
+    }
+
+    /// Resolve one view's window **by handle**, copying nothing.
+    ///
+    /// The checks are [`Self::view_bytes`]'s own — same order, same names — and
+    /// the window the handle names holds exactly the bytes the copy would have
+    /// carried. The bytes stay alive as long as the handle does, which is the
+    /// one property a caller relying on the copy also had.
+    pub fn view_window(
+        &self,
+        lease_id: LeaseId,
+        view: &BufferView,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<LeaseWindowBytes, ProviderError> {
         self.window_bytes(lease_id, LeaseWindow::View(view), device_epoch, resources)
     }
 
@@ -8109,6 +8207,20 @@ impl LeaseRegistry {
         device_epoch: DeviceEpoch,
         resources: &ResourceTableSnapshot,
     ) -> Result<Vec<u8>, ProviderError> {
+        Ok(self
+            .texture_window(lease_id, texture, device_epoch, resources)?
+            .to_vec())
+    }
+
+    /// Resolve a texture's window **by handle**, copying nothing: the texture
+    /// half of [`Self::view_window`], landed through the same checks.
+    pub fn texture_window(
+        &self,
+        lease_id: LeaseId,
+        texture: &TextureView,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<LeaseWindowBytes, ProviderError> {
         self.window_bytes(
             lease_id,
             LeaseWindow::Texture(texture),
@@ -8117,19 +8229,23 @@ impl LeaseRegistry {
         )
     }
 
-    /// One window's bytes out of the staged copy.
+    /// One window's bytes out of the staged copy, by handle.
     ///
     /// Both public entry points land here, so a view and a texture are held to
     /// the same identity, snapshot, epoch and bounds checks in the same order:
     /// the staged import first (`lease_not_imported`), then the admitted
     /// reservation (`lease_not_admitted`), and the window's own range last.
+    ///
+    /// The answer is a handle on the registry's own bytes rather than a copy of
+    /// them; the lock is taken for the checks and dropped before the handle
+    /// escapes, which is why the bytes are held by [`Arc`] and not borrowed.
     fn window_bytes(
         &self,
         lease_id: LeaseId,
         window: LeaseWindow<'_>,
         device_epoch: DeviceEpoch,
         resources: &ResourceTableSnapshot,
-    ) -> Result<Vec<u8>, ProviderError> {
+    ) -> Result<LeaseWindowBytes, ProviderError> {
         let leases = self.lock();
         let staged = leases
             .get(&lease_id)
@@ -8188,20 +8304,21 @@ impl LeaseRegistry {
         let end = start.checked_add(length).ok_or_else(|| {
             contract_error_refusal(ContractError::ArithmeticOverflow("staged lease slice"))
         })?;
-        staged
-            .bytes
-            .get(start..end)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| {
-                lease_error(
-                    "lease_range_out_of_bounds",
-                    lease_id,
-                    ProviderErrorClass::Resource,
-                )
-            })
+        if staged.bytes.get(start..end).is_none() {
+            return Err(lease_error(
+                "lease_range_out_of_bounds",
+                lease_id,
+                ProviderErrorClass::Resource,
+            ));
+        }
+        Ok(LeaseWindowBytes {
+            lease: Arc::clone(staged),
+            offset: start,
+            length,
+        })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<LeaseId, StagedLease>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<LeaseId, Arc<StagedLease>>> {
         self.leases
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -20071,6 +20188,88 @@ mod tests {
         assert_eq!(
             registry
                 .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_not_imported"
+        );
+    }
+
+    /// The window handle and the copy are the same bytes, read through the same
+    /// checks, and the handle keeps them alive on its own.
+    ///
+    /// The two entry points differ in what they answer with — a handle on the
+    /// registry's own bytes versus a fresh `Vec` — and in nothing else: same
+    /// identity, same reservation, same epoch, same bounds, same refusals by the
+    /// same names, and a read after `release` that still answers with what the
+    /// copy carried.
+    #[test]
+    fn a_staged_window_handle_reads_the_same_bytes_as_the_copy() {
+        let registry = LeaseRegistry::new();
+        let reservation = lease_reservation(1, 2, 8, 16);
+        let bytes: Vec<u8> = (0..16).collect();
+        registry
+            .import(StagedLease::new(reservation, bytes.clone()).unwrap())
+            .unwrap();
+
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(2),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 64,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+
+        let mut view = buffer(1, 0);
+        view.allocation_id = AllocationId::new(2);
+        view.offset = 12;
+        view.length = 4;
+        view.source = BufferSource::StagedLease(LeaseId::new(1));
+
+        let window = registry
+            .view_window(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+            .unwrap();
+        let copy = registry
+            .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+            .unwrap();
+        assert_eq!(window.as_slice(), copy.as_slice());
+        assert_eq!(window.len(), copy.len());
+        assert_eq!(window.to_vec(), copy);
+        assert_eq!(window.lease_id(), LeaseId::new(1));
+        assert_eq!(window.reservation(), reservation);
+        assert!(!window.is_empty());
+        assert_eq!(&*window, copy.as_slice());
+
+        // The handle is not a way around the checks the copy runs: the same
+        // view outside the reservation and the same view under a moved epoch are
+        // refused by the same names.
+        let mut outside = view.clone();
+        outside.offset = 24;
+        outside.length = 4;
+        assert_eq!(
+            registry
+                .view_window(LeaseId::new(1), &outside, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_range_out_of_bounds"
+        );
+        assert_eq!(
+            registry
+                .view_window(LeaseId::new(1), &view, DeviceEpoch::new(2), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_epoch_mismatch"
+        );
+
+        // The handle outlives the import: after the owner's release the registry
+        // refuses new windows by name, and the window taken before it still reads
+        // the bytes the copy carried — the lifetime the copy gave, no longer.
+        registry.release(LeaseId::new(1)).unwrap();
+        assert_eq!(window.as_slice(), copy.as_slice());
+        assert_eq!(
+            registry
+                .view_window(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
                 .unwrap_err()
                 .slug,
             "lease_not_imported"

@@ -17,10 +17,10 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::completion::AbandonmentOutcome;
 use metal_api_core::provider::{
-    BorrowedLeaseRegistry, CompletionDisposition, FieldValue, LeaseId, PipelineContract,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderLifecycle,
-    ProviderPhase, QueuePriority, QueueSchedulingPolicy, Retryability, SamplerCoordinates,
-    SemanticDigest, TerminalRefusal, MAX_SERIAL_RESOURCES,
+    BorrowedLeaseRegistry, CompletionDisposition, FieldValue, LeaseId, LeaseWindowBytes,
+    PipelineContract, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderLifecycle, ProviderPhase, QueuePriority, QueueSchedulingPolicy, Retryability,
+    SamplerCoordinates, SemanticDigest, TerminalRefusal, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -47,6 +47,7 @@ mod render_import_pool;
 mod render_setup_reuse;
 mod render_texture_pool;
 mod serial_resources_borrow;
+mod staging_borrow;
 mod submit_binding_borrow;
 
 pub use compute_buffer_pool::ComputeBufferPoolCounts;
@@ -5219,10 +5220,17 @@ pub(crate) enum PoolBinding<'a> {
 /// borrowed rather than kept: the trace's own snapshot bytes (a view's
 /// `BufferSource::OwnedBytes`, which the submission's serial resource pool
 /// already holds for the whole call), the staging registry's bytes (a fresh
-/// `Vec` per view), and the gathered guest runs (a fresh `Vec` per view). The
-/// sixth cut's mechanism (`crate::submit_binding_borrow`) lets the first borrow
-/// the table the call already holds instead of copying it a second time;
-/// [`BindingBytes::Copied`] is the pre-cut arm and the default.
+/// `Vec` per view), and the gathered guest runs (a fresh `Vec` per view). Two of
+/// the three have been cut: the sixth cut's mechanism
+/// (`crate::submit_binding_borrow`) lets the first borrow the table the call
+/// already holds instead of copying it a second time, and the eighth cut's
+/// (`crate::staging_borrow`) lets the second hold a handle on the registry's own
+/// bytes ([`BindingBytes::Staged`]) instead of a copy of them. The gathered runs
+/// stay owned: the gather is what produces them.
+///
+/// [`BindingBytes::Copied`] is the pre-cut arm of both cuts and stays the
+/// default: the sixth cut's switch decides between the first two arms and the
+/// eighth cut's between [`Self::Copied`] and [`Self::Staged`].
 #[derive(Debug)]
 pub(crate) enum BindingBytes<'a> {
     /// The submission's own copy of the bytes.
@@ -5230,6 +5238,10 @@ pub(crate) enum BindingBytes<'a> {
     /// A borrow of bytes the submission holds for the whole call — the serial
     /// resource pool's own view sources, which outlive every binding.
     Borrowed(&'a [u8]),
+    /// A handle on the provider's own staged bytes (`crate::staging_borrow`):
+    /// the same allocation the registry imported, kept alive by this value
+    /// rather than copied into a fresh `Vec`.
+    Staged(LeaseWindowBytes),
 }
 
 impl BindingBytes<'_> {
@@ -5237,6 +5249,7 @@ impl BindingBytes<'_> {
         match self {
             Self::Copied(bytes) => bytes.as_slice(),
             Self::Borrowed(bytes) => bytes,
+            Self::Staged(window) => window.as_slice(),
         }
     }
 

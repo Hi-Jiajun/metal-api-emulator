@@ -6291,7 +6291,12 @@ pub(crate) enum RenderInputSource<'a> {
     TraceBytes(&'a [u8]),
     /// The provider's staged copy of an owner lease
     /// (`BufferSource::StagedLease`); the rail uploads it like trace bytes.
-    StagedBytes(Vec<u8>),
+    ///
+    /// The payload is the cut's own decision: the registry's fresh `Vec`
+    /// (`crate::BindingBytes::Copied`, the default) or a handle on the bytes the
+    /// registry already imports (`crate::BindingBytes::Staged`,
+    /// `crate::staging_borrow`). Both read the same window.
+    StagedBytes(crate::BindingBytes<'a>),
     /// The owner's own mapping (`BufferSource::BorrowedNoCopy`): the rail
     /// imports this window instead of copying it, and holds a retain on the
     /// lease until the pass's fence has signalled.
@@ -6370,7 +6375,7 @@ impl RenderInputSource<'_> {
     fn proof_bytes(&self) -> &[u8] {
         match self {
             Self::TraceBytes(bytes) => bytes,
-            Self::StagedBytes(bytes) => bytes,
+            Self::StagedBytes(bytes) => bytes.as_slice(),
             Self::ProducedBytes(bytes) => bytes,
             Self::GatheredBytes { bytes, .. } => bytes,
             // SAFETY: the window was resolved by the no-copy registry for an
@@ -6397,7 +6402,7 @@ impl RenderInputSource<'_> {
     fn host_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::TraceBytes(bytes) => Some(bytes),
-            Self::StagedBytes(bytes) => Some(bytes),
+            Self::StagedBytes(bytes) => Some(bytes.as_slice()),
             Self::ProducedBytes(bytes) => Some(bytes),
             Self::GatheredBytes { bytes, .. } => Some(bytes),
             Self::Borrowed { .. } | Self::AttachmentSnapshot { .. } => None,
@@ -6510,17 +6515,15 @@ fn resolve_render_input<'a>(
             })?;
             // The registry's own region: it copies the window out of the staged
             // bytes while it holds its lock, and the copy is what the binding
-            // uploads. The bar and the counter read that copy
-            // (`crate::phase_profile::Phase::StagingWindow`).
-            let _window =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::StagingWindow);
-            let bytes = leases.staging.view_bytes(
+            // uploads — or, with the eighth cut's mechanism on, a handle on the
+            // bytes it already holds (`crate::staging_borrow`).
+            let bytes = crate::staging_borrow::resolve_view(
+                &leases.staging,
                 *lease_id,
                 view,
                 leases.device_epoch,
                 leases.resources,
             )?;
-            crate::phase_profile::note_staging_window_copy(bytes.len() as u64);
             Ok(RenderInputSource::StagedBytes(bytes))
         }
         BufferSource::BorrowedNoCopy(lease_id) => {
@@ -7531,15 +7534,13 @@ fn resolve_render_texture_source<'a>(
             })?;
             // The texture arm takes the same window out of the same registry
             // and pays the same copy (`crate::phase_profile::Phase::StagingWindow`).
-            let _window =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::StagingWindow);
-            let bytes = leases.staging.texture_bytes(
+            let bytes = crate::staging_borrow::resolve_texture(
+                &leases.staging,
                 *lease_id,
                 view,
                 leases.device_epoch,
                 leases.resources,
             )?;
-            crate::phase_profile::note_staging_window_copy(bytes.len() as u64);
             Ok(RenderInputSource::StagedBytes(bytes))
         }
         TextureSource::BorrowedNoCopy(lease_id) => {
@@ -14629,7 +14630,7 @@ impl<'a> OffscreenObjects<'a> {
                     self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
                 RenderInputSource::StagedBytes(bytes) => {
-                    let texels = texture.gathered.as_deref().unwrap_or(bytes);
+                    let texels = texture.gathered.as_deref().unwrap_or(bytes.as_slice());
                     self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
                 // The trace's own production uploads exactly as the two
@@ -16285,7 +16286,7 @@ impl<'a> OffscreenObjects<'a> {
             RenderInputSource::StagedBytes(bytes) => self.create_host_visible_buffer(
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 usage,
-                bytes,
+                bytes.as_slice(),
                 name,
             ),
             // The trace's own production is copied in exactly as the two

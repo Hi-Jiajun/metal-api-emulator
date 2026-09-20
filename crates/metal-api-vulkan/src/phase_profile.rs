@@ -1640,6 +1640,11 @@ struct Local {
     /// (`crate::staging_borrow`).
     staging_window_copies: u64,
     staging_window_copy_bytes: u64,
+    /// The same batch of bytes on the cut's arm: the windows the registry lent
+    /// by handle (`LeaseWindowBytes`) instead of copying, and their total length
+    /// (`crate::staging_borrow`).
+    staging_window_shares: u64,
+    staging_window_share_bytes: u64,
     /// The declared bytes the window's *pool derivations* moved, split the same
     /// way: a copy the derivation made for itself (`ComputeTrace::serial_resources`,
     /// the pre-cut path) or a loan of the trace's own declarations
@@ -1753,6 +1758,8 @@ impl Default for Local {
             binding_borrow_bytes: 0,
             staging_window_copies: 0,
             staging_window_copy_bytes: 0,
+            staging_window_shares: 0,
+            staging_window_share_bytes: 0,
             resource_copy_views: 0,
             resource_copy_bytes: 0,
             resource_borrow_views: 0,
@@ -1969,6 +1976,8 @@ impl Local {
         let binding_borrow_bytes = std::mem::take(&mut self.binding_borrow_bytes);
         let staging_window_copies = std::mem::take(&mut self.staging_window_copies);
         let staging_window_copy_bytes = std::mem::take(&mut self.staging_window_copy_bytes);
+        let staging_window_shares = std::mem::take(&mut self.staging_window_shares);
+        let staging_window_share_bytes = std::mem::take(&mut self.staging_window_share_bytes);
         let resource_copy_views = std::mem::take(&mut self.resource_copy_views);
         let resource_copy_bytes = std::mem::take(&mut self.resource_copy_bytes);
         let resource_borrow_views = std::mem::take(&mut self.resource_borrow_views);
@@ -2073,6 +2082,8 @@ impl Local {
              submit_binding_borrows_bytes={binding_borrow_bytes} \
              staging_window_copies_n={staging_window_copies} \
              staging_window_copies_bytes={staging_window_copy_bytes} \
+             staging_window_shares_n={staging_window_shares} \
+             staging_window_shares_bytes={staging_window_share_bytes} \
              submit_resource_copies_n={resource_copy_views} \
              submit_resource_copies_bytes={resource_copy_bytes} \
              submit_resource_borrows_n={resource_borrow_views} \
@@ -2178,6 +2189,25 @@ pub(crate) fn note_staging_window_copy(bytes: u64) {
         let mut local = local.borrow_mut();
         local.staging_window_copies += 1;
         local.staging_window_copy_bytes += bytes;
+    });
+}
+
+/// The same staged window the registry **lent** by handle instead of copying
+/// (`crate::staging_borrow`): one entry per resolved staged view or texture and
+/// the bytes the resolution did *not* have to move.
+///
+/// Read beside [`note_staging_window_copy`]: the two pairs partition every
+/// resolution, so a round sees the same batch of bytes change hands beside a
+/// copy count that falls to zero.
+#[inline]
+pub(crate) fn note_staging_window_share(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.staging_window_shares += 1;
+        local.staging_window_share_bytes += bytes;
     });
 }
 
