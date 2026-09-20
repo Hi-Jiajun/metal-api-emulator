@@ -10136,14 +10136,32 @@ fn execute_offscreen_render_with_retains(
             resident_layouts.publish(true);
             // The pipeline-shaped objects have retired with the fence, so they
             // go back to the shape cache before anything else in this pass
-            // reads the frame (`crate::render_setup_reuse`).
+            // reads the frame (`crate::render_setup_reuse`). The three returns
+            // are their own residual bars: "give it back" is only free if a
+            // reading says so, and a pool's eviction destroys objects inside
+            // the return (`crate::phase_profile`, fourth cut).
+            let _release_reuse =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseReuse);
             objects.release_reusable();
+            drop(_release_reuse);
             // The sampled textures' pooled backing retires with the same
             // fence (`crate::render_texture_pool`).
+            let _release_pool =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleasePool);
             objects.release_pooled_textures();
+            drop(_release_pool);
             // The owner-window imports retire with the same fence
             // (`crate::render_import_pool`).
+            let _release_import =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseImport);
             objects.release_imported_windows();
+            drop(_release_import);
+            // The rail-owned host-visible upload buffers retire with the same
+            // fence (`crate::render_buffer_pool`).
+            let _release_uploads =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseUploads);
+            objects.release_pooled_uploads();
+            drop(_release_uploads);
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -10178,7 +10196,10 @@ fn execute_offscreen_render_with_retains(
     );
     if readback.is_ok() {
         if let Some(retains) = retains.as_mut() {
+            let _retire =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRetire);
             retains.retire();
+            drop(_retire);
         }
     }
     // The pass's objects are torn down here rather than by the scope's own end
@@ -11032,7 +11053,7 @@ struct OffscreenObjects<'a> {
     /// or imported by [`Self::create_stage_buffers`]. Empty for every pre-v83
     /// pass, which is the shape the pipeline layout and the descriptor binds
     /// branch on.
-    stage_buffer_inputs: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    stage_buffer_inputs: Vec<RenderUploadBuffer>,
     /// The descriptor sets the pass's stage buffers are bound through, one per
     /// set index the streams land in, in ascending set order
     /// (`research/docs/23` §3.3, v83/v84): the reviewed pair's fixed sets 1
@@ -11056,19 +11077,16 @@ struct OffscreenObjects<'a> {
     stage_buffer_gap_layouts: Vec<vk::DescriptorSetLayout>,
     /// The host-visible `INDIRECT_BUFFER` an indirect draw replays from. Null
     /// for a direct draw.
-    indirect_buffer: vk::Buffer,
-    indirect_memory: vk::DeviceMemory,
+    indirect: RenderUploadBuffer,
     /// The rail's own `INDEX_BUFFER` holding `[0, 1, 2]` for an indexed
     /// indirect draw. Null for a direct or non-indexed draw.
-    index_buffer: vk::Buffer,
-    index_memory: vk::DeviceMemory,
+    index: RenderUploadBuffer,
     /// The caller-held vertex streams the pass binds, in binding order
     /// (`research/docs/23` §3.3). Each entry is the device buffer holding one
     /// pool view's bytes; empty for the `vertex_id` milestone.
-    vertex_inputs: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    vertex_inputs: Vec<RenderUploadBuffer>,
     /// The caller-held index buffer, when the draw is indexed.
-    input_index_buffer: vk::Buffer,
-    input_index_memory: vk::DeviceMemory,
+    input_index: RenderUploadBuffer,
     /// The render pass's own descriptions (`crate::render_setup_reuse`), read
     /// back from the structures handed to `vkCreateRenderPass2`. `None` until
     /// the render pass exists, and the definition the shape key carries.
@@ -11144,9 +11162,13 @@ struct SampledTextureObjects {
     /// the descriptor carries the image alone, and the pipeline's
     /// specialization constants are this extent beside the render area's.
     gathered_fetch: bool,
-    /// The owner-window buffer a no-copy texture is copied out of, or `None`
-    /// for the two uploaded arms.
-    copy_source: Option<(vk::Buffer, vk::DeviceMemory)>,
+    /// The owner-window buffer a no-copy texture is copied out of — or the
+    /// rail's own staging buffer a three-dimensional declaration's texels
+    /// travel through — or `None` for the two uploaded arms. It is the pass's
+    /// own [`RenderUploadBuffer`], so it retires with the pass's other upload
+    /// buffers (`crate::render_buffer_pool`) or goes back to the import pool
+    /// when it is an owner-window import (`crate::render_import_pool`).
+    copy_source: Option<RenderUploadBuffer>,
     /// The owner window's import this texture holds, keyed by its own range
     /// (`crate::render_import_pool`), or `None` for a declaration whose source
     /// is not a borrowed window and for a declaration that ran with the switch
@@ -11300,6 +11322,78 @@ struct StencilResolveObjects {
     shares_backing: bool,
 }
 
+/// One host-visible upload buffer a pass binds, with the pool entry it came
+/// from.
+///
+/// [`OffscreenObjects::create_host_visible_buffer`] fills it — the pair the
+/// driver just made, or the pair `crate::render_buffer_pool` handed over — and
+/// `record` binds the buffer exactly as it bound the fresh one.
+/// [`OffscreenObjects::release_pooled_uploads`] hands the pair back after the
+/// fence when [`Self::pooled`] is `Some`; the pass's own teardown destroys
+/// whatever is left, which is what makes a failed pass (and a pool switched
+/// off) fail closed, exactly as the fresh path always did.
+struct RenderUploadBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    /// The key this buffer was created (or taken) under, or `None` for a buffer
+    /// that is not the pool's business — an owner-window import, whose own pool
+    /// keeps it, and every buffer created while the switch was off.
+    pooled: Option<crate::render_buffer_pool::UploadKey>,
+}
+
+impl RenderUploadBuffer {
+    /// The empty entry a pass that binds no such buffer states.
+    const fn null() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            pooled: None,
+        }
+    }
+
+    /// Whether this entry holds no buffer at all.
+    fn is_null(&self) -> bool {
+        self.buffer == vk::Buffer::null() && self.memory == vk::DeviceMemory::null()
+    }
+
+    /// Release the pair in the order the pass always released them, counting
+    /// what was really destroyed for the profile's `td_*_n` population.
+    fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            if self.buffer != vk::Buffer::null() {
+                device.destroy_buffer(self.buffer, None);
+                crate::phase_profile::note_teardown_object(
+                    crate::phase_profile::TeardownObject::Buffer,
+                );
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                device.free_memory(self.memory, None);
+                crate::phase_profile::note_teardown_object(
+                    crate::phase_profile::TeardownObject::Memory,
+                );
+            }
+        }
+    }
+
+    /// Hand the pair back and make this entry empty.
+    ///
+    /// The bytes are no longer this pass's once the readback has copied what it
+    /// needed out (the writeback of a writable stage buffer copies at the
+    /// readback, before the hand-back), and the fence has proven the device
+    /// done with the pair, so the next creation of the same shape may take it.
+    fn release(&mut self, context: &VulkanContext) {
+        let Some(key) = self.pooled.take() else {
+            return;
+        };
+        let uploaded = crate::render_buffer_pool::UploadedBuffer {
+            buffer: std::mem::replace(&mut self.buffer, vk::Buffer::null()),
+            memory: std::mem::replace(&mut self.memory, vk::DeviceMemory::null()),
+        };
+        let outcome = context.give_render_upload_back(key, uploaded);
+        crate::phase_profile::note_buffer_pool(outcome);
+    }
+}
+
 /// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
 ///
 /// `load_op` and `initial_layout` travel with the attachment because both feed
@@ -11356,8 +11450,7 @@ struct AttachmentObjects {
     publishes: bool,
     /// The host-visible staging buffer holding this attachment's previous bytes
     /// for a `LoadOp::Load` pass. Null unless the attachment loads.
-    previous_buffer: vk::Buffer,
-    previous_memory: vk::DeviceMemory,
+    previous: RenderUploadBuffer,
 }
 
 /// The layout guards one pass holds on the provider-owned images it renders
@@ -11551,16 +11644,13 @@ impl<'a> OffscreenObjects<'a> {
             stage_buffer_landings: Vec::new(),
             stage_buffer_layout_slots: Vec::new(),
             stage_buffer_gap_layouts: Vec::new(),
-            indirect_buffer: vk::Buffer::null(),
-            indirect_memory: vk::DeviceMemory::null(),
-            index_buffer: vk::Buffer::null(),
-            index_memory: vk::DeviceMemory::null(),
+            indirect: RenderUploadBuffer::null(),
+            index: RenderUploadBuffer::null(),
             vertex_inputs: Vec::new(),
             render_pass_def: None,
             layout_defs: Vec::new(),
             reusable: None,
-            input_index_buffer: vk::Buffer::null(),
-            input_index_memory: vk::DeviceMemory::null(),
+            input_index: RenderUploadBuffer::null(),
             draw: DrawShape::Milestone,
             instance_count: 1,
             base_vertex: 0,
@@ -11616,8 +11706,7 @@ impl<'a> OffscreenObjects<'a> {
                 owns_image: false,
                 owns_resolve: false,
                 publishes: true,
-                previous_buffer: vk::Buffer::null(),
-                previous_memory: vk::DeviceMemory::null(),
+                previous: RenderUploadBuffer::null(),
             });
             self.present = true;
             return Ok(());
@@ -11680,8 +11769,7 @@ impl<'a> OffscreenObjects<'a> {
             owns_image: true,
             owns_resolve: false,
             publishes: true,
-            previous_buffer: vk::Buffer::null(),
-            previous_memory: vk::DeviceMemory::null(),
+            previous: RenderUploadBuffer::null(),
         });
         self.present = true;
         Ok(())
@@ -11769,8 +11857,7 @@ impl<'a> OffscreenObjects<'a> {
             owns_image: false,
             owns_resolve: false,
             publishes: store_publishes(attachment.store),
-            previous_buffer: vk::Buffer::null(),
-            previous_memory: vk::DeviceMemory::null(),
+            previous: RenderUploadBuffer::null(),
         });
         Ok(())
     }
@@ -12365,8 +12452,7 @@ impl<'a> OffscreenObjects<'a> {
             // (`research/docs/23` §3.3, v51).
             owns_image: true,
             owns_resolve: true,
-            previous_buffer: vk::Buffer::null(),
-            previous_memory: vk::DeviceMemory::null(),
+            previous: RenderUploadBuffer::null(),
         });
         Ok(())
     }
@@ -13279,7 +13365,7 @@ impl<'a> OffscreenObjects<'a> {
         target: &RenderTextureImage,
         texels: &[u8],
         volume: bool,
-    ) -> Result<Option<(vk::Buffer, vk::DeviceMemory)>, ProviderError> {
+    ) -> Result<Option<RenderUploadBuffer>, ProviderError> {
         // The texels' own trip into the backing (`crate::phase_profile`): the
         // host write for the linear lanes, the staging write a volume takes
         // before its device copy. It is a *nested* bar inside
@@ -13534,7 +13620,15 @@ impl<'a> OffscreenObjects<'a> {
                         Ok((imported, key)) => {
                             import_key = Some(key);
                             import_requirements = imported.requirements_size;
-                            Some((imported.buffer, imported.memory))
+                            Some(RenderUploadBuffer {
+                                buffer: imported.buffer,
+                                memory: imported.memory,
+                                // The import pool owns this pair, not the
+                                // upload pool: the range is the owner's, and
+                                // the hand-back that pools it is
+                                // `release_imported_windows`.
+                                pooled: None,
+                            })
                         }
                         Err(error) => {
                             unsafe {
@@ -13595,9 +13689,8 @@ impl<'a> OffscreenObjects<'a> {
                     drop(_view);
                     created.map_err(|error| {
                         unsafe {
-                            if let Some((buffer, buffer_memory)) = copy_source {
-                                self.context.device.destroy_buffer(buffer, None);
-                                self.context.device.free_memory(buffer_memory, None);
+                            if let Some(source) = &copy_source {
+                                source.destroy(&self.context.device);
                             }
                             self.context.device.destroy_image(image, None);
                             self.context.device.free_memory(memory, None);
@@ -13635,9 +13728,8 @@ impl<'a> OffscreenObjects<'a> {
                     drop(_sampler);
                     created.map_err(|error| {
                         unsafe {
-                            if let Some((buffer, buffer_memory)) = copy_source {
-                                self.context.device.destroy_buffer(buffer, None);
-                                self.context.device.free_memory(buffer_memory, None);
+                            if let Some(source) = &copy_source {
+                                source.destroy(&self.context.device);
                             }
                             self.context.device.destroy_image_view(view, None);
                             self.context.device.destroy_image(image, None);
@@ -14154,7 +14246,7 @@ impl<'a> OffscreenObjects<'a> {
             // beside it.
             let mut buffer_infos = Vec::with_capacity(set_streams.len());
             for stream in set_streams {
-                let (buffer, memory) = self.bind_render_input(
+                let buffer = self.bind_render_input(
                     &stream.source,
                     vk::BufferUsageFlags::STORAGE_BUFFER,
                     "stage buffer",
@@ -14165,6 +14257,7 @@ impl<'a> OffscreenObjects<'a> {
                 // no-copy binding's bytes are the owner's own mapping; a
                 // rail-owned one is the host-visible allocation that was just
                 // filled, which the readback re-maps.
+                let memory = buffer.memory;
                 if stream.writable {
                     let landing = match &stream.source {
                         // A stage buffer's source is a `BufferSource` arm, so
@@ -14215,15 +14308,15 @@ impl<'a> OffscreenObjects<'a> {
                     };
                     self.stage_buffer_landings.push(landing);
                 }
-                self.stage_buffer_inputs.push((buffer, memory));
                 buffer_infos.push(
                     vk::DescriptorBufferInfo::default()
-                        .buffer(buffer)
+                        .buffer(buffer.buffer)
                         .offset(0)
                         // The buffer is exactly the view's own length, so the
                         // whole range is the binding's range.
                         .range(vk::WHOLE_SIZE),
                 );
+                self.stage_buffer_inputs.push(buffer);
             }
             let writes = buffer_infos
                 .iter()
@@ -14722,18 +14815,54 @@ impl<'a> OffscreenObjects<'a> {
             let Some(key) = texture.imported.take() else {
                 continue;
             };
-            let Some((buffer, memory)) = texture.copy_source.take() else {
+            let Some(source) = texture.copy_source.take() else {
                 continue;
             };
             let outcome = self.context.give_render_import_back(
                 key,
                 crate::render_import_pool::Imported {
-                    buffer,
-                    memory,
+                    buffer: source.buffer,
+                    memory: source.memory,
                     requirements_size: texture.import_requirements,
                 },
             );
             crate::phase_profile::note_import_pool(outcome);
+        }
+    }
+
+    /// Hand the rail-owned host-visible upload buffers back once this pass's
+    /// work has retired on the device.
+    ///
+    /// Called after the fence, beside the three returns above and for the same
+    /// reason: no command buffer is still reading them, and the readback has
+    /// already copied out everything a writeback needs
+    /// ([`Self::stage_buffer_readback_bytes`] runs inside the readback bar, so a
+    /// writable stage buffer's bytes are the pass's own Vec by the time the
+    /// hand-back runs). The pass's own teardown then has nothing to destroy for
+    /// these fields — each handle is left null behind the hand-back — while a
+    /// buffer the pool did not serve (the switch was off, or a shape the cap
+    /// cannot hold) keeps its pair and drops it exactly as it always did
+    /// (`crate::render_buffer_pool`).
+    fn release_pooled_uploads(&mut self) {
+        self.indirect.release(self.context);
+        self.index.release(self.context);
+        self.input_index.release(self.context);
+        for input in &mut self.vertex_inputs {
+            input.release(self.context);
+        }
+        for input in &mut self.stage_buffer_inputs {
+            input.release(self.context);
+        }
+        for attachment in &mut self.attachments {
+            attachment.previous.release(self.context);
+        }
+        for texture in &mut self.textures {
+            // A no-copy declaration's import is the import pool's own business
+            // and carries no upload key, so this is a no-op for it; a volume's
+            // staging buffer is the upload pool's and goes back here.
+            if let Some(source) = texture.copy_source.as_mut() {
+                source.release(self.context);
+            }
         }
     }
 
@@ -15129,21 +15258,20 @@ impl<'a> OffscreenObjects<'a> {
         index: Option<&IndexStream<'_>>,
     ) -> Result<(), ProviderError> {
         for stream in streams {
-            let (buffer, memory) = self.bind_render_input(
+            let buffer = self.bind_render_input(
                 &stream.source,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 "vertex input",
             )?;
-            self.vertex_inputs.push((buffer, memory));
+            self.vertex_inputs.push(buffer);
         }
         if let Some(index) = index {
-            let (buffer, memory) = self.bind_render_input(
+            let buffer = self.bind_render_input(
                 &index.source,
                 vk::BufferUsageFlags::INDEX_BUFFER,
                 "index input",
             )?;
-            self.input_index_buffer = buffer;
-            self.input_index_memory = memory;
+            self.input_index = buffer;
             self.input_index_type = indices_format(index.format);
         }
         Ok(())
@@ -15161,7 +15289,7 @@ impl<'a> OffscreenObjects<'a> {
         source: &RenderInputSource<'_>,
         usage: vk::BufferUsageFlags,
         name: &'static str,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), ProviderError> {
+    ) -> Result<RenderUploadBuffer, ProviderError> {
         match source {
             RenderInputSource::TraceBytes(bytes) => self.create_host_visible_buffer(
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -15195,7 +15323,15 @@ impl<'a> OffscreenObjects<'a> {
             ),
             RenderInputSource::Borrowed { window, .. } => self
                 .import_host_pointer_buffer(window, usage, name)
-                .map(|(buffer, memory, _requirements_size)| (buffer, memory)),
+                .map(|(buffer, memory, _requirements_size)| RenderUploadBuffer {
+                    buffer,
+                    memory,
+                    // An owner-window import is the import pool's own business
+                    // (`crate::render_import_pool`): the buffer this rail's
+                    // upload pool would be handed back under never described
+                    // it, and a window's bytes are the owner's.
+                    pooled: None,
+                }),
             // The pass-entry snapshot arm is a *texture* source
             // (`research/docs/23` §118, E-TX15): its bytes live in the
             // attachment image the device copies before the pass opens, so a
@@ -15389,13 +15525,12 @@ impl<'a> OffscreenObjects<'a> {
         index: usize,
         source: &RenderInputSource<'_>,
     ) -> Result<(), ProviderError> {
-        let (buffer, memory) = self.bind_render_input(
+        let buffer = self.bind_render_input(
             source,
             vk::BufferUsageFlags::TRANSFER_SRC,
             "attachment previous bytes",
         )?;
-        self.attachments[index].previous_buffer = buffer;
-        self.attachments[index].previous_memory = memory;
+        self.attachments[index].previous = buffer;
         self.attachments[index].load_op = vk::AttachmentLoadOp::LOAD;
         Ok(())
     }
@@ -15575,76 +15710,21 @@ impl<'a> OffscreenObjects<'a> {
             first_instance: 0,
         };
         let byte_length = std::mem::size_of::<vk::DrawIndirectCommand>() as u64;
-        let info = vk::BufferCreateInfo::default()
-            .size(byte_length)
-            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { self.context.device.create_buffer(&info, None) }
-            .map_err(|error| execution_refusal("create indirect buffer", &error.to_string()))?;
-        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.context.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(execution_refusal(
-                    "find indirect memory type",
-                    &error.to_string(),
-                ));
-            }
-        };
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(execution_refusal(
-                    "allocate indirect memory",
-                    &error.to_string(),
-                ));
-            }
-        };
-        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.context.device.destroy_buffer(buffer, None);
-                self.context.device.free_memory(memory, None);
-            }
-            return Err(execution_refusal(
-                "bind indirect memory",
-                &error.to_string(),
-            ));
-        }
-        let mapping = match unsafe {
-            self.context.device.map_memory(
-                memory,
-                0,
-                requirements.size,
-                vk::MemoryMapFlags::empty(),
-            )
-        } {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                unsafe {
-                    self.context.device.destroy_buffer(buffer, None);
-                    self.context.device.free_memory(memory, None);
-                }
-                return Err(execution_refusal("map indirect memory", &error.to_string()));
-            }
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
+        // The command bytes travel through the same helper every other upload
+        // buffer does: one creation path, so the pool's key and the fresh
+        // path's structures cannot describe two different buffers.
+        let command_bytes = unsafe {
+            std::slice::from_raw_parts(
                 &command as *const vk::DrawIndirectCommand as *const u8,
-                mapping as *mut u8,
                 byte_length as usize,
-            );
-            self.context.device.unmap_memory(memory);
-        }
-        self.indirect_buffer = buffer;
-        self.indirect_memory = memory;
+            )
+        };
+        self.indirect = self.create_host_visible_buffer(
+            byte_length,
+            vk::BufferUsageFlags::INDIRECT_BUFFER,
+            command_bytes,
+            "indirect",
+        )?;
         Ok(())
     }
 
@@ -15657,59 +15737,82 @@ impl<'a> OffscreenObjects<'a> {
         usage: vk::BufferUsageFlags,
         bytes: &[u8],
         name: &'static str,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), ProviderError> {
-        let info = vk::BufferCreateInfo::default()
-            .size(byte_length)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer =
-            unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
-                execution_refusal(&format!("create {name} buffer"), &error.to_string())
-            })?;
-        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.context.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(execution_refusal(
-                    &format!("find {name} memory type"),
-                    &error.to_string(),
-                ));
+    ) -> Result<RenderUploadBuffer, ProviderError> {
+        // The shape decides the pair before the driver sees anything: a buffer
+        // of the same size and usage is one the driver would be handed twice,
+        // so the pool is asked first (`crate::render_buffer_pool`). A hit skips
+        // the four creation calls and states the same map/copy/unmap the fresh
+        // path states; a miss builds the pair exactly as this rail always did.
+        let key = crate::render_buffer_pool::UploadKey::new(byte_length, usage);
+        let (taken, outcome) = self.context.take_render_upload(key);
+        crate::phase_profile::note_buffer_pool(outcome);
+        let (buffer, memory, mapped_size) = match taken {
+            Some(uploaded) => (
+                uploaded.buffer,
+                uploaded.memory,
+                // The hit path maps the whole allocation: the fresh path's
+                // `requirements.size` covered the buffer's own bytes and this
+                // covers them too, and the requirements the driver stated for
+                // an identical creation are not carried back with the pair.
+                vk::WHOLE_SIZE,
+            ),
+            None => {
+                let info = vk::BufferCreateInfo::default()
+                    .size(byte_length)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let buffer =
+                    unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
+                        execution_refusal(&format!("create {name} buffer"), &error.to_string())
+                    })?;
+                let requirements =
+                    unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+                let memory_type = match self.context.memory_type(
+                    requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        unsafe { self.context.device.destroy_buffer(buffer, None) };
+                        return Err(execution_refusal(
+                            &format!("find {name} memory type"),
+                            &error.to_string(),
+                        ));
+                    }
+                };
+                let allocation = vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type);
+                let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) }
+                {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        unsafe { self.context.device.destroy_buffer(buffer, None) };
+                        return Err(execution_refusal(
+                            &format!("allocate {name} memory"),
+                            &error.to_string(),
+                        ));
+                    }
+                };
+                if let Err(error) =
+                    unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) }
+                {
+                    unsafe {
+                        self.context.device.destroy_buffer(buffer, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(execution_refusal(
+                        &format!("bind {name} memory"),
+                        &error.to_string(),
+                    ));
+                }
+                (buffer, memory, requirements.size)
             }
         };
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(execution_refusal(
-                    &format!("allocate {name} memory"),
-                    &error.to_string(),
-                ));
-            }
-        };
-        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.context.device.destroy_buffer(buffer, None);
-                self.context.device.free_memory(memory, None);
-            }
-            return Err(execution_refusal(
-                &format!("bind {name} memory"),
-                &error.to_string(),
-            ));
-        }
         let mapping = match unsafe {
-            self.context.device.map_memory(
-                memory,
-                0,
-                requirements.size,
-                vk::MemoryMapFlags::empty(),
-            )
+            self.context
+                .device
+                .map_memory(memory, 0, mapped_size, vk::MemoryMapFlags::empty())
         } {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -15727,7 +15830,17 @@ impl<'a> OffscreenObjects<'a> {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping as *mut u8, bytes.len());
             self.context.device.unmap_memory(memory);
         }
-        Ok((buffer, memory))
+        Ok(RenderUploadBuffer {
+            buffer,
+            memory,
+            // A creation that ran with the switch off has nothing to hand
+            // back; a hit and a miss both carry the key the pair will be
+            // returned under, so the pool fills as this round's shapes repeat.
+            pooled: match outcome {
+                crate::render_buffer_pool::UploadOutcome::Disabled => None,
+                _ => Some(key),
+            },
+        })
     }
 
     /// Encode one `VkDrawIndexedIndirectCommand` into a host-visible
@@ -15752,14 +15865,12 @@ impl<'a> OffscreenObjects<'a> {
             .iter()
             .flat_map(|index| index.to_le_bytes())
             .collect::<Vec<u8>>();
-        let (index_buffer, index_memory) = self.create_host_visible_buffer(
+        self.index = self.create_host_visible_buffer(
             index_bytes.len() as u64,
             vk::BufferUsageFlags::INDEX_BUFFER,
             &index_bytes,
             "index",
         )?;
-        self.index_buffer = index_buffer;
-        self.index_memory = index_memory;
 
         let command = vk::DrawIndexedIndirectCommand {
             index_count,
@@ -15775,14 +15886,12 @@ impl<'a> OffscreenObjects<'a> {
                 byte_length as usize,
             )
         };
-        let (buffer, memory) = self.create_host_visible_buffer(
+        self.indirect = self.create_host_visible_buffer(
             byte_length,
             vk::BufferUsageFlags::INDIRECT_BUFFER,
             command_bytes,
             "indirect",
         )?;
-        self.indirect_buffer = buffer;
-        self.indirect_memory = memory;
         Ok(())
     }
 
@@ -16020,7 +16129,7 @@ impl<'a> OffscreenObjects<'a> {
         // the same command buffer, so the copy cannot be observed after the
         // draw. One round trip per attachment, in location order.
         for attachment in &self.attachments {
-            if attachment.previous_buffer == vk::Buffer::null() {
+            if attachment.previous.is_null() {
                 continue;
             }
             unsafe {
@@ -16059,7 +16168,7 @@ impl<'a> OffscreenObjects<'a> {
                     });
                 self.context.device.cmd_copy_buffer_to_image(
                     self.command,
-                    attachment.previous_buffer,
+                    attachment.previous.buffer,
                     attachment.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     std::slice::from_ref(&copy),
@@ -16270,7 +16379,8 @@ impl<'a> OffscreenObjects<'a> {
             if texture.snapshot_from.is_some() {
                 continue;
             }
-            if let Some((buffer, _)) = texture.copy_source {
+            if let Some(source) = &texture.copy_source {
+                let buffer = source.buffer;
                 let [width, height] = texture.extent;
                 // The device-copied arm's own volume statement (2026-09-20,
                 // the `D3` sampled arm): a three-dimensional declaration's
@@ -16415,7 +16525,7 @@ impl<'a> OffscreenObjects<'a> {
                 let buffers = self
                     .vertex_inputs
                     .iter()
-                    .map(|(buffer, _)| *buffer)
+                    .map(|input| input.buffer)
                     .collect::<Vec<_>>();
                 // The pool upload puts each view's bytes at offset zero of its
                 // own buffer, so the bind offsets are zero by construction.
@@ -16427,7 +16537,7 @@ impl<'a> OffscreenObjects<'a> {
                     DrawShape::Indexed { index_count } => {
                         self.context.device.cmd_bind_index_buffer(
                             self.command,
-                            self.input_index_buffer,
+                            self.input_index.buffer,
                             0,
                             self.input_index_type,
                         );
@@ -16457,7 +16567,7 @@ impl<'a> OffscreenObjects<'a> {
                         ));
                     }
                 }
-            } else if self.input_index_buffer != vk::Buffer::null() {
+            } else if !self.input_index.is_null() {
                 // An indexed draw whose vertex stage reads no `[[stage_in]]` at
                 // all (`research/docs/23` §92, R9k): the reviewed stage-buffer
                 // vertex stage takes its positions from a descriptor, so the
@@ -16468,7 +16578,7 @@ impl<'a> OffscreenObjects<'a> {
                 // the contract stated for it was read from this same window.
                 self.context.device.cmd_bind_index_buffer(
                     self.command,
-                    self.input_index_buffer,
+                    self.input_index.buffer,
                     0,
                     self.input_index_type,
                 );
@@ -16492,25 +16602,25 @@ impl<'a> OffscreenObjects<'a> {
                         ));
                     }
                 }
-            } else if self.index_buffer != vk::Buffer::null() {
+            } else if !self.index.is_null() {
                 // An indexed indirect replay binds the rail's own `[0, 1, 2]`
                 // index buffer and reads its counts from the `INDIRECT_BUFFER`
                 // the CPU encoded above. `stride` is the struct size because
                 // the first increment writes exactly one command.
                 self.context.device.cmd_bind_index_buffer(
                     self.command,
-                    self.index_buffer,
+                    self.index.buffer,
                     0,
                     vk::IndexType::UINT32,
                 );
                 self.context.device.cmd_draw_indexed_indirect(
                     self.command,
-                    self.indirect_buffer,
+                    self.indirect.buffer,
                     0,
                     1,
                     std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
-            } else if self.indirect_buffer == vk::Buffer::null() {
+            } else if self.indirect.is_null() {
                 // The `vertex_id` shape instances the same way the
                 // vertex-buffer arms do (`research/docs/23` §3.3, v31): the
                 // reviewed triangle is replayed once per instance, so a pass
@@ -16541,7 +16651,7 @@ impl<'a> OffscreenObjects<'a> {
                 // increment writes exactly one command.
                 self.context.device.cmd_draw_indirect(
                     self.command,
-                    self.indirect_buffer,
+                    self.indirect.buffer,
                     0,
                     1,
                     std::mem::size_of::<vk::DrawIndirectCommand>() as u32,
@@ -16822,7 +16932,18 @@ impl<'a> OffscreenObjects<'a> {
 
 impl<'a> Drop for OffscreenObjects<'a> {
     fn drop(&mut self) {
+        use crate::phase_profile::{note_teardown_object, TeardownObject};
         unsafe {
+            // The drop is the one region of the render half that the first
+            // split left as a single number (`Phase::RenderTeardown`), and it
+            // is a *sequence* of destroy groups with very different costs. Each
+            // group below is charged to its own nested bar
+            // (`crate::phase_profile`, fourth cut), so a reading can say
+            // whether the pass pays for its images, its buffers, its
+            // descriptor state or its command pool — and the counters count
+            // only the handles that were really destroyed, so a group the
+            // pools already emptied reads as zero rather than as "free".
+            let _sync = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownSync);
             if self.fence != vk::Fence::null() {
                 self.context.device.destroy_fence(self.fence, None);
             }
@@ -16831,6 +16952,9 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_command_pool(self.command_pool, None);
             }
+            drop(_sync);
+            let _pipeline =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownPipeline);
             if self.pipeline != vk::Pipeline::null() {
                 self.context.device.destroy_pipeline(self.pipeline, None);
             }
@@ -16849,6 +16973,9 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_shader_module(self.vertex_module, None);
             }
+            drop(_pipeline);
+            let _passes =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownPasses);
             if self.framebuffer != vk::Framebuffer::null() {
                 self.context
                     .device
@@ -16869,10 +16996,13 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_render_pass(self.render_pass, None);
             }
+            drop(_passes);
             // The sampled textures and the descriptor the fragment stage read
             // them through are the pass's own (`research/docs/23` §3.3, v70):
             // the pool owns the set, so destroying the pool releases both and
             // the layout goes with it.
+            let _textures =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownTextures);
             for texture in &self.textures {
                 // A texel-fetch binding created no sampler
                 // (`research/docs/23` §3.3, v105), so only a slot that owns one
@@ -16880,29 +17010,31 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 if let Some(sampler) = texture.sampler {
                     if sampler != vk::Sampler::null() {
                         self.context.device.destroy_sampler(sampler, None);
+                        note_teardown_object(TeardownObject::Sampler);
                     }
                 }
                 if texture.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(texture.view, None);
+                    note_teardown_object(TeardownObject::View);
                 }
                 if texture.image != vk::Image::null() {
                     self.context.device.destroy_image(texture.image, None);
+                    note_teardown_object(TeardownObject::Image);
                 }
                 if texture.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(texture.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
                 // The no-copy arm's imported window is the pass's own too
                 // (`research/docs/23` §75, R5c): the object is destroyed once
                 // the pass is terminal, exactly like the image it fed.
-                if let Some((buffer, memory)) = texture.copy_source {
-                    if buffer != vk::Buffer::null() {
-                        self.context.device.destroy_buffer(buffer, None);
-                    }
-                    if memory != vk::DeviceMemory::null() {
-                        self.context.device.free_memory(memory, None);
-                    }
+                if let Some(source) = &texture.copy_source {
+                    source.destroy(&self.context.device);
                 }
             }
+            drop(_textures);
+            let _descriptors =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownDescriptors);
             if self.descriptor_pool != vk::DescriptorPool::null() {
                 self.context
                     .device
@@ -16937,14 +17069,18 @@ impl<'a> Drop for OffscreenObjects<'a> {
                         .destroy_descriptor_set_layout(layout, None);
                 }
             }
-            for (buffer, memory) in self.stage_buffer_inputs.drain(..) {
-                if buffer != vk::Buffer::null() {
-                    self.context.device.destroy_buffer(buffer, None);
-                }
-                if memory != vk::DeviceMemory::null() {
-                    self.context.device.free_memory(memory, None);
-                }
+            drop(_descriptors);
+            // The stage buffers the sets above pointed at are their own group:
+            // they are buffers with memories, which is what the counter beside
+            // their bar counts.
+            let _stage_buffers =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownBuffers);
+            for input in self.stage_buffer_inputs.drain(..) {
+                input.destroy(&self.context.device);
             }
+            drop(_stage_buffers);
+            let _depth_stencil =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownDepthStencil);
             if let Some(depth) = &self.depth {
                 // The depth resolve target is owned by the same pass scope
                 // (`research/docs/23` §3.3, v57), so it is destroyed beside
@@ -16952,22 +17088,28 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 if let Some(resolve) = &depth.resolve {
                     if resolve.view != vk::ImageView::null() {
                         self.context.device.destroy_image_view(resolve.view, None);
+                        note_teardown_object(TeardownObject::View);
                     }
                     if resolve.image != vk::Image::null() {
                         self.context.device.destroy_image(resolve.image, None);
+                        note_teardown_object(TeardownObject::Image);
                     }
                     if resolve.memory != vk::DeviceMemory::null() {
                         self.context.device.free_memory(resolve.memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
                 if depth.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(depth.view, None);
+                    note_teardown_object(TeardownObject::View);
                 }
                 if depth.image != vk::Image::null() {
                     self.context.device.destroy_image(depth.image, None);
+                    note_teardown_object(TeardownObject::Image);
                 }
                 if depth.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(depth.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
             if let Some(stencil) = &self.stencil {
@@ -16978,25 +17120,34 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 // (`research/docs/23` §3.3, v60).
                 if stencil.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(stencil.view, None);
+                    note_teardown_object(TeardownObject::View);
                 }
                 if let Some(resolve) = &stencil.resolve {
                     if resolve.view != vk::ImageView::null() {
                         self.context.device.destroy_image_view(resolve.view, None);
+                        note_teardown_object(TeardownObject::View);
                     }
                     if resolve.image != vk::Image::null() && !resolve.shares_backing {
                         self.context.device.destroy_image(resolve.image, None);
+                        note_teardown_object(TeardownObject::Image);
                     }
                     if resolve.memory != vk::DeviceMemory::null() && !resolve.shares_backing {
                         self.context.device.free_memory(resolve.memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
                 if stencil.image != vk::Image::null() && !stencil.shares_backing {
                     self.context.device.destroy_image(stencil.image, None);
+                    note_teardown_object(TeardownObject::Image);
                 }
                 if stencil.memory != vk::DeviceMemory::null() && !stencil.shares_backing {
                     self.context.device.free_memory(stencil.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
+            drop(_depth_stencil);
+            let _attachments =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownAttachments);
             for attachment in &self.attachments {
                 // The resolve target of a rail-owned multisampled attachment
                 // is owned by the same pass scope (`research/docs/23` §3.3,
@@ -17008,12 +17159,15 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     if let Some(resolve) = &attachment.resolve {
                         if resolve.view != vk::ImageView::null() {
                             self.context.device.destroy_image_view(resolve.view, None);
+                            note_teardown_object(TeardownObject::View);
                         }
                         if resolve.image != vk::Image::null() {
                             self.context.device.destroy_image(resolve.image, None);
+                            note_teardown_object(TeardownObject::Image);
                         }
                         if resolve.memory != vk::DeviceMemory::null() {
                             self.context.device.free_memory(resolve.memory, None);
+                            note_teardown_object(TeardownObject::Memory);
                         }
                     }
                 }
@@ -17022,78 +17176,58 @@ impl<'a> Drop for OffscreenObjects<'a> {
                         self.context
                             .device
                             .destroy_image_view(attachment.view, None);
+                        note_teardown_object(TeardownObject::View);
                     }
                     if attachment.image != vk::Image::null() {
                         self.context.device.destroy_image(attachment.image, None);
+                        note_teardown_object(TeardownObject::Image);
                     }
                     if attachment.memory != vk::DeviceMemory::null() {
                         self.context.device.free_memory(attachment.memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
             }
+            drop(_attachments);
+            let _readbacks =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownReadbacks);
             for readback in &self.readbacks {
                 if readback.memory != vk::DeviceMemory::null() {
                     self.context.device.unmap_memory(readback.memory);
                 }
                 if readback.buffer != vk::Buffer::null() {
                     self.context.device.destroy_buffer(readback.buffer, None);
+                    note_teardown_object(TeardownObject::Buffer);
                 }
                 if readback.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(readback.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
+            drop(_readbacks);
+            let _input_buffers =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownBuffers);
             // The indirect buffer is unbound by construction (its memory is
             // freed right after), so destroy before free.
-            if self.indirect_buffer != vk::Buffer::null() {
-                self.context
-                    .device
-                    .destroy_buffer(self.indirect_buffer, None);
-            }
-            if self.indirect_memory != vk::DeviceMemory::null() {
-                self.context.device.free_memory(self.indirect_memory, None);
-            }
+            self.indirect.destroy(&self.context.device);
             // The index buffer is unbound by construction (its memory is freed
             // right after), so destroy before free.
-            if self.index_buffer != vk::Buffer::null() {
-                self.context.device.destroy_buffer(self.index_buffer, None);
-            }
-            if self.index_memory != vk::DeviceMemory::null() {
-                self.context.device.free_memory(self.index_memory, None);
-            }
+            self.index.destroy(&self.context.device);
             // The caller-held streams are unbound by construction (their memory
             // is freed right after), so destroy before free.
-            for (buffer, memory) in self.vertex_inputs.drain(..) {
-                if buffer != vk::Buffer::null() {
-                    self.context.device.destroy_buffer(buffer, None);
-                }
-                if memory != vk::DeviceMemory::null() {
-                    self.context.device.free_memory(memory, None);
-                }
+            for input in self.vertex_inputs.drain(..) {
+                input.destroy(&self.context.device);
             }
-            if self.input_index_buffer != vk::Buffer::null() {
-                self.context
-                    .device
-                    .destroy_buffer(self.input_index_buffer, None);
-            }
-            if self.input_index_memory != vk::DeviceMemory::null() {
-                self.context
-                    .device
-                    .free_memory(self.input_index_memory, None);
-            }
+            self.input_index.destroy(&self.context.device);
+            drop(_input_buffers);
+            let _previous =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownPrevious);
             // The staging buffer is unbound by construction (its memory is
             // freed right after), so destroy before free.
             for attachment in &self.attachments {
-                if attachment.previous_buffer != vk::Buffer::null() {
-                    self.context
-                        .device
-                        .destroy_buffer(attachment.previous_buffer, None);
-                }
-                if attachment.previous_memory != vk::DeviceMemory::null() {
-                    self.context
-                        .device
-                        .free_memory(attachment.previous_memory, None);
-                }
+                attachment.previous.destroy(&self.context.device);
             }
+            drop(_previous);
         }
     }
 }

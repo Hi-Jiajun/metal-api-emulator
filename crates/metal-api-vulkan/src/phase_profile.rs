@@ -44,6 +44,8 @@
 //!   pool_drop_n=...
 //!   import_hit_n=... import_miss_n=... import_disabled_n=... import_return_n=...
 //!   import_drop_n=...
+//!   buffer_hit_n=... buffer_miss_n=... buffer_disabled_n=... buffer_return_n=...
+//!   buffer_drop_n=...
 //!   render_offscreen_n=... render_present_n=...
 //!   readback_rect_us=... readback_full_us=... readback_seed_us=...
 //!   readback_surfaces_us=... readback_shape_us=... readback_named_us=...
@@ -51,12 +53,20 @@
 //!   landing_record_us=... landing_wait_us=... landing_fetch_us=...
 //!   landing_write_us=... landing_release_us=... landing_named_us=...
 //!   landing_n=... landing_bytes=...
+//!   teardown_sync_us=... teardown_pipeline_us=... teardown_passes_us=...
+//!   teardown_textures_us=... teardown_descriptors_us=...
+//!   teardown_depth_stencil_us=... teardown_attachments_us=...
+//!   teardown_readbacks_us=... teardown_buffers_us=... teardown_previous_us=...
+//!   teardown_named_us=... render_release_reuse_us=... render_release_pool_us=...
+//!   render_release_import_us=... render_release_uploads_us=... render_retire_us=...
+//!   td_image_n=... td_view_n=... td_sampler_n=... td_buffer_n=... td_memory_n=...
 //!   ```
 //!
 //! and, beside the disjoint fields, the aggregate readings the nested splits
 //! imply: `render_us` (the five `render_*` children), `render_residual_us`
-//! (their eight siblings that divide what those five leave unnamed) and
-//! `texture_named_us` (the six nested regions inside `setup_textures`). The
+//! (their thirteen siblings that divide what those five leave unnamed),
+//! `texture_named_us` (the six nested regions inside `setup_textures`) and
+//! `teardown_named_us` (the ten nested regions inside `render_teardown`). The
 //! aggregates are printed beside the fields they aggregate rather than added to
 //! them, exactly as `plan_settle_us` already was.
 //!
@@ -90,7 +100,8 @@
 //!   loop's resolution and publication around each pass, a landing-only plan
 //!   entry, the present rail's own pass, the offscreen rail entry's admissions
 //!   and affine index resolution, the input retains, the owner-window landing
-//!   that follows a pass, and the pass objects' teardown. `sum(render children)
+//!   that follows a pass, the pass objects' teardown, the four pooled
+//!   hand-backs and the retains' release. `sum(render children)
 //!   + sum(render residual) <= render_total_us`.
 //!
 //! The `readback_*` fields are the one exception in *unit*, not in window: they
@@ -125,6 +136,36 @@
 //!   host fetch of the copied frame, the write into the owner's pages and the
 //!   release of those objects. The printed `landing_named_us` is their sum, and
 //!   `landing_n` / `landing_bytes` count what they were spent on.
+//!
+//! The fourth round splits the bar the first one left untouched — the pass
+//! objects' teardown — and the residual regions beside it:
+//!
+//! * `teardown_sync_us`, `teardown_pipeline_us`, `teardown_passes_us`,
+//!   `teardown_textures_us`, `teardown_descriptors_us`,
+//!   `teardown_depth_stencil_us`, `teardown_attachments_us`,
+//!   `teardown_readbacks_us`, `teardown_buffers_us` and
+//!   `teardown_previous_us` divide `render_teardown` itself — the two sync
+//!   objects, the pipeline-shaped objects the shape cache did not take, the
+//!   render pass and framebuffers, the sampled declarations' own objects, the
+//!   descriptor pools and layouts, the depth/stencil surfaces, the colour
+//!   attachments, the readback destinations, the remaining buffers and the
+//!   previous-byte staging buffers — in the order `OffscreenObjects::drop`
+//!   works through them. The printed `teardown_named_us` is their sum, so
+//!   `sum(teardown children) <= render_teardown_us` and the difference is the
+//!   seam between the groups.
+//! * `render_release_reuse_us`, `render_release_pool_us`,
+//!   `render_release_import_us`, `render_release_uploads_us` and
+//!   `render_retire_us` are siblings of
+//!   `render_teardown` inside the render half's residual: the three pooled
+//!   returns (`OffscreenObjects::release_reusable` /
+//!   `release_pooled_textures` / `release_imported_windows`, which the teardown
+//!   bar does *not* enclose because they run before it) and the input retains'
+//!   release. They are named because "give it back" is only free if a reading
+//!   says so, and because a pool's eviction destroys objects inside the return.
+//! * the five `td_*_n` counters are the population behind those bars: how many
+//!   images, image views, samplers, buffers and memories the window's teardowns
+//!   really destroyed (a null handle charges no count). A family whose count is
+//!   zero is a region the pools already emptied.
 //!
 //! The accumulator is **thread-local**, and a line is emitted by the thread that
 //! filled its own window. That is what makes each line self-consistent: with one
@@ -362,9 +403,75 @@ pub(crate) enum Phase {
     /// Inside `render_landing`: releasing the staging objects — the fence, the
     /// command pool, the mapping, the buffer and its memory.
     LandingRelease,
+    /// Inside `render_teardown`: the pass's two synchronisation objects — the
+    /// completion fence and the command pool the command buffer was allocated
+    /// from (`vkDestroyFence` / `vkDestroyCommandPool`, the latter releasing
+    /// the buffer with it).
+    ///
+    /// This bar and the nine below it divide `render_teardown` itself, so they
+    /// are *nested* inside [`Phase::RenderTeardown`] rather than beside it:
+    /// `sum(teardown children) <= render_teardown_us`, and the difference is
+    /// the seam between the groups of `OffscreenObjects::drop`.
+    TeardownSync,
+    /// Inside `render_teardown`: the pipeline-shaped objects the shape cache
+    /// did not take — the graphics pipeline, its layout and the two shader
+    /// modules. A pass whose key the cache answered leaves these null and
+    /// charges nothing here (`crate::render_setup_reuse`).
+    TeardownPipeline,
+    /// Inside `render_teardown`: the render pass, the seed render pass a
+    /// multisampled `Load` runs first, and both framebuffers.
+    TeardownPasses,
+    /// Inside `render_teardown`: the sampled declarations' own samplers, views,
+    /// images and memories — what neither the texture backing pool nor a
+    /// texel-fetch slot's missing sampler left behind
+    /// (`crate::render_texture_pool`), beside a no-copy arm's imported window
+    /// when the import pool did not take it back.
+    TeardownTextures,
+    /// Inside `render_teardown`: the sampler set's descriptor pool and layout,
+    /// the stage-buffer sets' own pools and layouts, and the empty layouts the
+    /// pipeline layout's unused slots hold.
+    TeardownDescriptors,
+    /// Inside `render_teardown`: the rail-owned depth and stencil surfaces with
+    /// their resolve targets (`research/docs/23` §3.3, v36/v47/v60).
+    TeardownDepthStencil,
+    /// Inside `render_teardown`: the colour attachment images (or the resolve
+    /// targets they own), their views and their memories.
+    TeardownAttachments,
+    /// Inside `render_teardown`: the readback destinations — one unmap, one
+    /// buffer and one memory per stored colour attachment.
+    TeardownReadbacks,
+    /// Inside `render_teardown`: every remaining buffer with its memory — the
+    /// stage buffers, the indirect and index buffers, and the caller-held
+    /// vertex streams.
+    TeardownBuffers,
+    /// Inside `render_teardown`: the previous-byte staging buffers a `Load`
+    /// uploaded from, which are destroyed in their own loop after the buffers
+    /// above.
+    TeardownPrevious,
+    /// Inside the render half's residual, beside [`Phase::RenderRetain`]:
+    /// handing the pipeline-shaped objects back to the shape cache once the
+    /// fence has retired them (`OffscreenObjects::release_reusable`).
+    RenderReleaseReuse,
+    /// Inside the render half's residual: handing the sampled textures' pooled
+    /// backing back (`OffscreenObjects::release_pooled_textures`) — which also
+    /// pays whatever the pool's own eviction destroys.
+    RenderReleasePool,
+    /// Inside the render half's residual: handing the owner-window imports
+    /// back (`OffscreenObjects::release_imported_windows`).
+    RenderReleaseImport,
+    /// Inside the render half's residual: handing the rail-owned host-visible
+    /// upload buffers back (`OffscreenObjects::release_pooled_uploads`) — the
+    /// previous bytes, vertex streams, index and indirect buffers and stage
+    /// buffers one pass built or took, which the fourth cut pools
+    /// (`crate::render_buffer_pool`).
+    RenderReleaseUploads,
+    /// Inside the render half's residual: the input retains the pass took
+    /// before its first import being released once the fence has proven the
+    /// device done with the owner's pages (`RenderInputRetains::retire`).
+    RenderRetire,
 }
 
-const PHASE_COUNT: usize = Phase::LandingRelease as usize + 1;
+const PHASE_COUNT: usize = Phase::RenderRetire as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -422,6 +529,21 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "landing_fetch",
     "landing_write",
     "landing_release",
+    "teardown_sync",
+    "teardown_pipeline",
+    "teardown_passes",
+    "teardown_textures",
+    "teardown_descriptors",
+    "teardown_depth_stencil",
+    "teardown_attachments",
+    "teardown_readbacks",
+    "teardown_buffers",
+    "teardown_previous",
+    "render_release_reuse",
+    "render_release_pool",
+    "render_release_import",
+    "render_release_uploads",
+    "render_retire",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -451,7 +573,7 @@ const RENDER_SLOTS: [usize; 5] = [
 ///
 /// The list is a reading aid rather than a printed field; a tool that checks
 /// the identity reads it from here.
-const RENDER_RESIDUAL_SLOTS: [usize; 8] = [
+const RENDER_RESIDUAL_SLOTS: [usize; 13] = [
     Phase::RenderResolve as usize,
     Phase::RenderPresent as usize,
     Phase::RenderPublish as usize,
@@ -460,6 +582,29 @@ const RENDER_RESIDUAL_SLOTS: [usize; 8] = [
     Phase::RenderRetain as usize,
     Phase::RenderLandOwner as usize,
     Phase::RenderTeardown as usize,
+    Phase::RenderReleaseReuse as usize,
+    Phase::RenderReleasePool as usize,
+    Phase::RenderReleaseImport as usize,
+    Phase::RenderReleaseUploads as usize,
+    Phase::RenderRetire as usize,
+];
+
+/// The nested split of `render_teardown`, added by the fourth cut: the ten
+/// regions `OffscreenObjects::drop` works through, in the order it works
+/// through them. `render_teardown` stays their enclosing bar, so
+/// `sum(teardown children) <= render_teardown_us` and the difference is the
+/// seam between the groups. The printed `teardown_named_us` is this set's sum.
+const TEARDOWN_SLOTS: [usize; 10] = [
+    Phase::TeardownSync as usize,
+    Phase::TeardownPipeline as usize,
+    Phase::TeardownPasses as usize,
+    Phase::TeardownTextures as usize,
+    Phase::TeardownDescriptors as usize,
+    Phase::TeardownDepthStencil as usize,
+    Phase::TeardownAttachments as usize,
+    Phase::TeardownReadbacks as usize,
+    Phase::TeardownBuffers as usize,
+    Phase::TeardownPrevious as usize,
 ];
 
 /// The nested split of `setup_textures`, beside the two upload/backing bars it
@@ -684,6 +829,31 @@ pub(crate) fn note_import_pool(outcome: crate::render_import_pool::ImportOutcome
     });
 }
 
+/// Count one host-visible upload buffer's use of the pooled pair
+/// (`crate::render_buffer_pool`) for the emitting thread's window.
+///
+/// The five outcomes partition every creation that reaches the mechanism: the
+/// pool held a buffer of this shape and handed it over, it held none and the
+/// creation built its own, the switch was off, or a completed pass handed a
+/// buffer back and the pool kept it (or destroyed it instead).
+#[inline]
+pub(crate) fn note_buffer_pool(outcome: crate::render_buffer_pool::UploadOutcome) {
+    if !enabled() {
+        return;
+    }
+    use crate::render_buffer_pool::UploadOutcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            UploadOutcome::Hit => local.buffer_hit_n += 1,
+            UploadOutcome::Miss => local.buffer_miss_n += 1,
+            UploadOutcome::Disabled => local.buffer_disabled_n += 1,
+            UploadOutcome::Returned => local.buffer_return_n += 1,
+            UploadOutcome::Dropped => local.buffer_drop_n += 1,
+        }
+    });
+}
+
 /// Which shape one executed render pass had: the offscreen rail the five
 /// `render_*` children were placed for, or the present rail, whose own setup,
 /// recording and readback are the residual's [`Phase::RenderPresent`].
@@ -748,6 +918,13 @@ struct Local {
     import_disabled_n: u64,
     import_return_n: u64,
     import_drop_n: u64,
+    /// The host-visible upload buffers this window's passes created or handed
+    /// back, by what `crate::render_buffer_pool` answered.
+    buffer_hit_n: u64,
+    buffer_miss_n: u64,
+    buffer_disabled_n: u64,
+    buffer_return_n: u64,
+    buffer_drop_n: u64,
     /// The render passes this window's submissions executed, by shape. The two
     /// do not share a cost shape, so a bar reading has to name its population.
     render_offscreen_n: u64,
@@ -760,6 +937,15 @@ struct Local {
     /// memory type the selection took.
     staging_cached_n: u64,
     staging_plain_n: u64,
+    /// The device objects the window's teardowns actually destroyed, by family.
+    /// They are the population behind the `teardown_*` bars: a bar's
+    /// microseconds divided by its own family's count is one object's cost, and
+    /// a family whose count is zero is a region the pools already emptied.
+    td_image_n: u64,
+    td_view_n: u64,
+    td_sampler_n: u64,
+    td_buffer_n: u64,
+    td_memory_n: u64,
 }
 
 /// An empty window, spelled out because the slot tables are longer than the
@@ -794,12 +980,22 @@ impl Default for Local {
             import_disabled_n: 0,
             import_return_n: 0,
             import_drop_n: 0,
+            buffer_hit_n: 0,
+            buffer_miss_n: 0,
+            buffer_disabled_n: 0,
+            buffer_return_n: 0,
+            buffer_drop_n: 0,
             render_offscreen_n: 0,
             render_present_n: 0,
             landing_n: 0,
             landing_bytes: 0,
             staging_cached_n: 0,
             staging_plain_n: 0,
+            td_image_n: 0,
+            td_view_n: 0,
+            td_sampler_n: 0,
+            td_buffer_n: 0,
+            td_memory_n: 0,
         }
     }
 }
@@ -854,6 +1050,7 @@ impl Local {
         let mut texture_named_ns = 0u64;
         let mut readback_named_ns = 0u64;
         let mut landing_named_ns = 0u64;
+        let mut teardown_named_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
             self.calls[slot] = 0;
@@ -874,6 +1071,9 @@ impl Local {
             }
             if LANDING_SLOTS.contains(&slot) {
                 landing_named_ns += ns;
+            }
+            if TEARDOWN_SLOTS.contains(&slot) {
+                teardown_named_ns += ns;
             }
             if WAIT_SLOTS.contains(&slot) {
                 let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
@@ -908,12 +1108,22 @@ impl Local {
         let import_disabled_n = std::mem::take(&mut self.import_disabled_n);
         let import_return_n = std::mem::take(&mut self.import_return_n);
         let import_drop_n = std::mem::take(&mut self.import_drop_n);
+        let buffer_hit_n = std::mem::take(&mut self.buffer_hit_n);
+        let buffer_miss_n = std::mem::take(&mut self.buffer_miss_n);
+        let buffer_disabled_n = std::mem::take(&mut self.buffer_disabled_n);
+        let buffer_return_n = std::mem::take(&mut self.buffer_return_n);
+        let buffer_drop_n = std::mem::take(&mut self.buffer_drop_n);
         let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
         let render_present_n = std::mem::take(&mut self.render_present_n);
         let landing_n = std::mem::take(&mut self.landing_n);
         let landing_bytes = std::mem::take(&mut self.landing_bytes);
         let staging_cached_n = std::mem::take(&mut self.staging_cached_n);
         let staging_plain_n = std::mem::take(&mut self.staging_plain_n);
+        let td_image_n = std::mem::take(&mut self.td_image_n);
+        let td_view_n = std::mem::take(&mut self.td_view_n);
+        let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
+        let td_buffer_n = std::mem::take(&mut self.td_buffer_n);
+        let td_memory_n = std::mem::take(&mut self.td_memory_n);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
@@ -921,6 +1131,7 @@ impl Local {
         let texture_named_us = micros(texture_named_ns);
         let readback_named_us = micros(readback_named_ns);
         let landing_named_us = micros(landing_named_ns);
+        let teardown_named_us = micros(teardown_named_ns);
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
@@ -928,6 +1139,7 @@ impl Local {
              texture_named_us={texture_named_us:.3} \
              readback_named_us={readback_named_us:.3} \
              landing_named_us={landing_named_us:.3} \
+             teardown_named_us={teardown_named_us:.3} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
@@ -939,10 +1151,15 @@ impl Local {
              import_hit_n={import_hit_n} import_miss_n={import_miss_n} \
              import_disabled_n={import_disabled_n} import_return_n={import_return_n} \
              import_drop_n={import_drop_n} \
+             buffer_hit_n={buffer_hit_n} buffer_miss_n={buffer_miss_n} \
+             buffer_disabled_n={buffer_disabled_n} buffer_return_n={buffer_return_n} \
+             buffer_drop_n={buffer_drop_n} \
              render_offscreen_n={render_offscreen_n} \
              render_present_n={render_present_n} \
              landing_n={landing_n} landing_bytes={landing_bytes} \
-             staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n}",
+             staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n} \
+             td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
+             td_buffer_n={td_buffer_n} td_memory_n={td_memory_n}",
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
@@ -988,6 +1205,42 @@ pub(crate) fn note_staging_memory(cached: bool) {
             local.staging_cached_n += 1;
         } else {
             local.staging_plain_n += 1;
+        }
+    });
+}
+
+/// One device object a teardown really destroyed (the handle was not null, so
+/// the count is the population the `teardown_*` bars were spent on — not the
+/// slots the drop walked past).
+///
+/// The families are the ones the printed counters name: an image (a colour
+/// attachment, a depth or stencil surface, its resolve target or a sampled
+/// declaration's own image), an image view, a sampler, a buffer (a readback
+/// destination, a stage buffer, an indirect or index buffer, a caller-held
+/// stream or a previous-byte staging buffer) and a device memory freed beside
+/// one of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TeardownObject {
+    Image,
+    View,
+    Sampler,
+    Buffer,
+    Memory,
+}
+
+#[inline]
+pub(crate) fn note_teardown_object(object: TeardownObject) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match object {
+            TeardownObject::Image => local.td_image_n += 1,
+            TeardownObject::View => local.td_view_n += 1,
+            TeardownObject::Sampler => local.td_sampler_n += 1,
+            TeardownObject::Buffer => local.td_buffer_n += 1,
+            TeardownObject::Memory => local.td_memory_n += 1,
         }
     });
 }
@@ -1191,6 +1444,38 @@ mod tests {
             assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
             assert!(!RENDER_SLOTS.contains(&slot));
             assert!(!READBACK_ARM_SLOTS.contains(&slot));
+        }
+        // The teardown split (the fourth round) is nested inside a residual
+        // slot rather than beside it, so its members must be neither the
+        // enclosing bar nor any sibling the disjoint sum or another split
+        // already claims — a slot in two lists would be counted twice by a
+        // reader who summed them.
+        for slot in TEARDOWN_SLOTS {
+            assert_ne!(slot, Phase::RenderTeardown as usize);
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!TEXTURE_SLOTS.contains(&slot));
+            assert!(!READBACK_ARM_SLOTS.contains(&slot));
+            assert!(!LANDING_SLOTS.contains(&slot));
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+        }
+        assert_eq!(PHASE_NAMES[Phase::TeardownSync as usize], "teardown_sync");
+        assert_eq!(
+            PHASE_NAMES[Phase::TeardownPrevious as usize],
+            "teardown_previous",
+            "the teardown split's last slot is the previous-byte buffers"
+        );
+        // The three pooled returns and the retain release are residual
+        // siblings of the teardown bar, not children of it: a slot in both
+        // sets would count the same microseconds twice.
+        for phase in [
+            Phase::RenderReleaseReuse,
+            Phase::RenderReleasePool,
+            Phase::RenderReleaseImport,
+            Phase::RenderRetire,
+        ] {
+            assert!(RENDER_RESIDUAL_SLOTS.contains(&(phase as usize)));
+            assert!(!TEARDOWN_SLOTS.contains(&(phase as usize)));
+            assert_ne!(phase, Phase::RenderTeardown);
         }
         assert_eq!(
             PHASE_NAMES[Phase::LandingLookup as usize],

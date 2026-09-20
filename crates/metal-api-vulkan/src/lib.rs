@@ -40,6 +40,7 @@ mod provider;
 mod readback_memory;
 mod readback_rect;
 mod render;
+mod render_buffer_pool;
 mod render_import_pool;
 mod render_setup_reuse;
 mod render_texture_pool;
@@ -51,6 +52,7 @@ pub use compute_provider::{
 };
 pub use render::RenderStage;
 pub use render::STAGE_BUFFER_NAMESPACE_SET;
+pub use render_buffer_pool::RenderBufferPoolCounts;
 pub use render_import_pool::RenderImportPoolCounts;
 pub use render_setup_reuse::RenderSetupReuseCounts;
 pub use render_texture_pool::RenderTexturePoolCounts;
@@ -977,6 +979,35 @@ impl VulkanExecutor {
         self.context.clear_render_import_pool();
     }
 
+    /// What the pooled host-visible upload buffers have seen
+    /// (`crate::render_buffer_pool`): how many creations the pool served, how
+    /// many built their own buffer, how many were asked while the switch was
+    /// off, and how many buffers were kept, evicted or dropped.
+    #[doc(hidden)]
+    pub fn render_buffer_pool_counts(&self) -> RenderBufferPoolCounts {
+        self.context.render_buffer_pool_counts()
+    }
+
+    /// Whether the pooled host-visible upload buffers are on for this executor.
+    #[doc(hidden)]
+    pub fn render_buffer_pool_enabled(&self) -> bool {
+        self.context.render_buffer_pool_enabled()
+    }
+
+    /// Turn the pooled host-visible upload buffers on or off, dropping what
+    /// they held when they go off.
+    #[doc(hidden)]
+    pub fn set_render_buffer_pool(&self, enabled: bool) {
+        self.context.set_render_buffer_pool(enabled);
+    }
+
+    /// Drop every pooled upload buffer: the contract surface they were built
+    /// from moved.
+    #[doc(hidden)]
+    pub fn clear_render_buffer_pool(&self) {
+        self.context.clear_render_buffer_pool();
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1677,6 +1708,12 @@ pub(crate) struct VulkanContext {
     /// import was checked against. On by default, off with
     /// `METAL_API_VULKAN_RENDER_IMPORT_POOL=0`.
     render_import_pool: Mutex<render_import_pool::RenderImportPool>,
+    /// The host-visible upload buffer one offscreen pass may hand the next
+    /// creation of the same shape (`crate::render_buffer_pool`): the buffer and
+    /// its memory for the previous bytes, the vertex streams, the index and
+    /// indirect buffers and the stage buffers a pass binds. On by default, off
+    /// with `METAL_API_VULKAN_RENDER_BUFFER_POOL=0`.
+    render_buffer_pool: Mutex<render_buffer_pool::RenderBufferPool>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -1932,6 +1969,10 @@ impl VulkanContext {
         // The pooled owner-window import reads the same way: its own switch and
         // its own empty table, built before the literal takes `device`.
         let render_import_pool = render_import_pool::RenderImportPool::new(device.clone());
+        // The pooled host-visible upload buffers read the same way: their own
+        // switch and their own empty table, built before the literal takes
+        // `device`.
+        let render_buffer_pool = render_buffer_pool::RenderBufferPool::new(device.clone());
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
@@ -1966,6 +2007,7 @@ impl VulkanContext {
             render_setup_reuse: Mutex::new(render_setup_reuse),
             render_texture_pool: Mutex::new(render_texture_pool),
             render_import_pool: Mutex::new(render_import_pool),
+            render_buffer_pool: Mutex::new(render_buffer_pool),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -2144,6 +2186,61 @@ impl VulkanContext {
     /// moved.
     pub(crate) fn clear_render_import_pool(&self) {
         self.lock_render_import_pool().clear();
+    }
+
+    /// The host-visible upload buffers this device keeps
+    /// (`crate::render_buffer_pool`). A poisoned lock is recovered for the same
+    /// reason the other pools' is: the pool's state is a list of device
+    /// handles, and a panic elsewhere must not turn a reusable buffer into a
+    /// refusal.
+    fn lock_render_buffer_pool(&self) -> MutexGuard<'_, render_buffer_pool::RenderBufferPool> {
+        self.render_buffer_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The upload buffer a creation of this shape may take, and what the pool
+    /// answered.
+    pub(crate) fn take_render_upload(
+        &self,
+        key: render_buffer_pool::UploadKey,
+    ) -> (
+        Option<render_buffer_pool::UploadedBuffer>,
+        render_buffer_pool::UploadOutcome,
+    ) {
+        self.lock_render_buffer_pool().take(key)
+    }
+
+    /// Hand a completed pass's upload buffer back, or destroy it when the
+    /// mechanism is off.
+    pub(crate) fn give_render_upload_back(
+        &self,
+        key: render_buffer_pool::UploadKey,
+        uploaded: render_buffer_pool::UploadedBuffer,
+    ) -> render_buffer_pool::UploadOutcome {
+        self.lock_render_buffer_pool().give(key, uploaded)
+    }
+
+    /// The upload-buffer pool counters one reading reports.
+    pub(crate) fn render_buffer_pool_counts(&self) -> render_buffer_pool::RenderBufferPoolCounts {
+        self.lock_render_buffer_pool().counts()
+    }
+
+    /// Whether the upload-buffer pool is on for this device.
+    pub(crate) fn render_buffer_pool_enabled(&self) -> bool {
+        self.lock_render_buffer_pool().enabled()
+    }
+
+    /// Turn the upload-buffer pool on or off, and drop what it holds when it
+    /// goes off.
+    pub(crate) fn set_render_buffer_pool(&self, enabled: bool) {
+        self.lock_render_buffer_pool().set_enabled(enabled);
+    }
+
+    /// Drop every pooled upload buffer: the contract surface they were built
+    /// from moved.
+    pub(crate) fn clear_render_buffer_pool(&self) {
+        self.lock_render_buffer_pool().clear();
     }
 
     /// The selected device's own limits, for the render rail's attachment

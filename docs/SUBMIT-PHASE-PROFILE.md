@@ -54,6 +54,13 @@ landing_lookup_us=... landing_windows_us=... landing_stage_us=...
 landing_record_us=... landing_wait_us=... landing_fetch_us=...
 landing_write_us=... landing_release_us=... landing_named_us=...
 landing_n=... landing_bytes=... staging_cached_n=... staging_plain_n=...
+teardown_sync_us=... teardown_pipeline_us=... teardown_passes_us=...
+teardown_textures_us=... teardown_descriptors_us=...
+teardown_depth_stencil_us=... teardown_attachments_us=...
+teardown_readbacks_us=... teardown_buffers_us=... teardown_previous_us=...
+teardown_named_us=... render_release_reuse_us=... render_release_pool_us=...
+render_release_import_us=... render_retire_us=...
+td_image_n=... td_view_n=... td_sampler_n=... td_buffer_n=... td_memory_n=...
 ```
 
 Every µs field is a **sum over that line's own window**, not a mean, with three
@@ -121,6 +128,20 @@ have their own setup and readback).
 | `render_retain` | inside the render half's residual: the input retains a pass takes before its first import |
 | `render_land_owner` | inside the render half's residual: the owner-window landing that follows a successful pass |
 | `render_teardown` | inside the render half's residual: the pass objects' destruction once the fence proved the device done |
+| `render_release_reuse` | inside the render half's residual, beside `render_teardown`: handing the pipeline-shaped objects back to the shape cache |
+| `render_release_pool` | inside the render half's residual: handing the sampled textures' pooled backing back, eviction included |
+| `render_release_import` | inside the render half's residual: handing the owner-window imports back |
+| `render_retire` | inside the render half's residual: releasing the input retains the pass took |
+| `teardown_sync` | inside `render_teardown`: the completion fence and the command pool |
+| `teardown_pipeline` | inside `render_teardown`: the pipeline, its layout and the two shader modules the shape cache did not take |
+| `teardown_passes` | inside `render_teardown`: the render pass, the seed render pass and both framebuffers |
+| `teardown_textures` | inside `render_teardown`: the sampled declarations' own samplers, views, images, memories and imported windows |
+| `teardown_descriptors` | inside `render_teardown`: the descriptor pools, set layouts and the empty layouts of unused set positions |
+| `teardown_depth_stencil` | inside `render_teardown`: the depth and stencil surfaces with their resolve targets |
+| `teardown_attachments` | inside `render_teardown`: the colour attachments' images, views, memories and resolve targets |
+| `teardown_readbacks` | inside `render_teardown`: the readback destinations — one unmap, buffer and memory per stored attachment |
+| `teardown_buffers` | inside `render_teardown`: the stage buffers, the indirect and index buffers and the caller-held vertex streams |
+| `teardown_previous` | inside `render_teardown`: the previous-byte staging buffers a `Load` uploaded from |
 | `readback_rect` | inside `render_readback`: one stored attachment's trimmed frame — the written rectangle copied out of the mapping and the seed rebuilt around it |
 | `readback_full` | inside `render_readback`: one stored attachment's whole extent copied out of its mapping |
 | `readback_seed` | inside `readback_rect`: the rebuild itself (the seed and the patch), which only the trimmed arm pays |
@@ -153,14 +174,29 @@ is part of the disjoint sum either:
   owner's window or writes descriptors — the reading that selected the second
   cut (`docs/RENDER-IMPORT-POOL.md`), where `texture_import_us` was 1 117.7 of
   `setup_textures`'s 1 141.1 µs/submit and the other five came to 5.6 µs.
-* the eight `render_*` residual fields divide what `render_total` cost minus its
-  five children — the outer loop around each pass, a landing-only entry, the
+* the twelve `render_*` residual fields divide what `render_total` cost minus
+  its five children — the outer loop around each pass, a landing-only entry, the
   present rail, the offscreen rail entry's own admissions, the retains, the
-  owner-window landing and the pass teardown:
+  owner-window landing, the pass teardown, the three pooled hand-backs and the
+  retains' release:
   `sum(render children) + sum(render residual) <= render_total`, with the
   printed `render_residual_us` as the residual's own sum. The seam that remains
   is the function-call boundary between them, and the sp4 round read it as
   32.0 µs/submit out of a 1 769.0 µs/submit residual.
+* the ten `teardown_*` fields divide `render_teardown` itself — the pass's two
+  synchronisation objects, the pipeline-shaped objects the shape cache did not
+  take, the render pass and framebuffers, the sampled declarations' own objects,
+  the descriptor state, the depth/stencil surfaces, the colour attachments, the
+  readback destinations, the remaining buffers and the previous-byte staging
+  buffers, in the order `OffscreenObjects::drop` works through them — with
+  `teardown_named_us` as their printed sum, so
+  `sum(teardown children) <= render_teardown_us`. They are the fourth cut's
+  subject: `render_teardown` was the largest unnamed bar the third cut left
+  (494.2 of 2 697.3 µs/submit), and the five `td_*_n` counters beside them are
+  its population — how many images, image views, samplers, buffers and memories
+  the window's teardowns really destroyed, so a bar's microseconds can be
+  divided by what they were spent on and a region the pools already emptied
+  reads as a zero count rather than as a free one.
 * the readback's four arms divide `render_readback` itself: the trimmed arm
   (`readback_rect`, with `readback_seed` nested inside it — the rebuild only that
   arm pays), the whole-extent arm (`readback_full`) and the depth, stencil and
