@@ -990,12 +990,25 @@ const SUBMIT_SEAM_SLOTS: [usize; 6] = [
 /// call's own tail drops them. `submit_release` stays their enclosing bar, so
 /// `sum(SUBMIT_RELEASE_SLOTS) <= submit_release_us`; the printed
 /// `submit_release_named_us` is this set's sum.
-const SUBMIT_RELEASE_SLOTS: [usize; 4] = [
+const SUBMIT_RELEASE_SLOTS: [usize; 3] = [
     Phase::SubmitReleaseBindings as usize,
     Phase::SubmitReleaseViews as usize,
-    Phase::SubmitReleasePool as usize,
     Phase::SubmitReleasePlan as usize,
 ];
+
+/// The nested split of `submit_release_views`: the pool's own table, dropped
+/// apart from the texture views that share its parent. The parent stays the
+/// enclosing bar, so `submit_release_pool_us <= submit_release_views_us` and the
+/// pool's share is read as a share rather than added to the release's three
+/// children.
+///
+/// The set is read by the tests rather than by the printer: a one-member nested
+/// split needs no printed sum of its own — the bar is the field — but the rule
+/// that it is nested and not a fourth sibling is what keeps
+/// `submit_release_named_us` a sum of the release's children, so it is held
+/// there.
+#[cfg(test)]
+const SUBMIT_RELEASE_VIEWS_SLOTS: [usize; 1] = [Phase::SubmitReleasePool as usize];
 
 /// The nested split of `submit_validate`: the two pool derivations the
 /// validation takes, the walk that reads them, and the release of the tables
@@ -2739,13 +2752,25 @@ mod tests {
             PHASE_NAMES[Phase::SubmitValidateCheck as usize],
             "submit_validate_check"
         );
-        // The release's four children are the whole of it (the seventh cut
-        // split its `views` child in two), and the validation has exactly three
-        // regions (the seventh cut named the release that used to be its seam):
-        // a set that missed one would read as a seam rather than as an unsplit
-        // region.
-        assert_eq!(SUBMIT_RELEASE_SLOTS.len(), 4);
+        // The release has exactly three children, and the validation has exactly
+        // three regions (the seventh cut named the release that used to be its
+        // seam): a set that missed one would read as a seam rather than as an
+        // unsplit region.
+        assert_eq!(SUBMIT_RELEASE_SLOTS.len(), 3);
         assert_eq!(SUBMIT_VALIDATE_SLOTS.len(), 3);
+        // The seventh cut's pool bar is a *nested* child of `submit_release_views`
+        // rather than a fourth sibling: a set that held it would make
+        // `submit_release_named_us` count the pool twice, once in its parent and
+        // once on its own.
+        assert!(!SUBMIT_RELEASE_SLOTS.contains(&(Phase::SubmitReleasePool as usize)));
+        assert_eq!(
+            SUBMIT_RELEASE_VIEWS_SLOTS,
+            [Phase::SubmitReleasePool as usize]
+        );
+        assert_ne!(
+            Phase::SubmitReleasePool as usize,
+            Phase::SubmitReleaseViews as usize
+        );
         assert_eq!(
             PHASE_NAMES[Phase::SubmitReleasePool as usize],
             "submit_release_pool"
@@ -2773,9 +2798,16 @@ mod tests {
             assert!(!SUBMIT_TEARDOWN_SLOTS.contains(&slot));
             assert!(!RENDER_SLOTS.contains(&slot));
         }
-        assert!(SUBMIT_RELEASE_SLOTS.contains(&(Phase::SubmitReleasePool as usize)));
+        assert!(SUBMIT_RELEASE_VIEWS_SLOTS.contains(&(Phase::SubmitReleasePool as usize)));
         assert!(SUBMIT_VALIDATE_SLOTS.contains(&(Phase::SubmitValidateRelease as usize)));
         assert!(PLAN_SETTLE_SLOTS.contains(&(Phase::Plan as usize)));
+        // The release's three children are disjoint from the nested pool child
+        // and from each other, so a reader adds the three and reads the fourth
+        // as a share of `submit_release_views`.
+        for slot in SUBMIT_RELEASE_VIEWS_SLOTS {
+            assert!(!SUBMIT_RELEASE_SLOTS.contains(&slot));
+            assert!(!SUBMIT_VALIDATE_SLOTS.contains(&slot));
+        }
     }
 
     /// A window drains on the `total` bar that fills it, and a drained window
