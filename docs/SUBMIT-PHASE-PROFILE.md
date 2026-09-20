@@ -48,6 +48,12 @@ render_teardown_us=... render_residual_us=... texture_named_us=...
 pool_hit_n=... pool_miss_n=... pool_disabled_n=... pool_return_n=...
 pool_drop_n=... import_hit_n=... import_miss_n=... import_disabled_n=...
 import_return_n=... import_drop_n=... render_offscreen_n=... render_present_n=...
+readback_rect_us=... readback_full_us=... readback_seed_us=...
+readback_surfaces_us=... readback_shape_us=... readback_named_us=...
+landing_lookup_us=... landing_windows_us=... landing_stage_us=...
+landing_record_us=... landing_wait_us=... landing_fetch_us=...
+landing_write_us=... landing_release_us=... landing_named_us=...
+landing_n=... landing_bytes=... staging_cached_n=... staging_plain_n=...
 ```
 
 Every µs field is a **sum over that line's own window**, not a mean, with three
@@ -115,6 +121,19 @@ have their own setup and readback).
 | `render_retain` | inside the render half's residual: the input retains a pass takes before its first import |
 | `render_land_owner` | inside the render half's residual: the owner-window landing that follows a successful pass |
 | `render_teardown` | inside the render half's residual: the pass objects' destruction once the fence proved the device done |
+| `readback_rect` | inside `render_readback`: one stored attachment's trimmed frame — the written rectangle copied out of the mapping and the seed rebuilt around it |
+| `readback_full` | inside `render_readback`: one stored attachment's whole extent copied out of its mapping |
+| `readback_seed` | inside `readback_rect`: the rebuild itself (the seed and the patch), which only the trimmed arm pays |
+| `readback_surfaces` | inside `render_readback`: the depth, stencil and writable stage-buffer copy-outs |
+| `readback_shape` | inside `setup_readbacks` (not inside `render_readback`): the decision itself, taken before any device object exists. This is a *time*; the `readback_shape_n` counter next to the `readback_*` counts is the number of attachments that decision sent to the whole-extent arm |
+| `landing_lookup` | inside `render_landing`: the kept frame's target and the landing view's own declaration |
+| `landing_windows` | inside `render_landing`: the owner windows the frame lands in, resolved against the lease channel |
+| `landing_stage` | inside `render_landing`: the staging buffer, its memory and mapping, the command pool, the command buffer and the fence |
+| `landing_record` | inside `render_landing`: the copy's recording and its submission |
+| `landing_wait` | inside `render_landing`: `vkWaitForFences` for the landing copy |
+| `landing_fetch` | inside `render_landing`: the host read of the copied frame — the part a landing shares with the readback channel |
+| `landing_write` | inside `render_landing`: the write into the owner's live pages |
+| `landing_release` | inside `render_landing`: destroying the fence, the command pool, the mapping, the buffer and its memory |
 
 The ten `setup_*` fields are the one nested split in the line: they divide
 `render_setup` itself, so `sum(setup_*) <= render_setup_us` and the difference is
@@ -142,6 +161,33 @@ is part of the disjoint sum either:
   printed `render_residual_us` as the residual's own sum. The seam that remains
   is the function-call boundary between them, and the sp4 round read it as
   32.0 µs/submit out of a 1 769.0 µs/submit residual.
+* the readback's four arms divide `render_readback` itself: the trimmed arm
+  (`readback_rect`, with `readback_seed` nested inside it — the rebuild only that
+  arm pays), the whole-extent arm (`readback_full`) and the depth, stencil and
+  writable stage-buffer copy-outs (`readback_surfaces`). `readback_shape` is the
+  decision that picks the arm, and it is nested inside `setup_readbacks` rather
+  than inside the readback bar because it is taken before any device object
+  exists; `readback_named_us` is the printed sum of the three arms. The sp7
+  round read 1 816.6 of `render_readback`'s 1 845.1 µs/submit in the whole-extent
+  arm, at 169 MB/s, and 27.7 in the trimmed one.
+* the eight `landing_*` fields divide one landing-only entry (`render_landing`):
+  its identity lookup, its window resolution, its staging objects, the copy's
+  recording and submission, its fence wait, the host fetch of the copied frame,
+  the write into the owner's pages and the release of those objects, with
+  `landing_named_us` as their printed sum and `landing_n` / `landing_bytes` as
+  what they were spent on. The sp7 round read 49 206.8 of a landing's
+  51 939.2 µs in `landing_fetch` — 168 MB/s, the same rate the whole-extent
+  readback arm paid, which is what named the memory both mappings point at as
+  the third cut's subject (`docs/READBACK-MEMORY.md`).
+
+`staging_cached_n` and `staging_plain_n` count the readback staging buffers a
+window's submissions allocated, by which memory type the selection took
+(`crate::readback_memory`): the first for a buffer backed by the device's
+host-cached type, the second for one backed by the first host-visible type the
+device states — a device with no cached type, or the mechanism's own control
+arm. The process also prints the type it chose once, as
+`STAGING readback memory type_index=... flags=... cached=...`, while the profile
+is on.
 
 The `reuse_*` fields are counts, not times, and they partition every offscreen
 pass that reached the shape cache: `reuse_hit_n` passes were served the shader
