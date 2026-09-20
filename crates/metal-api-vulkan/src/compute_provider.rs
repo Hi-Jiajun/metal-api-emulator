@@ -4643,9 +4643,38 @@ impl ComputeProvider for VulkanComputeProvider {
             {
                 let _validate =
                     crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitValidate);
-                output.validate_for_trace(trace).map_err(|error| {
-                    output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
-                })?;
+                // The sixth cut splits this bar into the two pool derivations
+                // the terminal validation takes for itself and the walk that
+                // reads them (`crate::phase_profile::Phase::SubmitValidateDerive`
+                // / `SubmitValidateCheck`). The two calls are the ones
+                // `validate_for_trace` makes, in the order it makes them: the
+                // derivation is pure and reads the same borrowed trace, and the
+                // walk is `ProviderSubmission::validate_with_pools`, which is
+                // that method's own body with the tables handed in.
+                let (derived_resources, derived_textures) = {
+                    let _derive = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::SubmitValidateDerive,
+                    );
+                    (
+                        trace.serial_resources().map_err(|error| {
+                            output_error(token, "writeback_contract_invalid")
+                                .with_detail(error.to_string())
+                        })?,
+                        trace.serial_texture_resources().map_err(|error| {
+                            output_error(token, "writeback_contract_invalid")
+                                .with_detail(error.to_string())
+                        })?,
+                    )
+                };
+                let _check = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitValidateCheck,
+                );
+                output
+                    .validate_with_pools(trace, &derived_resources, &derived_textures)
+                    .map_err(|error| {
+                        output_error(token, "writeback_contract_invalid")
+                            .with_detail(error.to_string())
+                    })?;
             }
             Ok(output)
         })
@@ -4681,6 +4710,48 @@ impl ComputeProvider for VulkanComputeProvider {
                 );
         }
         self.sync_completion_health();
+        // The sixth cut's second region: the tail of the call. `total` is the
+        // first binding in `submit`, so it is the last to drop, and the values
+        // declared after it — the pooled bindings with their byte copies, the
+        // resource pool, the texture views, the dispatch list, the heap plan,
+        // the render plan and the pipeline artifacts — drop *after* the
+        // `settle` guard that was declared last. That tail is inside `total`
+        // and outside every other bar, and nothing named it
+        // (`crate::phase_profile::Phase::SubmitRelease`).
+        //
+        // The release bar resolves to `None` when the profile is off, and the
+        // branch below is skipped with it: the tail values then drop exactly
+        // where they dropped before the cut, at the end of the scope. With the
+        // profile on, the settle bar is closed first so the two regions stay
+        // disjoint and the release's own three children divide it.
+        drop(_settle);
+        if let Some(_release) =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitRelease)
+        {
+            drop(executor);
+            {
+                let _bindings = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitReleaseBindings,
+                );
+                drop(buffers);
+            }
+            {
+                let _views = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitReleaseViews,
+                );
+                drop(pool);
+                drop(textures);
+            }
+            {
+                let _plan = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitReleasePlan,
+                );
+                drop(dispatches);
+                drop(heap_plan);
+                drop(render_plan);
+                drop(artifacts);
+            }
+        }
         result
     }
 
