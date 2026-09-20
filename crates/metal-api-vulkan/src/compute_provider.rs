@@ -3,10 +3,11 @@
 
 use crate::{
     execute_pool_sequence_with_status, render, Binding, BoundDispatch, ComputeBufferPoolCounts,
-    FloatControls2Support, LandingTarget, LandingUpdate, PendingExecution, PoolBinding, PoolKey,
-    PoolKind, RenderBufferPoolCounts, RenderImportPoolCounts, RenderSetupReuseCounts,
-    RenderTexturePoolCounts, SequenceTail, SpirvFeaturePolicy, TranslatedComputePipeline,
-    VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
+    ComputePipelineReuseCounts, FloatControls2Support, LandingTarget, LandingUpdate,
+    PendingExecution, PoolBinding, PoolKey, PoolKind, RenderBufferPoolCounts,
+    RenderImportPoolCounts, RenderSetupReuseCounts, RenderTexturePoolCounts, SequenceTail,
+    SpirvFeaturePolicy, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -3211,6 +3212,51 @@ impl VulkanComputeProvider {
             .clear_compute_buffer_pool();
     }
 
+    /// What the compute half's shape-decided pipeline reuse has seen
+    /// (`crate::compute_pipeline_reuse`): how many creations the table served
+    /// and how many built their own objects, how many digest collisions the
+    /// full comparison refused, how many were asked while the switch was off,
+    /// and how many groups the table kept, evicted or dropped.
+    #[doc(hidden)]
+    pub fn compute_pipeline_reuse_counts(&self) -> ComputePipelineReuseCounts {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .compute_pipeline_reuse_counts()
+    }
+
+    /// Whether the compute half's shape-decided pipeline reuse is on for this
+    /// provider: the environment's answer unless a caller stated its own.
+    #[doc(hidden)]
+    pub fn compute_pipeline_reuse_enabled(&self) -> bool {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .compute_pipeline_reuse_enabled()
+    }
+
+    /// Turn the compute half's shape-decided pipeline reuse on or off for this
+    /// provider.
+    ///
+    /// The process environment states the default
+    /// (`METAL_API_VULKAN_COMPUTE_PIPELINE_REUSE=0` turns it off); this is what
+    /// a test's own arms and a build without the environment state, so both
+    /// arms of a comparison can run against one device in one process.
+    /// Switching it off destroys what it held.
+    #[doc(hidden)]
+    pub fn set_compute_pipeline_reuse(&self, enabled: bool) {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .set_compute_pipeline_reuse(enabled);
+    }
+
+    /// Drop every reusable compute pipeline group: the contract surface they
+    /// were built from moved.
+    #[doc(hidden)]
+    pub fn invalidate_compute_pipeline_reuse(&self) {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .clear_compute_pipeline_reuse();
+    }
+
     fn retire(&self, pending: PendingExecution) {
         let mut slot = match self.retire_tx.lock() {
             Ok(slot) => slot,
@@ -3769,6 +3815,17 @@ impl PipelineProvider for VulkanComputeProvider {
             ));
         }
         pipelines.remove(&metadata.pipeline_id);
+        // The released registration is part of the contract surface the
+        // shape-decided compute objects were built from: a submission that
+        // dispatches through a retired registration must not be served by an
+        // entry minted while it was live, so the whole table goes and the next
+        // submission of any shape builds exactly as it did before the table
+        // existed (`crate::compute_pipeline_reuse`). The key is the module's own
+        // SPIR-V, so this is a memory bound rather than a correctness one — a
+        // re-registered function whose translation differs states different
+        // words and would meet no entry anyway.
+        drop(pipelines);
+        self.invalidate_compute_pipeline_reuse();
         Ok(())
     }
 

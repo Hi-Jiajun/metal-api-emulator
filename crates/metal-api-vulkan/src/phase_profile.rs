@@ -49,6 +49,9 @@
 //!   compute_buffer_hit_n=... compute_buffer_miss_n=...
 //!   compute_buffer_disabled_n=... compute_buffer_return_n=...
 //!   compute_buffer_drop_n=...
+//!   compute_pipeline_hit_n=... compute_pipeline_miss_n=...
+//!   compute_pipeline_mismatch_n=... compute_pipeline_disabled_n=...
+//!   compute_pipeline_return_n=... compute_pipeline_drop_n=...
 //!   render_offscreen_n=... render_present_n=...
 //!   render_batch_n=... render_batch_passes=...
 //!   render_batch_passes_1=... render_batch_passes_2=...
@@ -1144,6 +1147,38 @@ pub(crate) fn note_compute_buffer_pool(outcome: crate::compute_buffer_pool::Comp
     });
 }
 
+/// Count one compute creation's use of the shape-decided pipeline table
+/// (`crate::compute_pipeline_reuse`) for the emitting thread's window.
+///
+/// The six outcomes partition every creation that reaches the mechanism and
+/// every hand-back a completed submission makes: the table held objects of this
+/// shape and handed them over, it held none and the creation built its own, an
+/// entry shared the digest but not the shape, the switch was off, or a
+/// submission whose fence was observed handed its objects back and the table
+/// kept them (or destroyed them instead). They are separate from the render
+/// rail's `reuse_*_n` because the two rails have their own switches: a round
+/// has to be able to see the compute half's reuse on its own.
+#[inline]
+pub(crate) fn note_compute_pipeline_reuse(
+    outcome: crate::compute_pipeline_reuse::ComputePipelineOutcome,
+) {
+    if !enabled() {
+        return;
+    }
+    use crate::compute_pipeline_reuse::ComputePipelineOutcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            ComputePipelineOutcome::Hit => local.compute_pipeline_hit_n += 1,
+            ComputePipelineOutcome::Miss => local.compute_pipeline_miss_n += 1,
+            ComputePipelineOutcome::Mismatch => local.compute_pipeline_mismatch_n += 1,
+            ComputePipelineOutcome::Disabled => local.compute_pipeline_disabled_n += 1,
+            ComputePipelineOutcome::Returned => local.compute_pipeline_return_n += 1,
+            ComputePipelineOutcome::Dropped => local.compute_pipeline_drop_n += 1,
+        }
+    });
+}
+
 /// Which shape one executed render pass had: the offscreen rail the five
 /// `render_*` children were placed for, or the present rail, whose own setup,
 /// recording and readback are the residual's [`Phase::RenderPresent`].
@@ -1273,6 +1308,17 @@ struct Local {
     compute_buffer_disabled_n: u64,
     compute_buffer_return_n: u64,
     compute_buffer_drop_n: u64,
+    /// The compute half's own shape-decided pipeline groups this window's
+    /// submissions took, built or handed back, by what
+    /// `crate::compute_pipeline_reuse` answered. A separate group from
+    /// `reuse_*_n` because the two rails carry their own switch, and separate
+    /// from `rb_pipeline_n` because a group that was handed over built nothing.
+    compute_pipeline_hit_n: u64,
+    compute_pipeline_miss_n: u64,
+    compute_pipeline_mismatch_n: u64,
+    compute_pipeline_disabled_n: u64,
+    compute_pipeline_return_n: u64,
+    compute_pipeline_drop_n: u64,
     /// The render passes this window's submissions executed, by shape. The two
     /// do not share a cost shape, so a bar reading has to name its population.
     render_offscreen_n: u64,
@@ -1365,6 +1411,12 @@ impl Default for Local {
             compute_buffer_disabled_n: 0,
             compute_buffer_return_n: 0,
             compute_buffer_drop_n: 0,
+            compute_pipeline_hit_n: 0,
+            compute_pipeline_miss_n: 0,
+            compute_pipeline_mismatch_n: 0,
+            compute_pipeline_disabled_n: 0,
+            compute_pipeline_return_n: 0,
+            compute_pipeline_drop_n: 0,
             render_offscreen_n: 0,
             render_present_n: 0,
             render_batch_n: 0,
@@ -1550,6 +1602,12 @@ impl Local {
         let compute_buffer_disabled_n = std::mem::take(&mut self.compute_buffer_disabled_n);
         let compute_buffer_return_n = std::mem::take(&mut self.compute_buffer_return_n);
         let compute_buffer_drop_n = std::mem::take(&mut self.compute_buffer_drop_n);
+        let compute_pipeline_hit_n = std::mem::take(&mut self.compute_pipeline_hit_n);
+        let compute_pipeline_miss_n = std::mem::take(&mut self.compute_pipeline_miss_n);
+        let compute_pipeline_mismatch_n = std::mem::take(&mut self.compute_pipeline_mismatch_n);
+        let compute_pipeline_disabled_n = std::mem::take(&mut self.compute_pipeline_disabled_n);
+        let compute_pipeline_return_n = std::mem::take(&mut self.compute_pipeline_return_n);
+        let compute_pipeline_drop_n = std::mem::take(&mut self.compute_pipeline_drop_n);
         let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
         let render_present_n = std::mem::take(&mut self.render_present_n);
         let render_batch_n = std::mem::take(&mut self.render_batch_n);
@@ -1629,6 +1687,12 @@ impl Local {
              compute_buffer_disabled_n={compute_buffer_disabled_n} \
              compute_buffer_return_n={compute_buffer_return_n} \
              compute_buffer_drop_n={compute_buffer_drop_n} \
+             compute_pipeline_hit_n={compute_pipeline_hit_n} \
+             compute_pipeline_miss_n={compute_pipeline_miss_n} \
+             compute_pipeline_mismatch_n={compute_pipeline_mismatch_n} \
+             compute_pipeline_disabled_n={compute_pipeline_disabled_n} \
+             compute_pipeline_return_n={compute_pipeline_return_n} \
+             compute_pipeline_drop_n={compute_pipeline_drop_n} \
              render_offscreen_n={render_offscreen_n} \
              render_present_n={render_present_n} \
              render_batch_n={render_batch_n} \
