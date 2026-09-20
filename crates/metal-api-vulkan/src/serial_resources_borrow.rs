@@ -82,12 +82,17 @@ pub(crate) fn enabled_from_env() -> bool {
     })
 }
 
-/// The switch's own reading: the control words turn the mechanism on and
-/// everything else — including unset — leaves it off.
+/// The switch's own reading: **on unless the variable turns it off**
+/// (`0`/`off`/`false`/`no`), the default B-1 took on 2026-09-20. Unset is on:
+/// the mechanism removes two copies the submission made for itself (the seventh
+/// knife's A/B read the four bars together −389.6/−402.7 µs per submission, the
+/// same sum differing by 13.1 between two identical control arms, with the byte
+/// counters showing 2.04–2.42 MB of copies become 0 and 2.48 MB of borrows),
+/// and the off arm stays reachable as the control.
 fn parse_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some("1" | "on" | "ON" | "true" | "yes")
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -95,23 +100,21 @@ fn parse_enabled(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    /// Off unless the variable says otherwise: this is the pre-cut path, and a
-    /// round that leaves the variable alone has to read the submission the cut
-    /// found.
+    /// On unless the variable turns it off: the pre-cut path stays reachable as
+    /// the control a round compares against.
     #[test]
-    fn the_switch_is_off_unless_the_variable_says_otherwise() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_the_variable_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("no")));
         assert!(!parse_enabled(Some("false")));
-        assert!(!parse_enabled(Some("borrow-resources")));
+        assert!(!parse_enabled(Some("OFF")));
+        assert!(!parse_enabled(Some("No ")));
+        assert!(!parse_enabled(Some("False")));
         assert!(parse_enabled(Some("1")));
         assert!(parse_enabled(Some("on")));
-        assert!(parse_enabled(Some("ON")));
-        assert!(parse_enabled(Some("ON ")));
-        assert!(parse_enabled(Some("true")));
-        assert!(parse_enabled(Some("yes")));
+        assert!(parse_enabled(Some("borrow-resources")));
     }
 }
