@@ -1643,6 +1643,74 @@ impl BufferView {
     }
 }
 
+/// One entry of a trace's serial resource pool, **lent** rather than owned.
+///
+/// [`ComputeTrace::serial_resources`] returns the pool a trace derives for
+/// serial execution: every buffer view its passes and its attachments declare,
+/// in first-use order, with the access this submission's uses merge over the
+/// view's own declaration. Owning that table means owning a copy of every
+/// view, including the bytes of each `OwnedBytes` source — which is a
+/// megabyte-scale copy per derivation for a trace that declares a frame's
+/// worth of uploads.
+///
+/// A reader that only *uses* the pool — a provider sizing its bindings,
+/// uploading a view's bytes, or walking writebacks against the identities and
+/// ranges the pool carries — never needs to own it. This type is the lending
+/// half: the trace's own declaration, plus the access the pool merged over it.
+/// [`Self::view`] borrows the trace for as long as the entry lives, so a pool
+/// derived this way holds no copy of the declaration bytes and cannot outlive
+/// the declarations it reads.
+///
+/// [`Self::to_view`] is the owned entry the same pool position materializes
+/// to, and [`ComputeTrace::serial_resources`] is defined as exactly the map of
+/// this type's entries through it — the two entry points cannot disagree about
+/// a view's identity, range, bytes or merged access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SerialResource<'a> {
+    view: &'a BufferView,
+    access: BufferAccess,
+}
+
+impl<'a> SerialResource<'a> {
+    /// The trace's own declaration: the identity, the bytes, the range and the
+    /// binding label the pool entry was derived from.
+    pub fn view(&self) -> &'a BufferView {
+        self.view
+    }
+
+    /// The access the pool merged over every use of this view in this
+    /// submission — the union the owned entry carries in its own `access`
+    /// field. A use the trace declares `Unused`, or that only a render pass's
+    /// read or landing contributes, is part of the merge exactly as it is for
+    /// [`ComputeTrace::serial_resources`].
+    pub fn access(&self) -> BufferAccess {
+        self.access
+    }
+
+    /// The entry of an already-materialized pool: a view that *is* the derived
+    /// one, so its own `access` is the merged access.
+    ///
+    /// This is how a caller that holds owned views — today's
+    /// [`ComputeTrace::serial_resources`] table, a fixture, or a provider
+    /// keeping a pre-cut copy — reads them as pool entries without deriving
+    /// anything twice.
+    pub fn from_derived(view: &'a BufferView) -> Self {
+        Self {
+            view,
+            access: view.access,
+        }
+    }
+
+    /// The owned view this entry stands for: the trace's declaration with the
+    /// merged access written over it. Byte for byte the entry
+    /// [`ComputeTrace::serial_resources`] returns for the same pool position.
+    pub fn to_view(&self) -> BufferView {
+        let mut view = self.view.clone();
+        view.access = self.access;
+        view
+    }
+}
+
 /// The two direct Metal launch forms. `Threadgroups` is retained in the value
 /// model for the future extension, but B0 providers may refuse it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9735,9 +9803,31 @@ impl ComputeTrace {
     /// (`research/docs/23` §3.6). Texture-backed targets add no buffer entry —
     /// the sampled-texture pool stays read-only and its attachment byte landing
     /// belongs to the render execution step.
+    ///
+    /// This is the **owning** entry point: every pooled view is cloned, which
+    /// for a trace of `OwnedBytes` declarations copies each view's bytes.
+    /// [`Self::serial_resources_ref`] derives the same pool while only
+    /// borrowing the trace, and this method is defined as that derivation
+    /// mapped through [`SerialResource::to_view`], so the two entries can
+    /// never disagree about a pool position.
     pub fn serial_resources(&self) -> Result<Vec<BufferView>, ContractError> {
+        Ok(self
+            .serial_resources_ref()?
+            .into_iter()
+            .map(|resource| resource.to_view())
+            .collect())
+    }
+
+    /// The same pool, **lent**: every entry borrows the trace's own view
+    /// declaration for as long as the returned table lives, so the derivation
+    /// copies no view and no declaration byte. The rules that decide a pool
+    /// position and its merged access are the ones documented on
+    /// [`Self::serial_resources`] — this is that derivation with the clone
+    /// removed, and a caller that needs an owned table materializes it with
+    /// [`SerialResource::to_view`].
+    pub fn serial_resources_ref(&self) -> Result<Vec<SerialResource<'_>>, ContractError> {
         self.validate_serial_buffer_reuse()?;
-        let mut resources = Vec::<BufferView>::new();
+        let mut resources = Vec::<SerialResource<'_>>::new();
         let mut positions = BTreeMap::<ViewId, usize>::new();
         for pass in self.compute_passes() {
             for view in &pass.buffers {
@@ -9750,7 +9840,10 @@ impl ComputeTrace {
                     };
                 } else {
                     positions.insert(view.view_id, resources.len());
-                    resources.push(view.clone());
+                    resources.push(SerialResource {
+                        view,
+                        access: view.access,
+                    });
                 }
             }
         }
@@ -10056,7 +10149,7 @@ impl ProviderSubmission {
     /// any pass has one full writeback reflecting all passes.
     pub fn validate_for_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         self.validate()?;
-        let resources = trace.serial_resources()?;
+        let resources = trace.serial_resources_ref()?;
         let textures = trace.serial_texture_resources()?;
         validate_writebacks_for_trace(
             self.completion,
@@ -10069,17 +10162,21 @@ impl ProviderSubmission {
 
     /// The same validation [`ProviderSubmission::validate_for_trace`] runs,
     /// with the two resource tables the caller has already derived from the
-    /// same trace.
+    /// same trace — **lent**, not owned.
     ///
     /// A provider that has already called [`ComputeTrace::serial_resources`]
-    /// and [`ComputeTrace::serial_texture_resources`] for its own plan does not
-    /// have to derive them a second time here. Both derivations are pure
-    /// functions of the borrowed trace — they read the declaration lists and
-    /// return new tables, with no interior mutability, no identity minting and
-    /// no device state — so a caller that hands over the tables its own earlier
-    /// calls returned hands over the values this function would have computed.
-    /// The checks below are the same checks in the same order; the only
-    /// difference is who paid for the two derivations.
+    /// (or [`ComputeTrace::serial_resources_ref`]) and
+    /// [`ComputeTrace::serial_texture_resources`] for its own plan does not have
+    /// to derive them a second time here, and a plan that derived its pool by
+    /// borrowing the trace hands that same table over: [`SerialResource`] is
+    /// the lending shape, so the tables a caller passes are the trace's own
+    /// declarations plus the merged access, with no view copied. Both
+    /// derivations are pure functions of the borrowed trace — they read the
+    /// declaration lists and return new tables, with no interior mutability, no
+    /// identity minting and no device state — so a caller that hands over the
+    /// tables its own earlier calls returned hands over the values this
+    /// function would have computed. The checks below are the same checks in
+    /// the same order; the only difference is who paid for the two derivations.
     ///
     /// The caller is responsible for the one thing this cannot re-check: the
     /// tables must be the ones this trace derives. A trace that has been
@@ -10089,7 +10186,7 @@ impl ProviderSubmission {
     pub fn validate_with_pools(
         &self,
         trace: &ComputeTrace,
-        resources: &[BufferView],
+        resources: &[SerialResource<'_>],
         textures: &[TextureView],
     ) -> Result<(), ContractError> {
         self.validate()?;
@@ -10134,7 +10231,7 @@ impl CompletionReadback {
     /// has one full writeback reflecting all passes.
     pub fn validate_for_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         self.validate()?;
-        let resources = trace.serial_resources()?;
+        let resources = trace.serial_resources_ref()?;
         let textures = trace.serial_texture_resources()?;
         validate_writebacks_for_trace(
             self.completion,
@@ -10172,7 +10269,7 @@ fn validate_writebacks_for_trace(
     completion: CompletionDisposition,
     writebacks: &[BufferWriteback],
     trace: &ComputeTrace,
-    resources: &[BufferView],
+    resources: &[SerialResource<'_>],
     texture_resources: &[TextureView],
 ) -> Result<(), ContractError> {
     // A storage image is a landing too (`research/docs/26` §21.4, C2): its
@@ -10196,7 +10293,8 @@ fn validate_writebacks_for_trace(
         ));
     }
     for writeback in writebacks {
-        let Some(view) = resources.iter().find(|view| {
+        let Some(resource) = resources.iter().find(|resource| {
+            let view = resource.view();
             view.allocation_id == writeback.allocation_id && view.view_id == writeback.view_id
         }) else {
             // A writeback that names no buffer view falls back to the texture
@@ -10235,7 +10333,8 @@ fn validate_writebacks_for_trace(
             }
             continue;
         };
-        if !view.access.is_writable() {
+        let view = resource.view();
+        if !resource.access().is_writable() {
             return Err(ContractError::ReadOnlyWriteback(view.view_id));
         }
         let view_end = view.validate_shape()?;
@@ -10256,7 +10355,11 @@ fn validate_writebacks_for_trace(
     if trace.completion_policy == CompletionPolicy::HostReadback
         && matches!(completion, CompletionDisposition::CompletedVisible { .. })
     {
-        for view in resources.iter().filter(|view| view.access.is_writable()) {
+        for resource in resources
+            .iter()
+            .filter(|resource| resource.access().is_writable())
+        {
+            let view = resource.view();
             let covered = writebacks.iter().any(|writeback| {
                 writeback.allocation_id == view.allocation_id && writeback.view_id == view.view_id
             });
@@ -18177,6 +18280,66 @@ mod tests {
             assert_eq!(resources[0].access, expected);
             assert_eq!(resources[1].access, expected);
         }
+    }
+
+    /// The lending entry is the owning entry with the clone removed: the same
+    /// pool positions in the same first-use order, with the same identities,
+    /// the same ranges, the same declared bytes and the same merged access.
+    ///
+    /// A provider's plan reads the pool through the lending entry when its
+    /// borrow switch is on, so this is the equivalence that switch rests on;
+    /// `SerialResource::to_view` is what the owning entry is defined as, which
+    /// is why the two cannot drift apart.
+    #[test]
+    fn the_lending_pool_entry_derives_the_pool_the_owning_entry_clones() {
+        // `ping_pong_trace` declares two owned-byte views whose accesses the
+        // two passes merge (`b` is read then written), so the equality below
+        // covers the merge rule as well as the bytes.
+        let value = ping_pong_trace();
+        let owned = value.serial_resources().unwrap();
+        let lent = value.serial_resources_ref().unwrap();
+        assert_eq!(owned.len(), lent.len());
+        // The lent entry *is* the declaration — the pointer equality is the
+        // mechanism's own proof that the derivation cloned nothing — and the
+        // first position is the first pass's first view, in first-use order.
+        assert!(std::ptr::eq(
+            lent[0].view(),
+            &compute_pass(&value, 0).buffers[0]
+        ));
+        assert_eq!(
+            owned,
+            lent.iter()
+                .map(|resource| resource.to_view())
+                .collect::<Vec<_>>()
+        );
+        for (owned_view, resource) in owned.iter().zip(&lent) {
+            // The lent entry borrows the trace's own declaration: its bytes are
+            // the declaration's bytes, byte for byte the ones the owned entry
+            // cloned, and its merged access is the one the owned entry states
+            // in its own field.
+            assert_eq!(resource.view().view_id, owned_view.view_id);
+            assert_eq!(resource.view().offset, owned_view.offset);
+            assert_eq!(resource.view().length, owned_view.length);
+            assert_eq!(resource.view().source, owned_view.source);
+            assert_eq!(resource.access(), owned_view.access);
+            assert!(matches!(
+                resource.view().source,
+                BufferSource::OwnedBytes(_)
+            ));
+        }
+        // Reading an already-materialized table back as entries — the shape a
+        // caller that holds owned views hands over — states the same pool again.
+        let relaid = owned
+            .iter()
+            .map(SerialResource::from_derived)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relaid
+                .iter()
+                .map(|resource| resource.to_view())
+                .collect::<Vec<_>>(),
+            owned
+        );
     }
 
     #[test]
@@ -28006,7 +28169,7 @@ mod tests {
         // The pool reports the landing view as writable, so a visible
         // completion owes a writeback for it: the render track's bytes land
         // through the readback the compute path already uses.
-        let resources = admitted_trace.serial_resources().unwrap();
+        let resources = admitted_trace.serial_resources_ref().unwrap();
         let textures = admitted_trace.serial_texture_resources().unwrap();
         assert_eq!(
             validate_writebacks_for_trace(

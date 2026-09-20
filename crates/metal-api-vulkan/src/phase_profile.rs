@@ -22,6 +22,7 @@
 //!
 //!   ```text
 //!   PHASE submit n=256 total_us=... admit_us=... plan_us=... pool_us=...
+//!   plan_resources_us=...
 //!   resource_build_us=... record_us=... queue_submit_us=... fence_wait_us=...
 //!   fence_wait_idle_n=... fence_wait_idle_us=... fence_wait_blocked_n=...
 //!   fence_wait_blocked_us=... fence_wait_timeout_n=... read_updates_us=...
@@ -80,9 +81,10 @@
 //!   submit_td_retains_n=... submit_td_named_us=... submit_lock_us=...
 //!   submit_bookkeep_us=... submit_merge_us=... submit_validate_us=...
 //!   submit_validate_derive_us=... submit_validate_check_us=...
-//!   submit_validate_named_us=...
+//!   submit_validate_release_us=... submit_validate_named_us=...
 //!   submit_release_us=... submit_release_bindings_us=...
-//!   submit_release_views_us=... submit_release_plan_us=...
+//!   submit_release_views_us=... submit_release_pool_us=...
+//!   submit_release_plan_us=...
 //!   submit_release_named_us=... submit_seam_us=...
 //!   wait_submit_n=... wait_render_n=... wait_landing_n=...
 //!   wait_present_n=... wait_queue_n=... wait_timeline_n=... wait_ahead_sum=...
@@ -298,6 +300,13 @@ pub(crate) enum Phase {
     /// placement plan, the registered pipelines, the serial resource pool and
     /// the per-pass dispatch list.
     Plan,
+    /// Inside `plan`: the derivation of the submission's own serial resource
+    /// pool. It is one call — `ComputeTrace::serial_resources`, which owns the
+    /// table and copies every view's declared bytes, or
+    /// `ComputeTrace::serial_resources_ref`, which lends the trace's own
+    /// declarations and copies nothing — and it is the region the seventh
+    /// cut's switch moves (`crate::serial_resources_borrow`).
+    PlanResources,
     /// The submission's own inputs: device bindings for every pooled view,
     /// including the owned-byte copies, the staged-lease resolution and the
     /// gathered guest runs, plus the borrow retains that keep them alive.
@@ -685,6 +694,12 @@ pub(crate) enum Phase {
     /// Inside `submit_release`: the submission's serial resource pool and its
     /// texture views, the two derived tables the plan and the validation read.
     SubmitReleaseViews,
+    /// Inside `submit_release_views`: the pool's *own* table — what `plan`
+    /// derived — dropped on its own so the two halves of that child can be read
+    /// apart. Off it is the first of the two copies a submission pays for its
+    /// declared bytes; on it is a table of references to the trace's
+    /// declarations (`crate::serial_resources_borrow`).
+    SubmitReleasePool,
     /// Inside `submit_release`: the plan values the call held for its own tail —
     /// the per-pass dispatch list, the heap placement plan, the render plan and
     /// the pipeline artifacts the plan selected.
@@ -704,15 +719,22 @@ pub(crate) enum Phase {
     /// Inside `submit_validate`: the walk that checks the merged writeback list
     /// against the derived resources and the exact submitted trace.
     SubmitValidateCheck,
+    /// Inside `submit_validate`: the release of the two tables the validation
+    /// derived for itself, which the block used to pay as an unnamed seam
+    /// (`sp16` read it at 43.0 µs/submission). Off it is the third copy's
+    /// `free`; on the tables are lent, so it is the release of a table of
+    /// references (`crate::serial_resources_borrow`).
+    SubmitValidateRelease,
 }
 
-const PHASE_COUNT: usize = Phase::SubmitValidateCheck as usize + 1;
+const PHASE_COUNT: usize = Phase::SubmitValidateRelease as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "total",
     "admit",
     "plan",
+    "plan_resources",
     "pool",
     "resource_build",
     "record",
@@ -800,9 +822,11 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "submit_release",
     "submit_release_bindings",
     "submit_release_views",
+    "submit_release_pool",
     "submit_release_plan",
     "submit_validate_derive",
     "submit_validate_check",
+    "submit_validate_release",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -972,13 +996,35 @@ const SUBMIT_RELEASE_SLOTS: [usize; 3] = [
     Phase::SubmitReleasePlan as usize,
 ];
 
+/// The nested split of `submit_release_views`: the pool's own table, dropped
+/// apart from the texture views that share its parent. The parent stays the
+/// enclosing bar, so `submit_release_pool_us <= submit_release_views_us` and the
+/// pool's share is read as a share rather than added to the release's three
+/// children.
+///
+/// The set is read by the tests rather than by the printer: a one-member nested
+/// split needs no printed sum of its own — the bar is the field — but the rule
+/// that it is nested and not a fourth sibling is what keeps
+/// `submit_release_named_us` a sum of the release's children, so it is held
+/// there.
+#[cfg(test)]
+const SUBMIT_RELEASE_VIEWS_SLOTS: [usize; 1] = [Phase::SubmitReleasePool as usize];
+
 /// The nested split of `submit_validate`: the two pool derivations the
-/// validation takes and the walk that reads them. Like the other splits it is
-/// not part of the disjoint sum, and `submit_validate` stays the enclosing bar:
+/// validation takes, the walk that reads them, and the release of the tables
+/// the validation derived for itself. Like the other splits it is not part of
+/// the disjoint sum, and `submit_validate` stays the enclosing bar:
 /// `sum(SUBMIT_VALIDATE_SLOTS) <= submit_validate_us`.
-const SUBMIT_VALIDATE_SLOTS: [usize; 2] = [
+///
+/// The seventh cut added the release: before it, that region was the seam this
+/// bar carried (`submit_validate_us` minus the two halves), which the `sp16`
+/// round read at 43.0 µs/submission — the third copy of a submission's declared
+/// bytes being freed. Naming it makes the split whole on both of the seventh
+/// cut's arms instead of leaving a difference a reader has to interpret.
+const SUBMIT_VALIDATE_SLOTS: [usize; 3] = [
     Phase::SubmitValidateDerive as usize,
     Phase::SubmitValidateCheck as usize,
+    Phase::SubmitValidateRelease as usize,
 ];
 
 /// The teardown groups whose *call count* is printed beside their
@@ -1563,6 +1609,17 @@ struct Local {
     binding_copy_bytes: u64,
     binding_borrow_calls: u64,
     binding_borrow_bytes: u64,
+    /// The declared bytes the window's *pool derivations* moved, split the same
+    /// way: a copy the derivation made for itself (`ComputeTrace::serial_resources`,
+    /// the pre-cut path) or a loan of the trace's own declarations
+    /// (`ComputeTrace::serial_resources_ref`). One submission derives its pool
+    /// twice — once in `plan` and once in `submit_validate` — so the two
+    /// counters read two derivations' worth per submission on either arm
+    /// (`crate::serial_resources_borrow`).
+    resource_copy_views: u64,
+    resource_copy_bytes: u64,
+    resource_borrow_views: u64,
+    resource_borrow_bytes: u64,
     /// The device objects the window's teardowns actually destroyed, by family.
     /// They are the population behind the `teardown_*` bars: a bar's
     /// microseconds divided by its own family's count is one object's cost, and
@@ -1663,6 +1720,10 @@ impl Default for Local {
             binding_copy_bytes: 0,
             binding_borrow_calls: 0,
             binding_borrow_bytes: 0,
+            resource_copy_views: 0,
+            resource_copy_bytes: 0,
+            resource_borrow_views: 0,
+            resource_borrow_bytes: 0,
             td_image_n: 0,
             td_view_n: 0,
             td_sampler_n: 0,
@@ -1873,6 +1934,10 @@ impl Local {
         let binding_copy_bytes = std::mem::take(&mut self.binding_copy_bytes);
         let binding_borrow_calls = std::mem::take(&mut self.binding_borrow_calls);
         let binding_borrow_bytes = std::mem::take(&mut self.binding_borrow_bytes);
+        let resource_copy_views = std::mem::take(&mut self.resource_copy_views);
+        let resource_copy_bytes = std::mem::take(&mut self.resource_copy_bytes);
+        let resource_borrow_views = std::mem::take(&mut self.resource_borrow_views);
+        let resource_borrow_bytes = std::mem::take(&mut self.resource_borrow_bytes);
         let td_image_n = std::mem::take(&mut self.td_image_n);
         let td_view_n = std::mem::take(&mut self.td_view_n);
         let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
@@ -1971,6 +2036,10 @@ impl Local {
              submit_binding_copies_bytes={binding_copy_bytes} \
              submit_binding_borrows_n={binding_borrow_calls} \
              submit_binding_borrows_bytes={binding_borrow_bytes} \
+             submit_resource_copies_n={resource_copy_views} \
+             submit_resource_copies_bytes={resource_copy_bytes} \
+             submit_resource_borrows_n={resource_borrow_views} \
+             submit_resource_borrows_bytes={resource_borrow_bytes} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
              td_buffer_n={td_buffer_n} td_memory_n={td_memory_n}",
             readback.rect_n,
@@ -2051,6 +2120,51 @@ pub(crate) fn note_binding_borrow(bytes: u64) {
         local.binding_borrow_calls += 1;
         local.binding_borrow_bytes += bytes;
     });
+}
+
+/// The declared bytes one **pool derivation** copied for itself: the views
+/// `ComputeTrace::serial_resources` cloned, by count and by byte
+/// (`crate::serial_resources_borrow`). One submission derives its pool twice —
+/// in `plan` and in `submit_validate` — so a submission that declares N bytes
+/// reads `2N` here on the pre-cut path.
+#[inline]
+pub(crate) fn note_resource_copy(views: u64, bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.resource_copy_views += views;
+        local.resource_copy_bytes += bytes;
+    });
+}
+
+/// The same declared bytes the seventh cut's *lending* derivation borrowed:
+/// `ComputeTrace::serial_resources_ref` copies no view, so the bytes it hands
+/// over are the trace's own. Read beside [`note_resource_copy`], the pair says
+/// which arm ran and how much of the declaration the derivation moved.
+#[inline]
+pub(crate) fn note_resource_borrow(views: u64, bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.resource_borrow_views += views;
+        local.resource_borrow_bytes += bytes;
+    });
+}
+
+/// Whether the profile is on, for a call site that would otherwise *compute* a
+/// reading's own inputs before handing them to a `note_*`.
+///
+/// The byte counters are the one kind of reading whose inputs cost something to
+/// collect (a walk over the pool), so the site that collects them asks this
+/// first: with the profile off it is the same one relaxed load every other
+/// instrumented site pays, and nothing else is touched.
+#[inline]
+pub(crate) fn counting() -> bool {
+    enabled()
 }
 
 /// One device object a `resource_build` family created.
@@ -2638,11 +2752,62 @@ mod tests {
             PHASE_NAMES[Phase::SubmitValidateCheck as usize],
             "submit_validate_check"
         );
-        // The release's three children are the whole of it, and the validation
-        // has exactly two halves: a set that missed one would read as a seam
-        // rather than as an unsplit region.
+        // The release has exactly three children, and the validation has exactly
+        // three regions (the seventh cut named the release that used to be its
+        // seam): a set that missed one would read as a seam rather than as an
+        // unsplit region.
         assert_eq!(SUBMIT_RELEASE_SLOTS.len(), 3);
-        assert_eq!(SUBMIT_VALIDATE_SLOTS.len(), 2);
+        assert_eq!(SUBMIT_VALIDATE_SLOTS.len(), 3);
+        // The seventh cut's pool bar is a *nested* child of `submit_release_views`
+        // rather than a fourth sibling: a set that held it would make
+        // `submit_release_named_us` count the pool twice, once in its parent and
+        // once on its own.
+        assert!(!SUBMIT_RELEASE_SLOTS.contains(&(Phase::SubmitReleasePool as usize)));
+        assert_eq!(
+            SUBMIT_RELEASE_VIEWS_SLOTS,
+            [Phase::SubmitReleasePool as usize]
+        );
+        assert_ne!(
+            Phase::SubmitReleasePool as usize,
+            Phase::SubmitReleaseViews as usize
+        );
+        assert_eq!(
+            PHASE_NAMES[Phase::SubmitReleasePool as usize],
+            "submit_release_pool"
+        );
+        assert_eq!(
+            PHASE_NAMES[Phase::SubmitValidateRelease as usize],
+            "submit_validate_release"
+        );
+        assert_eq!(PHASE_NAMES[Phase::PlanResources as usize], "plan_resources");
+        // The seventh cut's three regions are nested exactly like the sixth
+        // cut's: one inside `plan`, one inside `submit_validate` and one inside
+        // `submit_release_views`, and none of them is a seam bar or a member of
+        // the disjoint sum.
+        for slot in [
+            Phase::PlanResources as usize,
+            Phase::SubmitValidateRelease as usize,
+            Phase::SubmitReleasePool as usize,
+        ] {
+            assert!(
+                !SUBMIT_SEAM_SLOTS.contains(&slot),
+                "a nested region is not a seam bar of its own"
+            );
+            assert!(!COUNTED_SLOTS.contains(&slot));
+            assert!(!RESOURCE_BUILD_SLOTS.contains(&slot));
+            assert!(!SUBMIT_TEARDOWN_SLOTS.contains(&slot));
+            assert!(!RENDER_SLOTS.contains(&slot));
+        }
+        assert!(SUBMIT_RELEASE_VIEWS_SLOTS.contains(&(Phase::SubmitReleasePool as usize)));
+        assert!(SUBMIT_VALIDATE_SLOTS.contains(&(Phase::SubmitValidateRelease as usize)));
+        assert!(PLAN_SETTLE_SLOTS.contains(&(Phase::Plan as usize)));
+        // The release's three children are disjoint from the nested pool child
+        // and from each other, so a reader adds the three and reads the fourth
+        // as a share of `submit_release_views`.
+        for slot in SUBMIT_RELEASE_VIEWS_SLOTS {
+            assert!(!SUBMIT_RELEASE_SLOTS.contains(&slot));
+            assert!(!SUBMIT_VALIDATE_SLOTS.contains(&slot));
+        }
     }
 
     /// A window drains on the `total` bar that fills it, and a drained window

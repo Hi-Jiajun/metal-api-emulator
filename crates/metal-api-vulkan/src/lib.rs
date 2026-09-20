@@ -46,6 +46,7 @@ mod render_buffer_pool;
 mod render_import_pool;
 mod render_setup_reuse;
 mod render_texture_pool;
+mod serial_resources_borrow;
 mod submit_binding_borrow;
 
 pub use compute_buffer_pool::ComputeBufferPoolCounts;
