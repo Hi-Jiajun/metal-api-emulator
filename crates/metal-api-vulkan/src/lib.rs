@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+mod compute_buffer_pool;
 mod compute_provider;
 mod phase_profile;
 mod provider;
@@ -45,6 +46,7 @@ mod render_import_pool;
 mod render_setup_reuse;
 mod render_texture_pool;
 
+pub use compute_buffer_pool::ComputeBufferPoolCounts;
 pub use compute_provider::{
     CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
     ResidentTargetRetirement, TranslatedRenderPipelineRequest, VulkanComputeProvider,
@@ -1008,6 +1010,36 @@ impl VulkanExecutor {
         self.context.clear_render_buffer_pool();
     }
 
+    /// What the compute half's pooled host-visible upload buffers have seen
+    /// (`crate::compute_buffer_pool`): how many creations the pool served, how
+    /// many built their own buffer, how many were asked while the switch was
+    /// off, and how many buffers were kept, evicted or dropped.
+    #[doc(hidden)]
+    pub fn compute_buffer_pool_counts(&self) -> ComputeBufferPoolCounts {
+        self.context.compute_buffer_pool_counts()
+    }
+
+    /// Whether the compute half's pooled host-visible upload buffers are on for
+    /// this executor.
+    #[doc(hidden)]
+    pub fn compute_buffer_pool_enabled(&self) -> bool {
+        self.context.compute_buffer_pool_enabled()
+    }
+
+    /// Turn the compute half's pooled host-visible upload buffers on or off,
+    /// dropping what they held when they go off.
+    #[doc(hidden)]
+    pub fn set_compute_buffer_pool(&self, enabled: bool) {
+        self.context.set_compute_buffer_pool(enabled);
+    }
+
+    /// Drop every pooled compute upload buffer: the contract surface they were
+    /// built from moved.
+    #[doc(hidden)]
+    pub fn clear_compute_buffer_pool(&self) {
+        self.context.clear_compute_buffer_pool();
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1714,6 +1746,12 @@ pub(crate) struct VulkanContext {
     /// indirect buffers and the stage buffers a pass binds. On by default, off
     /// with `METAL_API_VULKAN_RENDER_BUFFER_POOL=0`.
     render_buffer_pool: Mutex<render_buffer_pool::RenderBufferPool>,
+    /// The host-visible upload buffer the compute half may hand the next
+    /// submission of the same shape (`crate::compute_buffer_pool`): the buffer
+    /// and its memory for a submission's own staged bytes, a shared backing's
+    /// allocation, and the indirect replay's own command. On by default, off
+    /// with `METAL_API_VULKAN_COMPUTE_BUFFER_POOL=0`.
+    compute_buffer_pool: Mutex<compute_buffer_pool::ComputeBufferPool>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -1973,6 +2011,10 @@ impl VulkanContext {
         // switch and their own empty table, built before the literal takes
         // `device`.
         let render_buffer_pool = render_buffer_pool::RenderBufferPool::new(device.clone());
+        // The compute half's own pooled upload buffers read the same way: their
+        // own switch, their own empty table, built before the literal takes
+        // `device`.
+        let compute_buffer_pool = compute_buffer_pool::ComputeBufferPool::new(device.clone());
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
@@ -2008,6 +2050,7 @@ impl VulkanContext {
             render_texture_pool: Mutex::new(render_texture_pool),
             render_import_pool: Mutex::new(render_import_pool),
             render_buffer_pool: Mutex::new(render_buffer_pool),
+            compute_buffer_pool: Mutex::new(compute_buffer_pool),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -2241,6 +2284,63 @@ impl VulkanContext {
     /// from moved.
     pub(crate) fn clear_render_buffer_pool(&self) {
         self.lock_render_buffer_pool().clear();
+    }
+
+    /// The compute half's own host-visible upload buffers
+    /// (`crate::compute_buffer_pool`). A poisoned lock is recovered for the
+    /// same reason the render pool's is: the pool's state is a list of device
+    /// handles, and a panic elsewhere must not turn a reusable buffer into a
+    /// refusal.
+    fn lock_compute_buffer_pool(&self) -> MutexGuard<'_, compute_buffer_pool::ComputeBufferPool> {
+        self.compute_buffer_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The upload buffer a creation of this shape may take, and what the pool
+    /// answered.
+    pub(crate) fn take_compute_upload(
+        &self,
+        key: compute_buffer_pool::ComputeBufferKey,
+    ) -> (
+        Option<compute_buffer_pool::ComputeUploadedBuffer>,
+        compute_buffer_pool::ComputeBufferOutcome,
+    ) {
+        self.lock_compute_buffer_pool().take(key)
+    }
+
+    /// Hand a completed submission's upload buffer back, or destroy it when the
+    /// mechanism is off.
+    pub(crate) fn give_compute_upload_back(
+        &self,
+        key: compute_buffer_pool::ComputeBufferKey,
+        uploaded: compute_buffer_pool::ComputeUploadedBuffer,
+    ) -> compute_buffer_pool::ComputeBufferOutcome {
+        self.lock_compute_buffer_pool().give(key, uploaded)
+    }
+
+    /// The compute upload-buffer pool counters one reading reports.
+    pub(crate) fn compute_buffer_pool_counts(
+        &self,
+    ) -> compute_buffer_pool::ComputeBufferPoolCounts {
+        self.lock_compute_buffer_pool().counts()
+    }
+
+    /// Whether the compute upload-buffer pool is on for this device.
+    pub(crate) fn compute_buffer_pool_enabled(&self) -> bool {
+        self.lock_compute_buffer_pool().enabled()
+    }
+
+    /// Turn the compute upload-buffer pool on or off, and drop what it holds
+    /// when it goes off.
+    pub(crate) fn set_compute_buffer_pool(&self, enabled: bool) {
+        self.lock_compute_buffer_pool().set_enabled(enabled);
+    }
+
+    /// Drop every pooled compute upload buffer: the contract surface they were
+    /// built from moved.
+    pub(crate) fn clear_compute_buffer_pool(&self) {
+        self.lock_compute_buffer_pool().clear();
     }
 
     /// The selected device's own limits, for the render rail's attachment
@@ -5052,6 +5152,13 @@ struct GpuBuffer {
     /// Byte ranges already copied into this backing, keyed by their view
     /// offset. A write-only view copies nothing in and leaves no entry.
     uploaded_ranges: BTreeMap<usize, usize>,
+    /// The pool key this buffer's pair is given back under
+    /// (`crate::compute_buffer_pool`), or `None` for a pair that is not the
+    /// pool's business: a heap placement (its memory is the submission's slab
+    /// and its offset comes from the heap plan), an owner-window import (its
+    /// identity is the owner's pointer), and every buffer created while the
+    /// switch was off.
+    pooled: Option<compute_buffer_pool::ComputeBufferKey>,
 }
 
 /// One texture owned by an execution. A sampled texture is a host-visible
@@ -5146,6 +5253,11 @@ struct ExecutionResources {
     /// Step 4).
     indirect_buffer: vk::Buffer,
     indirect_memory: vk::DeviceMemory,
+    /// The pool key the indirect pair is handed back under
+    /// (`crate::compute_buffer_pool`), or `None` for a pair that is not the
+    /// pool's business: no indirect dispatch, or one built while the switch was
+    /// off.
+    indirect_pooled: Option<compute_buffer_pool::ComputeBufferKey>,
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 }
 
@@ -5517,6 +5629,7 @@ impl ExecutionResources {
             view_windows: BTreeMap::new(),
             indirect_buffer: vk::Buffer::null(),
             indirect_memory: vk::DeviceMemory::null(),
+            indirect_pooled: None,
             borrowed: None,
         }
     }
@@ -5973,6 +6086,11 @@ impl ExecutionResources {
                 host_pointer: None,
                 mapping: Some(mapped as usize),
                 uploaded_ranges: BTreeMap::new(),
+                // A heap placement's pair is the buffer plus the submission's
+                // slab, whose memory type is the intersection of every
+                // placement's requirements: the shape does not decide it
+                // (`crate::compute_buffer_pool`).
+                pooled: None,
             });
         }
         self.buffers.extend(bound);
@@ -6574,6 +6692,12 @@ impl ExecutionResources {
 
     /// One host-visible device buffer, uploaded once from `bytes`. A shared view
     /// names it by its allocation identity instead of by its pool key.
+    ///
+    /// The shape decides the pair before the driver sees anything: a buffer of
+    /// the same size and usage is one the driver would be handed twice, so the
+    /// pool is asked first (`crate::compute_buffer_pool`). A hit skips the four
+    /// creation calls and states the same map/copy the fresh path states; a miss
+    /// builds the pair exactly as this half always did.
     fn create_owned_backing(
         &mut self,
         index: u64,
@@ -6585,54 +6709,73 @@ impl ExecutionResources {
         // read (`research/docs/15` step 4).
         let size = u64::try_from(size)
             .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer =
-            unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
-                ExecutionFailure::vulkan(error, format!("create buffer {}: {error}", index))
-            })?;
-        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Buffer);
-        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.context.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(error.into());
+        // The key is the creation the driver is about to be handed, and the
+        // size the hit path maps is the whole allocation: the fresh path's
+        // `requirements.size` covered the buffer's own bytes, and the
+        // requirements the driver stated for an identical creation are not
+        // carried back with the pair (`crate::compute_buffer_pool`).
+        let key =
+            compute_buffer_pool::ComputeBufferKey::new(size, vk::BufferUsageFlags::STORAGE_BUFFER);
+        let (taken, outcome) = self.context.take_compute_upload(key);
+        crate::phase_profile::note_compute_buffer_pool(outcome);
+        let (buffer, memory, mapped_size) = match taken {
+            Some(uploaded) => (uploaded.buffer, uploaded.memory, vk::WHOLE_SIZE),
+            None => {
+                let buffer_info = vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let buffer = unsafe { self.context.device.create_buffer(&buffer_info, None) }
+                    .map_err(|error| {
+                        ExecutionFailure::vulkan(error, format!("create buffer {}: {error}", index))
+                    })?;
+                crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Buffer);
+                let requirements =
+                    unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+                let memory_type = match self.context.memory_type(
+                    requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        unsafe { self.context.device.destroy_buffer(buffer, None) };
+                        return Err(error.into());
+                    }
+                };
+                let allocation = vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type);
+                let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) }
+                {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        unsafe { self.context.device.destroy_buffer(buffer, None) };
+                        return Err(ExecutionFailure::vulkan(
+                            error,
+                            format!("allocate buffer {} memory: {error}", index),
+                        ));
+                    }
+                };
+                crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
+                if let Err(error) =
+                    unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) }
+                {
+                    unsafe {
+                        self.context.device.destroy_buffer(buffer, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("bind buffer {} memory: {error}", index),
+                    ));
+                }
+                (buffer, memory, size)
             }
         };
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(ExecutionFailure::vulkan(
-                    error,
-                    format!("allocate buffer {} memory: {error}", index),
-                ));
-            }
-        };
-        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
-        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.context.device.destroy_buffer(buffer, None);
-                self.context.device.free_memory(memory, None);
-            }
-            return Err(ExecutionFailure::vulkan(
-                error,
-                format!("bind buffer {} memory: {error}", index),
-            ));
-        }
         let mapped = match unsafe {
             self.context
                 .device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_memory(memory, 0, mapped_size, vk::MemoryMapFlags::empty())
         } {
             Ok(mapped) => mapped,
             Err(error) => {
@@ -6662,6 +6805,13 @@ impl ExecutionResources {
             host_pointer: None,
             mapping: Some(mapped as usize),
             uploaded_ranges: BTreeMap::new(),
+            // A creation that ran with the switch off has nothing to hand
+            // back; a hit and a miss both carry the key the pair will be
+            // returned under, so the pool fills as the round's shapes repeat.
+            pooled: match outcome {
+                compute_buffer_pool::ComputeBufferOutcome::Disabled => None,
+                _ => Some(key),
+            },
         });
         Ok(())
     }
@@ -6767,6 +6917,8 @@ impl ExecutionResources {
             host_pointer: Some(pointer),
             mapping: None,
             uploaded_ranges: BTreeMap::new(),
+            // An import's identity is the owner's pointer, not a shape.
+            pooled: None,
         });
         Ok(())
     }
@@ -7125,57 +7277,76 @@ impl ExecutionResources {
             z: threadgroups[2],
         };
         let byte_length = std::mem::size_of::<vk::DispatchIndirectCommand>() as u64;
-        let info = vk::BufferCreateInfo::default()
-            .size(byte_length)
-            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer =
-            unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
-                ExecutionFailure::vulkan(error, format!("create indirect buffer: {error}"))
-            })?;
-        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Indirect);
-        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.context.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(error.into());
+        // The one shape an indirect replay states — a twelve-byte
+        // `INDIRECT_BUFFER` — is decided by the same two fields as every other
+        // upload buffer, so it is asked of the same pool
+        // (`crate::compute_buffer_pool`).
+        let key = compute_buffer_pool::ComputeBufferKey::new(
+            byte_length,
+            vk::BufferUsageFlags::INDIRECT_BUFFER,
+        );
+        let (taken, outcome) = self.context.take_compute_upload(key);
+        crate::phase_profile::note_compute_buffer_pool(outcome);
+        let (buffer, memory, mapped_size) = match taken {
+            Some(uploaded) => (uploaded.buffer, uploaded.memory, vk::WHOLE_SIZE),
+            None => {
+                let info = vk::BufferCreateInfo::default()
+                    .size(byte_length)
+                    .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let buffer =
+                    unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
+                        ExecutionFailure::vulkan(error, format!("create indirect buffer: {error}"))
+                    })?;
+                crate::phase_profile::note_build_object(
+                    crate::phase_profile::BuildObject::Indirect,
+                );
+                let requirements =
+                    unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+                let memory_type = match self.context.memory_type(
+                    requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                ) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        unsafe { self.context.device.destroy_buffer(buffer, None) };
+                        return Err(error.into());
+                    }
+                };
+                let allocation = vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type);
+                let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) }
+                {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        unsafe { self.context.device.destroy_buffer(buffer, None) };
+                        return Err(ExecutionFailure::vulkan(
+                            error,
+                            format!("allocate indirect memory: {error}"),
+                        ));
+                    }
+                };
+                crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
+                if let Err(error) =
+                    unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) }
+                {
+                    unsafe {
+                        self.context.device.destroy_buffer(buffer, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("bind indirect memory: {error}"),
+                    ));
+                }
+                (buffer, memory, requirements.size)
             }
         };
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(ExecutionFailure::vulkan(
-                    error,
-                    format!("allocate indirect memory: {error}"),
-                ));
-            }
-        };
-        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
-        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.context.device.destroy_buffer(buffer, None);
-                self.context.device.free_memory(memory, None);
-            }
-            return Err(ExecutionFailure::vulkan(
-                error,
-                format!("bind indirect memory: {error}"),
-            ));
-        }
         let mapping = match unsafe {
-            self.context.device.map_memory(
-                memory,
-                0,
-                requirements.size,
-                vk::MemoryMapFlags::empty(),
-            )
+            self.context
+                .device
+                .map_memory(memory, 0, mapped_size, vk::MemoryMapFlags::empty())
         } {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -7199,6 +7370,13 @@ impl ExecutionResources {
         }
         self.indirect_buffer = buffer;
         self.indirect_memory = memory;
+        // The pair is unmapped again before it is handed back, so a taken pair
+        // is in the same state a fresh one leaves: mapped only while the host
+        // writes the command in.
+        self.indirect_pooled = match outcome {
+            compute_buffer_pool::ComputeBufferOutcome::Disabled => None,
+            _ => Some(key),
+        };
         Ok(())
     }
 
@@ -7741,6 +7919,15 @@ impl Drop for ExecutionResources {
         // `total`, and its microseconds belong to no submission's window
         // (`crate::phase_profile::Bar::enter_in_submission`).
         let _teardown = Bar::enter_in_submission(Phase::SubmitTeardown);
+        // Only a submission whose fence was observed hands its buffers back
+        // (`crate::compute_buffer_pool`): a submission that never reached the
+        // queue, and one whose device was lost, destroy every pair they own,
+        // which is the direction the fresh path always failed in. The host-side
+        // readback that follows the fence is what made the bytes readable, and
+        // it has already run by the time this drop does, so a readback that
+        // failed does not keep a buffer out of the pool — the device is done
+        // with it either way, and the failure was reported.
+        let returning_buffers = self.completed && !self.device_lost;
         if self.submitted && !self.completed {
             self.context.record_queue_retirement(self.queue_index);
         }
@@ -7779,6 +7966,20 @@ impl Drop for ExecutionResources {
             }
             for buffer in &self.buffers {
                 let _buffers = Bar::enter_in_submission(Phase::SubmitTdBuffers);
+                // A pooled pair is unmapped before it leaves this submission:
+                // the fresh path keeps its own mapping for the submission's
+                // lifetime, and Vulkan refuses to map a memory twice, so the
+                // pool's resident state is the one its next taker maps.
+                if let (Some(key), true) = (buffer.pooled, returning_buffers) {
+                    self.context.device.unmap_memory(buffer.memory);
+                    let uploaded = compute_buffer_pool::ComputeUploadedBuffer {
+                        buffer: buffer.buffer,
+                        memory: buffer.memory,
+                    };
+                    let outcome = self.context.give_compute_upload_back(key, uploaded);
+                    crate::phase_profile::note_compute_buffer_pool(outcome);
+                    continue;
+                }
                 self.context.device.destroy_buffer(buffer.buffer, None);
                 if buffer.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(buffer.memory, None);
@@ -7810,6 +8011,19 @@ impl Drop for ExecutionResources {
             // freed right after), so destroy before free, matching the render
             // rail's `create_indirect_draw` teardown.
             let _buffers = Bar::enter_in_submission(Phase::SubmitTdBuffers);
+            // The pair is unmapped by construction (the command's write unmap
+            // is the last thing `create_indirect_dispatch` states), so unlike
+            // the submission's own upload buffers it needs no unmap here.
+            if let (Some(key), true) = (self.indirect_pooled.take(), returning_buffers) {
+                let uploaded = compute_buffer_pool::ComputeUploadedBuffer {
+                    buffer: self.indirect_buffer,
+                    memory: self.indirect_memory,
+                };
+                self.indirect_buffer = vk::Buffer::null();
+                self.indirect_memory = vk::DeviceMemory::null();
+                let outcome = self.context.give_compute_upload_back(key, uploaded);
+                crate::phase_profile::note_compute_buffer_pool(outcome);
+            }
             if self.indirect_buffer != vk::Buffer::null() {
                 self.context
                     .device

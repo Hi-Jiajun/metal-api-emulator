@@ -47,7 +47,11 @@ render_prepare_us=... render_retain_us=... render_land_owner_us=...
 render_teardown_us=... render_residual_us=... texture_named_us=...
 pool_hit_n=... pool_miss_n=... pool_disabled_n=... pool_return_n=...
 pool_drop_n=... import_hit_n=... import_miss_n=... import_disabled_n=...
-import_return_n=... import_drop_n=... render_offscreen_n=... render_present_n=...
+import_return_n=... import_drop_n=... buffer_hit_n=... buffer_miss_n=...
+buffer_disabled_n=... buffer_return_n=... buffer_drop_n=...
+compute_buffer_hit_n=... compute_buffer_miss_n=... compute_buffer_disabled_n=...
+compute_buffer_return_n=... compute_buffer_drop_n=...
+render_offscreen_n=... render_present_n=...
 readback_rect_us=... readback_full_us=... readback_seed_us=...
 readback_surfaces_us=... readback_shape_us=... readback_named_us=...
 landing_lookup_us=... landing_windows_us=... landing_stage_us=...
@@ -172,14 +176,14 @@ have their own setup and readback).
 | `landing_write` | inside `render_landing`: the write into the owner's live pages |
 | `landing_release` | inside `render_landing`: destroying the fence, the command pool, the mapping, the buffer and its memory |
 | `rb_pipeline` | inside `resource_build`: the pipeline-shaped objects one compute pipeline needs — `create_pipeline_objects`, one bar per pipeline |
-| `rb_buffer` | inside `resource_build`: every device buffer the submission builds with its memory bound and uploaded — `create_buffers` as one region (owned backings, the heap slab's placements, the imported host windows, the storage image's transfer buffer) |
+| `rb_buffer` | inside `resource_build`: every device buffer the submission builds with its memory bound and uploaded — `create_buffers` as one region (owned backings, the heap slab's placements, the imported host windows, the storage image's transfer buffer). A creation of a shape the compute pool holds takes the pool's pair instead of building one (`docs/COMPUTE-BUFFER-POOL.md`), which is exactly what `compute_buffer_hit_n` counts; the family's own `rb_buffer_n` counts the buffers the window really built, so a hit arm's region is smaller than its population |
 | `rb_image` | inside `resource_build`: one sampled or storage image's backing — `allocate_image_backing` plus, for the sampled arm, the texels' trip into it (`create_textures` / `create_storage_texture`, one bar per image) |
 | `rb_view` | inside `resource_build`: one image view (`create_color_image_view` in the compute texture paths, one bar per view) |
 | `rb_sampler` | inside `resource_build`: the static samplers of the translated modules (`create_static_samplers`) and each sampled declaration's own sampler, one bar per sampler |
 | `rb_descriptor` | inside `resource_build`: one pass's immutable descriptor set — the pool, the set layouts, the allocation and the writes (`create_descriptors`, one region per submission that builds sets) |
 | `rb_indirect` | inside `resource_build`: the indirect replay's command buffer and the memory bound to it (`create_indirect_dispatch`; a direct dispatch builds none) |
 | `submit_teardown` | the compute half's own teardown (`ExecutionResources::drop`) — the fence, the pools, the pipeline objects, the buffers, the images, the samplers and the borrowed retains, destroyed once the fence proved the device done with them. The counterpart of the render half's `render_teardown`, and charged only while the submission's own `total` bar is open |
-| `submit_td_sync` / `submit_td_pipeline` / `submit_td_buffers` / `submit_td_textures` / `submit_td_retains` | inside `submit_teardown`: the computation fence, the command pool and the descriptor pool; the pipeline-shaped objects; every buffer with its memory; the sampled and storage declarations' samplers, views, images and memories; and retiring the borrowed leases the submission's gathers took — in the order the drop works through them |
+| `submit_td_sync` / `submit_td_pipeline` / `submit_td_buffers` / `submit_td_textures` / `submit_td_retains` | inside `submit_teardown`: the computation fence, the command pool and the descriptor pool; the pipeline-shaped objects; every buffer with its memory; the sampled and storage declarations' samplers, views, images and memories; and retiring the borrowed leases the submission's gathers took — in the order the drop works through them. The buffer group's per-buffer region is either the destroy the fresh path always stated or the unmap-and-hand-back of a pooled pair, so the pool's own counters (`compute_buffer_return_n`, `compute_buffer_drop_n`) say which of the two a window's entries were |
 | `submit_lock` | the submission's executor lock, queue pick, queue lock and arena admission, before the compute half's first bar |
 | `submit_bookkeep` | between `pool` and `resource_build`: the translated-artifact list and `plan_pipeline_sequence` |
 | `submit_merge` | between the halves: the keyed merge of the compute and render writebacks |
@@ -281,7 +285,12 @@ destroyed buffers by at most two entries per submission. A round that wants one
 buffer's cost reads it from the build side (`rb_buffer_us / rb_buffer_n`) or
 subtracts the per-submission entries: the g3a round read 85 825 buffer-group
 entries against 43 329 buffers built and 42 496 submissions, i.e. one buffer
-created and destroyed per submission. One boundary is worth stating:
+created and destroyed per submission. With the compute pool on
+(`docs/COMPUTE-BUFFER-POOL.md`) the same entries are no longer all destroys — a
+submission whose fence was observed hands its pair back (and unmaps it) inside
+the very same region — so the region's microseconds fall while its `_n`
+population does not, which is what the increment's own A/B reads.
+One boundary is worth stating:
 a deferred object API retires its resources from `wait`, outside any submission,
 and those microseconds belong to no submission's window — the teardown bars
 therefore resolve to nothing when no `total` bar is open, so a window's fields
@@ -320,6 +329,16 @@ backing (`docs/TEXTURE-BACKING-POOL.md`) and the `import_*` fields for the
 pooled owner-window import (`docs/RENDER-IMPORT-POOL.md`): `hit`/`miss`/
 `disabled` partition a declaration's `take`, `return`/`drop` partition a
 completed pass's hand-back, and the five can be added to the same `n=`.
+The `buffer_*` fields are that reading for the render half's own host-visible
+upload buffers (`docs/RENDER-BUFFER-POOL.md`) and the `compute_buffer_*` fields
+are the compute half's counterpart (`docs/COMPUTE-BUFFER-POOL.md`): a separate
+group because the two rails carry their own switch and a round has to be able to
+read one half's reuse without the other's numbers standing in for it. On the
+compute side one `take` is one device buffer the submission builds or takes —
+the submission's own staged bytes, its shared backing, and the indirect
+replay's twelve-byte command — and one `return` is one pair handed back after
+the submission's fence was observed; the five partition the same population
+`rb_buffer_n` counts on the build side.
 `render_offscreen_n` and `render_present_n` count the render passes a window's
 submissions executed, by shape: the five `render_*` children divide the
 offscreen executor, so a reading of them beside a present count would otherwise
