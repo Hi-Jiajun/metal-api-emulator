@@ -111,5 +111,51 @@ image / view / memory 也都保持原样：g3a 读到的第一支配项是「每
 
 ## 4. A/B 读数
 
-见 `evidence/compute-buffer-pool-<sha>-2026-09-20/`（三臂同一个 exe：开 / 关 / 开，各 300 s；
-相位仪开、帧剖面开）。本节在那一轮的证据落盘后补齐。
+三臂同一个 exe 字节（sha256 `c506cf9e276b…`，`40-ab-exe-identity.txt`），launcher 只差
+`METAL_API_VULKAN_COMPUTE_BUFFER_POOL=0` 一行；坐标 reims `35dcd14` × provider `8e2836e`，
+300 s × 3 背靠背（每臂之间 settle 75 s），三臂都 attempt=1 / alive / 0 panic / `BOOT_EXIT=0`。
+完整读数、形状表与红线在 `evidence/compute-buffer-pool-8e2836e-2026-09-20/`。
+
+| µs/提交（窗口和 / Σn） | g3c（开） | g3c-off（关） | g3c-b（开） | 关 → 开（两开臂均值） |
+|---|---|---|---|---|
+| **`total`** | **2 208.1** | **2 371.0** | **2 115.2** | **−209.3（−8.8%）** |
+| `resource_build` | 147.2 | 273.5 | 139.1 | −130.4 |
+| ├ **`rb_buffer`** | **44.5** | **172.6** | **45.7** | **−127.5（−73.9%）** |
+| └ `rb_pipeline`（未被碰） | 98.0 | 96.7 | 89.0 | −3.1 |
+| `submit_teardown` | 23.5 | 148.7 | 21.7 | −126.1（−84.8%） |
+| └ **`submit_td_buffers`** | **0.3** | **126.2** | **0.3** | **−125.8（−99.8%）** |
+| `render_readback`（未被碰的对照条） | 78.5 | 75.1 | 73.6 | +0.9（+1.2%） |
+| `render_landing`（未被碰） | 59.3 | 56.3 | 55.9 | +1.3 |
+| `render_teardown`（未被碰） | 135.4 | 128.8 | 126.9 | +2.3 |
+| `plan` / `pool` / `submit_validate`（纯 CPU，与本刀无交集） | 125.7 / 154.7 / 131.0 | 124.9 / 152.1 / 128.2 | 121.5 / 147.9 / 124.3 | −1.3 / −0.8 / −0.6 |
+| `render_setup`（未被碰，宿主状态带） | 289.2 | 253.0 | 349.4 | +66.3 |
+| 机制计数 `compute_buffer_hit_n` / `miss_n` / `disabled_n` / `return_n` | **1.020 / 0 / 0 / 1.020** | 0 / 0 / **1.020** / 0 | **1.020 / 0 / 0 / 1.020** | — |
+| 人口 `rb_buffer_n` / `rb_memory_n` | **0.000 / 0.000** | 1.020 / 1.020 | **0.000 / 0.000** | — |
+| 提交数 / 窗口数 | 63 488 / 248 | 60 416 / 236 | 52 480 / 205 | — |
+
+**R 侧独立读数**（`frame_span`，与相位仪无关）：`prov_submit_us_mean` 按每 draw 折算
+**352 973 / 373 100 / 321 695** —— 两侧量的是同一次调用差（E `total` −209.3 µs/提交，
+R −35 766 µs/draw = −9.6%），差 0.8 个百分点以内。
+
+**这一刀砍掉什么**
+
+* **创建侧**：每提交 1.020 次创建降到 **0**（`rb_buffer_n` 1.020 → 0.000，`rb_memory_n` 同），
+  `rb_buffer` −127.5 µs（−73.9%）——剩下的是"取池 + map + 拷贝"本身。
+* **销毁侧**：`submit_td_buffers` 从 126.2 掉到 **0.3**（−99.8%）——那一档是"取不到就建"
+  的形状；取到的 1.020 个 pair 走的是同一个 region 里的 unmap + 还回（`compute_buffer_return_n`
+  = 1.020）。
+* 两条合起来 **−253.3 µs/提交 = 关臂整笔提交的 10.7%**；整笔 `total` 掉 −209.3（−8.8%），
+  差额来自**未被碰的渲染半边自己的宿主状态带**（`render_setup` 两个开臂之间就差 60 µs，
+  关臂比开臂均值低 66 µs；`render_total` 整体 +81.1 µs），而不是这一刀的成本。
+
+**没砍的、与边界**
+
+* pipeline 仍然每提交重建一次（`rb_pipeline_n` 三臂都是 1.020）——G3-A 点名的第二名，
+  是下一刀的候选。
+* 覆盖面无回归：三臂都是 `out_of_class_shape_lines distinct=0`、`render_seam
+  ok/ok_resident/out_of_class = 0/0/0`、`compute_provider_out_of_class=47`（与 g3a 同值），
+  `pass_color_slots_1 == render_provider_canonical`（63 518 / 60 307 / 52 577），三个 shape
+  表**逐字节相同**。
+* "丢画"这条在本 regime 只有计数器 / 形状 / 路由三个口径：QMP `screendump` 拍到的三臂桌面
+  都是全黑（与 g3a、sp11 同，属该 display 读不出来的已知边界），所以本轮**没有像素口径**，
+  这一点在证据 README 的 Known limitation 里写明。
