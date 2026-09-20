@@ -59,6 +59,10 @@ const INDEX_ALLOCATION: AllocationId = AllocationId::new(984);
 /// with the pass that kept a *different* frame.
 const DRIFTED_VIEW: ViewId = ViewId::new(976);
 const DRIFTED_ALLOCATION: AllocationId = AllocationId::new(986);
+/// A second image a later pass of one trace may name: the pass that names it is
+/// no member of the earlier pass's run, because a run states one image.
+const SECOND_IMAGE_VIEW: ViewId = ViewId::new(977);
+const SECOND_IMAGE_ALLOCATION: AllocationId = AllocationId::new(987);
 /// The declaring kernel's own scratch write, which its contract requires.
 const SCRATCH_VIEW: ViewId = ViewId::new(975);
 const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(985);
@@ -76,6 +80,17 @@ fn batched_frame_bytes() -> Vec<u8> {
     for _row in 0..2 {
         bytes.extend_from_slice(&QUAD_TEXEL);
         bytes.extend_from_slice(&QUAD_TEXEL);
+    }
+    bytes
+}
+
+/// The frame a publishing head lands: its own column beside the seeded clear
+/// the other column holds.
+fn head_only_frame_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    for _row in 0..2 {
+        bytes.extend_from_slice(&QUAD_TEXEL);
+        bytes.extend_from_slice(&CLEAR_TEXEL);
     }
     bytes
 }
@@ -170,6 +185,18 @@ struct Fixture {
     /// The control arm's two traces, one pass each: the pre-batch shape.
     keeping: ComputeTrace,
     consuming: ComputeTrace,
+    /// G3-B/B-1 (B-1): the run whose **head publishes** — the shape the run
+    /// rail's own plan states, where the record that opens the run states the
+    /// caller's store arm as well as keeping its frame in the identity's image.
+    publishing: ComputeTrace,
+    /// The same two passes as two traces, one pass each: the reference the
+    /// publishing head's run has to land byte for byte.
+    publishing_head: ComputeTrace,
+    /// A run whose second pass does **not** open from the image the first one
+    /// kept: the second pass names another image entirely (a `Clear` into its
+    /// own identity), so the two passes are not one run and the trace runs the
+    /// per-pass path.
+    unlinked: ComputeTrace,
     resources: ResourceTableSnapshot,
 }
 
@@ -328,12 +355,86 @@ fn fixture(executor: Arc<VulkanExecutor>) -> Option<Fixture> {
             TracePass::Render(consuming_pass.clone()),
         ],
     );
-    let keeping = trace(42, vec![declared(), TracePass::Render(keeping_pass)]);
-    let consuming = trace(43, vec![declared(), TracePass::Render(consuming_pass)]);
+    let keeping = trace(
+        42,
+        vec![declared(), TracePass::Render(keeping_pass.clone())],
+    );
+    let consuming = trace(
+        43,
+        vec![declared(), TracePass::Render(consuming_pass.clone())],
+    );
+    // The publishing head: it loads the identity's own image — which is what
+    // makes it keep its frame (`RenderAttachment::declares_resident_target`) —
+    // and states `StoreOp::Store`, so the frame it kept is published to the
+    // caller as well. That is the pair the run rail's head states when the
+    // record that opens a run is also a record the caller reads back.
+    let publishing_head_pass = RenderPassDescriptor {
+        pipeline: render.pipeline_id,
+        color_attachments: vec![attachment(LoadOp::Resident, StoreOp::Store)],
+        vertices: index_count,
+        vertex_buffers: vec![vertex_buffer(
+            KEEPING_VERTEX_VIEW,
+            KEEPING_VERTEX_ALLOCATION,
+            false,
+        )],
+        indices: Some(IndexBufferBinding {
+            view: index_buffer.clone(),
+            format: IndexFormat::Uint16,
+        }),
+        ..render_pass_defaults(render.pipeline_id)
+    };
+    // The pass that does not open from the image the member before it kept: it
+    // clears its *own* identity, so no member of the first pass's run may be
+    // this one — one submission states one image.
+    let second_image_pass = RenderPassDescriptor {
+        pipeline: render.pipeline_id,
+        color_attachments: vec![RenderAttachment {
+            view_id: SECOND_IMAGE_VIEW,
+            allocation_id: SECOND_IMAGE_ALLOCATION,
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            load: LoadOp::Clear(ClearColor::new(CLEAR_TEXEL)),
+            store: StoreOp::Store,
+        }],
+        vertices: index_count,
+        vertex_buffers: vec![vertex_buffer(
+            CONSUMING_VERTEX_VIEW,
+            CONSUMING_VERTEX_ALLOCATION,
+            true,
+        )],
+        indices: Some(IndexBufferBinding {
+            view: index_buffer.clone(),
+            format: IndexFormat::Uint16,
+        }),
+        ..render_pass_defaults(render.pipeline_id)
+    };
+    let publishing = trace(
+        44,
+        vec![
+            declared(),
+            TracePass::Render(publishing_head_pass.clone()),
+            TracePass::Render(consuming_pass.clone()),
+        ],
+    );
+    let publishing_head = trace(
+        45,
+        vec![declared(), TracePass::Render(publishing_head_pass.clone())],
+    );
+    let unlinked = trace(
+        46,
+        vec![
+            declared(),
+            TracePass::Render(publishing_head_pass.clone()),
+            declaring(SECOND_IMAGE_VIEW, SECOND_IMAGE_ALLOCATION),
+            TracePass::Render(second_image_pass),
+        ],
+    );
 
     let mut resources = ResourceTableSnapshot::new();
     for (allocation, size) in [
         (ATTACHMENT_ALLOCATION, 16_u64),
+        (SECOND_IMAGE_ALLOCATION, 16),
         (KEEPING_VERTEX_ALLOCATION, 32),
         (CONSUMING_VERTEX_ALLOCATION, 32),
         (INDEX_ALLOCATION, 12),
@@ -353,8 +454,29 @@ fn fixture(executor: Arc<VulkanExecutor>) -> Option<Fixture> {
         batched,
         keeping,
         consuming,
+        publishing,
+        publishing_head,
+        unlinked,
         resources,
     })
+}
+
+/// The frame a trace published for the attachment, taken from the **last**
+/// writeback that names it.
+///
+/// A run's members publish in member order, so the last entry is the record the
+/// caller reads the frame from — the run's tail. A per-record arm has exactly
+/// one entry, and the two arms are only comparable through this rule.
+fn last_frame_of(
+    provider: &VulkanComputeProvider,
+    trace: &ComputeTrace,
+    resources: &ResourceTableSnapshot,
+) -> Vec<u8> {
+    submit(provider, trace, resources)
+        .into_iter()
+        .rfind(|writeback| writeback.view_id == ATTACHMENT_VIEW)
+        .map(|writeback| writeback.bytes)
+        .expect("the trace publishes the frame the caller reads")
 }
 
 fn submit(
@@ -441,6 +563,124 @@ fn a_run_of_two_kept_passes_is_one_submission_and_the_same_frame() {
         hex(&batched_frame_bytes()),
         "the frame is the keeping pass's column beside the consuming pass's own: \
          a load that missed the keeping pass's store would leave the clear texel"
+    );
+}
+
+/// G3-B/B-1 (B-1): a run whose **head publishes** still travels as one
+/// submission, and its tail lands the frame the per-record arm lands.
+///
+/// The head states `StoreOp::Store` — the caller's own store arm, which is what
+/// the run rail's opening record states when the record that opens a run is also
+/// a record its caller reads back — beside a `LoadOp::Resident`, which is what
+/// keeps its frame in the identity's image. What a run needs of a member is that
+/// second half only: the pass after it opens from that image, so the head's
+/// writes have to be *in* it. A head whose load is a `Clear` and whose store is
+/// a `Store` publishes into a per-pass image and keeps nothing — the shape this
+/// test's predicate refuses by name (`BatchRefusal::FrameNotKept`, asserted in
+/// `compute_provider.rs`'s own tests), because a run that carried it would hand
+/// its successor an image the head never wrote.
+///
+/// The readings are the increment's own: one queue submission carries the head
+/// and the tail together, against one each when the switch is off, and the frame
+/// the tail publishes is the frame the two-submission arm published, byte for
+/// byte.
+#[test]
+fn a_run_whose_head_publishes_is_one_submission_and_the_same_frame() {
+    if std::env::var("REIMS_VGPU_RENDER_BATCH").is_err() {
+        std::env::set_var("REIMS_VGPU_RENDER_BATCH", "1");
+    }
+    let batching = metal_api_vulkan::render_batch_enabled();
+    let Some(executor) = executor() else {
+        return;
+    };
+    let Some(fixture) = fixture(Arc::clone(&executor)) else {
+        return;
+    };
+    let provider = Arc::clone(&fixture.provider);
+
+    // Both arms begin from the same image: the keeping pass seeds the
+    // identity's own bytes, exactly as the submission before a mid-frame run
+    // leaves them.
+    submit(&provider, &fixture.keeping, &fixture.resources);
+    let before = submissions(&executor);
+    let head_frame = frame_of(&provider, &fixture.publishing_head, &fixture.resources);
+    let reference = frame_of(&provider, &fixture.consuming, &fixture.resources);
+    let per_record = submissions(&executor) - before;
+    assert_eq!(
+        per_record, 4,
+        "the per-record arm states two traces, each with its declaring half"
+    );
+    assert_eq!(
+        hex(&head_frame),
+        hex(&head_only_frame_bytes()),
+        "the publishing head's own frame is its column beside the seeded clear"
+    );
+
+    // The batch arm: the same two passes in one trace, whose head publishes.
+    submit(&provider, &fixture.keeping, &fixture.resources);
+    let before = submissions(&executor);
+    let batched = last_frame_of(&provider, &fixture.publishing, &fixture.resources);
+    let run_submissions = submissions(&executor) - before;
+    assert_eq!(
+        run_submissions,
+        if batching { 2 } else { 3 },
+        "one declaring half plus one run when the switch is on, one declaring \
+         half plus one submission per pass when it is off"
+    );
+    assert_eq!(
+        hex(&batched),
+        hex(&reference),
+        "the run's tail publishes the frame the two-submission arm published"
+    );
+    assert_eq!(
+        hex(&batched),
+        hex(&batched_frame_bytes()),
+        "the run's own frame is both columns drawn: the head's publishing store \
+         and the tail's load of the image the head kept land the same bytes the \
+         per-record arm lands"
+    );
+}
+
+/// G3-B/B-1 (B-1): a pass that names **another image** ends the run, and the
+/// trace falls back to one submission per pass.
+///
+/// One submission states one image: the run carries the passes that load it, so
+/// a pass that clears an identity of its own is no member of the run — it runs
+/// the per-pass path, whichever arm this binary is. This is the increment's
+/// fail-closed direction, read as a submission count: a shape a run may not
+/// carry is executed exactly as it was executed before the switch existed,
+/// never as a partial member.
+#[test]
+fn a_pass_that_names_another_image_ends_the_run() {
+    if std::env::var("REIMS_VGPU_RENDER_BATCH").is_err() {
+        std::env::set_var("REIMS_VGPU_RENDER_BATCH", "1");
+    }
+    let Some(executor) = executor() else {
+        return;
+    };
+    let Some(fixture) = fixture(Arc::clone(&executor)) else {
+        return;
+    };
+    let provider = Arc::clone(&fixture.provider);
+
+    // The first pass opens from the identity's own image, so the image has to
+    // hold something: the keeping pass seeds it exactly as the submission before
+    // a mid-frame run leaves it.
+    submit(&provider, &fixture.keeping, &fixture.resources);
+    let before = submissions(&executor);
+    let frame = last_frame_of(&provider, &fixture.unlinked, &fixture.resources);
+    let used = submissions(&executor) - before;
+    assert_eq!(
+        used, 3,
+        "one declaring half plus one submission per pass, on both arms: the \
+         second pass is no member of the first pass's run"
+    );
+    assert_eq!(
+        hex(&frame),
+        hex(&head_only_frame_bytes()),
+        "the fallback still lands the keeping pass's own frame for the first \
+         image: a run that carried the second pass would have published another \
+         picture here"
     );
 }
 
