@@ -78,9 +78,10 @@ submit_validate_us=... submit_validate_derive_us=... submit_validate_check_us=..
 submit_validate_release_us=... submit_validate_named_us=...
 submit_release_us=... submit_release_bindings_us=... submit_release_views_us=...
 submit_release_pool_us=... submit_release_plan_us=... submit_release_named_us=...
-plan_resources_us=... submit_seam_us=...
+plan_resources_us=... staging_window_us=... submit_seam_us=...
 submit_resource_copies_n=... submit_resource_copies_bytes=...
 submit_resource_borrows_n=... submit_resource_borrows_bytes=...
+staging_window_copies_n=... staging_window_copies_bytes=...
 rb_pipeline_n=... rb_buffer_n=... rb_image_n=... rb_view_n=... rb_sampler_n=...
 rb_descriptor_n=... rb_indirect_n=... rb_memory_n=...
 wait_submit_n=... wait_render_n=... wait_landing_n=... wait_present_n=...
@@ -384,6 +385,24 @@ always owned and are counted in neither: a staged lease's bytes are copied out
 of the staging registry's lock and a gathered run list is built by the gather
 itself. The pair is the mechanism's own reading, and
 `docs/SUBMIT-BINDING-BORROW.md` carries the A/B that prices it.
+
+The eighth cut names the fourth source of a binding's bytes, the one the three
+cuts before it left unnamed:
+
+* `staging_window_us` is the region a **staged lease**'s window is resolved in —
+  `LeaseRegistry::view_bytes` / `::texture_bytes` on the compute half's `pool` and
+  on the render half's input resolution (the render texture walk takes
+  `::texture_bytes`). It is *nested*: the bar it divides stays its parent, so it
+  is never added to the disjoint sum. Off the cut's mechanism the region is the
+  registry's one `Vec` clone per resolved window; on it the same region hands the
+  binding a handle on the registry's own bytes and clones nothing
+  (`crate::staging_borrow`).
+* `staging_window_copies_n` / `staging_window_copies_bytes` count the windows the
+  registry copied for the window's submissions, and their total length: one entry
+  per resolved staged view or texture, and the bytes that entry cloned. This pair
+  is the reading the cut that follows is ranked by: the same owner bytes the
+  sixth and seventh cuts took off the submission, copied a third time because the
+  binding cannot borrow the registry's lock.
 
 `staging_cached_n` and `staging_plain_n` count the readback staging buffers a
 window's submissions allocated, by which memory type the selection took

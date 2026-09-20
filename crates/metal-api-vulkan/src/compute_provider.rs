@@ -4506,12 +4506,19 @@ impl ComputeProvider for VulkanComputeProvider {
                     });
                 }
                 BufferSource::StagedLease(lease_id) => {
+                    // The registry's own region: it copies the window out of
+                    // the staged bytes while it holds its lock, and the binding
+                    // uploads that copy (`crate::phase_profile::Phase::StagingWindow`).
+                    let _window = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::StagingWindow,
+                    );
                     let bytes = self.staging.view_bytes(
                         *lease_id,
                         view,
                         self.device_epoch(),
                         admitted.resources(),
                     )?;
+                    crate::phase_profile::note_staging_window_copy(bytes.len() as u64);
                     buffers.push(PoolBinding::Owned {
                         index,
                         bytes: crate::BindingBytes::Copied(bytes),

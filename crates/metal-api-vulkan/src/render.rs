@@ -6508,12 +6508,19 @@ fn resolve_render_input<'a>(
                      input cannot be read",
                 )
             })?;
+            // The registry's own region: it copies the window out of the staged
+            // bytes while it holds its lock, and the copy is what the binding
+            // uploads. The bar and the counter read that copy
+            // (`crate::phase_profile::Phase::StagingWindow`).
+            let _window =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::StagingWindow);
             let bytes = leases.staging.view_bytes(
                 *lease_id,
                 view,
                 leases.device_epoch,
                 leases.resources,
             )?;
+            crate::phase_profile::note_staging_window_copy(bytes.len() as u64);
             Ok(RenderInputSource::StagedBytes(bytes))
         }
         BufferSource::BorrowedNoCopy(lease_id) => {
@@ -7522,12 +7529,17 @@ fn resolve_render_texture_source<'a>(
                      texture cannot be read",
                 )
             })?;
+            // The texture arm takes the same window out of the same registry
+            // and pays the same copy (`crate::phase_profile::Phase::StagingWindow`).
+            let _window =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::StagingWindow);
             let bytes = leases.staging.texture_bytes(
                 *lease_id,
                 view,
                 leases.device_epoch,
                 leases.resources,
             )?;
+            crate::phase_profile::note_staging_window_copy(bytes.len() as u64);
             Ok(RenderInputSource::StagedBytes(bytes))
         }
         TextureSource::BorrowedNoCopy(lease_id) => {
