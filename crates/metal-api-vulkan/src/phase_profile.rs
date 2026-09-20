@@ -46,6 +46,9 @@
 //!   import_drop_n=...
 //!   buffer_hit_n=... buffer_miss_n=... buffer_disabled_n=... buffer_return_n=...
 //!   buffer_drop_n=...
+//!   compute_buffer_hit_n=... compute_buffer_miss_n=...
+//!   compute_buffer_disabled_n=... compute_buffer_return_n=...
+//!   compute_buffer_drop_n=...
 //!   render_offscreen_n=... render_present_n=...
 //!   readback_rect_us=... readback_full_us=... readback_seed_us=...
 //!   readback_surfaces_us=... readback_shape_us=... readback_named_us=...
@@ -1109,6 +1112,34 @@ pub(crate) fn note_buffer_pool(outcome: crate::render_buffer_pool::UploadOutcome
     });
 }
 
+/// Count one compute-side host-visible upload buffer's use of the pooled pair
+/// (`crate::compute_buffer_pool`) for the emitting thread's window.
+///
+/// The five outcomes partition every creation that reaches the mechanism: the
+/// pool held a buffer of this shape and handed it over, it held none and the
+/// creation built its own, the switch was off, or a submission whose fence was
+/// observed handed a buffer back and the pool kept it (or destroyed it
+/// instead). They are separate from the render rail's `buffer_*_n` because the
+/// two rails have their own switches: a round has to be able to see the compute
+/// half's reuse on its own.
+#[inline]
+pub(crate) fn note_compute_buffer_pool(outcome: crate::compute_buffer_pool::ComputeBufferOutcome) {
+    if !enabled() {
+        return;
+    }
+    use crate::compute_buffer_pool::ComputeBufferOutcome;
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        match outcome {
+            ComputeBufferOutcome::Hit => local.compute_buffer_hit_n += 1,
+            ComputeBufferOutcome::Miss => local.compute_buffer_miss_n += 1,
+            ComputeBufferOutcome::Disabled => local.compute_buffer_disabled_n += 1,
+            ComputeBufferOutcome::Returned => local.compute_buffer_return_n += 1,
+            ComputeBufferOutcome::Dropped => local.compute_buffer_drop_n += 1,
+        }
+    });
+}
+
 /// Which shape one executed render pass had: the offscreen rail the five
 /// `render_*` children were placed for, or the present rail, whose own setup,
 /// recording and readback are the residual's [`Phase::RenderPresent`].
@@ -1195,6 +1226,15 @@ struct Local {
     buffer_disabled_n: u64,
     buffer_return_n: u64,
     buffer_drop_n: u64,
+    /// The compute half's own host-visible upload buffers this window's
+    /// submissions created or handed back, by what
+    /// `crate::compute_buffer_pool` answered. A separate group from
+    /// `buffer_*_n` because the two rails carry their own switch.
+    compute_buffer_hit_n: u64,
+    compute_buffer_miss_n: u64,
+    compute_buffer_disabled_n: u64,
+    compute_buffer_return_n: u64,
+    compute_buffer_drop_n: u64,
     /// The render passes this window's submissions executed, by shape. The two
     /// do not share a cost shape, so a bar reading has to name its population.
     render_offscreen_n: u64,
@@ -1272,6 +1312,11 @@ impl Default for Local {
             buffer_disabled_n: 0,
             buffer_return_n: 0,
             buffer_drop_n: 0,
+            compute_buffer_hit_n: 0,
+            compute_buffer_miss_n: 0,
+            compute_buffer_disabled_n: 0,
+            compute_buffer_return_n: 0,
+            compute_buffer_drop_n: 0,
             render_offscreen_n: 0,
             render_present_n: 0,
             landing_n: 0,
@@ -1445,6 +1490,11 @@ impl Local {
         let buffer_disabled_n = std::mem::take(&mut self.buffer_disabled_n);
         let buffer_return_n = std::mem::take(&mut self.buffer_return_n);
         let buffer_drop_n = std::mem::take(&mut self.buffer_drop_n);
+        let compute_buffer_hit_n = std::mem::take(&mut self.compute_buffer_hit_n);
+        let compute_buffer_miss_n = std::mem::take(&mut self.compute_buffer_miss_n);
+        let compute_buffer_disabled_n = std::mem::take(&mut self.compute_buffer_disabled_n);
+        let compute_buffer_return_n = std::mem::take(&mut self.compute_buffer_return_n);
+        let compute_buffer_drop_n = std::mem::take(&mut self.compute_buffer_drop_n);
         let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
         let render_present_n = std::mem::take(&mut self.render_present_n);
         let landing_n = std::mem::take(&mut self.landing_n);
@@ -1512,6 +1562,11 @@ impl Local {
              buffer_hit_n={buffer_hit_n} buffer_miss_n={buffer_miss_n} \
              buffer_disabled_n={buffer_disabled_n} buffer_return_n={buffer_return_n} \
              buffer_drop_n={buffer_drop_n} \
+             compute_buffer_hit_n={compute_buffer_hit_n} \
+             compute_buffer_miss_n={compute_buffer_miss_n} \
+             compute_buffer_disabled_n={compute_buffer_disabled_n} \
+             compute_buffer_return_n={compute_buffer_return_n} \
+             compute_buffer_drop_n={compute_buffer_drop_n} \
              render_offscreen_n={render_offscreen_n} \
              render_present_n={render_present_n} \
              landing_n={landing_n} landing_bytes={landing_bytes} \
