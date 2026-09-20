@@ -272,7 +272,16 @@ because it runs at the end of the call, after the readback. Before this cut it
 ran inside the enclosing `total` and inside no other field, so it was invisible
 to every reading above. Its five children divide it in the order
 `ExecutionResources::drop` walks, with `submit_td_named_us` as their sum and the
-same `_n` counts beside the three object groups. One boundary is worth stating:
+same `_n` counts beside the three object groups. Those counts are populations
+with one caveat each: the pipeline and texture groups are entered once per
+destroyed object, the sync and retain groups once per submission, and the buffer
+group once per buffer **plus** once for the heap slab's own memory and once for
+the indirect replay's pair — so `submit_td_buffers_n` is an upper bound on the
+destroyed buffers by at most two entries per submission. A round that wants one
+buffer's cost reads it from the build side (`rb_buffer_us / rb_buffer_n`) or
+subtracts the per-submission entries: the g3a round read 85 825 buffer-group
+entries against 43 329 buffers built and 42 496 submissions, i.e. one buffer
+created and destroyed per submission. One boundary is worth stating:
 a deferred object API retires its resources from `wait`, outside any submission,
 and those microseconds belong to no submission's window — the teardown bars
 therefore resolve to nothing when no `total` bar is open, so a window's fields
