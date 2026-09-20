@@ -3729,7 +3729,16 @@ impl ComputeProvider for VulkanComputeProvider {
                 writebacks: Vec::new(),
             });
         }
-        let executor = self.lock_executor()?.clone();
+        // The seam before the compute half's first bar: acquiring the executor,
+        // the queue the policy picks and that queue's host lock, then the
+        // arena's own admission. The fifth cut names it (`submit_lock`) rather
+        // than leaving it inside the enclosing `total`, because a lock whose
+        // wait shows up as "the submission costs this much" is exactly the
+        // reading a reader cannot act on.
+        let executor = {
+            let _lock = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitLock);
+            self.lock_executor()?.clone()
+        };
         let result = execute_on_context(
             &executor,
             &artifacts,
@@ -3766,20 +3775,35 @@ impl ComputeProvider for VulkanComputeProvider {
                     crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTotal);
                 self.execute_render_passes(trace, &pool, &render_plan, admitted.resources())?
             };
-            let mut merged = BTreeMap::new();
-            for writeback in mapped.into_iter().chain(rendered) {
-                merged.insert((writeback.allocation_id, writeback.view_id), writeback);
-            }
-            let _writebacks =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Writebacks);
-            let writebacks: Vec<BufferWriteback> = merged.into_values().collect();
+            // The merge is the seam between the two halves, not part of either
+            // (`submit_merge`): it is one keyed insert per written view, and a
+            // round that reads `writebacks_us` alone would charge it to the
+            // compute half's mapping.
+            let writebacks: Vec<BufferWriteback> = {
+                let _merge =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitMerge);
+                let mut merged = BTreeMap::new();
+                for writeback in mapped.into_iter().chain(rendered) {
+                    merged.insert((writeback.allocation_id, writeback.view_id), writeback);
+                }
+                let _writebacks =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Writebacks);
+                // The collected list is what the compute half's own bar
+                // covers; the contract check below is its own region, so the
+                // two are not read as one number.
+                merged.into_values().collect()
+            };
             let output = ProviderSubmission {
                 completion: CompletionDisposition::CompletedVisible { token },
                 writebacks,
             };
-            output.validate_for_trace(trace).map_err(|error| {
-                output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
-            })?;
+            {
+                let _validate =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitValidate);
+                output.validate_for_trace(trace).map_err(|error| {
+                    output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
+                })?;
+            }
             Ok(output)
         })
         .map_err(|error| attach_token(error, token));
@@ -4079,12 +4103,22 @@ fn execute_on_context(
     // The synchronous path goes through the same queue policy as the deferred
     // object path (`research/docs/21` §4): the tier table decides which idle
     // queue receives the work, and a one-queue device keeps answering zero.
-    let queue_index = executor.context.pick_queue();
-    let _execution = executor
-        .context
-        .lock_queue(queue_index)
-        .map_err(|_| registry_poisoned())?;
-    ensure_executor_usable(executor)?;
+    //
+    // This prologue is the rest of the submission seam the fifth cut names
+    // (`crate::phase_profile::Phase::SubmitLock`, charged here and at the
+    // executor lock above): the queue pick, the queue's host lock and the
+    // arena's admission, all of which can wait on another thread rather than
+    // on the device.
+    let (queue_index, _execution) = {
+        let _lock = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitLock);
+        let queue_index = executor.context.pick_queue();
+        let execution = executor
+            .context
+            .lock_queue(queue_index)
+            .map_err(|_| registry_poisoned())?;
+        ensure_executor_usable(executor)?;
+        (queue_index, execution)
+    };
     execute_pool_sequence_with_status(
         &executor.context,
         artifacts,

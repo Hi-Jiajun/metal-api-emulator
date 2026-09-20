@@ -7154,7 +7154,13 @@ pub(crate) fn land_kept_frame(
         context.record_queue_submission(queue_index);
         let waited = {
             // The wait is the landing's own region: it is where the copy's
-            // device time (and the queue's latency) is paid.
+            // device time (and the queue's latency) is paid. Its object is
+            // counted in the window's fence census without charging the
+            // microseconds twice (`crate::phase_profile`).
+            crate::phase_profile::note_fence_wait_object(
+                crate::phase_profile::WaitObject::LandingFence,
+                context.queue_in_flight(queue_index).saturating_sub(1),
+            );
             let _landing_wait =
                 crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingWait);
             context.wait_for_fence(fence, crate::FENCE_TIMEOUT_NS)
@@ -10450,6 +10456,10 @@ impl ProviderTargetImage {
                 return Err(error);
             }
             context.record_queue_submission(queue_index);
+            crate::phase_profile::note_fence_wait_object(
+                crate::phase_profile::WaitObject::PresentFence,
+                context.queue_in_flight(queue_index).saturating_sub(1),
+            );
             let waited = context
                 .wait_for_fence(fence, crate::FENCE_TIMEOUT_NS)
                 .map_err(|result| {
@@ -16909,8 +16919,16 @@ impl<'a> OffscreenObjects<'a> {
         self.submitted = true;
         self.context.record_queue_submission(queue_index);
         drop(_render_submit);
-        let mut _render_wait =
-            crate::phase_profile::Bar::enter_fence_wait(crate::phase_profile::Phase::RenderWait);
+        // The wait's object is the pass's own binary completion fence, and the
+        // depth read here says how much of the graphics queue's earlier work
+        // the wait was behind (this submission is already recorded, so `n - 1`
+        // is what stood ahead of it) — `crate::phase_profile`.
+        let ahead = self.context.queue_in_flight(queue_index).saturating_sub(1);
+        let mut _render_wait = crate::phase_profile::Bar::enter_fence_wait(
+            crate::phase_profile::Phase::RenderWait,
+            crate::phase_profile::WaitObject::RenderFence,
+            ahead,
+        );
         if let Err(result) = self
             .context
             .wait_for_fence(self.fence, crate::FENCE_TIMEOUT_NS)
