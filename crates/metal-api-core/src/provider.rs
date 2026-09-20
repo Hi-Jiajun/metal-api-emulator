@@ -28006,8 +28006,16 @@ mod tests {
         // The pool reports the landing view as writable, so a visible
         // completion owes a writeback for it: the render track's bytes land
         // through the readback the compute path already uses.
+        let resources = admitted_trace.serial_resources().unwrap();
+        let textures = admitted_trace.serial_texture_resources().unwrap();
         assert_eq!(
-            validate_writebacks_for_trace(admitted_completion(), &[], admitted_trace),
+            validate_writebacks_for_trace(
+                admitted_completion(),
+                &[],
+                admitted_trace,
+                &resources,
+                &textures
+            ),
             Err(ContractError::MissingWriteback {
                 allocation: AllocationId::new(9),
                 view: ViewId::new(7),
@@ -28019,7 +28027,14 @@ mod tests {
             offset: 0,
             bytes: [0x40, 0x80, 0xc0, 0xff].repeat(4),
         };
-        validate_writebacks_for_trace(admitted_completion(), &[landed], admitted_trace).unwrap();
+        validate_writebacks_for_trace(
+            admitted_completion(),
+            &[landed],
+            admitted_trace,
+            &resources,
+            &textures,
+        )
+        .unwrap();
 
         // Control: a compute-only trace whose view stays read-only keeps the
         // pre-render pool access, so nothing about its readback changed.
