@@ -124,3 +124,8 @@ give-back census、R 侧 frame profile、E 侧 phase profile），三臂都 aliv
 * 不动 `submit_validate` 的两半：`docs/COMPUTE-PIPELINE-REUSE.md` §6 已用分布证据
   量出"可删的重复派生"只有 ≈4.9 µs/提交（0.2 %），并据此否决了那条扩宽契约的入口；
   本刀只**读**这个拆分，不落那条机制。
+
+> **后续（第七刀）**：§5 的第一名已经落刀 —— `ComputeTrace::serial_resources_ref` 让 `plan`
+> 与 `submit_validate` **借**这张池表而不是各拷一份，见
+> `docs/SUBMIT-RESOURCE-BORROW.md` 与开关 `METAL_API_VULKAN_SUBMIT_RESOURCE_BORROW`。
+> 本刀（第六刀）的绑定借用与它的开关/计数器一字未改；两把开关各自独立，默认都关。

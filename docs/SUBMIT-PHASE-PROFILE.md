@@ -74,7 +74,13 @@ submit_td_pipeline_us=... submit_td_pipeline_n=... submit_td_buffers_us=...
 submit_td_buffers_n=... submit_td_textures_us=... submit_td_textures_n=...
 submit_td_retains_us=... submit_td_retains_n=... submit_td_named_us=...
 submit_lock_us=... submit_bookkeep_us=... submit_merge_us=...
-submit_validate_us=... submit_seam_us=...
+submit_validate_us=... submit_validate_derive_us=... submit_validate_check_us=...
+submit_validate_release_us=... submit_validate_named_us=...
+submit_release_us=... submit_release_bindings_us=... submit_release_views_us=...
+submit_release_pool_us=... submit_release_plan_us=... submit_release_named_us=...
+plan_resources_us=... submit_seam_us=...
+submit_resource_copies_n=... submit_resource_copies_bytes=...
+submit_resource_borrows_n=... submit_resource_borrows_bytes=...
 rb_pipeline_n=... rb_buffer_n=... rb_image_n=... rb_view_n=... rb_sampler_n=...
 rb_descriptor_n=... rb_indirect_n=... rb_memory_n=...
 wait_submit_n=... wait_render_n=... wait_landing_n=... wait_present_n=...
@@ -338,6 +344,35 @@ that was already named:
   tail rather than per-submission work (`docs/COMPUTE-PIPELINE-REUSE.md` §6
   measured the derivations a cut would remove at ≈4.9 µs, 0.2 % of a
   submission), which is why this cut reads the split and does not cut it.
+
+The seventh cut names the same batch of bytes three more times, and moves two
+of the three:
+
+* `plan_resources_us` is the one call inside `plan` that derives the
+  submission's serial resource pool: `ComputeTrace::serial_resources`, which
+  owns the table and clones every view with its declared bytes, or — with the
+  seventh cut's mechanism on (`METAL_API_VULKAN_SUBMIT_RESOURCE_BORROW`, off by
+  default) — `ComputeTrace::serial_resources_ref`, which returns the trace's own
+  declarations lent. `plan` stays the enclosing bar, so
+  `plan_resources_us <= plan_us`.
+* `submit_validate_release_us` is the third child of `submit_validate`: the
+  release of the two tables the validation derived for itself, which before the
+  cut was the unnamed remainder of that bar. The sp16 round read that remainder
+  at 43.0 µs/submission while its siblings summed to 186.1 of the bar's 229.1 —
+  the free of a second copy of the submission's declared bytes.
+* `submit_release_pool_us` is the second child of `submit_release_views`: the
+  pool's *own* table (what `plan` derived), dropped on its own rather than with
+  the texture views beside it.
+
+`submit_resource_copies_n` / `_bytes` and `submit_resource_borrows_n` / `_bytes`
+count the declared bytes a **pool derivation** moved — the views whose source is
+the trace's own snapshot, and their total length. One submission derives its
+pool twice (once in `plan`, once in `submit_validate`), so the pre-cut path
+reports two copies of a submission's declared bytes and the cut's arm reports
+the same bytes lent twice and no copies. The other two sources (`StagedLease`,
+`GuestRuns`) carry no bytes of their own in the pool and are counted in neither.
+The pair is the mechanism's own reading, and
+`docs/SUBMIT-RESOURCE-BORROW.md` carries the A/B that prices it.
 
 `submit_binding_copies_n` / `submit_binding_copies_bytes` and
 `submit_binding_borrows_n` / `submit_binding_borrows_bytes` say how the window's

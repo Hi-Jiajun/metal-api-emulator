@@ -21,8 +21,8 @@ use metal_api_core::provider::{
     PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
     ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
     ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, TerminalState, TextureSource, TracePass,
+    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, SerialResource,
+    ShaderSource, StagedLease, StorageMode, SubmissionId, TerminalState, TextureSource, TracePass,
     ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
@@ -209,10 +209,46 @@ struct PlannedRenderDraws {
     draws: Vec<PlannedRenderPass>,
 }
 
+/// One pooled view's identity and geometry, without its bytes.
+///
+/// A deferred submission's readback resolves each landing the device reports
+/// through the pool it was planned against: the landing names a pool position,
+/// and the writeback it becomes needs that position's view identity and the
+/// offset the view starts at inside its allocation. It never needs the view's
+/// declared bytes — those were uploaded before the submission reached the
+/// queue, and the device owns its own copy of them from that point on
+/// (`crate::serial_resources_borrow`).
+///
+/// The completion slot therefore carries this projection rather than the pool
+/// itself. The pool is borrowed from the trace when the cut is on and owned by
+/// the call when it is off, and in neither arm does it have to outlive the
+/// call: the slot needs the geometry, not the bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PoolGeometry {
+    view_id: ViewId,
+    allocation_id: AllocationId,
+    offset: u64,
+}
+
+impl PoolGeometry {
+    /// The projection of one pool entry: the three fields a deferred readback
+    /// resolves a landing with.
+    fn of(resource: &SerialResource<'_>) -> Self {
+        let view = resource.view();
+        Self {
+            view_id: view.view_id,
+            allocation_id: view.allocation_id,
+            offset: view.offset,
+        }
+    }
+}
+
 struct CompletionSlot {
     record: Arc<CompletionRecord>,
     pending: Option<PendingExecution>,
-    pool: Vec<BufferView>,
+    /// The buffer pool's identity and geometry, in pool order
+    /// ([`PoolGeometry`]): what the deferred readback maps a landing through.
+    pool_geometry: Vec<PoolGeometry>,
     /// The texture pool the deferred readback maps its storage image landings
     /// through (`research/docs/26` §21.4, C2). A storage image's landing is
     /// keyed by a texture view identity rather than a buffer pool key, so the
@@ -461,6 +497,27 @@ fn build_provider_capabilities(executor: &VulkanExecutor) -> ProviderCapabilitie
         capabilities.storage_modes.push(StorageMode::BorrowedNoCopy);
     }
     capabilities
+}
+
+/// The trace's own declaration of one pooled identity, when the pool carries it.
+///
+/// Every resolution the render rail makes against the pool is by identity — an
+/// attachment's previous contents, a landing view, a stored depth or stencil
+/// surface — and each of them is resolved to the trace's *declaration*: the
+/// bytes, their range and the binding label, which the rail reads as it reads
+/// any other render input (`resolve_render_input`). The lending pool's entries
+/// carry exactly that, so this is the one place the pool's shape is read.
+fn pool_view<'a>(
+    pool: &'a [SerialResource<'a>],
+    allocation_id: AllocationId,
+    view_id: ViewId,
+) -> Option<&'a BufferView> {
+    pool.iter()
+        .find(|resource| {
+            let declared = resource.view();
+            declared.view_id == view_id && declared.allocation_id == allocation_id
+        })
+        .map(|resource| resource.view())
 }
 
 /// One offscreen pass's declaration surface, resolved before the render rail is
@@ -1548,7 +1605,7 @@ impl VulkanComputeProvider {
     fn resolve_offscreen_pass<'a>(
         &self,
         planned: &'a PlannedRenderPass,
-        pool: &'a [BufferView],
+        pool: &'a [SerialResource<'a>],
         host_readback: bool,
     ) -> Result<ResolvedOffscreenPass<'a>, ProviderError> {
         // The offscreen shape: resolve one landing view and one
@@ -1584,9 +1641,7 @@ impl VulkanComputeProvider {
         // consumed becomes deliverable again once this pass completes.
         let mut rekept_identities = Vec::new();
         for attachment in &planned.pass.color_attachments {
-            let declared = pool.iter().find(|view| {
-                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
-            });
+            let declared = pool_view(pool, attachment.allocation_id, attachment.view_id);
             // A resident target is resolved — or refused by name — before
             // any device object exists: the registry decides whether the
             // identity holds bytes a load may read, and a pass that renders
@@ -1683,9 +1738,7 @@ impl VulkanComputeProvider {
             // trace never declares is refused by the rail by name.
             let landing_view = match attachment.store {
                 metal_api_core::provider::StoreOp::BorrowedLanding(named) => {
-                    pool.iter().find(|view| {
-                        view.view_id == named.view_id && view.allocation_id == named.allocation_id
-                    })
+                    pool_view(pool, named.allocation_id, named.view_id)
                 }
                 _ => None,
             };
@@ -1708,12 +1761,8 @@ impl VulkanComputeProvider {
                         None
                     } else {
                         Some(
-                            pool.iter()
-                                .find(|view| {
-                                    view.view_id == identity.view_id
-                                        && view.allocation_id == identity.allocation_id
-                                })
-                                .ok_or_else(|| {
+                            pool_view(pool, identity.allocation_id, identity.view_id).ok_or_else(
+                                || {
                                     refusal(
                                     ProviderPhase::Resolve,
                                     ProviderErrorClass::Capability,
@@ -1732,7 +1781,8 @@ impl VulkanComputeProvider {
                                      writeback channel, and this trace declares no buffer view \
                                      covering the attachment",
                                 )
-                                })?,
+                                },
+                            )?,
                         )
                     }
                 }
@@ -1754,12 +1804,8 @@ impl VulkanComputeProvider {
                         None
                     } else {
                         Some(
-                            pool.iter()
-                                .find(|view| {
-                                    view.view_id == identity.view_id
-                                        && view.allocation_id == identity.allocation_id
-                                })
-                                .ok_or_else(|| {
+                            pool_view(pool, identity.allocation_id, identity.view_id).ok_or_else(
+                                || {
                                     refusal(
                                     ProviderPhase::Resolve,
                                     ProviderErrorClass::Capability,
@@ -1778,7 +1824,8 @@ impl VulkanComputeProvider {
                                      writeback channel, and this trace declares no buffer view \
                                      covering the attachment",
                                 )
-                                })?,
+                                },
+                            )?,
                         )
                     }
                 }
@@ -2129,7 +2176,7 @@ impl VulkanComputeProvider {
     fn execute_render_passes(
         &self,
         trace: &ComputeTrace,
-        pool: &[BufferView],
+        pool: &[SerialResource<'_>],
         plan: &[PlannedRenderEntry],
         resources: &ResourceTableSnapshot,
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
@@ -2406,10 +2453,7 @@ impl VulkanComputeProvider {
                 // opens (`research/docs/23` §3.3/§74). A loading pass therefore
                 // needs the declaration even when the trace asks for no host
                 // readback.
-                let declared = pool.iter().find(|view| {
-                    view.view_id == attachment.view_id
-                        && view.allocation_id == attachment.allocation_id
-                });
+                let declared = pool_view(pool, attachment.allocation_id, attachment.view_id);
                 let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
                 let storing = matches!(attachment.store, metal_api_core::provider::StoreOp::Store);
                 // A stored attachment's bytes land through the writeback
@@ -3036,7 +3080,7 @@ impl VulkanComputeProvider {
     fn land_kept_frame_entry(
         &self,
         landing: &KeptFrameLanding,
-        pool: &[BufferView],
+        pool: &[SerialResource<'_>],
         leases: &render::RenderLeaseContext<'_>,
     ) -> Result<(), ProviderError> {
         // The entry's identities are the first region of its residual
@@ -3049,12 +3093,7 @@ impl VulkanComputeProvider {
                 crate::phase_profile::Bar::enter(crate::phase_profile::Phase::LandingLookup);
             let identity = landing.identity();
             let image = self.kept_frame_target(&landing.frame)?;
-            let view = pool
-                .iter()
-                .find(|view| {
-                    view.view_id == landing.landing.view_id
-                        && view.allocation_id == landing.landing.allocation_id
-                })
+            let view = pool_view(pool, landing.landing.allocation_id, landing.landing.view_id)
                 .ok_or_else(|| {
                     refusal(
                         ProviderPhase::Resolve,
@@ -3657,7 +3696,15 @@ impl VulkanComputeProvider {
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
         self.validate_token(token)?;
-        let (record, pending, pool, textures, render_writebacks, heap_observations, deadline) = {
+        let (
+            record,
+            pending,
+            pool_geometry,
+            textures,
+            render_writebacks,
+            heap_observations,
+            deadline,
+        ) = {
             let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
             let slot = completions
                 .get_mut(&token.submission_id)
@@ -3676,7 +3723,7 @@ impl VulkanComputeProvider {
                 (
                     Arc::clone(&slot.record),
                     Some(pending),
-                    slot.pool.clone(),
+                    slot.pool_geometry.clone(),
                     slot.textures.clone(),
                     slot.render_writebacks.clone(),
                     slot.heap_observations.clone(),
@@ -3704,7 +3751,7 @@ impl VulkanComputeProvider {
         match pending.wait(duration_to_nanos(deadline.clamp(timeout))) {
             Ok(true) => match pending
                 .read_updates()
-                .and_then(|updates| map_writebacks(&pool, &textures, updates, token))
+                .and_then(|updates| map_writebacks(&pool_geometry, &textures, updates, token))
             {
                 Ok(writebacks) => {
                     drop(pending);
@@ -3862,7 +3909,7 @@ impl VulkanComputeProvider {
     fn plan_heap_placements(
         &self,
         trace: &ComputeTrace,
-        pool: &[BufferView],
+        pool: &[SerialResource<'_>],
         resources: &ResourceTableSnapshot,
     ) -> Result<Option<HeapPlan>, ProviderError> {
         let Some(heap) = &trace.heap else {
@@ -3885,8 +3932,8 @@ impl VulkanComputeProvider {
         }
         let mut owned = BTreeSet::<u64>::new();
         for resource in pool {
-            if matches!(resource.source, BufferSource::OwnedBytes(_)) {
-                owned.insert(resource.allocation_id.get());
+            if matches!(resource.view().source, BufferSource::OwnedBytes(_)) {
+                owned.insert(resource.view().allocation_id.get());
             }
         }
         let owned: Vec<u64> = owned.into_iter().collect();
@@ -4267,14 +4314,53 @@ impl ComputeProvider for VulkanComputeProvider {
                 })
                 .collect::<Result<Vec<_>, ProviderError>>()?
         };
-        let pool = trace.serial_resources().map_err(|error| {
-            refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Resource,
-                "resource_contract_invalid",
-            )
-            .with_detail(error.to_string())
-        })?;
+        // The submission's serial resource pool: the trace's declarations in
+        // first-use order, each with the access this submission merges over
+        // every use of it. The seventh cut's switch decides whether the call
+        // *derives* that table — borrowing the trace's own declarations and
+        // copying nothing — or *materializes* it, which is the pre-cut table of
+        // owned views and the first of the two copies a submission paid
+        // (`crate::serial_resources_borrow`).
+        //
+        // The owning arm's table is declared first on purpose: the lending
+        // table below borrows its views for the rest of the call, so it has to
+        // outlive it, exactly as it has to outlive the trace. Rust enforces
+        // both ends.
+        let borrow_resources = crate::serial_resources_borrow::enabled_from_env();
+        let owned_pool: Option<Vec<BufferView>> = if borrow_resources {
+            None
+        } else {
+            let _resources =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::PlanResources);
+            Some(trace.serial_resources().map_err(|error| {
+                refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "resource_contract_invalid",
+                )
+                .with_detail(error.to_string())
+            })?)
+        };
+        // What the rest of the call reads: the cut arm's own derivation (the
+        // trace's declarations, lent) or the control arm's views read back as
+        // entries. Either way it is a table of references, so nothing below
+        // this point can tell the two arms apart.
+        let pool: Vec<SerialResource<'_>> = match &owned_pool {
+            Some(views) => views.iter().map(SerialResource::from_derived).collect(),
+            None => {
+                let _resources =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::PlanResources);
+                trace.serial_resources_ref().map_err(|error| {
+                    refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Resource,
+                        "resource_contract_invalid",
+                    )
+                    .with_detail(error.to_string())
+                })?
+            }
+        };
+        note_pool_derivation(&pool, borrow_resources);
         let heap_plan = self.plan_heap_placements(trace, &pool, admitted.resources())?;
         let mut dispatches = Vec::with_capacity(trace.passes.len());
         for pass in trace.compute_passes() {
@@ -4286,7 +4372,7 @@ impl ComputeProvider for VulkanComputeProvider {
                 .map(|view| {
                     let position = pool
                         .iter()
-                        .position(|resource| resource.view_id == view.view_id)
+                        .position(|resource| resource.view().view_id == view.view_id)
                         .expect("validated resource pool");
                     Binding {
                         metal_index: view.metal_binding,
@@ -4346,9 +4432,9 @@ impl ComputeProvider for VulkanComputeProvider {
         };
         let mut owned_per_allocation = BTreeMap::<AllocationId, usize>::new();
         for resource in pool.iter() {
-            if matches!(resource.source, BufferSource::OwnedBytes(_)) {
+            if matches!(resource.view().source, BufferSource::OwnedBytes(_)) {
                 *owned_per_allocation
-                    .entry(resource.allocation_id)
+                    .entry(resource.view().allocation_id)
                     .or_default() += 1;
             }
         }
@@ -4358,7 +4444,11 @@ impl ComputeProvider for VulkanComputeProvider {
             // The validated pool has at most 64 resources. First-use Metal
             // binding labels may repeat across different passes.
             let index = position as u32;
-            match &resource.source {
+            // The view the trace declares, and the access this submission
+            // merged over every use of it: the two halves of a pool entry.
+            let view = resource.view();
+            let access = resource.access();
+            match &view.source {
                 BufferSource::OwnedBytes(bytes) => {
                     // A heap-bearing trace binds every owned allocation into
                     // the heap slab instead of its own device memory. The
@@ -4366,18 +4456,18 @@ impl ComputeProvider for VulkanComputeProvider {
                     // the view still addresses its own window inside it
                     // (`research/docs/25` §6 Step 3).
                     if let Some(plan) = &heap_plan {
-                        if let Some(heap_offset) = plan.offsets.get(&resource.allocation_id.get()) {
+                        if let Some(heap_offset) = plan.offsets.get(&view.allocation_id.get()) {
                             let allocation_size = plan
                                 .sizes
-                                .get(&resource.allocation_id.get())
+                                .get(&view.allocation_id.get())
                                 .copied()
                                 .ok_or_else(&overflow)?;
                             buffers.push(PoolBinding::HeapOwned {
                                 index,
-                                allocation: resource.allocation_id.get(),
-                                offset: usize::try_from(resource.offset).map_err(|_| overflow())?,
-                                length: usize::try_from(resource.length).map_err(|_| overflow())?,
-                                access: resource.access,
+                                allocation: view.allocation_id.get(),
+                                offset: usize::try_from(view.offset).map_err(|_| overflow())?,
+                                length: usize::try_from(view.length).map_err(|_| overflow())?,
+                                access,
                                 bytes: snapshot_binding_bytes(bytes),
                                 allocation_size: usize::try_from(allocation_size)
                                     .map_err(|_| overflow())?,
@@ -4392,7 +4482,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     // A lone owned view keeps its exact-length buffer; only a
                     // repeated allocation shares one backing across its views.
                     if owned_per_allocation
-                        .get(&resource.allocation_id)
+                        .get(&view.allocation_id)
                         .copied()
                         .unwrap_or(0)
                         < 2
@@ -4405,20 +4495,20 @@ impl ComputeProvider for VulkanComputeProvider {
                     }
                     buffers.push(PoolBinding::SharedOwned {
                         index,
-                        allocation: resource.allocation_id.get(),
-                        offset: usize::try_from(resource.offset).map_err(|_| overflow())?,
-                        length: usize::try_from(resource.length).map_err(|_| overflow())?,
+                        allocation: view.allocation_id.get(),
+                        offset: usize::try_from(view.offset).map_err(|_| overflow())?,
+                        length: usize::try_from(view.length).map_err(|_| overflow())?,
                         // A view that cannot read uploads nothing: its snapshot
                         // bytes are never observable. Every other view copies
                         // in exactly its own bytes (`research/docs/15` step 4).
-                        access: resource.access,
+                        access,
                         bytes: snapshot_binding_bytes(bytes),
                     });
                 }
                 BufferSource::StagedLease(lease_id) => {
                     let bytes = self.staging.view_bytes(
                         *lease_id,
-                        resource,
+                        view,
                         self.device_epoch(),
                         admitted.resources(),
                     )?;
@@ -4435,26 +4525,26 @@ impl ComputeProvider for VulkanComputeProvider {
                             "storage_mode_unsupported",
                         ));
                     }
-                    let view = self.borrowed.view_pointer(
+                    let window = self.borrowed.view_pointer(
                         *lease_id,
-                        resource,
+                        view,
                         self.device_epoch(),
                         admitted.resources(),
                     )?;
                     let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
-                    if !view.pointer.is_multiple_of(alignment) {
+                    if !window.pointer.is_multiple_of(alignment) {
                         return Err(borrowed_alignment_error(
                             *lease_id,
-                            view.pointer,
+                            window.pointer,
                             alignment as u64,
                         ));
                     }
                     borrowed_leases.push(*lease_id);
                     buffers.push(PoolBinding::Imported {
                         index,
-                        pointer: view.pointer,
-                        len: view.len,
-                        capacity: view.capacity,
+                        pointer: window.pointer,
+                        len: window.len,
+                        capacity: window.capacity,
                     });
                 }
                 // The compute half of the guest-runs arm (`research/docs/23`
@@ -4486,6 +4576,12 @@ impl ComputeProvider for VulkanComputeProvider {
             )
             .with_detail(error.to_string())
         })?;
+        // The pool's identity and geometry, without its bytes: what a readback
+        // — deferred or immediate — resolves a landing through
+        // ([`PoolGeometry`]). The bytes do not ride here and do not have to
+        // outlive the call: they were uploaded before the first command was
+        // recorded, and the device owns its own copy from that point on.
+        let pool_geometry: Vec<PoolGeometry> = pool.iter().map(PoolGeometry::of).collect();
         drop(_pool);
         if self.async_execution {
             let executor = self.lock_executor()?.clone();
@@ -4511,10 +4607,12 @@ impl ComputeProvider for VulkanComputeProvider {
             };
             // The device has its own copies of every binding now, so the
             // submission's bindings are done. They are dropped here rather
-            // than at the end of the scope because a borrow of the resource
-            // pool below would otherwise still be live when that pool is
-            // moved into the completion slot
-            // (`crate::submit_binding_borrow`); the drop itself is the same
+            // than at the end of the scope: a binding that hands over the
+            // trace's own bytes holds those declarations for as long as it
+            // lives, and every consumer of them — the deferred readback
+            // included, which resolves through the pool's geometry rather than
+            // the pool — is done with them here (`crate::submit_binding_borrow`,
+            // `crate::serial_resources_borrow`). The drop itself is the same
             // one the synchronous path pays at the end of the call.
             drop(buffers);
             // The indirect dispatch replay is encoded and submitted above, so
@@ -4570,7 +4668,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     CompletionSlot {
                         record,
                         pending: Some(pending),
-                        pool,
+                        pool_geometry,
                         textures: textures.clone(),
                         render_writebacks,
                         heap_observations: heap_plan
@@ -4625,7 +4723,7 @@ impl ComputeProvider for VulkanComputeProvider {
             let mapped = {
                 let _writebacks =
                     crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Writebacks);
-                map_writebacks(&pool, &textures, updates, token)?
+                map_writebacks(&pool_geometry, &textures, updates, token)?
             };
             let rendered = {
                 let _render =
@@ -4666,38 +4764,81 @@ impl ComputeProvider for VulkanComputeProvider {
                 // walk is `ProviderSubmission::validate_with_pools`, which is
                 // that method's own body with the tables handed in.
                 //
-                // The split is a *reading*, not a mechanism: handing the walk
-                // the tables `plan` and `pool` already derived would take the
-                // whole of `submit_validate_derive_us` away, and the
-                // `g3dprobe` round measured what that is worth (≈4.9 µs, 0.2 %
-                // of a submission) and declined to widen the contract for it
-                // (`docs/COMPUTE-PIPELINE-REUSE.md` §6). This cut leaves the
-                // entry unused for that reason; what it lands is the release
-                // (`crate::submit_binding_borrow`).
-                let (derived_resources, derived_textures) = {
+                // The seventh cut makes both derivations *lend*: off, the two
+                // tables are owned here and dropped at the end of this block,
+                // which is the seam the bar carried before the cut; on, the
+                // buffer pool borrows the trace's own declarations, so neither
+                // the copy nor its release is paid and the third child below
+                // reads what is left of them
+                // (`crate::serial_resources_borrow`). The *walk* is unchanged
+                // and is the half no cut can remove: it is the contract check
+                // this block exists for.
+                //
+                // The owning arm's table is declared first, as it is in `plan`:
+                // the entries below borrow its views, so it has to outlive
+                // them.
+                let borrow_resources = crate::serial_resources_borrow::enabled_from_env();
+                let derived_owned_pool: Option<Vec<BufferView>> = if borrow_resources {
+                    None
+                } else {
                     let _derive = crate::phase_profile::Bar::enter(
                         crate::phase_profile::Phase::SubmitValidateDerive,
                     );
-                    (
-                        trace.serial_resources().map_err(|error| {
+                    Some(trace.serial_resources().map_err(|error| {
+                        output_error(token, "writeback_contract_invalid")
+                            .with_detail(error.to_string())
+                    })?)
+                };
+                let derived_resources: Vec<SerialResource<'_>> = match &derived_owned_pool {
+                    Some(views) => views.iter().map(SerialResource::from_derived).collect(),
+                    None => {
+                        let _derive = crate::phase_profile::Bar::enter(
+                            crate::phase_profile::Phase::SubmitValidateDerive,
+                        );
+                        trace.serial_resources_ref().map_err(|error| {
                             output_error(token, "writeback_contract_invalid")
                                 .with_detail(error.to_string())
-                        })?,
-                        trace.serial_texture_resources().map_err(|error| {
-                            output_error(token, "writeback_contract_invalid")
-                                .with_detail(error.to_string())
-                        })?,
-                    )
+                        })?
+                    }
+                };
+                note_pool_derivation(&derived_resources, borrow_resources);
+                let derived_textures = {
+                    let _derive = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::SubmitValidateDerive,
+                    );
+                    trace.serial_texture_resources().map_err(|error| {
+                        output_error(token, "writeback_contract_invalid")
+                            .with_detail(error.to_string())
+                    })?
                 };
                 let _check = crate::phase_profile::Bar::enter(
                     crate::phase_profile::Phase::SubmitValidateCheck,
                 );
-                output
+                let validated = output
                     .validate_with_pools(trace, &derived_resources, &derived_textures)
                     .map_err(|error| {
                         output_error(token, "writeback_contract_invalid")
                             .with_detail(error.to_string())
-                    })?;
+                    });
+                // The check's own bar closes before the release begins, so the
+                // two are disjoint regions of `submit_validate` rather than one
+                // nested in the other: a reader adds the three children and
+                // cannot charge the free to the walk.
+                drop(_check);
+                {
+                    // The release this block's seam used to carry without a
+                    // name: the two tables the validation derived for itself,
+                    // freed before the bar closes. Off it is the third copy's
+                    // `free`; on it is a table of references
+                    // (`crate::phase_profile::Phase::SubmitValidateRelease`).
+                    let _release = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::SubmitValidateRelease,
+                    );
+                    drop(derived_resources);
+                    drop(derived_textures);
+                    drop(derived_owned_pool);
+                }
+                validated?;
             }
             Ok(output)
         })
@@ -4724,7 +4865,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     CompletionSlot {
                         record: observation,
                         pending: None,
-                        pool: Vec::new(),
+                        pool_geometry: Vec::new(),
                         textures: Vec::new(),
                         render_writebacks: Vec::new(),
                         heap_observations: Vec::new(),
@@ -4736,8 +4877,9 @@ impl ComputeProvider for VulkanComputeProvider {
         // The sixth cut's second region: the tail of the call. `total` is the
         // first binding in `submit`, so it is the last to drop, and the values
         // declared after it — the pooled bindings with their byte copies, the
-        // resource pool, the texture views, the dispatch list, the heap plan,
-        // the render plan and the pipeline artifacts — drop *after* the
+        // resource pool with the copy the plan derived for it, the texture
+        // views, the dispatch list, the heap plan, the render plan and the
+        // pipeline artifacts — drop *after* the
         // `settle` guard that was declared last. That tail is inside `total`
         // and outside every other bar, and nothing named it
         // (`crate::phase_profile::Phase::SubmitRelease`).
@@ -4746,7 +4888,9 @@ impl ComputeProvider for VulkanComputeProvider {
         // branch below is skipped with it: the tail values then drop exactly
         // where they dropped before the cut, at the end of the scope. With the
         // profile on, the settle bar is closed first so the two regions stay
-        // disjoint and the release's own three children divide it.
+        // disjoint and the release's own four children divide it — the seventh
+        // cut added `submit_release_pool` so the pool's own drop can be read
+        // apart from the texture views beside it.
         drop(_settle);
         if let Some(_release) =
             crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitRelease)
@@ -4763,6 +4907,16 @@ impl ComputeProvider for VulkanComputeProvider {
                     crate::phase_profile::Phase::SubmitReleaseViews,
                 );
                 drop(pool);
+                {
+                    // The pool's *own* table, the one the plan derived: off it
+                    // is the first copy's `free`, and on it is a table of
+                    // references to the trace's declarations
+                    // (`crate::serial_resources_borrow`).
+                    let _pool = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::SubmitReleasePool,
+                    );
+                    drop(owned_pool);
+                }
                 drop(textures);
             }
             {
@@ -4984,7 +5138,7 @@ fn narrow_dimensions(wide: [u64; 3]) -> Result<Size, ProviderError> {
 }
 
 fn map_writebacks(
-    pool: &[BufferView],
+    pool: &[PoolGeometry],
     textures: &[metal_api_core::provider::TextureView],
     updates: Vec<LandingUpdate>,
     token: CompletionToken,
@@ -4993,17 +5147,22 @@ fn map_writebacks(
     for update in updates {
         match update.target {
             LandingTarget::Buffer(index) => {
-                let view = usize::try_from(index)
+                // The pool position carries the identity and the window a
+                // landing becomes a writeback with. Its bytes are the device's
+                // by now: the upload happened before the submission was
+                // recorded, so the mapping never reads them
+                // ([`PoolGeometry`]).
+                let entry = usize::try_from(index)
                     .ok()
                     .and_then(|position| pool.get(position))
                     .ok_or_else(|| output_error(token, "writeback_unknown_binding"))?;
-                let offset = view
+                let offset = entry
                     .offset
                     .checked_add(update.offset as u64)
                     .ok_or_else(|| output_error(token, "writeback_range_overflow"))?;
                 writebacks.push(BufferWriteback {
-                    view_id: view.view_id,
-                    allocation_id: view.allocation_id,
+                    view_id: entry.view_id,
+                    allocation_id: entry.allocation_id,
                     offset,
                     bytes: update.bytes,
                 });
@@ -5057,6 +5216,45 @@ fn snapshot_binding_bytes(bytes: &Vec<u8>) -> crate::BindingBytes<'_> {
     } else {
         crate::phase_profile::note_binding_copy(bytes.len() as u64);
         crate::BindingBytes::Copied(bytes.clone())
+    }
+}
+
+/// The declared bytes one pool carries, and how many of its entries carry them.
+///
+/// These are the bytes a derivation copies when it owns the table and lends
+/// when it does not: a view whose source is the trace's own snapshot. The other
+/// two sources (`StagedLease`, `GuestRuns`) carry no bytes of their own here —
+/// the staged registry and the gather own those — so they are neither copied
+/// nor lent by this table (`crate::serial_resources_borrow`).
+fn pooled_declared_bytes(pool: &[SerialResource<'_>]) -> (u64, u64) {
+    let mut views = 0_u64;
+    let mut bytes = 0_u64;
+    for resource in pool {
+        if let BufferSource::OwnedBytes(source) = &resource.view().source {
+            views += 1;
+            bytes += source.len() as u64;
+        }
+    }
+    (views, bytes)
+}
+
+/// Count one pool derivation's declared bytes under the arm that ran.
+///
+/// The counters are the mechanism's own evidence and they are read beside the
+/// bars: off, a submission's two derivations report two copies of the bytes it
+/// declares; on, they report the same bytes lent and no copies
+/// (`crate::serial_resources_borrow`). Nothing is measured when the profile is
+/// off — the sum is only computed behind
+/// [`crate::phase_profile::counting`].
+fn note_pool_derivation(pool: &[SerialResource<'_>], borrowed: bool) {
+    if !crate::phase_profile::counting() {
+        return;
+    }
+    let (views, bytes) = pooled_declared_bytes(pool);
+    if borrowed {
+        crate::phase_profile::note_resource_borrow(views, bytes);
+    } else {
+        crate::phase_profile::note_resource_copy(views, bytes);
     }
 }
 
@@ -5663,7 +5861,11 @@ mod tests {
             device_epoch: DeviceEpoch::new(1),
             submission_id: SubmissionId::new(2),
         };
-        let pool: Vec<_> = [(330, 430, 20), (340, 440, 48)]
+        // The mapping reads the pool's identity and geometry and nothing else:
+        // a deferred submission resolves a landing through [`PoolGeometry`],
+        // the projection of the pool entry it was planned against, whose bytes
+        // are the device's by then.
+        let views: Vec<_> = [(330, 430, 20), (340, 440, 48)]
             .into_iter()
             .map(|(allocation, view, offset)| BufferView {
                 view_id: ViewId::new(view),
@@ -5675,6 +5877,11 @@ mod tests {
                 attribute_stride: None,
                 source: BufferSource::OwnedBytes(vec![0; 4]),
             })
+            .collect();
+        let pool: Vec<_> = views
+            .iter()
+            .map(SerialResource::from_derived)
+            .map(|resource| PoolGeometry::of(&resource))
             .collect();
         let updates = vec![
             LandingUpdate {
