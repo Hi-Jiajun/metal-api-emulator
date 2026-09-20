@@ -10136,14 +10136,26 @@ fn execute_offscreen_render_with_retains(
             resident_layouts.publish(true);
             // The pipeline-shaped objects have retired with the fence, so they
             // go back to the shape cache before anything else in this pass
-            // reads the frame (`crate::render_setup_reuse`).
+            // reads the frame (`crate::render_setup_reuse`). The three returns
+            // are their own residual bars: "give it back" is only free if a
+            // reading says so, and a pool's eviction destroys objects inside
+            // the return (`crate::phase_profile`, fourth cut).
+            let _release_reuse =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseReuse);
             objects.release_reusable();
+            drop(_release_reuse);
             // The sampled textures' pooled backing retires with the same
             // fence (`crate::render_texture_pool`).
+            let _release_pool =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleasePool);
             objects.release_pooled_textures();
+            drop(_release_pool);
             // The owner-window imports retire with the same fence
             // (`crate::render_import_pool`).
+            let _release_import =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseImport);
             objects.release_imported_windows();
+            drop(_release_import);
         }
         Err(error) => {
             if let Some(retains) = retains.as_mut() {
@@ -10178,7 +10190,10 @@ fn execute_offscreen_render_with_retains(
     );
     if readback.is_ok() {
         if let Some(retains) = retains.as_mut() {
+            let _retire =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRetire);
             retains.retire();
+            drop(_retire);
         }
     }
     // The pass's objects are torn down here rather than by the scope's own end
@@ -16822,7 +16837,18 @@ impl<'a> OffscreenObjects<'a> {
 
 impl<'a> Drop for OffscreenObjects<'a> {
     fn drop(&mut self) {
+        use crate::phase_profile::{note_teardown_object, TeardownObject};
         unsafe {
+            // The drop is the one region of the render half that the first
+            // split left as a single number (`Phase::RenderTeardown`), and it
+            // is a *sequence* of destroy groups with very different costs. Each
+            // group below is charged to its own nested bar
+            // (`crate::phase_profile`, fourth cut), so a reading can say
+            // whether the pass pays for its images, its buffers, its
+            // descriptor state or its command pool — and the counters count
+            // only the handles that were really destroyed, so a group the
+            // pools already emptied reads as zero rather than as "free".
+            let _sync = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownSync);
             if self.fence != vk::Fence::null() {
                 self.context.device.destroy_fence(self.fence, None);
             }
@@ -16831,6 +16857,9 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_command_pool(self.command_pool, None);
             }
+            drop(_sync);
+            let _pipeline =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownPipeline);
             if self.pipeline != vk::Pipeline::null() {
                 self.context.device.destroy_pipeline(self.pipeline, None);
             }
@@ -16849,6 +16878,9 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_shader_module(self.vertex_module, None);
             }
+            drop(_pipeline);
+            let _passes =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownPasses);
             if self.framebuffer != vk::Framebuffer::null() {
                 self.context
                     .device
@@ -16869,10 +16901,13 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_render_pass(self.render_pass, None);
             }
+            drop(_passes);
             // The sampled textures and the descriptor the fragment stage read
             // them through are the pass's own (`research/docs/23` §3.3, v70):
             // the pool owns the set, so destroying the pool releases both and
             // the layout goes with it.
+            let _textures =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownTextures);
             for texture in &self.textures {
                 // A texel-fetch binding created no sampler
                 // (`research/docs/23` §3.3, v105), so only a slot that owns one
@@ -16880,16 +16915,20 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 if let Some(sampler) = texture.sampler {
                     if sampler != vk::Sampler::null() {
                         self.context.device.destroy_sampler(sampler, None);
+                        note_teardown_object(TeardownObject::Sampler);
                     }
                 }
                 if texture.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(texture.view, None);
+                    note_teardown_object(TeardownObject::View);
                 }
                 if texture.image != vk::Image::null() {
                     self.context.device.destroy_image(texture.image, None);
+                    note_teardown_object(TeardownObject::Image);
                 }
                 if texture.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(texture.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
                 // The no-copy arm's imported window is the pass's own too
                 // (`research/docs/23` §75, R5c): the object is destroyed once
@@ -16897,12 +16936,17 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 if let Some((buffer, memory)) = texture.copy_source {
                     if buffer != vk::Buffer::null() {
                         self.context.device.destroy_buffer(buffer, None);
+                        note_teardown_object(TeardownObject::Buffer);
                     }
                     if memory != vk::DeviceMemory::null() {
                         self.context.device.free_memory(memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
             }
+            drop(_textures);
+            let _descriptors =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownDescriptors);
             if self.descriptor_pool != vk::DescriptorPool::null() {
                 self.context
                     .device
@@ -16937,14 +16981,25 @@ impl<'a> Drop for OffscreenObjects<'a> {
                         .destroy_descriptor_set_layout(layout, None);
                 }
             }
+            drop(_descriptors);
+            // The stage buffers the sets above pointed at are their own group:
+            // they are buffers with memories, which is what the counter beside
+            // their bar counts.
+            let _stage_buffers =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownBuffers);
             for (buffer, memory) in self.stage_buffer_inputs.drain(..) {
                 if buffer != vk::Buffer::null() {
                     self.context.device.destroy_buffer(buffer, None);
+                    note_teardown_object(TeardownObject::Buffer);
                 }
                 if memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
+            drop(_stage_buffers);
+            let _depth_stencil =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownDepthStencil);
             if let Some(depth) = &self.depth {
                 // The depth resolve target is owned by the same pass scope
                 // (`research/docs/23` §3.3, v57), so it is destroyed beside
@@ -16952,22 +17007,28 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 if let Some(resolve) = &depth.resolve {
                     if resolve.view != vk::ImageView::null() {
                         self.context.device.destroy_image_view(resolve.view, None);
+                        note_teardown_object(TeardownObject::View);
                     }
                     if resolve.image != vk::Image::null() {
                         self.context.device.destroy_image(resolve.image, None);
+                        note_teardown_object(TeardownObject::Image);
                     }
                     if resolve.memory != vk::DeviceMemory::null() {
                         self.context.device.free_memory(resolve.memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
                 if depth.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(depth.view, None);
+                    note_teardown_object(TeardownObject::View);
                 }
                 if depth.image != vk::Image::null() {
                     self.context.device.destroy_image(depth.image, None);
+                    note_teardown_object(TeardownObject::Image);
                 }
                 if depth.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(depth.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
             if let Some(stencil) = &self.stencil {
@@ -16978,25 +17039,34 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 // (`research/docs/23` §3.3, v60).
                 if stencil.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(stencil.view, None);
+                    note_teardown_object(TeardownObject::View);
                 }
                 if let Some(resolve) = &stencil.resolve {
                     if resolve.view != vk::ImageView::null() {
                         self.context.device.destroy_image_view(resolve.view, None);
+                        note_teardown_object(TeardownObject::View);
                     }
                     if resolve.image != vk::Image::null() && !resolve.shares_backing {
                         self.context.device.destroy_image(resolve.image, None);
+                        note_teardown_object(TeardownObject::Image);
                     }
                     if resolve.memory != vk::DeviceMemory::null() && !resolve.shares_backing {
                         self.context.device.free_memory(resolve.memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
                 if stencil.image != vk::Image::null() && !stencil.shares_backing {
                     self.context.device.destroy_image(stencil.image, None);
+                    note_teardown_object(TeardownObject::Image);
                 }
                 if stencil.memory != vk::DeviceMemory::null() && !stencil.shares_backing {
                     self.context.device.free_memory(stencil.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
+            drop(_depth_stencil);
+            let _attachments =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownAttachments);
             for attachment in &self.attachments {
                 // The resolve target of a rail-owned multisampled attachment
                 // is owned by the same pass scope (`research/docs/23` §3.3,
@@ -17008,12 +17078,15 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     if let Some(resolve) = &attachment.resolve {
                         if resolve.view != vk::ImageView::null() {
                             self.context.device.destroy_image_view(resolve.view, None);
+                            note_teardown_object(TeardownObject::View);
                         }
                         if resolve.image != vk::Image::null() {
                             self.context.device.destroy_image(resolve.image, None);
+                            note_teardown_object(TeardownObject::Image);
                         }
                         if resolve.memory != vk::DeviceMemory::null() {
                             self.context.device.free_memory(resolve.memory, None);
+                            note_teardown_object(TeardownObject::Memory);
                         }
                     }
                 }
@@ -17022,64 +17095,86 @@ impl<'a> Drop for OffscreenObjects<'a> {
                         self.context
                             .device
                             .destroy_image_view(attachment.view, None);
+                        note_teardown_object(TeardownObject::View);
                     }
                     if attachment.image != vk::Image::null() {
                         self.context.device.destroy_image(attachment.image, None);
+                        note_teardown_object(TeardownObject::Image);
                     }
                     if attachment.memory != vk::DeviceMemory::null() {
                         self.context.device.free_memory(attachment.memory, None);
+                        note_teardown_object(TeardownObject::Memory);
                     }
                 }
             }
+            drop(_attachments);
+            let _readbacks =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownReadbacks);
             for readback in &self.readbacks {
                 if readback.memory != vk::DeviceMemory::null() {
                     self.context.device.unmap_memory(readback.memory);
                 }
                 if readback.buffer != vk::Buffer::null() {
                     self.context.device.destroy_buffer(readback.buffer, None);
+                    note_teardown_object(TeardownObject::Buffer);
                 }
                 if readback.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(readback.memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
+            drop(_readbacks);
+            let _input_buffers =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownBuffers);
             // The indirect buffer is unbound by construction (its memory is
             // freed right after), so destroy before free.
             if self.indirect_buffer != vk::Buffer::null() {
                 self.context
                     .device
                     .destroy_buffer(self.indirect_buffer, None);
+                note_teardown_object(TeardownObject::Buffer);
             }
             if self.indirect_memory != vk::DeviceMemory::null() {
                 self.context.device.free_memory(self.indirect_memory, None);
+                note_teardown_object(TeardownObject::Memory);
             }
             // The index buffer is unbound by construction (its memory is freed
             // right after), so destroy before free.
             if self.index_buffer != vk::Buffer::null() {
                 self.context.device.destroy_buffer(self.index_buffer, None);
+                note_teardown_object(TeardownObject::Buffer);
             }
             if self.index_memory != vk::DeviceMemory::null() {
                 self.context.device.free_memory(self.index_memory, None);
+                note_teardown_object(TeardownObject::Memory);
             }
             // The caller-held streams are unbound by construction (their memory
             // is freed right after), so destroy before free.
             for (buffer, memory) in self.vertex_inputs.drain(..) {
                 if buffer != vk::Buffer::null() {
                     self.context.device.destroy_buffer(buffer, None);
+                    note_teardown_object(TeardownObject::Buffer);
                 }
                 if memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
             if self.input_index_buffer != vk::Buffer::null() {
                 self.context
                     .device
                     .destroy_buffer(self.input_index_buffer, None);
+                note_teardown_object(TeardownObject::Buffer);
             }
             if self.input_index_memory != vk::DeviceMemory::null() {
                 self.context
                     .device
                     .free_memory(self.input_index_memory, None);
+                note_teardown_object(TeardownObject::Memory);
             }
+            drop(_input_buffers);
+            let _previous =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TeardownPrevious);
             // The staging buffer is unbound by construction (its memory is
             // freed right after), so destroy before free.
             for attachment in &self.attachments {
@@ -17087,13 +17182,16 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     self.context
                         .device
                         .destroy_buffer(attachment.previous_buffer, None);
+                    note_teardown_object(TeardownObject::Buffer);
                 }
                 if attachment.previous_memory != vk::DeviceMemory::null() {
                     self.context
                         .device
                         .free_memory(attachment.previous_memory, None);
+                    note_teardown_object(TeardownObject::Memory);
                 }
             }
+            drop(_previous);
         }
     }
 }
