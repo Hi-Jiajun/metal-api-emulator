@@ -50,6 +50,10 @@
 //!   compute_buffer_disabled_n=... compute_buffer_return_n=...
 //!   compute_buffer_drop_n=...
 //!   render_offscreen_n=... render_present_n=...
+//!   render_batch_n=... render_batch_passes=...
+//!   render_batch_passes_1=... render_batch_passes_2=...
+//!   render_batch_passes_3_4=... render_batch_passes_5_8=...
+//!   render_batch_passes_gt8=...
 //!   readback_rect_us=... readback_full_us=... readback_seed_us=...
 //!   readback_surfaces_us=... readback_shape_us=... readback_named_us=...
 //!   landing_lookup_us=... landing_windows_us=... landing_stage_us=...
@@ -1168,6 +1172,40 @@ pub(crate) fn note_render_shape(shape: RenderShape) {
     });
 }
 
+/// Count one executed render *batch* and the passes it carried
+/// (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// A batch is one submission scope: one `vkQueueSubmit`, one fence and one
+/// wait, carrying `passes` recorded render passes. The reading a round wants
+/// beside `render_offscreen_n` is the divisor — `render_offscreen_n /
+/// render_batch_n` is the mean batch length, and the band counters say which
+/// lengths the window's population was made of (the same bands
+/// `runtime/exec/report.rs` uses for `stream_draws_*`, so the two rails'
+/// readings are comparable).
+///
+/// Every counted batch is one fence and one wait: `wait_render_n` divided by
+/// `render_batch_n` is therefore the waits per batch, and it falls below the
+/// per-pass count exactly to the degree this instrument's population is
+/// batched.
+#[inline]
+pub(crate) fn note_render_batch(passes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.render_batch_n += 1;
+        local.render_batch_passes += passes;
+        match passes {
+            0 | 1 => local.render_batch_passes_1 += 1,
+            2 => local.render_batch_passes_2 += 1,
+            3..=4 => local.render_batch_passes_3_4 += 1,
+            5..=8 => local.render_batch_passes_5_8 += 1,
+            _ => local.render_batch_passes_gt8 += 1,
+        }
+    });
+}
+
 /// One thread's window of the profile.
 struct Local {
     ns: [u64; PHASE_COUNT],
@@ -1239,6 +1277,16 @@ struct Local {
     /// do not share a cost shape, so a bar reading has to name its population.
     render_offscreen_n: u64,
     render_present_n: u64,
+    /// The render batches this window's submissions executed, the passes they
+    /// carried, and the batch-length bands those passes were grouped in
+    /// (`REIMS_VGPU_RENDER_BATCH`).
+    render_batch_n: u64,
+    render_batch_passes: u64,
+    render_batch_passes_1: u64,
+    render_batch_passes_2: u64,
+    render_batch_passes_3_4: u64,
+    render_batch_passes_5_8: u64,
+    render_batch_passes_gt8: u64,
     /// The kept frames this window's landing-only entries delivered, and the
     /// bytes the owner's pages received.
     landing_n: u64,
@@ -1319,6 +1367,13 @@ impl Default for Local {
             compute_buffer_drop_n: 0,
             render_offscreen_n: 0,
             render_present_n: 0,
+            render_batch_n: 0,
+            render_batch_passes: 0,
+            render_batch_passes_1: 0,
+            render_batch_passes_2: 0,
+            render_batch_passes_3_4: 0,
+            render_batch_passes_5_8: 0,
+            render_batch_passes_gt8: 0,
             landing_n: 0,
             landing_bytes: 0,
             staging_cached_n: 0,
@@ -1497,6 +1552,13 @@ impl Local {
         let compute_buffer_drop_n = std::mem::take(&mut self.compute_buffer_drop_n);
         let render_offscreen_n = std::mem::take(&mut self.render_offscreen_n);
         let render_present_n = std::mem::take(&mut self.render_present_n);
+        let render_batch_n = std::mem::take(&mut self.render_batch_n);
+        let render_batch_passes = std::mem::take(&mut self.render_batch_passes);
+        let render_batch_passes_1 = std::mem::take(&mut self.render_batch_passes_1);
+        let render_batch_passes_2 = std::mem::take(&mut self.render_batch_passes_2);
+        let render_batch_passes_3_4 = std::mem::take(&mut self.render_batch_passes_3_4);
+        let render_batch_passes_5_8 = std::mem::take(&mut self.render_batch_passes_5_8);
+        let render_batch_passes_gt8 = std::mem::take(&mut self.render_batch_passes_gt8);
         let landing_n = std::mem::take(&mut self.landing_n);
         let landing_bytes = std::mem::take(&mut self.landing_bytes);
         let staging_cached_n = std::mem::take(&mut self.staging_cached_n);
@@ -1569,6 +1631,13 @@ impl Local {
              compute_buffer_drop_n={compute_buffer_drop_n} \
              render_offscreen_n={render_offscreen_n} \
              render_present_n={render_present_n} \
+             render_batch_n={render_batch_n} \
+             render_batch_passes={render_batch_passes} \
+             render_batch_passes_1={render_batch_passes_1} \
+             render_batch_passes_2={render_batch_passes_2} \
+             render_batch_passes_3_4={render_batch_passes_3_4} \
+             render_batch_passes_5_8={render_batch_passes_5_8} \
+             render_batch_passes_gt8={render_batch_passes_gt8} \
              landing_n={landing_n} landing_bytes={landing_bytes} \
              staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
