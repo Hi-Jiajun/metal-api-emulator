@@ -46,6 +46,7 @@ mod render_buffer_pool;
 mod render_import_pool;
 mod render_setup_reuse;
 mod render_texture_pool;
+mod submit_binding_borrow;
 
 pub use compute_buffer_pool::ComputeBufferPoolCounts;
 pub use compute_pipeline_reuse::ComputePipelineReuseCounts;
@@ -3328,7 +3329,10 @@ pub(crate) fn execute_pipeline_sequence_with_status(
     refuse_executor_storage_landings(textures)?;
     let buffers = buffers
         .into_iter()
-        .map(PoolBinding::Owned)
+        .map(|binding| PoolBinding::Owned {
+            index: binding.index,
+            bytes: BindingBytes::Copied(binding.bytes),
+        })
         .collect::<Vec<_>>();
     buffer_updates(execute_pool_sequence_with_status(
         context,
@@ -3422,7 +3426,7 @@ pub(crate) struct SequenceTail<'a> {
 pub(crate) fn execute_pool_sequence_with_status(
     context: &Arc<VulkanContext>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
-    buffers: &[PoolBinding],
+    buffers: &[PoolBinding<'_>],
     dispatches: &[BoundDispatch],
     tail: SequenceTail<'_>,
     queue_index: usize,
@@ -3452,7 +3456,7 @@ pub(crate) fn execute_pool_sequence_with_status(
 fn execute_submission_stages(
     context: &Arc<VulkanContext>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
-    buffers: &[PoolBinding],
+    buffers: &[PoolBinding<'_>],
     dispatches: &[BoundDispatch],
     tail: SequenceTail<'_>,
     queue_index: usize,
@@ -3521,7 +3525,7 @@ impl PendingExecution {
         context: &Arc<VulkanContext>,
         queue_index: usize,
         artifacts: &[Arc<VulkanPipelineArtifact>],
-        buffers: &[PoolBinding],
+        buffers: &[PoolBinding<'_>],
         dispatches: &[BoundDispatch],
         tail: SequenceTail<'_>,
     ) -> Result<Self, ProviderError> {
@@ -5150,8 +5154,13 @@ fn strided_footprint_reach(
 /// One execution buffer, either copied into provider memory or imported from
 /// an owner host mapping.
 #[derive(Debug)]
-pub(crate) enum PoolBinding {
-    Owned(BufferBinding),
+pub(crate) enum PoolBinding<'a> {
+    /// One owned view of an allocation, its bytes supplied by the submission.
+    ///
+    /// A lone owned view keeps its exact-length buffer; the bytes are either
+    /// the submission's own copy of the trace's snapshot or a borrow of the
+    /// table that already holds them ([`BindingBytes`], `crate::submit_binding_borrow`).
+    Owned { index: u32, bytes: BindingBytes<'a> },
     /// One device buffer per allocation, shared by every owned view of it.
     ///
     /// `index` stays the pool key (the view), so the pool key space, the
@@ -5166,7 +5175,9 @@ pub(crate) enum PoolBinding {
         length: usize,
         /// Whether the view can read. A write-only view uploads nothing.
         access: metal_api_core::provider::BufferAccess,
-        bytes: Vec<u8>,
+        /// The snapshot bytes the shared backing is filled with. The first
+        /// view of an allocation carries them; see [`BindingBytes`].
+        bytes: BindingBytes<'a>,
     },
     /// One device buffer bound at a placement offset inside a heap slab.
     ///
@@ -5186,7 +5197,9 @@ pub(crate) enum PoolBinding {
         offset: usize,
         length: usize,
         access: metal_api_core::provider::BufferAccess,
-        bytes: Vec<u8>,
+        /// The view's own bytes, uploaded at its window inside the slab; see
+        /// [`BindingBytes`].
+        bytes: BindingBytes<'a>,
         allocation_size: usize,
         heap_offset: usize,
         heap_size: usize,
@@ -5199,10 +5212,42 @@ pub(crate) enum PoolBinding {
     },
 }
 
-impl PoolBinding {
+/// The bytes one pooled binding hands the device.
+///
+/// A submission's bindings come from three places, and only the first can be
+/// borrowed rather than kept: the trace's own snapshot bytes (a view's
+/// `BufferSource::OwnedBytes`, which the submission's serial resource pool
+/// already holds for the whole call), the staging registry's bytes (a fresh
+/// `Vec` per view), and the gathered guest runs (a fresh `Vec` per view). The
+/// sixth cut's mechanism (`crate::submit_binding_borrow`) lets the first borrow
+/// the table the call already holds instead of copying it a second time;
+/// [`BindingBytes::Copied`] is the pre-cut arm and the default.
+#[derive(Debug)]
+pub(crate) enum BindingBytes<'a> {
+    /// The submission's own copy of the bytes.
+    Copied(Vec<u8>),
+    /// A borrow of bytes the submission holds for the whole call — the serial
+    /// resource pool's own view sources, which outlive every binding.
+    Borrowed(&'a [u8]),
+}
+
+impl BindingBytes<'_> {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Copied(bytes) => bytes.as_slice(),
+            Self::Borrowed(bytes) => bytes,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl PoolBinding<'_> {
     pub(crate) fn index(&self) -> u32 {
         match self {
-            Self::Owned(binding) => binding.index,
+            Self::Owned { index, .. } => *index,
             Self::SharedOwned { index, .. }
             | Self::HeapOwned { index, .. }
             | Self::Imported { index, .. } => *index,
@@ -5211,7 +5256,7 @@ impl PoolBinding {
 
     pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Owned(binding) => binding.bytes.len(),
+            Self::Owned { bytes, .. } => bytes.len(),
             // The reflected binding width is the view, not the shared backing.
             Self::SharedOwned { length, .. } | Self::HeapOwned { length, .. } => *length,
             Self::Imported { len, .. } => *len,
@@ -5244,7 +5289,7 @@ impl PoolWidth for BufferBinding {
     }
 }
 
-impl PoolWidth for PoolBinding {
+impl PoolWidth for PoolBinding<'_> {
     fn pool_index(&self) -> u32 {
         self.index()
     }
@@ -5856,7 +5901,7 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn create_buffers(&mut self, bindings: &[PoolBinding]) -> Result<(), ExecutionFailure> {
+    fn create_buffers(&mut self, bindings: &[PoolBinding<'_>]) -> Result<(), ExecutionFailure> {
         // Every shared backing must be sized before any of them is created:
         // the first view of an allocation may not be its largest end offset.
         let mut shared_sizes = BTreeMap::<u64, usize>::new();
@@ -5951,10 +5996,10 @@ impl ExecutionResources {
         }
         for supplied in bindings {
             match supplied {
-                PoolBinding::Owned(binding) => {
-                    let index = binding.index;
-                    let length = binding.bytes.len();
-                    self.create_owned_buffer(binding)?;
+                PoolBinding::Owned { index, bytes } => {
+                    let index = *index;
+                    let length = bytes.len();
+                    self.create_owned_buffer(index, bytes.as_slice())?;
                     self.register_view(PoolKey::buffer(index), u64::from(index), 0, length)?;
                 }
                 PoolBinding::SharedOwned {
@@ -5994,8 +6039,9 @@ impl ExecutionResources {
                         .iter_mut()
                         .find(|buffer| buffer.index == *allocation)
                         .expect("shared backing was just created");
-                    let upload = if *access == metal_api_core::provider::BufferAccess::Write {
-                        &bytes[..0]
+                    let upload: &[u8] = if *access == metal_api_core::provider::BufferAccess::Write
+                    {
+                        &[]
                     } else {
                         bytes.as_slice()
                     };
@@ -6046,8 +6092,9 @@ impl ExecutionResources {
                         .iter_mut()
                         .find(|buffer| buffer.index == *allocation)
                         .expect("heap buffer was just created");
-                    let upload = if *access == metal_api_core::provider::BufferAccess::Write {
-                        &bytes[..0]
+                    let upload: &[u8] = if *access == metal_api_core::provider::BufferAccess::Write
+                    {
+                        &[]
                     } else {
                         bytes.as_slice()
                     };
@@ -6851,12 +6898,8 @@ impl ExecutionResources {
             .expect("validated GPU buffer view window")
     }
 
-    fn create_owned_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
-        self.create_owned_backing(
-            u64::from(supplied.index),
-            supplied.bytes.len(),
-            &supplied.bytes,
-        )
+    fn create_owned_buffer(&mut self, index: u32, bytes: &[u8]) -> Result<(), ExecutionFailure> {
+        self.create_owned_backing(u64::from(index), bytes.len(), bytes)
     }
 
     /// One host-visible device buffer, uploaded once from `bytes`. A shared view

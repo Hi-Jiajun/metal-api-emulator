@@ -28,7 +28,7 @@ use metal_api_core::provider::{
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
 };
-use metal_api_core::{AirSource, BufferBinding, Device, Function, Size};
+use metal_api_core::{AirSource, Device, Function, Size};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -4378,7 +4378,7 @@ impl ComputeProvider for VulkanComputeProvider {
                                 offset: usize::try_from(resource.offset).map_err(|_| overflow())?,
                                 length: usize::try_from(resource.length).map_err(|_| overflow())?,
                                 access: resource.access,
-                                bytes: bytes.clone(),
+                                bytes: snapshot_binding_bytes(bytes),
                                 allocation_size: usize::try_from(allocation_size)
                                     .map_err(|_| overflow())?,
                                 heap_offset: usize::try_from(*heap_offset)
@@ -4397,10 +4397,10 @@ impl ComputeProvider for VulkanComputeProvider {
                         .unwrap_or(0)
                         < 2
                     {
-                        buffers.push(PoolBinding::Owned(BufferBinding {
+                        buffers.push(PoolBinding::Owned {
                             index,
-                            bytes: bytes.clone(),
-                        }));
+                            bytes: snapshot_binding_bytes(bytes),
+                        });
                         continue;
                     }
                     buffers.push(PoolBinding::SharedOwned {
@@ -4412,7 +4412,7 @@ impl ComputeProvider for VulkanComputeProvider {
                         // bytes are never observable. Every other view copies
                         // in exactly its own bytes (`research/docs/15` step 4).
                         access: resource.access,
-                        bytes: bytes.clone(),
+                        bytes: snapshot_binding_bytes(bytes),
                     });
                 }
                 BufferSource::StagedLease(lease_id) => {
@@ -4422,7 +4422,10 @@ impl ComputeProvider for VulkanComputeProvider {
                         self.device_epoch(),
                         admitted.resources(),
                     )?;
-                    buffers.push(PoolBinding::Owned(BufferBinding { index, bytes }));
+                    buffers.push(PoolBinding::Owned {
+                        index,
+                        bytes: crate::BindingBytes::Copied(bytes),
+                    });
                 }
                 BufferSource::BorrowedNoCopy(lease_id) => {
                     if alignment == 0 {
@@ -4466,7 +4469,10 @@ impl ComputeProvider for VulkanComputeProvider {
                     for run in runs {
                         borrowed_leases.push(run.lease_id);
                     }
-                    buffers.push(PoolBinding::Owned(BufferBinding { index, bytes }));
+                    buffers.push(PoolBinding::Owned {
+                        index,
+                        bytes: crate::BindingBytes::Copied(bytes),
+                    });
                 }
             }
         }
@@ -4503,6 +4509,14 @@ impl ComputeProvider for VulkanComputeProvider {
                     },
                 )?
             };
+            // The device has its own copies of every binding now, so the
+            // submission's bindings are done. They are dropped here rather
+            // than at the end of the scope because a borrow of the resource
+            // pool below would otherwise still be live when that pool is
+            // moved into the completion slot
+            // (`crate::submit_binding_borrow`); the drop itself is the same
+            // one the synchronous path pays at the end of the call.
+            drop(buffers);
             // The indirect dispatch replay is encoded and submitted above, so
             // this is the point where its record becomes true (`docs/25` §5.1).
             if let Some(payload) = trace.indirect.as_deref() {
@@ -4643,9 +4657,47 @@ impl ComputeProvider for VulkanComputeProvider {
             {
                 let _validate =
                     crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitValidate);
-                output.validate_for_trace(trace).map_err(|error| {
-                    output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
-                })?;
+                // The sixth cut splits this bar into the two pool derivations
+                // the terminal validation takes for itself and the walk that
+                // reads them (`crate::phase_profile::Phase::SubmitValidateDerive`
+                // / `SubmitValidateCheck`). The two calls are the ones
+                // `validate_for_trace` makes, in the order it makes them: the
+                // derivation is pure and reads the same borrowed trace, and the
+                // walk is `ProviderSubmission::validate_with_pools`, which is
+                // that method's own body with the tables handed in.
+                //
+                // The split is a *reading*, not a mechanism: handing the walk
+                // the tables `plan` and `pool` already derived would take the
+                // whole of `submit_validate_derive_us` away, and the
+                // `g3dprobe` round measured what that is worth (≈4.9 µs, 0.2 %
+                // of a submission) and declined to widen the contract for it
+                // (`docs/COMPUTE-PIPELINE-REUSE.md` §6). This cut leaves the
+                // entry unused for that reason; what it lands is the release
+                // (`crate::submit_binding_borrow`).
+                let (derived_resources, derived_textures) = {
+                    let _derive = crate::phase_profile::Bar::enter(
+                        crate::phase_profile::Phase::SubmitValidateDerive,
+                    );
+                    (
+                        trace.serial_resources().map_err(|error| {
+                            output_error(token, "writeback_contract_invalid")
+                                .with_detail(error.to_string())
+                        })?,
+                        trace.serial_texture_resources().map_err(|error| {
+                            output_error(token, "writeback_contract_invalid")
+                                .with_detail(error.to_string())
+                        })?,
+                    )
+                };
+                let _check = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitValidateCheck,
+                );
+                output
+                    .validate_with_pools(trace, &derived_resources, &derived_textures)
+                    .map_err(|error| {
+                        output_error(token, "writeback_contract_invalid")
+                            .with_detail(error.to_string())
+                    })?;
             }
             Ok(output)
         })
@@ -4681,6 +4733,48 @@ impl ComputeProvider for VulkanComputeProvider {
                 );
         }
         self.sync_completion_health();
+        // The sixth cut's second region: the tail of the call. `total` is the
+        // first binding in `submit`, so it is the last to drop, and the values
+        // declared after it — the pooled bindings with their byte copies, the
+        // resource pool, the texture views, the dispatch list, the heap plan,
+        // the render plan and the pipeline artifacts — drop *after* the
+        // `settle` guard that was declared last. That tail is inside `total`
+        // and outside every other bar, and nothing named it
+        // (`crate::phase_profile::Phase::SubmitRelease`).
+        //
+        // The release bar resolves to `None` when the profile is off, and the
+        // branch below is skipped with it: the tail values then drop exactly
+        // where they dropped before the cut, at the end of the scope. With the
+        // profile on, the settle bar is closed first so the two regions stay
+        // disjoint and the release's own three children divide it.
+        drop(_settle);
+        if let Some(_release) =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitRelease)
+        {
+            drop(executor);
+            {
+                let _bindings = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitReleaseBindings,
+                );
+                drop(buffers);
+            }
+            {
+                let _views = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitReleaseViews,
+                );
+                drop(pool);
+                drop(textures);
+            }
+            {
+                let _plan = crate::phase_profile::Bar::enter(
+                    crate::phase_profile::Phase::SubmitReleasePlan,
+                );
+                drop(dispatches);
+                drop(heap_plan);
+                drop(render_plan);
+                drop(artifacts);
+            }
+        }
         result
     }
 
@@ -4943,10 +5037,33 @@ fn map_writebacks(
 /// Serialize device work on the selected queue with the standalone executor,
 /// then run the prepared sequence. The worker path calls this directly; the
 /// synchronous path calls it on the submitting thread.
+/// The bytes one pooled binding hands the device for a view the *trace*
+/// supplies.
+///
+/// The submission's serial resource pool already holds these bytes for the
+/// whole call, so the sixth cut's mechanism can hand the binding a borrow of
+/// them instead of a second copy (`crate::submit_binding_borrow`). Off is the
+/// default, and then this is the copy the cut found. The two counters say which
+/// arm ran and how many bytes it moved
+/// (`crate::phase_profile::note_binding_copy` / `note_binding_borrow`).
+///
+/// The other two binding sources are always owned: a staged lease's bytes are
+/// copied out of the staging registry's lock, and gathered guest runs are built
+/// by the gather itself. Neither can be borrowed, so neither is counted here.
+fn snapshot_binding_bytes(bytes: &Vec<u8>) -> crate::BindingBytes<'_> {
+    if crate::submit_binding_borrow::enabled_from_env() {
+        crate::phase_profile::note_binding_borrow(bytes.len() as u64);
+        crate::BindingBytes::Borrowed(bytes.as_slice())
+    } else {
+        crate::phase_profile::note_binding_copy(bytes.len() as u64);
+        crate::BindingBytes::Copied(bytes.clone())
+    }
+}
+
 fn execute_on_context(
     executor: &Arc<VulkanExecutor>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
-    buffers: &[PoolBinding],
+    buffers: &[PoolBinding<'_>],
     dispatches: &[BoundDispatch],
     retains: &mut BorrowedRetains,
     textures: &[metal_api_core::provider::TextureView],

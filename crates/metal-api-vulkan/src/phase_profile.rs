@@ -79,7 +79,12 @@
 //!   submit_td_textures_us=... submit_td_textures_n=... submit_td_retains_us=...
 //!   submit_td_retains_n=... submit_td_named_us=... submit_lock_us=...
 //!   submit_bookkeep_us=... submit_merge_us=... submit_validate_us=...
-//!   submit_seam_us=... wait_submit_n=... wait_render_n=... wait_landing_n=...
+//!   submit_validate_derive_us=... submit_validate_check_us=...
+//!   submit_validate_named_us=...
+//!   submit_release_us=... submit_release_bindings_us=...
+//!   submit_release_views_us=... submit_release_plan_us=...
+//!   submit_release_named_us=... submit_seam_us=...
+//!   wait_submit_n=... wait_render_n=... wait_landing_n=...
 //!   wait_present_n=... wait_queue_n=... wait_timeline_n=... wait_ahead_sum=...
 //!   wait_ahead_n=...
 //!   ```
@@ -211,11 +216,37 @@
 //!
 //! The remaining seam — the executor and queue locks, the per-submission plan
 //! between `pool` and `resource_build`, the merge of the two halves'
-//! writebacks and the terminal contract validation — is `submit_lock_us`,
-//! `submit_bookkeep_us`, `submit_merge_us` and `submit_validate_us`, printed
+//! writebacks, the terminal contract validation and the host-side release the
+//! call's own tail pays — is `submit_lock_us`, `submit_bookkeep_us`,
+//! `submit_merge_us`, `submit_validate_us` and `submit_release_us`, printed
 //! with `submit_seam_us` as their sum. They are disjoint from the disjoint sum
 //! rather than part of it: `sum(disjoint) + sum(seam) <= total_us`, and what
 //! remains is the function-call boundary between them.
+//!
+//! The sixth cut splits the two regions of that seam a reading can act on, and
+//! both are nested rather than disjoint:
+//!
+//! * `submit_release_us` names the tail of the call: the values `total` was
+//!   declared before, dropped after the last numbered bar — the pooled
+//!   bindings' own copies of the views' bytes, the serial resource pool and the
+//!   texture views, the dispatch list, the heap plan, the render plan and the
+//!   pipeline artifacts. `submit_release_bindings_us`,
+//!   `submit_release_views_us` and `submit_release_plan_us` divide it, with
+//!   `submit_release_named_us` as their printed sum, so
+//!   `sum(submit_release_*) <= submit_release_us`. The bar resolves to `None`
+//!   when the profile is off, and the tail values then drop exactly where they
+//!   dropped before the cut.
+//! * `submit_validate_derive_us` and `submit_validate_check_us` divide
+//!   `submit_validate` — the two pool derivations the terminal validation takes
+//!   for itself (`ComputeTrace::serial_resources` and
+//!   `serial_texture_resources`) and the walk that reads them, with
+//!   `submit_validate_named_us` as their printed sum. The two halves are the
+//!   reading a cut of that bar needs: the derivations are what the submission
+//!   has already paid for once (`plan` derived the resource pool, `pool` the
+//!   texture views) and the walk is the contract check the call exists for. The
+//!   `g3dprobe` round measured the derivations a cut would remove at ≈4.9 µs a
+//!   submission (0.2 %) and declined to widen the contract for them
+//!   (`docs/COMPUTE-PIPELINE-REUSE.md` §6), so this bar is read and not cut.
 //!
 //! The same round answers "what is a wait waiting on": `wait_submit_n`,
 //! `wait_render_n`, `wait_landing_n` and `wait_present_n` count every fence the
@@ -628,9 +659,54 @@ pub(crate) enum Phase {
     /// exact submitted trace. Before this cut it was charged to `writebacks`
     /// only because that bar's guard happened to be alive across it.
     SubmitValidate,
+    /// The sixth cut's first region: the host-side release of everything the
+    /// submission built or took, which runs **after** [`Phase::Settle`] has
+    /// been charged and is therefore inside the enclosing `total` and outside
+    /// every other bar.
+    ///
+    /// The order is forced by the language rather than chosen: `total` is the
+    /// first binding in `submit`, so it is the last to drop, and the values
+    /// declared after it — the pooled bindings' byte copies, the resource pool,
+    /// the texture views, the plan values and the pipeline artifacts — are
+    /// dropped *after* the `settle` guard that was declared last. That tail is
+    /// a real per-submission cost (it frees everything the call allocated) and
+    /// before this cut nothing named it: the fifth cut's seam residual, read as
+    /// `total_us` minus the disjoint bars, carried it without a name.
+    ///
+    /// It is a *nested* bar of the seam rather than a member of the disjoint
+    /// sum: entering it is gated on the profile being on (`Bar::enter` resolves
+    /// to `None` and the tail values drop where they always did), and its three
+    /// children below divide it the way the release itself is grouped.
+    SubmitRelease,
+    /// Inside `submit_release`: the pooled bindings — one device binding per
+    /// pooled view with its own copy of the view's bytes — dropped as one
+    /// vector.
+    SubmitReleaseBindings,
+    /// Inside `submit_release`: the submission's serial resource pool and its
+    /// texture views, the two derived tables the plan and the validation read.
+    SubmitReleaseViews,
+    /// Inside `submit_release`: the plan values the call held for its own tail —
+    /// the per-pass dispatch list, the heap placement plan, the render plan and
+    /// the pipeline artifacts the plan selected.
+    SubmitReleasePlan,
+    /// Inside `submit_validate`: the two pool derivations the terminal
+    /// validation takes for itself — `ComputeTrace::serial_resources` (which
+    /// re-validates the trace and walks every pass's buffer declarations) and
+    /// `ComputeTrace::serial_texture_resources`.
+    ///
+    /// This bar and [`Phase::SubmitValidateCheck`] divide `submit_validate`,
+    /// which the fifth cut named as the largest region of the seam: the
+    /// derivations are the half a cut can remove (the submission already holds
+    /// both tables — `plan` derived the pool and `pool` derived the texture
+    /// views), and the check is the half a cut cannot, because it is the
+    /// contract check the call exists for.
+    SubmitValidateDerive,
+    /// Inside `submit_validate`: the walk that checks the merged writeback list
+    /// against the derived resources and the exact submitted trace.
+    SubmitValidateCheck,
 }
 
-const PHASE_COUNT: usize = Phase::SubmitValidate as usize + 1;
+const PHASE_COUNT: usize = Phase::SubmitValidateCheck as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -721,6 +797,12 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "submit_bookkeep",
     "submit_merge",
     "submit_validate",
+    "submit_release",
+    "submit_release_bindings",
+    "submit_release_views",
+    "submit_release_plan",
+    "submit_validate_derive",
+    "submit_validate_check",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -865,12 +947,38 @@ const SUBMIT_TEARDOWN_SLOTS: [usize; 5] = [
 /// of the disjoint sum, so `sum(SUBMIT_SEAM_SLOTS) <= total_us -
 /// sum(disjoint bars)`, and the difference is the function-call boundary that
 /// remains. The printed `submit_seam_us` is this set's sum.
-const SUBMIT_SEAM_SLOTS: [usize; 5] = [
+///
+/// The sixth cut added `submit_release` to the set. It is the region the fifth
+/// cut's residual was largest in and the one no earlier cut could name: the
+/// tail of the call, after the last numbered bar, where the language drops the
+/// values `total` was declared before.
+const SUBMIT_SEAM_SLOTS: [usize; 6] = [
     Phase::SubmitTeardown as usize,
+    Phase::SubmitRelease as usize,
     Phase::SubmitLock as usize,
     Phase::SubmitBookkeep as usize,
     Phase::SubmitMerge as usize,
     Phase::SubmitValidate as usize,
+];
+
+/// The nested split of `submit_release`: the pooled bindings' byte copies, the
+/// resource pool and texture views, and the plan values, in the order the
+/// call's own tail drops them. `submit_release` stays their enclosing bar, so
+/// `sum(SUBMIT_RELEASE_SLOTS) <= submit_release_us`; the printed
+/// `submit_release_named_us` is this set's sum.
+const SUBMIT_RELEASE_SLOTS: [usize; 3] = [
+    Phase::SubmitReleaseBindings as usize,
+    Phase::SubmitReleaseViews as usize,
+    Phase::SubmitReleasePlan as usize,
+];
+
+/// The nested split of `submit_validate`: the two pool derivations the
+/// validation takes and the walk that reads them. Like the other splits it is
+/// not part of the disjoint sum, and `submit_validate` stays the enclosing bar:
+/// `sum(SUBMIT_VALIDATE_SLOTS) <= submit_validate_us`.
+const SUBMIT_VALIDATE_SLOTS: [usize; 2] = [
+    Phase::SubmitValidateDerive as usize,
+    Phase::SubmitValidateCheck as usize,
 ];
 
 /// The teardown groups whose *call count* is printed beside their
@@ -1444,6 +1552,17 @@ struct Local {
     /// memory type the selection took.
     staging_cached_n: u64,
     staging_plain_n: u64,
+    /// The bytes the window's submissions moved into their pooled bindings,
+    /// split by which way they arrived: a copy the submission made for itself
+    /// (the trace's own snapshot bytes with the sixth cut's mechanism off) or a
+    /// borrow of the table it already holds (with the mechanism on). The other
+    /// two binding sources — a staged lease's copy and a gathered run list —
+    /// are always owned and are counted in neither
+    /// (`crate::submit_binding_borrow`).
+    binding_copy_calls: u64,
+    binding_copy_bytes: u64,
+    binding_borrow_calls: u64,
+    binding_borrow_bytes: u64,
     /// The device objects the window's teardowns actually destroyed, by family.
     /// They are the population behind the `teardown_*` bars: a bar's
     /// microseconds divided by its own family's count is one object's cost, and
@@ -1540,6 +1659,10 @@ impl Default for Local {
             landing_bytes: 0,
             staging_cached_n: 0,
             staging_plain_n: 0,
+            binding_copy_calls: 0,
+            binding_copy_bytes: 0,
+            binding_borrow_calls: 0,
+            binding_borrow_bytes: 0,
             td_image_n: 0,
             td_view_n: 0,
             td_sampler_n: 0,
@@ -1629,6 +1752,8 @@ impl Local {
         let mut rb_named_ns = 0u64;
         let mut submit_td_named_ns = 0u64;
         let mut submit_seam_ns = 0u64;
+        let mut submit_release_named_ns = 0u64;
+        let mut submit_validate_named_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
             let calls = std::mem::replace(&mut self.calls[slot], 0);
@@ -1661,6 +1786,12 @@ impl Local {
             }
             if SUBMIT_SEAM_SLOTS.contains(&slot) {
                 submit_seam_ns += ns;
+            }
+            if SUBMIT_RELEASE_SLOTS.contains(&slot) {
+                submit_release_named_ns += ns;
+            }
+            if SUBMIT_VALIDATE_SLOTS.contains(&slot) {
+                submit_validate_named_ns += ns;
             }
             if WAIT_SLOTS.contains(&slot) {
                 let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
@@ -1738,6 +1869,10 @@ impl Local {
         let landing_bytes = std::mem::take(&mut self.landing_bytes);
         let staging_cached_n = std::mem::take(&mut self.staging_cached_n);
         let staging_plain_n = std::mem::take(&mut self.staging_plain_n);
+        let binding_copy_calls = std::mem::take(&mut self.binding_copy_calls);
+        let binding_copy_bytes = std::mem::take(&mut self.binding_copy_bytes);
+        let binding_borrow_calls = std::mem::take(&mut self.binding_borrow_calls);
+        let binding_borrow_bytes = std::mem::take(&mut self.binding_borrow_bytes);
         let td_image_n = std::mem::take(&mut self.td_image_n);
         let td_view_n = std::mem::take(&mut self.td_view_n);
         let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
@@ -1760,6 +1895,8 @@ impl Local {
         let rb_named_us = micros(rb_named_ns);
         let submit_td_named_us = micros(submit_td_named_ns);
         let submit_seam_us = micros(submit_seam_ns);
+        let submit_release_named_us = micros(submit_release_named_ns);
+        let submit_validate_named_us = micros(submit_validate_named_ns);
         let mut wait_fields = String::with_capacity(200);
         for (object_slot, object_name) in WAIT_OBJECT_NAMES.iter().enumerate() {
             wait_fields.push_str(&format!(
@@ -1784,7 +1921,9 @@ impl Local {
              landing_named_us={landing_named_us:.3} \
              teardown_named_us={teardown_named_us:.3} \
              rb_named_us={rb_named_us:.3} submit_td_named_us={submit_td_named_us:.3} \
-             submit_seam_us={submit_seam_us:.3}{build_fields}{wait_fields} \
+             submit_seam_us={submit_seam_us:.3} \
+             submit_release_named_us={submit_release_named_us:.3} \
+             submit_validate_named_us={submit_validate_named_us:.3}{build_fields}{wait_fields} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
@@ -1828,6 +1967,10 @@ impl Local {
              render_batch_broken_load_n={render_batch_broken_load_n} \
              landing_n={landing_n} landing_bytes={landing_bytes} \
              staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n} \
+             submit_binding_copies_n={binding_copy_calls} \
+             submit_binding_copies_bytes={binding_copy_bytes} \
+             submit_binding_borrows_n={binding_borrow_calls} \
+             submit_binding_borrows_bytes={binding_borrow_bytes} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
              td_buffer_n={td_buffer_n} td_memory_n={td_memory_n}",
             readback.rect_n,
@@ -1876,6 +2019,37 @@ pub(crate) fn note_staging_memory(cached: bool) {
         } else {
             local.staging_plain_n += 1;
         }
+    });
+}
+
+/// One pooled binding's bytes the submission *copied* for itself: the trace's
+/// own snapshot bytes, cloned into the binding's own vector
+/// (`crate::submit_binding_borrow`). The other two binding sources are always
+/// owned and are not counted here.
+#[inline]
+pub(crate) fn note_binding_copy(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.binding_copy_calls += 1;
+        local.binding_copy_bytes += bytes;
+    });
+}
+
+/// The same bytes the sixth cut's mechanism *borrowed* from the table the
+/// submission already holds. A round reads the pair of counters to say how many
+/// bytes the mechanism took off `pool` and the release.
+#[inline]
+pub(crate) fn note_binding_borrow(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.binding_borrow_calls += 1;
+        local.binding_borrow_bytes += bytes;
     });
 }
 
@@ -2423,6 +2597,52 @@ mod tests {
             "submit_teardown"
         );
         assert_eq!(WAIT_OBJECT_NAMES.len(), WAIT_OBJECT_COUNT);
+    }
+
+    /// The sixth cut's two splits divide regions the fifth cut named, and
+    /// neither may be read as part of the disjoint sum: the release is inside
+    /// the enclosing `total` *after* every numbered bar, and the validation's
+    /// two halves are inside `submit_validate`. The seam's own set names the
+    /// release but not its children, so `submit_seam_us` never counts the tail
+    /// twice.
+    #[test]
+    fn the_sixth_cut_stays_inside_what_it_divides() {
+        for slot in SUBMIT_RELEASE_SLOTS {
+            assert_ne!(slot, Phase::SubmitRelease as usize);
+            assert!(!SUBMIT_VALIDATE_SLOTS.contains(&slot));
+            assert!(
+                !SUBMIT_SEAM_SLOTS.contains(&slot),
+                "a child of the release is not a seam bar of its own"
+            );
+            assert!(!SUBMIT_TEARDOWN_SLOTS.contains(&slot));
+            assert!(!RESOURCE_BUILD_SLOTS.contains(&slot));
+            assert!(!COUNTED_SLOTS.contains(&slot));
+        }
+        for slot in SUBMIT_VALIDATE_SLOTS {
+            assert_ne!(slot, Phase::SubmitValidate as usize);
+            assert!(!SUBMIT_RELEASE_SLOTS.contains(&slot));
+            assert!(
+                !SUBMIT_SEAM_SLOTS.contains(&slot),
+                "a child of the validation is not a seam bar of its own"
+            );
+            assert!(!COUNTED_SLOTS.contains(&slot));
+        }
+        assert!(SUBMIT_SEAM_SLOTS.contains(&(Phase::SubmitRelease as usize)));
+        assert!(SUBMIT_SEAM_SLOTS.contains(&(Phase::SubmitValidate as usize)));
+        assert_eq!(PHASE_NAMES[Phase::SubmitRelease as usize], "submit_release");
+        assert_eq!(
+            PHASE_NAMES[Phase::SubmitValidateDerive as usize],
+            "submit_validate_derive"
+        );
+        assert_eq!(
+            PHASE_NAMES[Phase::SubmitValidateCheck as usize],
+            "submit_validate_check"
+        );
+        // The release's three children are the whole of it, and the validation
+        // has exactly two halves: a set that missed one would read as a seam
+        // rather than as an unsplit region.
+        assert_eq!(SUBMIT_RELEASE_SLOTS.len(), 3);
+        assert_eq!(SUBMIT_VALIDATE_SLOTS.len(), 2);
     }
 
     /// A window drains on the `total` bar that fills it, and a drained window

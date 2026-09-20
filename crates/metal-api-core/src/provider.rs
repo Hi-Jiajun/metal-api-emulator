@@ -10056,7 +10056,50 @@ impl ProviderSubmission {
     /// any pass has one full writeback reflecting all passes.
     pub fn validate_for_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         self.validate()?;
-        validate_writebacks_for_trace(self.completion, &self.writebacks, trace)
+        let resources = trace.serial_resources()?;
+        let textures = trace.serial_texture_resources()?;
+        validate_writebacks_for_trace(
+            self.completion,
+            &self.writebacks,
+            trace,
+            &resources,
+            &textures,
+        )
+    }
+
+    /// The same validation [`ProviderSubmission::validate_for_trace`] runs,
+    /// with the two resource tables the caller has already derived from the
+    /// same trace.
+    ///
+    /// A provider that has already called [`ComputeTrace::serial_resources`]
+    /// and [`ComputeTrace::serial_texture_resources`] for its own plan does not
+    /// have to derive them a second time here. Both derivations are pure
+    /// functions of the borrowed trace — they read the declaration lists and
+    /// return new tables, with no interior mutability, no identity minting and
+    /// no device state — so a caller that hands over the tables its own earlier
+    /// calls returned hands over the values this function would have computed.
+    /// The checks below are the same checks in the same order; the only
+    /// difference is who paid for the two derivations.
+    ///
+    /// The caller is responsible for the one thing this cannot re-check: the
+    /// tables must be the ones this trace derives. A trace that has been
+    /// derived and then mutated is not a value this API is written for — it is
+    /// borrowed immutably for the whole call, as it is in
+    /// [`ProviderSubmission::validate_for_trace`].
+    pub fn validate_with_pools(
+        &self,
+        trace: &ComputeTrace,
+        resources: &[BufferView],
+        textures: &[TextureView],
+    ) -> Result<(), ContractError> {
+        self.validate()?;
+        validate_writebacks_for_trace(
+            self.completion,
+            &self.writebacks,
+            trace,
+            resources,
+            textures,
+        )
     }
 }
 
@@ -10091,7 +10134,15 @@ impl CompletionReadback {
     /// has one full writeback reflecting all passes.
     pub fn validate_for_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         self.validate()?;
-        validate_writebacks_for_trace(self.completion, &self.writebacks, trace)
+        let resources = trace.serial_resources()?;
+        let textures = trace.serial_texture_resources()?;
+        validate_writebacks_for_trace(
+            self.completion,
+            &self.writebacks,
+            trace,
+            &resources,
+            &textures,
+        )
     }
 }
 
@@ -10121,14 +10172,15 @@ fn validate_writebacks_for_trace(
     completion: CompletionDisposition,
     writebacks: &[BufferWriteback],
     trace: &ComputeTrace,
+    resources: &[BufferView],
+    texture_resources: &[TextureView],
 ) -> Result<(), ContractError> {
-    let resources = trace.serial_resources()?;
     // A storage image is a landing too (`research/docs/26` §21.4, C2): its
     // texels leave through the same byte-keyed channel a buffer view's bytes
     // do, keyed by the view's own identity. The texture pool is resolved once
-    // and shared by the per-writeback walk and the coverage walk below, exactly
-    // as the executor's own texture pool is.
-    let texture_resources = trace.serial_texture_resources()?;
+    // by the caller and shared by the per-writeback walk and the coverage walk
+    // below, exactly as the executor's own texture pool is
+    // (`docs/SUBMIT-VALIDATE-POOLS.md`).
     let token = completion
         .token()
         .ok_or(ContractError::InvalidSubmissionCompletion(completion))?;
@@ -27954,8 +28006,16 @@ mod tests {
         // The pool reports the landing view as writable, so a visible
         // completion owes a writeback for it: the render track's bytes land
         // through the readback the compute path already uses.
+        let resources = admitted_trace.serial_resources().unwrap();
+        let textures = admitted_trace.serial_texture_resources().unwrap();
         assert_eq!(
-            validate_writebacks_for_trace(admitted_completion(), &[], admitted_trace),
+            validate_writebacks_for_trace(
+                admitted_completion(),
+                &[],
+                admitted_trace,
+                &resources,
+                &textures
+            ),
             Err(ContractError::MissingWriteback {
                 allocation: AllocationId::new(9),
                 view: ViewId::new(7),
@@ -27967,7 +28027,14 @@ mod tests {
             offset: 0,
             bytes: [0x40, 0x80, 0xc0, 0xff].repeat(4),
         };
-        validate_writebacks_for_trace(admitted_completion(), &[landed], admitted_trace).unwrap();
+        validate_writebacks_for_trace(
+            admitted_completion(),
+            &[landed],
+            admitted_trace,
+            &resources,
+            &textures,
+        )
+        .unwrap();
 
         // Control: a compute-only trace whose view stays read-only keeps the
         // pre-render pool access, so nothing about its readback changed.
