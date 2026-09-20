@@ -10561,21 +10561,27 @@ fn prepare_offscreen_batch_request<'a>(
 /// Whether `REIMS_VGPU_RENDER_BATCH` asks for one submission scope per run of
 /// resident-chain passes.
 ///
-/// Off by default, and read once: the switch is the control arm a round runs
-/// the pre-batch path with, so the two arms' frames can be compared byte for
-/// byte (`docs/WRITTEN-RECT-READBACK.md` §4 is the same discipline for the
-/// readback shape). Both rails read this one name — the rename rail decides
-/// whether to *assemble* a run into one trace, and this provider decides
-/// whether to *submit* that run as one scope.
+/// **On by default since 2026-09-20.** B-1's own A/B (same exe, same pose, only
+/// the switch differing) read per pass **1 485.6 → 1 143.6 µs (−23.0%)**, host
+/// per frame **0.494 → 0.354 s (−28.3%)** and per draw **3.717 → 2.648 ms
+/// (−28.8%)**; census v58 with it on read **100.000% coverage** with an empty
+/// bucket set and no lost draw, because a run the class refuses is given back
+/// whole to the per-record path rather than parked and dropped. The switch is
+/// still the control arm: `REIMS_VGPU_RENDER_BATCH=0/off/false/no` runs the
+/// pre-batch path, and the two arms' frames stay comparable byte for byte
+/// (`docs/WRITTEN-RECT-READBACK.md` §4 is the same discipline for the readback
+/// shape). Read once, and both rails read this one name — the rename rail
+/// decides whether to *assemble* a run into one trace, and this provider
+/// decides whether to *submit* that run as one scope.
 pub(crate) fn render_batch_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("REIMS_VGPU_RENDER_BATCH")
                 .ok()
                 .as_deref()
                 .map(str::trim),
-            Some("1" | "on" | "ON" | "true" | "yes")
+            Some("0" | "off" | "OFF" | "false" | "no" | "NO")
         )
     })
 }
