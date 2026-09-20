@@ -1435,13 +1435,13 @@ mod tests {
         PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
         ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
         ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
-        RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-        RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
-        RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount,
-        SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
-        StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
-        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp,
-        SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
+        RenderDepthIdentity, RenderDraw, RenderDrawsDescriptor, RenderPassBlend, RenderPassCull,
+        RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding,
+        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, Retryability,
+        SampleCount, SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest,
+        ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
+        StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
+        StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
         TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
@@ -3102,6 +3102,165 @@ mod tests {
         let _ = tag;
     }
 
+    /// The vertex-input fixture whose render entry is a **draw list**: the
+    /// reviewed quad as the head, then `tail` draws that state a rich
+    /// per-draw declaration of their own
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    fn draw_list_trace(tail: Vec<RenderDraw>) -> ComputeTrace {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(head)) = trace.passes.pop() else {
+            panic!("the fixture's render entry is a single-draw pass");
+        };
+        trace
+            .passes
+            .push(TracePass::RenderDraws(RenderDrawsDescriptor { head, tail }));
+        trace
+    }
+
+    /// One tail draw that states every per-draw section the entry has: its own
+    /// viewport and scissor, culling, blending, both test states, an instance
+    /// count, a base vertex, vertex and index streams, and a stage buffer.
+    fn rich_tail_draw() -> RenderDraw {
+        RenderDraw {
+            pipeline: PipelineId::new(0x51),
+            viewport: [1, 0, 1, 2],
+            scissor: Some([0, 0, 1, 2]),
+            vertices: 6,
+            vertex_buffers: vec![vertex_stream_view()],
+            indices: Some(IndexBufferBinding {
+                view: index_stream_view(),
+                format: IndexFormat::Uint16,
+            }),
+            base_vertex: 1,
+            cull: Some(RenderPassCull {
+                mode: CullMode::Back,
+                winding: Winding::CounterClockwise,
+            }),
+            blend: Some(RenderPassBlend {
+                attachments: vec![BlendAttachment {
+                    enabled: true,
+                    source_rgb: BlendFactor::SourceAlpha,
+                    destination_rgb: BlendFactor::OneMinusSourceAlpha,
+                    source_alpha: BlendFactor::SourceAlpha,
+                    destination_alpha: BlendFactor::OneMinusSourceAlpha,
+                    operation: BlendOperation::Add,
+                    alpha_operation: BlendOperation::Add,
+                    write_mask: ColorWriteMask::ALL,
+                }],
+            }),
+            depth_test: Some(DepthTest {
+                compare: CompareFunction::Less,
+                write: true,
+            }),
+            stencil_test: Some(StencilTest {
+                compare: StencilCompare::Equal,
+                fail_op: StencilOp::Keep,
+                depth_fail_op: StencilOp::Keep,
+                pass_op: StencilOp::Replace,
+                read_mask: 0xff,
+                write_mask: 0x0f,
+                reference: 3,
+            }),
+            instance_count: 3,
+            textures: Vec::new(),
+            samplers: Vec::new(),
+            stage_buffers: vec![stage_buffer_view()],
+        }
+    }
+
+    /// A render pass that carries an ordered list of draws takes a tag of its
+    /// own, writes its **head** in the single-draw family's own bytes, and
+    /// round-trips (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn a_draw_list_takes_its_own_tag_and_round_trips() {
+        // The head keeps the family's own encoding: the single-draw fixture's
+        // pass carries the vertex-input feature byte, so the list's head has to
+        // carry exactly that pair after the list's tag.
+        let single = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: vertex_input_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(
+            single.windows(2).any(|pair| pair == [0x10, 0x01]),
+            "the single-draw fixture keeps its vertex-input feature byte"
+        );
+
+        let mut tail = vec![rich_tail_draw()];
+        tail.push(RenderDraw {
+            // A second tail draw that states the *absent* shape of every
+            // optional section, so the entry's presence bytes travel both ways.
+            cull: None,
+            blend: None,
+            scissor: None,
+            depth_test: None,
+            stencil_test: None,
+            stage_buffers: Vec::new(),
+            instance_count: 1,
+            base_vertex: 0,
+            ..rich_tail_draw()
+        });
+        let request = CommandRequest::Submit {
+            trace: draw_list_trace(tail),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert!(
+            frame.windows(2).any(|pair| pair == [0x1a, 0x10]),
+            "the list takes its own tag and writes its head through the family's own kind byte"
+        );
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        assert_eq!(decoded, request, "the list round-trips whole");
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        let Some(list) = trace.passes.last().and_then(TracePass::as_render_draws) else {
+            panic!("the last entry is the draw list");
+        };
+        assert_eq!(list.draw_count(), 3, "the head plus two tail draws");
+        assert_eq!(list.tail[0], rich_tail_draw());
+        assert_eq!(
+            list.head.vertices, 6,
+            "the head keeps the single-draw pass's own declaration"
+        );
+        assert!(
+            trace.passes.last().and_then(TracePass::as_render).is_none(),
+            "a list is never read back as a lone pass"
+        );
+    }
+
+    /// A list above the contract's ceiling is refused before a byte of it is
+    /// written (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn a_draw_list_above_the_ceiling_is_refused_by_the_encoder() {
+        let Some(TracePass::Render(head)) = render_only_trace().passes.pop() else {
+            panic!("the fixture is a render pass");
+        };
+        let mut tail = Vec::new();
+        for _ in 1..metal_api_core::provider::MAX_DRAWS_PER_PASS {
+            tail.push(head.draw());
+        }
+        // One draw at the ceiling is written.
+        CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: draw_list_trace(tail.clone()),
+            resources: resources(),
+        })
+        .expect("the ceiling itself is admitted");
+        // One more is refused by name rather than truncated.
+        tail.push(head.draw());
+        let error = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: draw_list_trace(tail),
+            resources: resources(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CodecError::RenderDrawCount { count, maximum }
+                if count == metal_api_core::provider::MAX_DRAWS_PER_PASS + 1
+                    && maximum == metal_api_core::provider::MAX_DRAWS_PER_PASS
+        ));
+    }
+
     /// A render trace whose pass blends its single attachment with the
     /// reviewed factors (`research/docs/23` §3.3, v40).
     fn blend_trace() -> ComputeTrace {
@@ -4431,6 +4590,62 @@ mod tests {
             CommandCodec::decode_response(&patched),
             Err(CodecError::UnknownCapabilityTail(0x12))
         ));
+    }
+
+    /// The multi-draw capability is one declaration of two readings, and a
+    /// snapshot that does not declare it writes nothing
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn the_multi_draw_capability_round_trips_as_one_declaration() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        // Neither reading alone is the declaration: a bit with no window
+        // bounds nothing and a window with no bit says nothing about the arm.
+        capabilities.supports_render_multi_draw = true;
+        assert!(!capabilities.declares_render_multi_draw_support());
+        capabilities.max_draws_per_pass = 8;
+        assert!(capabilities.declares_render_multi_draw_support());
+        assert!(capabilities.declares_render_support());
+
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The section is the escape, its own tag, the bit and the window:
+        // one presence tag, one family tag, one bool, one `u32`.
+        let block = [0x00, 0x12, 0x01, 0x00, 0x00, 0x00, 0x08];
+        assert!(
+            frame.windows(block.len()).any(|window| window == block),
+            "the multi-draw tail carries its tag, its bit and its window"
+        );
+
+        // A snapshot that declares neither keeps the legacy tail: the same
+        // capabilities with both readings at their defaults carry no section.
+        let mut absent = capabilities.clone();
+        absent.supports_render_multi_draw = false;
+        absent.max_draws_per_pass = 0;
+        assert!(!absent.declares_render_multi_draw_support());
+        let absent_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: absent.clone(),
+        })
+        .unwrap();
+        assert!(
+            !absent_frame.windows(2).any(|window| window == [0x00, 0x12]),
+            "a snapshot that declares nothing about the arm writes no section"
+        );
+        assert_eq!(
+            CommandCodec::decode_response(&absent_frame).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: absent,
+            }
+        );
     }
 
     #[test]
@@ -6503,12 +6718,15 @@ mod tests {
         // A tag this version does not know is refused by name rather than read
         // as the entry's payload or as the next pass: that is the answer an
         // older decoder gives this frame, and the reason the tag carries the
-        // whole entry.
+        // whole entry. `0x1b` is the byte past the two newest tags — the
+        // landing entry's `0x19` and the multi-draw pass's `0x1a`
+        // (`research/docs/23` §3.3, G3-B/B-2) — so it is a tag no encoder of
+        // this version can have written.
         let mut unknown = with.clone();
-        unknown[at] = 0x1a;
+        unknown[at] = 0x1b;
         assert!(matches!(
             CommandCodec::decode_request(&unknown).unwrap_err(),
-            CodecError::UnknownPassTag(0x1a)
+            CodecError::UnknownPassTag(0x1b)
         ));
         // The payload is fixed-length: a frame whose entry is cut short is
         // refused rather than read as a shorter pass, whichever layer names the
@@ -7760,6 +7978,11 @@ mod tests {
                     supported_index_formats: Vec::new(),
                     supports_render_vertex_interface_superset: false,
                     supports_render_vertex_count_above_triangle: false,
+                    // The fixture snapshot declares no multi-draw render pass
+                    // (`research/docs/23` §3.3, G3-B/B-2): the arm keeps its
+                    // fail-closed by-name refusal on the wire and in admission.
+                    supports_render_multi_draw: false,
+                    max_draws_per_pass: 0,
                     supports_render_instancing: false,
                     max_render_instances: 0,
                     supports_render_multisample: false,
@@ -8156,6 +8379,11 @@ mod tests {
             supported_index_formats: Vec::new(),
             supports_render_vertex_interface_superset: false,
             supports_render_vertex_count_above_triangle: false,
+            // The fixture snapshot declares no multi-draw render pass
+            // (`research/docs/23` §3.3, G3-B/B-2): the arm keeps its
+            // fail-closed by-name refusal on the wire and in admission.
+            supports_render_multi_draw: false,
+            max_draws_per_pass: 0,
             supports_render_instancing: false,
             max_render_instances: 0,
             supports_render_multisample: false,
@@ -9983,8 +10211,7 @@ mod tests {
             .iter_mut()
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
-                TracePass::Compute(_) => None,
-                TracePass::Landing(_) => None,
+                TracePass::Compute(_) | TracePass::RenderDraws(_) | TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass")
     }
@@ -9996,8 +10223,7 @@ mod tests {
             .iter()
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
-                TracePass::Compute(_) => None,
-                TracePass::Landing(_) => None,
+                TracePass::Compute(_) | TracePass::RenderDraws(_) | TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass")
     }

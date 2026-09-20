@@ -528,6 +528,20 @@ pub(crate) enum Phase {
     /// before its first import being released once the fence has proven the
     /// device done with the owner's pages (`RenderInputRetains::retire`).
     RenderRetire,
+    /// Inside `render_record`: the loop that issues the draws **after** the
+    /// head of a render pass that carries an ordered list of draws
+    /// (`research/docs/23` §3.3, G3-B/B-2) — one binding and one `vkCmdDraw*`
+    /// per draw, through the same `record_draw_binding` the single-draw arm
+    /// uses.
+    ///
+    /// The bar is default-**off** in the sense that matters: it is entered only
+    /// when the phase profile is on *and* the pass actually carries draws
+    /// beyond its head, so a single-draw pass — every pass written before the
+    /// arm, and every pass of a trace that never assembles a list — charges
+    /// nothing here and its `render_record_us` is unchanged. It is a *nested*
+    /// bar inside `render_record`, not a sibling: adding it to the disjoint sum
+    /// would count the same microseconds twice.
+    RenderDrawsLoop,
     /// Inside `resource_build`: the pipeline-shaped objects one compute
     /// pipeline needs (`PipelineObjects::create`) — the two shader modules, the
     /// pipeline layout and the pipeline. Charged once per pipeline, so the
@@ -689,6 +703,7 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "render_release_import",
     "render_release_uploads",
     "render_retire",
+    "render_draws_loop",
     "rb_pipeline",
     "rb_buffer",
     "rb_image",

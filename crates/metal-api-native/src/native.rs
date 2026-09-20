@@ -318,6 +318,11 @@ impl NativeMetalProvider {
             // cannot drift.
             let stage_buffer_bits = render::stage_buffer_capability_bits();
             let capabilities = ProviderCapabilities {
+                // The native rail executes the single-draw render arm alone: a
+                // render pass that carries an ordered list of draws keeps its
+                // by-name refusal here (`research/docs/23` §3.3, G3-B/B-2).
+                supports_render_multi_draw: false,
+                max_draws_per_pass: 0,
                 // The stage-buffer face's own window (`research/docs/23` §83,
                 // §92, R9g/R9k): the reviewed modules and the encoder's
                 // `setVertexBuffer`/`setFragmentBuffer` binding are the shape

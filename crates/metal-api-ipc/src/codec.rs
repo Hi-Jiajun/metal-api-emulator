@@ -194,6 +194,17 @@ pub enum CodecError {
         count: usize,
         maximum: usize,
     },
+    /// A render pass declared more draws than the contract's
+    /// [`metal_api_core::provider::MAX_DRAWS_PER_PASS`]
+    /// (`research/docs/23` §3.3, G3-B/B-2). The list's tail count is one byte
+    /// and the contract refuses anything above the ceiling before a frame is
+    /// written, so this is the protocol's own bound: a frame that carried more
+    /// would have to be read as a shorter list with the remaining draws eaten
+    /// from the next entry's bytes.
+    RenderDrawCount {
+        count: usize,
+        maximum: usize,
+    },
     /// A render texture declaration list carried more entries than the
     /// contract's own bound (`research/docs/23` §3.3, v100/v102; E-TC1). The
     /// block's count is one byte, so this is the protocol's bound; the contract
@@ -433,6 +444,10 @@ impl fmt::Display for CodecError {
             Self::RenderSamplerCount { count, maximum } => write!(
                 formatter,
                 "runtime sampler list carries {count} bindings, maximum {maximum}"
+            ),
+            Self::RenderDrawCount { count, maximum } => write!(
+                formatter,
+                "render pass carries {count} draws, maximum {maximum}"
             ),
             Self::RenderTextureDeclarationCount {
                 stage,

@@ -187,7 +187,26 @@ struct PlannedRenderPass {
 #[allow(clippy::large_enum_variant)]
 enum PlannedRenderEntry {
     Pass(PlannedRenderPass),
+    /// One render pass that carries an ordered list of draws
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// The entry is planned as the single-draw passes its draws state — one
+    /// [`PlannedRenderPass`] per draw, each with its own registration — because
+    /// that is exactly what the rail executes: one render pass instance whose
+    /// draws are bound and issued in declaration order, sharing the pass state
+    /// the head carries.
+    Draws(PlannedRenderDraws),
     Landing(KeptFrameLanding),
+}
+
+/// The planned draws of one multi-draw render pass, in declaration order
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The list is never empty: it is the materialization of a
+/// [`metal_api_core::provider::RenderDrawsDescriptor`], whose draw count is at
+/// least one, and the first entry is the entry's own head.
+struct PlannedRenderDraws {
+    draws: Vec<PlannedRenderPass>,
 }
 
 struct CompletionSlot {
@@ -1419,6 +1438,36 @@ impl VulkanComputeProvider {
                         stages: Arc::clone(&registered.stages),
                     }));
                 }
+                TracePass::RenderDraws(list) => {
+                    // Every draw of the list is resolved through the *same*
+                    // registration gate a single-draw pass goes through
+                    // (`research/docs/23` §3.3, G3-B/B-2): the list is
+                    // materialized into one single-draw pass per draw, and each
+                    // of those names its own pipeline, so a second draw whose
+                    // registration is missing or whose table entry disagrees
+                    // with the registry is refused here — before the plan runs
+                    // — exactly as the first draw would be.
+                    let mut draws = Vec::with_capacity(list.draw_count());
+                    for pass in list.materialize() {
+                        let registered = registrations
+                            .get(&pass.pipeline)
+                            .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
+                        let requested = trace.pipeline(pass.pipeline).map_err(|error| {
+                            refusal(
+                                ProviderPhase::Resolve,
+                                ProviderErrorClass::Resource,
+                                "render_pipeline_identity_mismatch",
+                            )
+                            .with_detail(error.to_string())
+                        })?;
+                        validate_pipeline_identity(requested, &registered.metadata)?;
+                        draws.push(PlannedRenderPass {
+                            pass,
+                            stages: Arc::clone(&registered.stages),
+                        });
+                    }
+                    plan.push(PlannedRenderEntry::Draws(PlannedRenderDraws { draws }));
+                }
             }
         }
         Ok(plan)
@@ -1818,6 +1867,77 @@ impl VulkanComputeProvider {
         }
     }
 
+    /// Execute one render pass that carries an ordered list of draws: every
+    /// draw inside one render pass instance and one submission
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// The pass state — attachments and their load/store/clear decisions, the
+    /// render area, the multisample raster, the depth and stencil surfaces and
+    /// the present action — is resolved once, from the head's planned draw,
+    /// exactly as the single-draw rail resolves it: every draw of one list
+    /// states the same state, so one resolution serves all of them. What varies
+    /// per draw is the draw declaration itself, which travels as each planned
+    /// entry's own materialized pass.
+    fn execute_offscreen_draws<'a>(
+        &self,
+        draws: &[PlannedRenderPass],
+        resolved: &ResolvedOffscreenPass<'a>,
+        trace: &ComputeTrace,
+        writebacks: &[BufferWriteback],
+        produced_latest: &BTreeMap<(AllocationId, ViewId), usize>,
+        leases: &render::RenderLeaseContext<'_>,
+    ) -> Result<render::OffscreenReadback, ProviderError> {
+        // The ICB payload replays exactly one command into exactly one pass
+        // (`research/docs/25` §5.1): a pass that carries a list is refused by
+        // name rather than replayed as its head. The plan walk already refuses
+        // the pair; this is the rail's own restatement for a hand-built plan.
+        if trace.indirect.is_some() {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "render_multi_draw_indirect_unsupported",
+            )
+            .with_field(
+                "draws",
+                FieldValue::Unsigned(u64::try_from(draws.len()).unwrap_or(u64::MAX)),
+            )
+            .with_detail(
+                "an indirect command replayed by this increment names exactly one draw; a render \
+                 pass that carries an ordered list of draws is refused by name instead of being \
+                 replayed as its first draw",
+            ));
+        }
+        let executor = self.lock_executor()?;
+        // The resident targets and the trace's own production, in the same two
+        // contexts the single-draw path hands the rail: the list's draws share
+        // the pass state, so both are resolved once from the head.
+        let resident_refs: Vec<Option<&render::ProviderTargetImage>> = resolved
+            .resident
+            .iter()
+            .map(|image| image.as_deref())
+            .collect();
+        let produced = render::ProducedTraceViews::new(writebacks, produced_latest);
+        let inputs: Vec<render::OffscreenBatchInputs<'_>> = draws
+            .iter()
+            .map(|draw| render::OffscreenBatchInputs {
+                stages: draw.stages.as_ref(),
+                pass: &draw.pass,
+                previous: &resolved.previous,
+                landings: &resolved.landings,
+                resident: Some(&resident_refs),
+            })
+            .collect();
+        render::execute_offscreen_render_draws(
+            &executor.context,
+            &inputs,
+            Some(leases),
+            executor.context.admitted_depth_resolve_modes(),
+            executor.context.admitted_stencil_resolve_modes(),
+            executor.context.spirv_feature_policy(),
+            Some(&produced),
+        )
+    }
+
     /// Publish what one offscreen pass's outcome means: the identities it
     /// defined or re-armed, the writebacks its landings carried in location
     /// order, and the stage-buffer and depth/stencil landings that follow them.
@@ -2038,7 +2158,13 @@ impl VulkanComputeProvider {
                 .iter()
                 .filter_map(|entry| match entry {
                     PlannedRenderEntry::Pass(pass) => Some(pass),
-                    PlannedRenderEntry::Landing(_) => None,
+                    // A draw list is not the one pass the first indirect
+                    // increment replays into (`research/docs/23` §3.3,
+                    // G3-B/B-2), and neither is a landing-only entry: both
+                    // answer `None` here, so the count check below refuses the
+                    // plan by name instead of replaying the command into a
+                    // pass that draws more than the command states.
+                    PlannedRenderEntry::Draws(_) | PlannedRenderEntry::Landing(_) => None,
                 })
                 .collect::<Vec<_>>();
             if planned_passes.is_empty() {
@@ -2143,6 +2269,63 @@ impl VulkanComputeProvider {
             // entry that stands before its keeping pass refuse by name.
             let planned = match planned {
                 PlannedRenderEntry::Pass(pass) => pass,
+                // A render pass that carries an ordered list of draws runs as
+                // its own submission scope (`research/docs/23` §3.3,
+                // G3-B/B-2): its draws share one render pass instance, so it
+                // is neither a member of a pending run — the run is flushed
+                // first, exactly as a present tail flushes it — nor a run of
+                // its own.
+                PlannedRenderEntry::Draws(draws) => {
+                    run.flush(
+                        trace,
+                        &mut writebacks,
+                        &mut produced_latest,
+                        &leases,
+                        host_readback,
+                    )?;
+                    // The present action is the one pass-tail shape this
+                    // increment's list arm does not execute: the present rail
+                    // renders exactly one attachment through its own
+                    // single-draw setup (`research/docs/24` §3.5), so a list
+                    // that carries one is refused by name rather than executed
+                    // as its head.
+                    if draws.draws.iter().any(|draw| draw.pass.present.is_some()) {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "render_multi_draw_present_unsupported",
+                        )
+                        .with_field(
+                            "draws",
+                            FieldValue::Unsigned(
+                                u64::try_from(draws.draws.len()).unwrap_or(u64::MAX),
+                            ),
+                        )
+                        .with_detail(
+                            "a present action is the single-draw rail's tail: a render pass that \
+                             carries an ordered list of draws states no present in this increment, \
+                             so the pass is refused by name instead of presenting its first draw",
+                        ));
+                    }
+                    let resolved =
+                        self.resolve_offscreen_pass(&draws.draws[0], pool, host_readback)?;
+                    let outcome = self.execute_offscreen_draws(
+                        &draws.draws,
+                        &resolved,
+                        trace,
+                        &writebacks,
+                        &produced_latest,
+                        &leases,
+                    );
+                    self.publish_offscreen_readback(
+                        resolved,
+                        outcome,
+                        &mut writebacks,
+                        &mut produced_latest,
+                        host_readback,
+                    )?;
+                    continue;
+                }
                 PlannedRenderEntry::Landing(landing) => {
                     // A landing resolves a frame a *completed* pass kept, and a
                     // pending run's passes have not run yet: the run ends here.
@@ -4637,6 +4820,15 @@ fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), ProviderErr
         match entry {
             TracePass::Render(pass) => {
                 for attachment in &pass.color_attachments {
+                    render_written.entry(attachment.view_id).or_insert(index);
+                }
+            }
+            // A multi-draw pass writes the same colour attachments a
+            // single-draw one does — the list states them once, in its head —
+            // so the ordering walk registers them exactly as it registers the
+            // single-draw arm's (`research/docs/23` §3.3, G3-B/B-2).
+            TracePass::RenderDraws(list) => {
+                for attachment in &list.head.color_attachments {
                     render_written.entry(attachment.view_id).or_insert(index);
                 }
             }

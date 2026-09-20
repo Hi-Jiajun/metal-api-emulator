@@ -24,16 +24,17 @@ use metal_api_core::provider::{
     MultisampleStencilResolve, OperationId, PipelineCompileRequest, PipelineContract, PipelineId,
     PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
     ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-    RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding,
-    RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, Retryability,
-    SampleCount, SamplerAddressMode, SamplerCoordinates, SamplerFilter, SamplerPolicy,
-    SemanticDigest, ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
-    StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
-    StoreOp, SubmissionId, TextureAccess, TextureBindingContract, TextureFootprintProof,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
+    RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderDraw,
+    RenderDrawsDescriptor, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, RenderStencilAttachment,
+    RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SamplerAddressMode,
+    SamplerCoordinates, SamplerFilter, SamplerPolicy, SemanticDigest, ShaderSource,
+    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
+    TextureAccess, TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout, VertexStep, ViewId, Winding, MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES,
+    MAX_DRAWS_PER_PASS, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
     MAX_RENDER_STAGE_BUFFER_DECLARATIONS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_DECLARATIONS,
     MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
@@ -390,6 +391,26 @@ const PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS: u8 = 0x18;
 /// decoder refuses the frame with [`CodecError::UnknownPassTag`] rather than
 /// skipping the payload and reading the next entry out of its bytes.
 const PASS_KIND_LANDING_KEPT_FRAME: u8 = 0x19;
+
+/// One render pass that carries an **ordered list of draws**
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The payload is the list's **head** written through the single-draw family's
+/// own encoder — its kind byte and every section that kind states — followed by
+/// a `u8` count of the draws that come after it and that many per-draw
+/// declarations, in declaration order. The head travels in the family's own
+/// encoding rather than in a layout of its own so that every block a lone pass
+/// can state (vertex input, present, scissor, instancing, depth, cull, blend,
+/// the wide sections, textures, stage buffers, samplers) is stateable on the
+/// head of a list too, and so a block's meaning cannot drift between the two
+/// arms.
+///
+/// The tag is new, so a decoder that predates it answers
+/// [`CodecError::UnknownPassTag`] for a list instead of reading the list's tail
+/// as the next trace entry's bytes — the fail-closed direction the whole
+/// increment is stated in. A pass that carries one draw keeps writing the tags
+/// above, so every frame written before this increment keeps its exact bytes.
+const PASS_KIND_RENDER_DRAWS: u8 = 0x1a;
 
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
@@ -994,6 +1015,27 @@ const CAPABILITY_RENDER_HALF_CAPABILITIES_TAIL: u8 = 0x10;
 /// settled where they merge.
 const CAPABILITY_RENDER_TEXTURE_VOLUME_FORMATS_TAIL: u8 = 0x11;
 
+/// Tag, inside the tail's second family, of the **multi-draw render pass**
+/// declaration (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The section follows the volume-lane list and carries two readings that are
+/// one declaration: one bool — whether this snapshot executes a render pass
+/// that carries an ordered list of draws
+/// ([`ProviderCapabilities::supports_render_multi_draw`]) — and one `u32`, the
+/// draws one pass may carry on this snapshot
+/// ([`ProviderCapabilities::max_draws_per_pass`], the contract's ceiling
+/// clamped by the rail's own reading).
+///
+/// The two travel together because neither answers the question alone: a bit
+/// with no window bounds nothing, and a window with no bit says nothing about
+/// the arm the window is for. The predicate
+/// [`ProviderCapabilities::declares_render_multi_draw_support`] is what both
+/// the encoder and every consumer read, so a snapshot that declares neither
+/// writes nothing here — the pre-increment bytes exactly — and a consumer of an
+/// older frame reads the fail-closed "no draw list" answer and refuses the arm
+/// by name.
+const CAPABILITY_RENDER_MULTI_DRAW_TAIL: u8 = 0x12;
+
 /// Maximum texture formats one capability snapshot may declare as compute-side
 /// sampling sources.
 ///
@@ -1278,6 +1320,13 @@ impl CommandCodec {
                     // would keep the pre-increment `r32_float`-only reading for
                     // a lane the provider executes.
                     || capabilities.declares_render_texture_volume_formats()
+                    // The multi-draw render pass is a face of its own
+                    // (G3-B/B-2): a snapshot that declares only it still has
+                    // to write the extended payload, or its declaration would
+                    // be dropped on the wire and every consumer would keep the
+                    // fail-closed "no draw list" answer for an arm the
+                    // provider executes.
+                    || capabilities.declares_render_multi_draw_support()
                     // The per-stage sampled-texture window is a face of its
                     // own (`research/docs/23` §3.3, E-TC1): a snapshot that
                     // declares only it still has to write the extended
@@ -3509,6 +3558,440 @@ fn get_completion_policy(decoder: &mut Decoder<'_>) -> Result<CompletionPolicy, 
 /// pass. The caller writes the matching payload tag, so `SUBMIT_REQUEST`
 /// frames keep their exact legacy bytes and every tagged frame is
 /// self-describing.
+/// Encode one **single-draw** render entry: its tag and its whole payload
+/// (`research/docs/23` §3.3).
+///
+/// The tag selection is the family's own — the legacy pair, the narrow feature
+/// byte, the wide word and the four block tags — and it lives here rather than
+/// inline in [`put_trace`] because the multi-draw arm writes its **head**
+/// through the same encoder (`PASS_KIND_RENDER_DRAWS`, G3-B/B-2): the head of a
+/// draw list is a single-draw pass in every byte it states, so one encoder
+/// serves both and the two arms cannot drift apart in what a section means.
+fn put_render_entry(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Result<(), CodecError> {
+    if pass.color_attachments.len() > MAX_COLOR_ATTACHMENTS {
+        return Err(CodecError::ColorAttachmentCount {
+            count: pass.color_attachments.len(),
+            maximum: MAX_COLOR_ATTACHMENTS,
+        });
+    }
+    // `tagged` is true whenever a render entry exists, so the tag
+    // below always belongs to the extended layout.
+    // The pass kind carries the present half: an offscreen pass
+    // keeps `PASS_KIND_RENDER` and its previous bytes exactly, and
+    // a presenting pass is a tag an older decoder refuses
+    // (`docs/24` §4.1, §4.3).
+    //
+    // A pass that binds a caller-held vertex stream takes the
+    // feature-tagged kind instead, because two of the three
+    // optional sections would otherwise multiply the tag space
+    // (`docs/23` §3.3). Its present half travels as a feature bit,
+    // so the pair stays orthogonal.
+    let has_vertex_input = !pass.vertex_buffers.is_empty() || pass.indices.is_some();
+    // The instancing tail follows the same rule (`docs/23` §3.3,
+    // v31): a single-instance pass is the shape every earlier
+    // increment wrote, so only a multi-instance draw takes the
+    // extended kind and appends its own count.
+    let has_instancing = pass.instance_count != 1;
+    // The base vertex follows the same rule (`docs/23` §3.3, v34):
+    // only a draw that offsets its indices takes the extended kind
+    // and appends its own field.
+    let has_base_vertex = pass.base_vertex != 0;
+    // The depth block follows the same rule (`docs/23` §3.3, v36):
+    // only a pass that carries a depth attachment takes the
+    // extended kind and appends its shape.
+    let has_depth = pass.depth.is_some();
+    // The culling state follows the same rule (`docs/23` §3.3,
+    // v39): only a pass that culls something takes the extended
+    // kind and appends its state.
+    let has_cull = pass.cull.is_some();
+    let has_blend = pass.blend.is_some();
+    // The depth store action and the depth identity are the first
+    // sections that do not fit the narrow feature byte
+    // (`docs/23` §3.3, v43): both travel under the wide tag, whose
+    // word has a second byte for exactly this purpose, and neither
+    // is ever written by a frame that only needs narrow bits.
+    let has_depth_store = pass
+        .depth
+        .as_ref()
+        .is_some_and(|depth| depth.store.is_some());
+    let has_depth_resource = pass
+        .depth
+        .as_ref()
+        .is_some_and(|depth| depth.identity.is_some());
+    // The stencil block is the same story (`docs/23` §3.3, v47): a
+    // pass with no stencil attachment never sets the bit, so its
+    // bytes stay exactly what they were.
+    let has_stencil = pass.stencil.is_some();
+    // The stencil store action and identity follow the depth pair's
+    // own rule (`docs/23` §3.3, v43/v49).
+    let has_stencil_store = pass
+        .stencil
+        .as_ref()
+        .is_some_and(|stencil| stencil.store.is_some());
+    let has_stencil_resource = pass
+        .stencil
+        .as_ref()
+        .is_some_and(|stencil| stencil.identity.is_some());
+    // The multisample state is the pass's own, so its bit is the
+    // pass's own statement too (`research/docs/23` §3.3, v51).
+    let has_multisample = pass.multisample.is_some();
+    // The depth resolve is the stored depth surface's own tail
+    // (`research/docs/23` §3.3, v57): a pass that never resolves
+    // never sets the bit, and the contract refuses the bit without
+    // the stored multisampled depth surface it reduces.
+    let has_depth_resolve = pass.depth_resolve.is_some();
+    // The stencil resolve is the stored stencil surface's own tail
+    // (`research/docs/23` §3.3, v60): a pass that never resolves
+    // never sets the bit, and the contract refuses the bit without
+    // the stored multisampled stencil surface it reduces.
+    let has_stencil_resolve = pass.stencil_resolve.is_some();
+    // The sampled-texture block is the section the wide word had
+    // no bit for (`research/docs/23` §3.3, v70): a pass that binds
+    // no fragment texture never sets it, so every pre-v70 frame
+    // keeps its exact bytes and only a texture-bearing pass takes
+    // the tag of its own.
+    let has_render_textures = !pass.textures.is_empty();
+    if has_render_textures {
+        if let Some(refusal) = render_texture_count_refusal(pass.textures.len()) {
+            return Err(refusal);
+        }
+    }
+    // The stage buffer block follows the sampled-texture block's
+    // own rule (`research/docs/23` §3.3, v83): the wide word has
+    // no bit left for it either, so a pass that binds one takes
+    // the tag of its own and every pre-v83 frame keeps its exact
+    // bytes.
+    let has_stage_buffers = !pass.stage_buffers.is_empty();
+    if has_stage_buffers && pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS {
+        return Err(CodecError::RenderStageBufferCount {
+            stage: None,
+            count: pass.stage_buffers.len(),
+            maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+        });
+    }
+    // The runtime sampler block follows the same rule one more
+    // time (`research/docs/23` §3.3, v102): the wide word has no
+    // bit left for the states the pass's `[[sampler(n)]]`
+    // arguments execute with, so a pass that binds one takes a tag
+    // of its own and every pre-v102 frame keeps its exact bytes.
+    // The list is bound before a single entry is written, exactly
+    // as its decoder bounds it.
+    let has_render_samplers = !pass.samplers.is_empty();
+    if has_render_samplers && pass.samplers.len() > MAX_RENDER_SAMPLERS {
+        return Err(CodecError::RenderSamplerCount {
+            count: pass.samplers.len(),
+            maximum: MAX_RENDER_SAMPLERS,
+        });
+    }
+    let wide = has_depth_store
+        || has_depth_resource
+        || has_stencil
+        || has_stencil_store
+        || has_stencil_resource
+        || has_multisample
+        || has_depth_resolve
+        || has_stencil_resolve;
+    if has_vertex_input
+        || pass.scissor.is_some()
+        || has_instancing
+        || has_base_vertex
+        || has_depth
+        || has_cull
+        || has_blend
+        || wide
+        || has_render_textures
+        || has_stage_buffers
+        || has_render_samplers
+    {
+        let mut features = if has_vertex_input {
+            RENDER_FEATURE_VERTEX_INPUT
+        } else {
+            0
+        };
+        if pass.present.is_some() {
+            features |= RENDER_FEATURE_PRESENT;
+        }
+        if pass.scissor.is_some() {
+            features |= RENDER_FEATURE_SCISSOR;
+        }
+        if has_instancing {
+            features |= RENDER_FEATURE_INSTANCING;
+        }
+        if has_base_vertex {
+            features |= RENDER_FEATURE_BASE_VERTEX;
+        }
+        if has_depth {
+            features |= RENDER_FEATURE_DEPTH;
+        }
+        if has_cull {
+            features |= RENDER_FEATURE_CULL;
+        }
+        if has_blend {
+            features |= RENDER_FEATURE_BLEND;
+        }
+        if wide || has_render_textures || has_stage_buffers || has_render_samplers {
+            // The wide word's low byte is the narrow byte, so a
+            // decoder reads both tags through one section walker
+            // and only the extra bits differ.
+            let mut wide_features = u16::from(features);
+            if has_depth_store {
+                wide_features |= RENDER_WIDE_FEATURE_DEPTH_STORE;
+            }
+            if has_depth_resource {
+                wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOURCE;
+            }
+            if has_stencil {
+                wide_features |= RENDER_WIDE_FEATURE_STENCIL;
+            }
+            if has_stencil_store {
+                wide_features |= RENDER_WIDE_FEATURE_STENCIL_STORE;
+            }
+            if has_stencil_resource {
+                wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOURCE;
+            }
+            if has_multisample {
+                wide_features |= RENDER_WIDE_FEATURE_MULTISAMPLE;
+            }
+            if has_depth_resolve {
+                wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOLVE;
+            }
+            if has_stencil_resolve {
+                wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
+            }
+            // The wide word is full, so each block the word has no
+            // bit for rides a tag of its own, and a pass that
+            // carries more than one block takes the tag that
+            // appends them in the one order the decoder reads
+            // (`research/docs/23` §3.3, v70/v83/v102). A pass with
+            // no block keeps the plain wide tag.
+            let tag = match (has_render_textures, has_stage_buffers, has_render_samplers) {
+                (false, false, false) => PASS_KIND_RENDER_EXT_WIDE,
+                (true, false, false) => PASS_KIND_RENDER_SAMPLED,
+                (false, true, false) => PASS_KIND_RENDER_STAGE_BUFFERS,
+                (true, true, false) => PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS,
+                (false, false, true) => PASS_KIND_RENDER_SAMPLERS,
+                (true, false, true) => PASS_KIND_RENDER_SAMPLED_SAMPLERS,
+                (false, true, true) => PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS,
+                (true, true, true) => PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS,
+            };
+            encoder.u8(tag);
+            encoder.u16(wide_features);
+            if has_render_textures {
+                put_render_texture_block(encoder, &pass.textures)?;
+            }
+            if has_stage_buffers {
+                put_stage_buffer_block(encoder, &pass.stage_buffers)?;
+            }
+            if has_render_samplers {
+                put_render_sampler_block(encoder, &pass.samplers)?;
+            }
+        } else {
+            encoder.u8(PASS_KIND_RENDER_EXT);
+            encoder.u8(features);
+        }
+        put_render_pass(encoder, pass, false)?;
+        if has_vertex_input {
+            put_vertex_input(encoder, pass)?;
+        }
+        if let Some(present) = &pass.present {
+            put_present_descriptor(encoder, present)?;
+        }
+        if let Some([x, y, width, height]) = pass.scissor {
+            for dimension in [x, y, width, height] {
+                encoder.u32(dimension);
+            }
+        }
+        if has_instancing {
+            encoder.u32(pass.instance_count);
+        }
+        if has_base_vertex {
+            encoder.u32(pass.base_vertex);
+        }
+        if let Some(depth) = &pass.depth {
+            put_depth_block(encoder, depth, pass.depth_test.as_ref())?;
+            // The two wide sections follow the depth block, in the
+            // order their bits are declared: the store action
+            // first, then the identity the storing shape lands on
+            // (`docs/23` §3.3, v43).
+            if let Some(store) = depth.store {
+                encoder.u8(store.code());
+            }
+            if let Some(identity) = &depth.identity {
+                encoder.u64(identity.allocation_id.get());
+                encoder.u64(identity.view_id.get());
+            }
+        }
+        // The stencil block follows every depth section, so the two
+        // surfaces' state cannot be read in either order by a
+        // decoder that knows both bits (`docs/23` §3.3, v47).
+        if let Some(stencil) = &pass.stencil {
+            put_stencil_block(encoder, stencil, pass.stencil_test.as_ref());
+            if let Some(store) = stencil.store {
+                encoder.u8(u8::from(store == StoreOp::Store));
+            }
+            if let Some(identity) = &stencil.identity {
+                encoder.u64(identity.allocation_id.get());
+                encoder.u64(identity.view_id.get());
+            }
+        }
+        // The multisample section follows the stencil sections and
+        // precedes culling, in the same order the decoder walks
+        // (`research/docs/23` §3.3, v51): one sample count code.
+        if let Some(multisample) = &pass.multisample {
+            encoder.u8(multisample.sample_count.code());
+        }
+        // The depth resolve section follows the multisample
+        // section and precedes culling, in the same order the
+        // decoder walks (`research/docs/23` §3.3, v57): one
+        // filter code.
+        if let Some(resolve) = &pass.depth_resolve {
+            encoder.u8(resolve.filter.code());
+        }
+        // The stencil resolve section follows the depth resolve
+        // section and precedes culling, in the same order the
+        // decoder walks (`research/docs/23` §3.3, v60): one
+        // filter code.
+        if let Some(resolve) = &pass.stencil_resolve {
+            encoder.u8(resolve.filter.code());
+        }
+        if let Some(cull) = &pass.cull {
+            encoder.u8(cull.mode.code());
+            encoder.u8(cull.winding.code());
+        }
+        if let Some(blend) = &pass.blend {
+            encoder.u64(blend.attachments.len() as u64);
+            for (location, attachment) in blend.attachments.iter().enumerate() {
+                // The v40 section is five bytes per entry: the four
+                // factor codes and one operation code, for an entry
+                // that blends with every channel written
+                // (`research/docs/23` §3.3, v100). A pass that
+                // states the later fields is refused by name here
+                // rather than framed as the v40 shape it is not.
+                if !attachment.is_v40_shape() {
+                    let field = if !attachment.enabled {
+                        "blendingEnabled = false"
+                    } else if attachment.alpha_operation != attachment.operation {
+                        "an alpha operation of its own"
+                    } else {
+                        "a colour write mask"
+                    };
+                    return Err(CodecError::RenderBlendStateUnsupported { location, field });
+                }
+                encoder.u8(attachment.source_rgb.code());
+                encoder.u8(attachment.destination_rgb.code());
+                encoder.u8(attachment.source_alpha.code());
+                encoder.u8(attachment.destination_alpha.code());
+                encoder.u8(attachment.operation.code());
+            }
+        }
+        return Ok(());
+    }
+    encoder.u8(if pass.present.is_some() {
+        PASS_KIND_RENDER_PRESENT
+    } else {
+        PASS_KIND_RENDER
+    });
+    put_render_pass(encoder, pass, true)?;
+    Ok(())
+}
+
+/// Encode one **draw** of a render pass that carries a list
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The layout is fixed and self-contained — there is no feature word, because
+/// the whole entry is new and nothing has to be kept byte-exact here — and it
+/// states exactly the per-draw half of a single-draw pass: the pipeline, the
+/// viewport and scissor the draw rasterizes through, the vertex/index counts,
+/// the cull and blend state its pipeline is built with, the depth and stencil
+/// test state it runs with, its instance count, the vertex streams and index
+/// window it binds, the textures it samples, the runtime samplers it executes
+/// with and the stage buffers it reads. What it does *not* state is the pass
+/// state: attachments, load/store and clear decisions, the render area, the
+/// multisample raster, the depth and stencil surfaces and the present action
+/// belong to the pass and travel once, in the head.
+///
+/// Every block is the single-draw family's own encoder, so a section means one
+/// thing across the two arms; the counts are bound before a byte of the block
+/// is written, so a refused frame never carries a partial entry.
+fn put_render_draw(encoder: &mut Encoder, draw: &RenderDraw) -> Result<(), CodecError> {
+    encoder.u64(draw.pipeline.get());
+    for dimension in draw.viewport {
+        encoder.u32(dimension);
+    }
+    match draw.scissor {
+        Some([x, y, width, height]) => {
+            encoder.u8(1);
+            for dimension in [x, y, width, height] {
+                encoder.u32(dimension);
+            }
+        }
+        None => encoder.u8(0),
+    }
+    encoder.u32(draw.vertices);
+    encoder.u32(draw.instance_count);
+    encoder.u32(draw.base_vertex);
+    match &draw.cull {
+        Some(cull) => {
+            encoder.u8(1);
+            encoder.u8(cull.mode.code());
+            encoder.u8(cull.winding.code());
+        }
+        None => encoder.u8(0),
+    }
+    match &draw.blend {
+        Some(blend) => {
+            encoder.u8(1);
+            encoder.u64(blend.attachments.len() as u64);
+            for (location, attachment) in blend.attachments.iter().enumerate() {
+                // The v40 section is five bytes per entry, exactly as it is in
+                // the single-draw family (`research/docs/23` §3.3, v40/v100): a
+                // draw that states the later fields is refused by name here
+                // rather than framed as the v40 shape it is not.
+                if !attachment.is_v40_shape() {
+                    let field = if !attachment.enabled {
+                        "blendingEnabled = false"
+                    } else if attachment.alpha_operation != attachment.operation {
+                        "an alpha operation of its own"
+                    } else {
+                        "a colour write mask"
+                    };
+                    return Err(CodecError::RenderBlendStateUnsupported { location, field });
+                }
+                encoder.u8(attachment.source_rgb.code());
+                encoder.u8(attachment.destination_rgb.code());
+                encoder.u8(attachment.source_alpha.code());
+                encoder.u8(attachment.destination_alpha.code());
+                encoder.u8(attachment.operation.code());
+            }
+        }
+        None => encoder.u8(0),
+    }
+    put_depth_test_state(encoder, draw.depth_test.as_ref());
+    put_stencil_test_state(encoder, draw.stencil_test.as_ref());
+    if draw.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
+        return Err(CodecError::VertexBufferCount {
+            count: draw.vertex_buffers.len(),
+            maximum: MAX_VERTEX_BUFFERS,
+        });
+    }
+    encoder.u64(draw.vertex_buffers.len() as u64);
+    for view in &draw.vertex_buffers {
+        put_view(encoder, view);
+    }
+    match &draw.indices {
+        Some(indices) => {
+            encoder.u8(1);
+            put_view(encoder, &indices.view);
+            encoder.u8(indices.format.code());
+        }
+        None => encoder.u8(0),
+    }
+    put_render_texture_block(encoder, &draw.textures)?;
+    put_stage_buffer_block(encoder, &draw.stage_buffers)?;
+    put_render_sampler_block(encoder, &draw.samplers)?;
+    Ok(())
+}
+
 fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecError> {
     let tagged = trace.has_render_passes()
         || trace.has_heap_or_icb()
@@ -3547,338 +4030,26 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 put_compute_pass(encoder, pass);
             }
             TracePass::Render(pass) => {
-                if pass.color_attachments.len() > MAX_COLOR_ATTACHMENTS {
-                    return Err(CodecError::ColorAttachmentCount {
-                        count: pass.color_attachments.len(),
-                        maximum: MAX_COLOR_ATTACHMENTS,
+                put_render_entry(encoder, pass)?;
+            }
+            // One render pass that carries an ordered list of draws
+            // (`research/docs/23` §3.3, G3-B/B-2): the tag, then the list's head
+            // written through the single-draw family's own encoder — so every
+            // section a lone pass can state is stateable here too — then the
+            // draws that follow it.
+            TracePass::RenderDraws(list) => {
+                if list.draw_count() > MAX_DRAWS_PER_PASS {
+                    return Err(CodecError::RenderDrawCount {
+                        count: list.draw_count(),
+                        maximum: MAX_DRAWS_PER_PASS,
                     });
                 }
-                // `tagged` is true whenever a render entry exists, so the tag
-                // below always belongs to the extended layout.
-                // The pass kind carries the present half: an offscreen pass
-                // keeps `PASS_KIND_RENDER` and its previous bytes exactly, and
-                // a presenting pass is a tag an older decoder refuses
-                // (`docs/24` §4.1, §4.3).
-                //
-                // A pass that binds a caller-held vertex stream takes the
-                // feature-tagged kind instead, because two of the three
-                // optional sections would otherwise multiply the tag space
-                // (`docs/23` §3.3). Its present half travels as a feature bit,
-                // so the pair stays orthogonal.
-                let has_vertex_input = !pass.vertex_buffers.is_empty() || pass.indices.is_some();
-                // The instancing tail follows the same rule (`docs/23` §3.3,
-                // v31): a single-instance pass is the shape every earlier
-                // increment wrote, so only a multi-instance draw takes the
-                // extended kind and appends its own count.
-                let has_instancing = pass.instance_count != 1;
-                // The base vertex follows the same rule (`docs/23` §3.3, v34):
-                // only a draw that offsets its indices takes the extended kind
-                // and appends its own field.
-                let has_base_vertex = pass.base_vertex != 0;
-                // The depth block follows the same rule (`docs/23` §3.3, v36):
-                // only a pass that carries a depth attachment takes the
-                // extended kind and appends its shape.
-                let has_depth = pass.depth.is_some();
-                // The culling state follows the same rule (`docs/23` §3.3,
-                // v39): only a pass that culls something takes the extended
-                // kind and appends its state.
-                let has_cull = pass.cull.is_some();
-                let has_blend = pass.blend.is_some();
-                // The depth store action and the depth identity are the first
-                // sections that do not fit the narrow feature byte
-                // (`docs/23` §3.3, v43): both travel under the wide tag, whose
-                // word has a second byte for exactly this purpose, and neither
-                // is ever written by a frame that only needs narrow bits.
-                let has_depth_store = pass
-                    .depth
-                    .as_ref()
-                    .is_some_and(|depth| depth.store.is_some());
-                let has_depth_resource = pass
-                    .depth
-                    .as_ref()
-                    .is_some_and(|depth| depth.identity.is_some());
-                // The stencil block is the same story (`docs/23` §3.3, v47): a
-                // pass with no stencil attachment never sets the bit, so its
-                // bytes stay exactly what they were.
-                let has_stencil = pass.stencil.is_some();
-                // The stencil store action and identity follow the depth pair's
-                // own rule (`docs/23` §3.3, v43/v49).
-                let has_stencil_store = pass
-                    .stencil
-                    .as_ref()
-                    .is_some_and(|stencil| stencil.store.is_some());
-                let has_stencil_resource = pass
-                    .stencil
-                    .as_ref()
-                    .is_some_and(|stencil| stencil.identity.is_some());
-                // The multisample state is the pass's own, so its bit is the
-                // pass's own statement too (`research/docs/23` §3.3, v51).
-                let has_multisample = pass.multisample.is_some();
-                // The depth resolve is the stored depth surface's own tail
-                // (`research/docs/23` §3.3, v57): a pass that never resolves
-                // never sets the bit, and the contract refuses the bit without
-                // the stored multisampled depth surface it reduces.
-                let has_depth_resolve = pass.depth_resolve.is_some();
-                // The stencil resolve is the stored stencil surface's own tail
-                // (`research/docs/23` §3.3, v60): a pass that never resolves
-                // never sets the bit, and the contract refuses the bit without
-                // the stored multisampled stencil surface it reduces.
-                let has_stencil_resolve = pass.stencil_resolve.is_some();
-                // The sampled-texture block is the section the wide word had
-                // no bit for (`research/docs/23` §3.3, v70): a pass that binds
-                // no fragment texture never sets it, so every pre-v70 frame
-                // keeps its exact bytes and only a texture-bearing pass takes
-                // the tag of its own.
-                let has_render_textures = !pass.textures.is_empty();
-                if has_render_textures {
-                    if let Some(refusal) = render_texture_count_refusal(pass.textures.len()) {
-                        return Err(refusal);
-                    }
+                encoder.u8(PASS_KIND_RENDER_DRAWS);
+                put_render_entry(encoder, &list.head)?;
+                encoder.u8(list.tail.len() as u8);
+                for draw in &list.tail {
+                    put_render_draw(encoder, draw)?;
                 }
-                // The stage buffer block follows the sampled-texture block's
-                // own rule (`research/docs/23` §3.3, v83): the wide word has
-                // no bit left for it either, so a pass that binds one takes
-                // the tag of its own and every pre-v83 frame keeps its exact
-                // bytes.
-                let has_stage_buffers = !pass.stage_buffers.is_empty();
-                if has_stage_buffers
-                    && pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFER_DECLARATIONS
-                {
-                    return Err(CodecError::RenderStageBufferCount {
-                        stage: None,
-                        count: pass.stage_buffers.len(),
-                        maximum: MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
-                    });
-                }
-                // The runtime sampler block follows the same rule one more
-                // time (`research/docs/23` §3.3, v102): the wide word has no
-                // bit left for the states the pass's `[[sampler(n)]]`
-                // arguments execute with, so a pass that binds one takes a tag
-                // of its own and every pre-v102 frame keeps its exact bytes.
-                // The list is bound before a single entry is written, exactly
-                // as its decoder bounds it.
-                let has_render_samplers = !pass.samplers.is_empty();
-                if has_render_samplers && pass.samplers.len() > MAX_RENDER_SAMPLERS {
-                    return Err(CodecError::RenderSamplerCount {
-                        count: pass.samplers.len(),
-                        maximum: MAX_RENDER_SAMPLERS,
-                    });
-                }
-                let wide = has_depth_store
-                    || has_depth_resource
-                    || has_stencil
-                    || has_stencil_store
-                    || has_stencil_resource
-                    || has_multisample
-                    || has_depth_resolve
-                    || has_stencil_resolve;
-                if has_vertex_input
-                    || pass.scissor.is_some()
-                    || has_instancing
-                    || has_base_vertex
-                    || has_depth
-                    || has_cull
-                    || has_blend
-                    || wide
-                    || has_render_textures
-                    || has_stage_buffers
-                    || has_render_samplers
-                {
-                    let mut features = if has_vertex_input {
-                        RENDER_FEATURE_VERTEX_INPUT
-                    } else {
-                        0
-                    };
-                    if pass.present.is_some() {
-                        features |= RENDER_FEATURE_PRESENT;
-                    }
-                    if pass.scissor.is_some() {
-                        features |= RENDER_FEATURE_SCISSOR;
-                    }
-                    if has_instancing {
-                        features |= RENDER_FEATURE_INSTANCING;
-                    }
-                    if has_base_vertex {
-                        features |= RENDER_FEATURE_BASE_VERTEX;
-                    }
-                    if has_depth {
-                        features |= RENDER_FEATURE_DEPTH;
-                    }
-                    if has_cull {
-                        features |= RENDER_FEATURE_CULL;
-                    }
-                    if has_blend {
-                        features |= RENDER_FEATURE_BLEND;
-                    }
-                    if wide || has_render_textures || has_stage_buffers || has_render_samplers {
-                        // The wide word's low byte is the narrow byte, so a
-                        // decoder reads both tags through one section walker
-                        // and only the extra bits differ.
-                        let mut wide_features = u16::from(features);
-                        if has_depth_store {
-                            wide_features |= RENDER_WIDE_FEATURE_DEPTH_STORE;
-                        }
-                        if has_depth_resource {
-                            wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOURCE;
-                        }
-                        if has_stencil {
-                            wide_features |= RENDER_WIDE_FEATURE_STENCIL;
-                        }
-                        if has_stencil_store {
-                            wide_features |= RENDER_WIDE_FEATURE_STENCIL_STORE;
-                        }
-                        if has_stencil_resource {
-                            wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOURCE;
-                        }
-                        if has_multisample {
-                            wide_features |= RENDER_WIDE_FEATURE_MULTISAMPLE;
-                        }
-                        if has_depth_resolve {
-                            wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOLVE;
-                        }
-                        if has_stencil_resolve {
-                            wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
-                        }
-                        // The wide word is full, so each block the word has no
-                        // bit for rides a tag of its own, and a pass that
-                        // carries more than one block takes the tag that
-                        // appends them in the one order the decoder reads
-                        // (`research/docs/23` §3.3, v70/v83/v102). A pass with
-                        // no block keeps the plain wide tag.
-                        let tag =
-                            match (has_render_textures, has_stage_buffers, has_render_samplers) {
-                                (false, false, false) => PASS_KIND_RENDER_EXT_WIDE,
-                                (true, false, false) => PASS_KIND_RENDER_SAMPLED,
-                                (false, true, false) => PASS_KIND_RENDER_STAGE_BUFFERS,
-                                (true, true, false) => PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS,
-                                (false, false, true) => PASS_KIND_RENDER_SAMPLERS,
-                                (true, false, true) => PASS_KIND_RENDER_SAMPLED_SAMPLERS,
-                                (false, true, true) => PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS,
-                                (true, true, true) => {
-                                    PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS
-                                }
-                            };
-                        encoder.u8(tag);
-                        encoder.u16(wide_features);
-                        if has_render_textures {
-                            put_render_texture_block(encoder, &pass.textures)?;
-                        }
-                        if has_stage_buffers {
-                            put_stage_buffer_block(encoder, &pass.stage_buffers)?;
-                        }
-                        if has_render_samplers {
-                            put_render_sampler_block(encoder, &pass.samplers)?;
-                        }
-                    } else {
-                        encoder.u8(PASS_KIND_RENDER_EXT);
-                        encoder.u8(features);
-                    }
-                    put_render_pass(encoder, pass, false)?;
-                    if has_vertex_input {
-                        put_vertex_input(encoder, pass)?;
-                    }
-                    if let Some(present) = &pass.present {
-                        put_present_descriptor(encoder, present)?;
-                    }
-                    if let Some([x, y, width, height]) = pass.scissor {
-                        for dimension in [x, y, width, height] {
-                            encoder.u32(dimension);
-                        }
-                    }
-                    if has_instancing {
-                        encoder.u32(pass.instance_count);
-                    }
-                    if has_base_vertex {
-                        encoder.u32(pass.base_vertex);
-                    }
-                    if let Some(depth) = &pass.depth {
-                        put_depth_block(encoder, depth, pass.depth_test.as_ref())?;
-                        // The two wide sections follow the depth block, in the
-                        // order their bits are declared: the store action
-                        // first, then the identity the storing shape lands on
-                        // (`docs/23` §3.3, v43).
-                        if let Some(store) = depth.store {
-                            encoder.u8(store.code());
-                        }
-                        if let Some(identity) = &depth.identity {
-                            encoder.u64(identity.allocation_id.get());
-                            encoder.u64(identity.view_id.get());
-                        }
-                    }
-                    // The stencil block follows every depth section, so the two
-                    // surfaces' state cannot be read in either order by a
-                    // decoder that knows both bits (`docs/23` §3.3, v47).
-                    if let Some(stencil) = &pass.stencil {
-                        put_stencil_block(encoder, stencil, pass.stencil_test.as_ref());
-                        if let Some(store) = stencil.store {
-                            encoder.u8(u8::from(store == StoreOp::Store));
-                        }
-                        if let Some(identity) = &stencil.identity {
-                            encoder.u64(identity.allocation_id.get());
-                            encoder.u64(identity.view_id.get());
-                        }
-                    }
-                    // The multisample section follows the stencil sections and
-                    // precedes culling, in the same order the decoder walks
-                    // (`research/docs/23` §3.3, v51): one sample count code.
-                    if let Some(multisample) = &pass.multisample {
-                        encoder.u8(multisample.sample_count.code());
-                    }
-                    // The depth resolve section follows the multisample
-                    // section and precedes culling, in the same order the
-                    // decoder walks (`research/docs/23` §3.3, v57): one
-                    // filter code.
-                    if let Some(resolve) = &pass.depth_resolve {
-                        encoder.u8(resolve.filter.code());
-                    }
-                    // The stencil resolve section follows the depth resolve
-                    // section and precedes culling, in the same order the
-                    // decoder walks (`research/docs/23` §3.3, v60): one
-                    // filter code.
-                    if let Some(resolve) = &pass.stencil_resolve {
-                        encoder.u8(resolve.filter.code());
-                    }
-                    if let Some(cull) = &pass.cull {
-                        encoder.u8(cull.mode.code());
-                        encoder.u8(cull.winding.code());
-                    }
-                    if let Some(blend) = &pass.blend {
-                        encoder.u64(blend.attachments.len() as u64);
-                        for (location, attachment) in blend.attachments.iter().enumerate() {
-                            // The v40 section is five bytes per entry: the four
-                            // factor codes and one operation code, for an entry
-                            // that blends with every channel written
-                            // (`research/docs/23` §3.3, v100). A pass that
-                            // states the later fields is refused by name here
-                            // rather than framed as the v40 shape it is not.
-                            if !attachment.is_v40_shape() {
-                                let field = if !attachment.enabled {
-                                    "blendingEnabled = false"
-                                } else if attachment.alpha_operation != attachment.operation {
-                                    "an alpha operation of its own"
-                                } else {
-                                    "a colour write mask"
-                                };
-                                return Err(CodecError::RenderBlendStateUnsupported {
-                                    location,
-                                    field,
-                                });
-                            }
-                            encoder.u8(attachment.source_rgb.code());
-                            encoder.u8(attachment.destination_rgb.code());
-                            encoder.u8(attachment.source_alpha.code());
-                            encoder.u8(attachment.destination_alpha.code());
-                            encoder.u8(attachment.operation.code());
-                        }
-                    }
-                    continue;
-                }
-                encoder.u8(if pass.present.is_some() {
-                    PASS_KIND_RENDER_PRESENT
-                } else {
-                    PASS_KIND_RENDER
-                });
-                put_render_pass(encoder, pass, true)?;
             }
             // A landing-only entry is one tag and a fixed payload: the kept
             // frame's identity and shape, then the window's second declaration
@@ -4444,118 +4615,34 @@ fn get_trace_tagged(
     for _ in 0..pass_count {
         passes.push(match decoder.u8()? {
             PASS_KIND_COMPUTE => TracePass::Compute(get_compute_pass(decoder)?),
-            PASS_KIND_RENDER => TracePass::Render(get_render_pass(decoder, false)?),
-            // The present half is a property of the tag, not of a field inside
-            // the render payload, so a frame cannot claim a present section it
-            // did not write (`docs/24` §4.1).
-            PASS_KIND_RENDER_PRESENT => TracePass::Render(get_render_pass(decoder, true)?),
-            // The extended kind carries a feature byte: bit 0 is the
-            // vertex-input block and bit 1 the present tail, in that order
-            // after the base payload. A bit this version does not know is a
-            // decoder refusal, so a future section cannot be skipped silently.
-            PASS_KIND_RENDER_EXT => {
-                // As of v40 every bit of the narrow byte is known, so there is
-                // no unknown bit left for a decoder to refuse there: the next
-                // optional section needed a second byte or a tag of its own,
-                // and v43 chose the wide tag below. `RENDER_FEATURE_KNOWN`
-                // stays as the record of the narrow byte's contents for that
-                // decision.
-                let features = decoder.u8()?;
-                TracePass::Render(get_render_ext_pass(decoder, u16::from(features))?)
-            }
-            // The wide kind carries a `u16` feature word whose low byte is the
-            // narrow byte above (`docs/23` §3.3, v43). Its high bits name the
-            // sections the narrow byte had no room for, so the two tags share
-            // one section walker and only the masks differ. An unknown high bit
-            // is refused here exactly as an unknown tag is: a section this
-            // decoder does not know cannot be skipped to reach the ones after
-            // it.
-            PASS_KIND_RENDER_EXT_WIDE => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
+            // One render pass that carries an ordered list of draws
+            // (`research/docs/23` §3.3, G3-B/B-2): the head travels through the
+            // single-draw family's own decoder — its kind byte first — and the
+            // tail follows it as a count and that many per-draw declarations.
+            // A decoder that predates this tag refuses the frame at the
+            // fallback arm rather than reading the list's tail as the next
+            // entry's bytes.
+            PASS_KIND_RENDER_DRAWS => {
+                let head_kind = decoder.u8()?;
+                let head = match get_render_entry(decoder, head_kind)? {
+                    TracePass::Render(pass) => pass,
+                    // The inner byte is a *single-draw* kind by construction:
+                    // every other tag is refused here rather than read as a
+                    // head that is not one.
+                    _ => return Err(CodecError::UnknownPassTag(PASS_KIND_RENDER_DRAWS)),
+                };
+                let tail_count = usize::from(decoder.u8()?);
+                if 1 + tail_count > MAX_DRAWS_PER_PASS {
+                    return Err(CodecError::RenderDrawCount {
+                        count: 1 + tail_count,
+                        maximum: MAX_DRAWS_PER_PASS,
+                    });
                 }
-                TracePass::Render(get_render_ext_pass(decoder, features)?)
-            }
-            // The sampled kind carries the same wide feature word as the tag
-            // above and, right after it, the texture block the wide word had
-            // no bit for (`research/docs/23` §3.3, v70). An unknown bit is
-            // refused exactly as it is there: a section this decoder does not
-            // know cannot be skipped to reach the ones after it.
-            PASS_KIND_RENDER_SAMPLED => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
+                let mut tail = Vec::with_capacity(tail_count);
+                for _ in 0..tail_count {
+                    tail.push(get_render_draw(decoder)?);
                 }
-                TracePass::Render(get_render_sampled_pass(decoder, features)?)
-            }
-            // The stage-buffer kind carries the same wide feature word and,
-            // right after it, the stage buffer block (`research/docs/23`
-            // §3.3, v83). An unknown bit is refused exactly as it is above: a
-            // section this decoder does not know cannot be skipped to reach
-            // the ones after it.
-            PASS_KIND_RENDER_STAGE_BUFFERS => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
-                }
-                TracePass::Render(get_render_stage_buffer_pass(decoder, features)?)
-            }
-            // The combined kind writes the sampled tag's payload — the wide
-            // word and the texture block — and then the stage buffer block
-            // after it, so a pass that carries both blocks is one frame.
-            PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
-                }
-                TracePass::Render(get_render_sampled_stage_buffer_pass(decoder, features)?)
-            }
-            // The runtime-sampler kind carries the same wide feature word and,
-            // right after it, the sampler block (`research/docs/23` §3.3,
-            // v102). An unknown bit is refused exactly as it is above: a
-            // section this decoder does not know cannot be skipped to reach
-            // the ones after it.
-            PASS_KIND_RENDER_SAMPLERS => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
-                }
-                TracePass::Render(get_render_sampler_pass(decoder, features)?)
-            }
-            // The three combined kinds write the blocks the tags above carry
-            // and then the sampler block after them, in the one order the
-            // encoder writes and this walk reads.
-            PASS_KIND_RENDER_SAMPLED_SAMPLERS => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
-                }
-                TracePass::Render(get_render_sampled_sampler_pass(decoder, features)?)
-            }
-            PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
-                }
-                TracePass::Render(get_render_stage_buffer_sampler_pass(decoder, features)?)
-            }
-            PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS => {
-                let features = decoder.u16()?;
-                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
-                if unknown != 0 {
-                    return Err(CodecError::UnknownRenderFeature(unknown));
-                }
-                TracePass::Render(get_render_sampled_stage_buffer_sampler_pass(
-                    decoder, features,
-                )?)
+                TracePass::RenderDraws(RenderDrawsDescriptor { head, tail })
             }
             // A landing-only entry is not a pass at all
             // (`research/docs/23` §115 之后的增量，E-TX14/R4b): the tag's
@@ -4564,6 +4651,21 @@ fn get_trace_tagged(
             // the frame at the fallback arm instead of reading these bytes as
             // whatever pass it was expecting.
             PASS_KIND_LANDING_KEPT_FRAME => TracePass::Landing(get_kept_frame_landing(decoder)?),
+            // The single-draw family: every tag a lone render pass states is
+            // decoded by one walker, which the list arm above also calls for its
+            // head (`research/docs/23` §3.3, G3-B/B-2). A tag outside both
+            // families is the refusal below.
+            kind @ (PASS_KIND_RENDER
+            | PASS_KIND_RENDER_PRESENT
+            | PASS_KIND_RENDER_EXT
+            | PASS_KIND_RENDER_EXT_WIDE
+            | PASS_KIND_RENDER_SAMPLED
+            | PASS_KIND_RENDER_STAGE_BUFFERS
+            | PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS
+            | PASS_KIND_RENDER_SAMPLERS
+            | PASS_KIND_RENDER_SAMPLED_SAMPLERS
+            | PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS
+            | PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS) => get_render_entry(decoder, kind)?,
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -4592,6 +4694,313 @@ fn get_trace_tagged(
 /// The format byte goes through [`get_attachment_format`], so the closed
 /// family and its refusal stay the same one the attachment payloads use: a
 /// landing cannot name a colour surface the attachment walk would refuse.
+/// Decode one **single-draw** render entry from its tag
+/// (`research/docs/23` §3.3).
+///
+/// The walk is the family's own — the legacy pair, the narrow feature byte, the
+/// wide word and the four block tags — and it lives here rather than inline in
+/// the trace walk because the multi-draw arm reads its **head** through the same
+/// decoder (`PASS_KIND_RENDER_DRAWS`, G3-B/B-2): the head of a draw list is a
+/// single-draw pass in every byte it states, so one decoder serves both and the
+/// two arms cannot drift apart in what a section means.
+fn get_render_entry(decoder: &mut Decoder<'_>, tag: u8) -> Result<TracePass, CodecError> {
+    Ok(match tag {
+        PASS_KIND_RENDER => TracePass::Render(get_render_pass(decoder, false)?),
+        // The present half is a property of the tag, not of a field inside
+        // the render payload, so a frame cannot claim a present section it
+        // did not write (`docs/24` §4.1).
+        PASS_KIND_RENDER_PRESENT => TracePass::Render(get_render_pass(decoder, true)?),
+        // The extended kind carries a feature byte: bit 0 is the
+        // vertex-input block and bit 1 the present tail, in that order
+        // after the base payload. A bit this version does not know is a
+        // decoder refusal, so a future section cannot be skipped silently.
+        PASS_KIND_RENDER_EXT => {
+            // As of v40 every bit of the narrow byte is known, so there is
+            // no unknown bit left for a decoder to refuse there: the next
+            // optional section needed a second byte or a tag of its own,
+            // and v43 chose the wide tag below. `RENDER_FEATURE_KNOWN`
+            // stays as the record of the narrow byte's contents for that
+            // decision.
+            let features = decoder.u8()?;
+            TracePass::Render(get_render_ext_pass(decoder, u16::from(features))?)
+        }
+        // The wide kind carries a `u16` feature word whose low byte is the
+        // narrow byte above (`docs/23` §3.3, v43). Its high bits name the
+        // sections the narrow byte had no room for, so the two tags share
+        // one section walker and only the masks differ. An unknown high bit
+        // is refused here exactly as an unknown tag is: a section this
+        // decoder does not know cannot be skipped to reach the ones after
+        // it.
+        PASS_KIND_RENDER_EXT_WIDE => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_ext_pass(decoder, features)?)
+        }
+        // The sampled kind carries the same wide feature word as the tag
+        // above and, right after it, the texture block the wide word had
+        // no bit for (`research/docs/23` §3.3, v70). An unknown bit is
+        // refused exactly as it is there: a section this decoder does not
+        // know cannot be skipped to reach the ones after it.
+        PASS_KIND_RENDER_SAMPLED => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_sampled_pass(decoder, features)?)
+        }
+        // The stage-buffer kind carries the same wide feature word and,
+        // right after it, the stage buffer block (`research/docs/23`
+        // §3.3, v83). An unknown bit is refused exactly as it is above: a
+        // section this decoder does not know cannot be skipped to reach
+        // the ones after it.
+        PASS_KIND_RENDER_STAGE_BUFFERS => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_stage_buffer_pass(decoder, features)?)
+        }
+        // The combined kind writes the sampled tag's payload — the wide
+        // word and the texture block — and then the stage buffer block
+        // after it, so a pass that carries both blocks is one frame.
+        PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_sampled_stage_buffer_pass(decoder, features)?)
+        }
+        // The runtime-sampler kind carries the same wide feature word and,
+        // right after it, the sampler block (`research/docs/23` §3.3,
+        // v102). An unknown bit is refused exactly as it is above: a
+        // section this decoder does not know cannot be skipped to reach
+        // the ones after it.
+        PASS_KIND_RENDER_SAMPLERS => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_sampler_pass(decoder, features)?)
+        }
+        // The three combined kinds write the blocks the tags above carry
+        // and then the sampler block after them, in the one order the
+        // encoder writes and this walk reads.
+        PASS_KIND_RENDER_SAMPLED_SAMPLERS => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_sampled_sampler_pass(decoder, features)?)
+        }
+        PASS_KIND_RENDER_STAGE_BUFFERS_SAMPLERS => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_stage_buffer_sampler_pass(decoder, features)?)
+        }
+        PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS_SAMPLERS => {
+            let features = decoder.u16()?;
+            let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+            if unknown != 0 {
+                return Err(CodecError::UnknownRenderFeature(unknown));
+            }
+            TracePass::Render(get_render_sampled_stage_buffer_sampler_pass(
+                decoder, features,
+            )?)
+        }
+        other => return Err(CodecError::UnknownPassTag(other)),
+    })
+}
+
+/// Decode one **draw** of a render pass that carries a list
+/// (`research/docs/23` §3.3, G3-B/B-2), in the one order [`put_render_draw`]
+/// writes it.
+///
+/// Every block goes through the single-draw family's own reader, so a section
+/// means one thing across the two arms and a draw cannot carry a shape the
+/// single-draw arm would refuse. The counts are bounded before a single entry is
+/// read, so a corrupt count cannot drive the decoder past the entry's own bytes
+/// — which is what keeps an older decoder's `UnknownPassTag` refusal and a newer
+/// one's bounded walk the same fail-closed answer.
+fn get_render_draw(decoder: &mut Decoder<'_>) -> Result<RenderDraw, CodecError> {
+    let pipeline = PipelineId::new(decoder.u64()?);
+    let mut viewport = [0u32; 4];
+    for dimension in &mut viewport {
+        *dimension = decoder.u32()?;
+    }
+    let scissor = match decoder.u8()? {
+        0 => None,
+        1 => {
+            let mut rect = [0u32; 4];
+            for dimension in &mut rect {
+                *dimension = decoder.u32()?;
+            }
+            Some(rect)
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "render draw scissor presence",
+                value,
+            })
+        }
+    };
+    let vertices = decoder.u32()?;
+    let instance_count = decoder.u32()?;
+    let base_vertex = decoder.u32()?;
+    let cull = match decoder.u8()? {
+        0 => None,
+        1 => {
+            let mode = CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                field: "render cull mode",
+                value: 0,
+            })?;
+            let winding =
+                Winding::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "render cull winding",
+                    value: 0,
+                })?;
+            Some(RenderPassCull { mode, winding })
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "render draw cull presence",
+                value,
+            })
+        }
+    };
+    let blend = match decoder.u8()? {
+        0 => None,
+        1 => {
+            let count =
+                usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+                    needed: usize::MAX,
+                    remaining: decoder.remaining(),
+                })?;
+            if count > MAX_COLOR_ATTACHMENTS {
+                return Err(CodecError::ColorAttachmentCount {
+                    count,
+                    maximum: MAX_COLOR_ATTACHMENTS,
+                });
+            }
+            let mut attachments = Vec::with_capacity(count);
+            for _ in 0..count {
+                let source_rgb =
+                    BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                        field: "blend source rgb factor",
+                        value: 0,
+                    })?;
+                let destination_rgb =
+                    BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                        field: "blend destination rgb factor",
+                        value: 0,
+                    })?;
+                let source_alpha =
+                    BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                        field: "blend source alpha factor",
+                        value: 0,
+                    })?;
+                let destination_alpha =
+                    BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                        field: "blend destination alpha factor",
+                        value: 0,
+                    })?;
+                let operation = BlendOperation::from_code(decoder.u8()?).ok_or(
+                    CodecError::UnknownEnumValue {
+                        field: "blend operation",
+                        value: 0,
+                    },
+                )?;
+                attachments.push(BlendAttachment {
+                    // The draw entry's blend state is the v40 shape, exactly as
+                    // the single-draw family's own section is: blending enabled,
+                    // one operation for both channel pairs and every channel
+                    // written (G3-B/B-2, `research/docs/23` §3.3, v40/v100).
+                    enabled: true,
+                    source_rgb,
+                    destination_rgb,
+                    source_alpha,
+                    destination_alpha,
+                    operation,
+                    alpha_operation: operation,
+                    write_mask: ColorWriteMask::ALL,
+                });
+            }
+            Some(RenderPassBlend { attachments })
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "render draw blend presence",
+                value,
+            })
+        }
+    };
+    let depth_test = get_depth_test_state(decoder)?;
+    let stencil_test = get_stencil_test_state(decoder)?;
+    let vertex_buffer_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+    if vertex_buffer_count > MAX_VERTEX_BUFFERS {
+        return Err(CodecError::VertexBufferCount {
+            count: vertex_buffer_count,
+            maximum: MAX_VERTEX_BUFFERS,
+        });
+    }
+    let mut vertex_buffers = Vec::with_capacity(vertex_buffer_count);
+    for _ in 0..vertex_buffer_count {
+        vertex_buffers.push(get_view(decoder)?);
+    }
+    let indices = match decoder.u8()? {
+        0 => None,
+        1 => {
+            let view = get_view(decoder)?;
+            let format =
+                IndexFormat::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "index format",
+                    value: 0,
+                })?;
+            Some(IndexBufferBinding { view, format })
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "render draw index presence",
+                value,
+            })
+        }
+    };
+    let textures = get_render_texture_block(decoder)?;
+    let stage_buffers = get_stage_buffer_block(decoder)?;
+    let samplers = get_render_sampler_block(decoder)?;
+    Ok(RenderDraw {
+        pipeline,
+        viewport,
+        scissor,
+        vertices,
+        vertex_buffers,
+        indices,
+        base_vertex,
+        cull,
+        blend,
+        depth_test,
+        stencil_test,
+        instance_count,
+        textures,
+        samplers,
+        stage_buffers,
+    })
+}
+
 fn get_kept_frame_landing(decoder: &mut Decoder<'_>) -> Result<KeptFrameLanding, CodecError> {
     let frame_view = ViewId::new(decoder.u64()?);
     let frame_allocation = AllocationId::new(decoder.u64()?);
@@ -5220,6 +5629,18 @@ fn put_depth_block(
         }
         DepthLoadOp::Load => encoder.u8(1),
     }
+    put_depth_test_state(encoder, test);
+    Ok(())
+}
+
+/// Encode a depth test state, or the absence byte that reads as "no test"
+/// (`research/docs/23` §3.3, v36).
+///
+/// The block and every draw of a multi-draw pass state the test the same way,
+/// so the shape lives here once (G3-B/B-2): a draw's own test is the same
+/// declaration as the single-draw pass's, and a second spelling of it would be
+/// a second place for the two to disagree.
+fn put_depth_test_state(encoder: &mut Encoder, test: Option<&DepthTest>) {
     match test {
         Some(test) => {
             encoder.u8(1);
@@ -5228,7 +5649,6 @@ fn put_depth_block(
         }
         None => encoder.u8(0),
     }
-    Ok(())
 }
 
 /// Encode the stencil block of an extended render pass: the rail-owned stencil
@@ -5253,6 +5673,14 @@ fn put_stencil_block(
         }
         StencilLoadOp::Load => encoder.u8(1),
     }
+    put_stencil_test_state(encoder, test);
+}
+
+/// Encode a stencil test state, or the absence byte that reads as "no test"
+/// (`research/docs/23` §3.3, v47): the depth state's sibling, one byte wide per
+/// field, so a draw of a multi-draw pass and a single-draw pass state it the
+/// same way (G3-B/B-2).
+fn put_stencil_test_state(encoder: &mut Encoder, test: Option<&StencilTest>) {
     match test {
         Some(test) => {
             encoder.u8(1);
@@ -5289,7 +5717,66 @@ fn get_stencil_block(
             })
         }
     };
-    let test = match decoder.u8()? {
+    let test = get_stencil_test_state(decoder)?;
+    Ok((
+        RenderStencilAttachment {
+            format,
+            width,
+            height,
+            load,
+            // The base block never carries the v49 sections: the store action
+            // and the identity travel under the wide tag's own bits.
+            store: None,
+            identity: None,
+        },
+        test,
+    ))
+}
+
+/// Decode the depth block. An unknown format, compare function or presence byte
+/// is a typed refusal rather than a default.
+/// Decode a depth test state, or the absence byte that reads as "no test"
+/// (`research/docs/23` §3.3, v36).
+///
+/// The block and every draw of a multi-draw pass state the test the same way,
+/// so the walk lives here once (G3-B/B-2): a draw's own test is the same
+/// declaration as the single-draw pass's, and a second reader would be a second
+/// place for the two to disagree.
+fn get_depth_test_state(decoder: &mut Decoder<'_>) -> Result<Option<DepthTest>, CodecError> {
+    Ok(match decoder.u8()? {
+        0 => None,
+        1 => {
+            let compare =
+                CompareFunction::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "depth compare function",
+                    value: 0,
+                })?;
+            let write = match decoder.u8()? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(CodecError::UnknownEnumValue {
+                        field: "depth write enable",
+                        value,
+                    })
+                }
+            };
+            Some(DepthTest { compare, write })
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "depth state presence",
+                value,
+            })
+        }
+    })
+}
+
+/// Decode a stencil test state, or the absence byte that reads as "no test"
+/// (`research/docs/23` §3.3, v47): [`get_depth_test_state`]'s sibling one byte
+/// wide per field.
+fn get_stencil_test_state(decoder: &mut Decoder<'_>) -> Result<Option<StencilTest>, CodecError> {
+    Ok(match decoder.u8()? {
         0 => None,
         1 => {
             let compare =
@@ -5331,24 +5818,9 @@ fn get_stencil_block(
                 value,
             })
         }
-    };
-    Ok((
-        RenderStencilAttachment {
-            format,
-            width,
-            height,
-            load,
-            // The base block never carries the v49 sections: the store action
-            // and the identity travel under the wide tag's own bits.
-            store: None,
-            identity: None,
-        },
-        test,
-    ))
+    })
 }
 
-/// Decode the depth block. An unknown format, compare function or presence byte
-/// is a typed refusal rather than a default.
 fn get_depth_block(
     decoder: &mut Decoder<'_>,
 ) -> Result<(RenderDepthAttachment, Option<DepthTest>), CodecError> {
@@ -5368,33 +5840,7 @@ fn get_depth_block(
             })
         }
     };
-    let test = match decoder.u8()? {
-        0 => None,
-        1 => {
-            let compare =
-                CompareFunction::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
-                    field: "depth compare function",
-                    value: 0,
-                })?;
-            let write = match decoder.u8()? {
-                0 => false,
-                1 => true,
-                value => {
-                    return Err(CodecError::UnknownEnumValue {
-                        field: "depth write enable",
-                        value,
-                    })
-                }
-            };
-            Some(DepthTest { compare, write })
-        }
-        value => {
-            return Err(CodecError::UnknownEnumValue {
-                field: "depth state presence",
-                value,
-            })
-        }
-    };
+    let test = get_depth_test_state(decoder)?;
     Ok((
         RenderDepthAttachment {
             format,
@@ -6409,6 +6855,11 @@ fn put_capabilities(
         // decoder reads by position before the family's escape, or the
         // declaration would be dropped on the wire.
         || capabilities.declares_render_texture_volume_formats()
+        // The multi-draw render pass joins the same guard for the same reason
+        // (G3-B/B-2): a snapshot whose only statement is this declaration still
+        // has to write the heap/ICB half the decoder reads by position before
+        // the family's escape, or the declaration would be dropped on the wire.
+        || capabilities.declares_render_multi_draw_support()
         // The layout-free vertex count above the milestone's three joins the
         // same guard for the same reason (2026-09-19, census v45's
         // `vertex_span` bucket): a snapshot whose only statement is this bit
@@ -6809,6 +7260,18 @@ fn put_capabilities(
                 put_texture_format(encoder, *format);
             }
         }
+        // The multi-draw render pass is the family's next tag and follows the
+        // volume lane list (G3-B/B-2). It carries the two readings the
+        // constant above names — the bit and the pass's draw window — because
+        // they are one declaration, and a snapshot that declares neither writes
+        // nothing here, so the decoder reads the missing section as the
+        // fail-closed "no draw list" answer every pre-increment frame means.
+        if capabilities.declares_render_multi_draw_support() {
+            encoder.u8(CAPABILITY_EXTENDED_TAIL);
+            encoder.u8(CAPABILITY_RENDER_MULTI_DRAW_TAIL);
+            encoder.bool(capabilities.supports_render_multi_draw);
+            encoder.u32(capabilities.max_draws_per_pass);
+        }
     }
     Ok(())
 }
@@ -7009,6 +7472,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         supports_indirect_command_buffers: false,
         max_indirect_commands: 0,
         supported_indirect_commands: Vec::new(),
+        // A legacy payload cannot have declared the multi-draw render pass
+        // either: both readings take the fail-closed defaults, so a legacy
+        // provider is refused a pass that carries a draw list by name instead
+        // of executing its first draw (G3-B/B-2).
+        supports_render_multi_draw: false,
+        max_draws_per_pass: 0,
     })
 }
 
@@ -7064,6 +7533,7 @@ fn decode_capability_extended_tail(
             CAPABILITY_RENDER_TEXTURE_PER_STAGE_TAIL => {}
             CAPABILITY_RENDER_HALF_CAPABILITIES_TAIL => {}
             CAPABILITY_RENDER_TEXTURE_VOLUME_FORMATS_TAIL => {}
+            CAPABILITY_RENDER_MULTI_DRAW_TAIL => {}
             other => return Err(CodecError::UnknownCapabilityTail(other)),
         }
         // The family's tags are read in the one order the encoder writes them,
@@ -7138,6 +7608,15 @@ fn decode_capability_extended_tail(
                     lanes.push(get_texture_format(decoder)?);
                 }
                 capabilities.supported_render_texture_volume_formats = lanes;
+            }
+            CAPABILITY_RENDER_MULTI_DRAW_TAIL => {
+                // The two readings are one declaration (G3-B/B-2): the bit says
+                // the snapshot executes a pass that carries a draw list, the
+                // window says how many draws one pass may carry on it, and a
+                // consumer judges a list against their conjunction
+                // (`declares_render_multi_draw_support`).
+                capabilities.supports_render_multi_draw = decoder.bool()?;
+                capabilities.max_draws_per_pass = decoder.u32()?;
             }
             _ => {
                 capabilities.supports_render_kept_frame_landing = decoder.bool()?;

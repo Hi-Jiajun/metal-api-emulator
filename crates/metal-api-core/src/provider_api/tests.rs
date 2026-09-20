@@ -238,6 +238,12 @@ impl ComputeProvider for FakeProvider {
             // The fixture provider executes no volume at all, so it lists no
             // lane and never states a window beside one.
             supported_render_texture_volume_formats: Vec::new(),
+            // The fixture provider executes the single-draw render arm alone:
+            // a render pass that carries an ordered list of draws keeps its
+            // by-name refusal on this snapshot (`research/docs/23` §3.3,
+            // G3-B/B-2), exactly as the native rail keeps it.
+            supports_render_multi_draw: false,
+            max_draws_per_pass: 0,
             max_render_stage_buffers: if self.stage_buffers {
                 MAX_RENDER_STAGE_BUFFERS as u32
             } else {

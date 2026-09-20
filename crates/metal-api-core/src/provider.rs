@@ -19,6 +19,7 @@
 //! trace's own resource table and the serial pool; executing a render pass
 //! (Vulkan render pass, native `MTLRenderCommandEncoder`) is still open.
 
+use std::borrow::Cow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -35,6 +36,21 @@ pub const PROVIDER_SCHEMA_VERSION: u16 = 2;
 /// Maximum distinct logical views collected before one command-buffer submit.
 /// This shared bounded-resource policy applies to single-pass traces too.
 pub const MAX_SERIAL_RESOURCES: usize = 64;
+
+/// Ceiling on the number of draws one render pass may carry in one render pass
+/// instance (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The contract states the ceiling; a snapshot may declare a **lower** actual
+/// value in [`ProviderCapabilities::max_draws_per_pass`], and both sides judge
+/// against `min(ceiling, device_declared)`. `128` is the value the engine track
+/// already executes (`BATCH_MAX_DRAWS` on the unified-memory arm), so the two
+/// rails of this workspace name one number rather than two.
+///
+/// A pass that declares more draws than the ceiling is refused by name
+/// ([`ContractError::DrawsPerPassLimitExceeded`]); it is never truncated to the
+/// ceiling, because "the first N draws executed and the rest vanished" is
+/// exactly the silent draw loss the limit exists to make impossible.
+pub const MAX_DRAWS_PER_PASS: usize = 128;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -5670,6 +5686,251 @@ impl RenderPassDescriptor {
         }
         Ok(())
     }
+
+    /// This pass's *pass state* with one draw's own declaration — the shape
+    /// every single-draw pass already is, with the per-draw fields replaced by
+    /// `draw`'s (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// [`RenderDrawsDescriptor`] is the multi-draw arm, and this is the one
+    /// place the two halves are put back together: a multi-draw pass is the
+    /// single-draw pass stated once per draw, with the pass state (attachments
+    /// and their load/store/clear decisions, multisample raster, depth and
+    /// stencil surfaces and their resolves, and the present action) shared by
+    /// every draw and the per-draw declaration (pipeline, viewport, scissor,
+    /// vertex/index counts and streams, culling, blending, depth/stencil test
+    /// state, instance count, sampled textures, runtime samplers and stage
+    /// buffers) stated by each draw.
+    ///
+    /// Both rails materialize the list through this method and then run the
+    /// same per-draw code path they already run for a single-draw pass, which
+    /// is what makes "N draws in one pass" exactly "N passes, one draw each"
+    /// for every rule the contract states.
+    pub fn with_draw(&self, draw: &RenderDraw) -> Self {
+        Self {
+            pipeline: draw.pipeline,
+            color_attachments: self.color_attachments.clone(),
+            viewport: draw.viewport,
+            scissor: draw.scissor,
+            vertices: draw.vertices,
+            vertex_buffers: draw.vertex_buffers.clone(),
+            indices: draw.indices.clone(),
+            base_vertex: draw.base_vertex,
+            cull: draw.cull,
+            blend: draw.blend.clone(),
+            multisample: self.multisample,
+            depth_resolve: self.depth_resolve,
+            depth: self.depth.clone(),
+            depth_test: draw.depth_test,
+            stencil: self.stencil.clone(),
+            stencil_resolve: self.stencil_resolve,
+            stencil_test: draw.stencil_test,
+            instance_count: draw.instance_count,
+            present: self.present.clone(),
+            textures: draw.textures.clone(),
+            samplers: draw.samplers.clone(),
+            stage_buffers: draw.stage_buffers.clone(),
+        }
+    }
+
+    /// The per-draw half of this pass, as the multi-draw arm states it.
+    pub fn draw(&self) -> RenderDraw {
+        RenderDraw {
+            pipeline: self.pipeline,
+            viewport: self.viewport,
+            scissor: self.scissor,
+            vertices: self.vertices,
+            vertex_buffers: self.vertex_buffers.clone(),
+            indices: self.indices.clone(),
+            base_vertex: self.base_vertex,
+            cull: self.cull,
+            blend: self.blend.clone(),
+            depth_test: self.depth_test,
+            stencil_test: self.stencil_test,
+            instance_count: self.instance_count,
+            textures: self.textures.clone(),
+            samplers: self.samplers.clone(),
+            stage_buffers: self.stage_buffers.clone(),
+        }
+    }
+}
+
+/// Every draw of a trace's render entries, in trace order
+/// ([`ComputeTrace::render_draw_passes`]).
+///
+/// The iterator is a named type rather than a `flat_map` because the two arms
+/// hand back differently owned items and the legacy arm must allocate nothing:
+/// a single-draw entry yields a borrow of the descriptor the trace already
+/// holds, and an entry that carries a list yields one materialized pass per
+/// declared draw. A trace with no list entry therefore walks this iterator
+/// without touching the allocator, which is what keeps the pre-increment
+/// admission and pool walks exactly as cheap as they were.
+pub struct RenderDrawPasses<'a> {
+    entries: std::iter::Enumerate<std::slice::Iter<'a, TracePass>>,
+    materialized: std::vec::IntoIter<(usize, Cow<'a, RenderPassDescriptor>)>,
+}
+
+impl<'a> Iterator for RenderDrawPasses<'a> {
+    type Item = (usize, Cow<'a, RenderPassDescriptor>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.materialized.next() {
+            return Some(item);
+        }
+        loop {
+            let (index, entry) = self.entries.next()?;
+            match entry {
+                TracePass::Render(pass) => return Some((index, Cow::Borrowed(pass))),
+                TracePass::RenderDraws(list) => {
+                    // The pass state is stated once and every draw's own
+                    // declaration is materialized into a single-draw pass: the
+                    // one shape every rule in this contract is written against.
+                    self.materialized = list
+                        .materialize()
+                        .into_iter()
+                        .map(|pass| (index, Cow::Owned(pass)))
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                    if let Some(item) = self.materialized.next() {
+                        return Some(item);
+                    }
+                }
+                TracePass::Compute(_) | TracePass::Landing(_) => {}
+            }
+        }
+    }
+}
+
+/// One draw of a render pass that carries more than one
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The fields are exactly the per-draw half of [`RenderPassDescriptor`], with
+/// the same meanings, the same rules and the same wire codes; what is *absent*
+/// is the point of the type. A draw states no attachment, no load/store or
+/// clear decision, no render area and no present action: those belong to the
+/// pass it runs in, and repeating them per draw would leave a rail two places
+/// to read one fact from — the disagreement the contract refuses rather than
+/// resolves.
+///
+/// The two states a draw does state that the single-draw shape carries beside
+/// its attachments are the depth and stencil *test* state (`depth_test`,
+/// `stencil_test`): a test is executed per draw by both APIs (Vulkan bakes it
+/// into the graphics pipeline, Metal sets it on the encoder), so it travels
+/// with the draw whose pipeline is built from it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderDraw {
+    /// The registered pipeline that supplies this draw's vertex and fragment
+    /// entries. Two draws of one pass may name two different pipelines; each
+    /// one's pipeline is rebuilt (or reused) before its own draw is recorded.
+    pub pipeline: PipelineId,
+    /// `[origin_x, origin_y, width, height]`, the viewport this draw
+    /// rasterizes through (`research/docs/23` §3.3, v100). Viewport is
+    /// *dynamic* state in both APIs — Vulkan records it with
+    /// `vkCmdSetViewport` beside the scissor — so it is per draw, and every
+    /// draw's rect is held to the pass's raster exactly as a single-draw
+    /// pass's viewport is.
+    pub viewport: [u32; 4],
+    /// The scissor rectangle this draw is clipped to, or `None` for "the whole
+    /// viewport". Per draw for the same reason the viewport is.
+    pub scissor: Option<[u32; 4]>,
+    /// Vertices (or indices, when [`Self::indices`] is present) this draw
+    /// consumes.
+    pub vertices: u32,
+    /// Vertex streams this draw binds, in binding order.
+    pub vertex_buffers: Vec<BufferView>,
+    /// Index buffer this draw draws through, or `None` for a non-indexed draw.
+    pub indices: Option<IndexBufferBinding>,
+    /// Vertex offset added to every index this draw reads.
+    pub base_vertex: u32,
+    /// The culling state this draw's pipeline is built with.
+    pub cull: Option<RenderPassCull>,
+    /// The blend state this draw's pipeline is built with.
+    pub blend: Option<RenderPassBlend>,
+    /// The depth state this draw tests and writes with, or `None` for "no
+    /// test". Only meaningful beside a pass that opens a depth surface.
+    pub depth_test: Option<DepthTest>,
+    /// The stencil state this draw tests and writes with, or `None` for "no
+    /// test". Only meaningful beside a pass that opens a stencil surface.
+    pub stencil_test: Option<StencilTest>,
+    /// Instances of this draw.
+    pub instance_count: u32,
+    /// Sampled textures this draw's fragment stage reads, in canonical order.
+    pub textures: Vec<TextureView>,
+    /// The runtime samplers this draw's fragment stage executes with.
+    pub samplers: Vec<RenderSamplerBinding>,
+    /// Buffers this draw's stages read or write directly, in canonical order.
+    pub stage_buffers: Vec<StageBufferView>,
+}
+
+/// A render pass that carries an **ordered list of draws**
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The list is spelled head-and-tail rather than as one `Vec<RenderPassDescriptor>`
+/// for the reason the contract states: the pass state is stated once. `head` is
+/// a whole single-draw pass — the pass state plus the list's *first* draw — and
+/// `tail` are the draws that execute after it, in declaration order, inside the
+/// same render pass instance. `N = 1` is therefore exactly today's shape
+/// ([`ComputeTrace::passes`] carrying [`TracePass::Render`]), and a `tail` that
+/// is empty is admitted so that the equivalence is checkable rather than
+/// asserted: it is the same declaration, spelled in the arm that can also carry
+/// the second draw.
+///
+/// Every draw of the list is materialized as a single-draw pass by
+/// [`RenderDrawsDescriptor::materialize`], and every rule the contract states
+/// about a render pass is then applied to each of them — the pass state once
+/// per draw, the per-draw rules to each draw's own declaration. A rail that
+/// executes this arm must execute **every** draw: reading it as its head alone
+/// is the silent draw loss this arm exists to make impossible, which is why the
+/// rails that cannot execute it refuse it by name
+/// (`render_multi_draw_unsupported`) instead of narrowing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderDrawsDescriptor {
+    /// The pass state plus the list's first draw, stated exactly as the
+    /// single-draw arm states a pass.
+    pub head: RenderPassDescriptor,
+    /// The draws that follow `head`, in declaration order.
+    pub tail: Vec<RenderDraw>,
+}
+
+impl RenderDrawsDescriptor {
+    /// The number of draws this pass carries, `head` included.
+    pub fn draw_count(&self) -> usize {
+        self.tail.len() + 1
+    }
+
+    /// Every draw of this pass, as a single-draw pass: `head` itself first,
+    /// then one materialized pass per tail entry.
+    ///
+    /// The materialized passes are the contract's own answer to "what does this
+    /// draw state", and both rails and admission read them, so a multi-draw
+    /// pass cannot be judged by one rule set at admission and executed by
+    /// another at run time.
+    pub fn materialize(&self) -> Vec<RenderPassDescriptor> {
+        let mut passes = Vec::with_capacity(self.draw_count());
+        passes.push(self.head.clone());
+        passes.extend(self.tail.iter().map(|draw| self.head.with_draw(draw)));
+        passes
+    }
+
+    /// The pipeline every draw of this list names, in declaration order.
+    pub fn pipelines(&self) -> impl Iterator<Item = PipelineId> + '_ {
+        std::iter::once(self.head.pipeline).chain(self.tail.iter().map(|draw| draw.pipeline))
+    }
+
+    /// The list's structural rules, plus every rule each of its draws has to
+    /// satisfy as a draw of a single-draw pass.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.draw_count() > MAX_DRAWS_PER_PASS {
+            return Err(ContractError::DrawsPerPassLimitExceeded {
+                requested: self.draw_count(),
+                maximum: MAX_DRAWS_PER_PASS,
+            });
+        }
+        self.head.validate()?;
+        for draw in &self.tail {
+            self.head.with_draw(draw).validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Which of a render pipeline's two compiled entry points a refusal is about.
@@ -6975,6 +7236,15 @@ pub enum TracePass {
     Compute(ComputePass),
     /// One offscreen colour render pass (`research/docs/23` §3).
     Render(RenderPassDescriptor),
+    /// One offscreen colour render pass that carries an ordered list of draws
+    /// sharing one pass state (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// The arm is the third render entry rather than a field of
+    /// [`RenderPassDescriptor`] so that every frame written before this
+    /// increment keeps its exact bytes and every reader that does not know the
+    /// arm refuses it by name (`CodecError::UnknownPassTag` on the wire) instead
+    /// of reading a multi-draw pass as its first draw.
+    RenderDraws(RenderDrawsDescriptor),
     /// One landing-only entry: a frame the provider already kept in its own
     /// image lands in an owner's registered window, and nothing is drawn
     /// (`research/docs/23` §115 之后的增量，E-TX14/R4b).
@@ -6986,7 +7256,7 @@ impl TracePass {
     pub fn as_compute(&self) -> Option<&ComputePass> {
         match self {
             Self::Compute(pass) => Some(pass),
-            Self::Render(_) => None,
+            Self::Render(_) | Self::RenderDraws(_) => None,
             Self::Landing(_) => None,
         }
     }
@@ -6995,7 +7265,7 @@ impl TracePass {
     pub fn as_compute_mut(&mut self) -> Option<&mut ComputePass> {
         match self {
             Self::Compute(pass) => Some(pass),
-            Self::Render(_) => None,
+            Self::Render(_) | Self::RenderDraws(_) => None,
             Self::Landing(_) => None,
         }
     }
@@ -7003,16 +7273,30 @@ impl TracePass {
     /// The render payload, or `None` for a compute entry.
     pub fn as_render(&self) -> Option<&RenderPassDescriptor> {
         match self {
-            Self::Compute(_) => None,
+            Self::Compute(_) | Self::RenderDraws(_) => None,
             Self::Render(pass) => Some(pass),
             Self::Landing(_) => None,
+        }
+    }
+
+    /// The multi-draw render payload, or `None` for every other entry.
+    ///
+    /// The accessor is deliberately *not* folded into [`Self::as_render`]: a
+    /// reader that gets `None` from this one knows it is looking at a
+    /// single-draw pass, and a reader that would otherwise read the multi-draw
+    /// arm's head as if the pass carried one draw has to name this accessor
+    /// instead of silently taking the first draw of a list.
+    pub fn as_render_draws(&self) -> Option<&RenderDrawsDescriptor> {
+        match self {
+            Self::RenderDraws(pass) => Some(pass),
+            Self::Compute(_) | Self::Render(_) | Self::Landing(_) => None,
         }
     }
 
     /// The landing payload, or `None` for the two drawing entries.
     pub fn as_landing(&self) -> Option<&KeptFrameLanding> {
         match self {
-            Self::Compute(_) | Self::Render(_) => None,
+            Self::Compute(_) | Self::Render(_) | Self::RenderDraws(_) => None,
             Self::Landing(landing) => Some(landing),
         }
     }
@@ -7027,6 +7311,12 @@ impl From<ComputePass> for TracePass {
 impl From<RenderPassDescriptor> for TracePass {
     fn from(pass: RenderPassDescriptor) -> Self {
         Self::Render(pass)
+    }
+}
+
+impl From<RenderDrawsDescriptor> for TracePass {
+    fn from(pass: RenderDrawsDescriptor) -> Self {
+        Self::RenderDraws(pass)
     }
 }
 
@@ -8717,8 +9007,56 @@ impl ComputeTrace {
     }
 
     /// The render entries of `passes`, in trace order.
+    ///
+    /// This is the **single-draw** arm only. A trace that carries a
+    /// [`TracePass::RenderDraws`] entry yields nothing for that entry here, on
+    /// purpose: an iterator that handed back the list's head would let a reader
+    /// that knows only this method execute one draw of a list and drop the
+    /// rest. Every walk that has to see *what the trace draws* reads
+    /// [`ComputeTrace::render_draw_passes`] instead.
     pub fn render_passes(&self) -> impl Iterator<Item = &RenderPassDescriptor> {
         self.passes.iter().filter_map(TracePass::as_render)
+    }
+
+    /// Every render *entry* of `passes`, in trace order, whatever arm it
+    /// carries (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// The count of this iterator is the number of render passes a trace
+    /// states — the denominator admission's own `passes` field carries — while
+    /// [`ComputeTrace::render_draw_passes`] is the number of *draws* those
+    /// entries execute.
+    pub fn render_entries(&self) -> impl Iterator<Item = &TracePass> {
+        self.passes
+            .iter()
+            .filter(|pass| matches!(pass, TracePass::Render(_) | TracePass::RenderDraws(_)))
+    }
+
+    /// Every draw this trace's render entries carry, in trace order, as a
+    /// single-draw pass (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// A [`TracePass::Render`] entry is yielded borrowed — the descriptor the
+    /// trace already owns, so a single-draw trace allocates nothing here — and
+    /// a [`TracePass::RenderDraws`] entry yields one **materialized**
+    /// single-draw pass per declared draw (the pass state shared by all of
+    /// them, the per-draw declaration taken from the draw itself). The pair
+    /// beside each item is the index of the trace entry the draw belongs to,
+    /// exactly as [`ComputeTrace::attachments`] pairs an attachment with its
+    /// entry.
+    ///
+    /// Materializing is what lets admission, the serial-pool walks and both
+    /// rails answer "what does this draw state" with the same rule set a
+    /// single-draw pass is held to, instead of a second, narrower copy of those
+    /// rules for the list arm.
+    pub fn render_draw_passes(&self) -> RenderDrawPasses<'_> {
+        RenderDrawPasses {
+            entries: self.passes.iter().enumerate(),
+            materialized: Vec::new().into_iter(),
+        }
+    }
+
+    /// The render entries of `passes` that carry a draw list, in trace order.
+    pub fn render_draw_lists(&self) -> impl Iterator<Item = &RenderDrawsDescriptor> {
+        self.passes.iter().filter_map(TracePass::as_render_draws)
     }
 
     /// The landing-only entries of `passes`, in trace order
@@ -8762,7 +9100,13 @@ impl ComputeTrace {
             .iter()
             .enumerate()
             .flat_map(|(pass_index, pass)| {
-                pass.as_render().into_iter().flat_map(move |render| {
+                // The colour list is pass state: the multi-draw arm states it
+                // once, in its head, and every draw of the list renders into
+                // those same attachments.
+                let render = pass
+                    .as_render()
+                    .or_else(|| pass.as_render_draws().map(|list| &list.head));
+                render.into_iter().flat_map(move |render| {
                     render
                         .color_attachments
                         .iter()
@@ -8776,7 +9120,7 @@ impl ComputeTrace {
     pub fn has_render_passes(&self) -> bool {
         self.passes
             .iter()
-            .any(|pass| matches!(pass, TracePass::Render(_)))
+            .any(|pass| matches!(pass, TracePass::Render(_) | TracePass::RenderDraws(_)))
     }
 
     /// Every present action in pass order, tagged with the index of the trace
@@ -8793,6 +9137,7 @@ impl ComputeTrace {
             .enumerate()
             .filter_map(|(pass_index, pass)| {
                 pass.as_render()
+                    .or_else(|| pass.as_render_draws().map(|list| &list.head))
                     .and_then(|render| render.present.as_ref())
                     .map(|present| (pass_index, present))
             })
@@ -8885,6 +9230,22 @@ impl ComputeTrace {
                     pass.validate()?;
                     self.pipeline(pass.pipeline)?;
                     Some(pass.pipeline)
+                }
+                TracePass::RenderDraws(list) => {
+                    // The list's own rules are its ceiling plus one validation
+                    // of each declared draw, materialized as the single-draw
+                    // pass that draw states (`RenderDrawsDescriptor::validate`).
+                    // Every draw's pipeline is then held to this trace's table
+                    // and epoch: a list whose second draw names a pipeline the
+                    // table does not carry is refused here, not at execution.
+                    list.validate()?;
+                    for pipeline in list.pipelines() {
+                        self.pipeline(pipeline)?;
+                        *used
+                            .get_mut(&pipeline)
+                            .expect("pipeline lookup checked the metadata table") = true;
+                    }
+                    None
                 }
                 TracePass::Landing(landing) => {
                     landing.validate_shape()?;
@@ -9410,7 +9771,7 @@ impl ComputeTrace {
         // is uploaded — exactly as a colour attachment's view is. A depth
         // attachment a trace discards has no landing and keeps whatever access
         // its declaration stated.
-        for pass in self.render_passes() {
+        for (_, pass) in self.render_draw_passes() {
             let Some(identity) = pass
                 .depth
                 .as_ref()
@@ -9433,7 +9794,7 @@ impl ComputeTrace {
         // §3.3, v49): its view leaves through the same byte-keyed writeback
         // channel, so the view it was declared with has to be writable before
         // the pool is uploaded.
-        for pass in self.render_passes() {
+        for (_, pass) in self.render_draw_passes() {
             let Some(identity) = pass
                 .stencil
                 .as_ref()
@@ -9463,7 +9824,7 @@ impl ComputeTrace {
         // stays out of this pool on purpose — the render rail uploads the pass's
         // own bytes, and the pool is the compute rail's binding set
         // (`research/docs/23` §3.6, §3.3 v83).
-        for pass in self.render_passes() {
+        for (_, pass) in self.render_draw_passes() {
             let reads = pass
                 .vertex_buffers
                 .iter()
@@ -9859,14 +10220,9 @@ fn validate_writebacks_for_trace(
             // behind the discard.
             let mut stored = false;
             let mut discarded = false;
-            for attachment in trace
-                .render_passes()
-                .flat_map(|pass| pass.color_attachments.iter())
-                .filter(|attachment| {
-                    attachment.view_id == view.view_id
-                        && attachment.allocation_id == view.allocation_id
-                })
-            {
+            for (_, attachment) in trace.attachments().filter(|(_, attachment)| {
+                attachment.view_id == view.view_id && attachment.allocation_id == view.allocation_id
+            }) {
                 match attachment.store {
                     StoreOp::Store => stored = true,
                     // Both owner-window stores publish the same bytes through
@@ -10747,6 +11103,32 @@ pub struct ProviderCapabilities {
     pub max_indirect_commands: u32,
     /// Indirect command kinds this snapshot admits. Empty means none.
     pub supported_indirect_commands: Vec<IndirectCommandKind>,
+    /// Whether this snapshot executes a render pass that carries an ordered
+    /// list of draws (`research/docs/23` §3.3, G3-B/B-2). Defaults to `false`.
+    ///
+    /// The bit is the fail-closed half of the multi-draw arm: a snapshot that
+    /// never declared it refuses a [`TracePass::RenderDraws`] entry **by name**
+    /// (`render_multi_draw_unsupported`) instead of executing it as its first
+    /// draw or ignoring the tail. That is the direction that matters for the
+    /// rails: the native rail executes the single-draw arm's whole vocabulary
+    /// and has no multi-draw channel at all, so its answer has to be a named
+    /// refusal rather than a partially executed pass.
+    ///
+    /// It is one bit rather than one bit per rail because the question a
+    /// consumer asks is "may I hand this snapshot a pass with more than one
+    /// draw", and the answer is the same for every member of the arm.
+    pub supports_render_multi_draw: bool,
+    /// Draws one render pass may carry on this snapshot, the head included
+    /// (`research/docs/23` §3.3, G3-B/B-2). `0` — the field's own default —
+    /// means **no multi-draw pass at all**, which is the reading of every frame
+    /// written before the field existed.
+    ///
+    /// The value is `min(`[`MAX_DRAWS_PER_PASS`]`, the rail's own reading)`:
+    /// the contract's ceiling clamped by what the rail executes. Both sides
+    /// judge against that minimum — the ceiling alone would let a provider
+    /// advertise a count its rail refuses, and the rail's own number alone
+    /// would let a trace pass a device that never declared the arm.
+    pub max_draws_per_pass: u32,
 }
 
 impl ProviderCapabilities {
@@ -10776,6 +11158,19 @@ impl ProviderCapabilities {
             || self.declares_depth_resolve_support()
             || self.declares_stencil_resolve_support()
             || self.declares_render_texture_support()
+            || self.declares_render_multi_draw_support()
+    }
+
+    /// Whether this snapshot executes a render pass that carries an ordered
+    /// list of draws (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// The bit has a companion ceiling ([`Self::max_draws_per_pass`]), and the
+    /// predicate reads both: a snapshot that declared only the count without the
+    /// bit says nothing about the arm the count bounds, and one that declared
+    /// only the bit bounds nothing. The two are one declaration, exactly as the
+    /// instancing bit and its own window are.
+    pub fn declares_render_multi_draw_support(&self) -> bool {
+        self.supports_render_multi_draw && self.max_draws_per_pass != 0
     }
 
     /// Whether any vertex-input bit differs from its default. Part of the
@@ -11555,7 +11950,7 @@ impl ProviderCapabilities {
     /// gate that can check "this attachment format is the pipeline's own"
     /// without a provider registry.
     fn admit_render_passes(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        let render_pass_count = trace.render_passes().count();
+        let render_pass_count = trace.render_entries().count();
         if render_pass_count == 0 {
             return Ok(());
         }
@@ -11563,10 +11958,43 @@ impl ProviderCapabilities {
             return Err(capability_error("render_passes_unsupported")
                 .with_field("passes", FieldValue::Unsigned(render_pass_count as u64)));
         }
-        for (pass_index, entry) in trace.passes.iter().enumerate() {
-            let Some(pass) = entry.as_render() else {
-                continue;
-            };
+        // The multi-draw arm's two questions come first, before any per-draw
+        // rule (`research/docs/23` §3.3, G3-B/B-2): a snapshot that never
+        // declared the arm has no count to compare, and a count above the
+        // effective ceiling is the list's own refusal. Both are asked per
+        // *entry* rather than per draw, because both are facts about the list.
+        // The order is the one the rest of this walk uses: the bit a snapshot
+        // answers on its own, then the limit, then the per-draw detail.
+        for list in trace.render_draw_lists() {
+            if !self.supports_render_multi_draw {
+                return Err(capability_error("render_multi_draw_unsupported")
+                    .with_field(
+                        "draws",
+                        FieldValue::Unsigned(u64::try_from(list.draw_count()).unwrap_or(u64::MAX)),
+                    )
+                    .with_detail(
+                        "a render pass that carries more than one draw is executed by the rails \
+                         that declare `supports_render_multi_draw`; this snapshot does not, so the \
+                         pass is refused by name instead of being executed as its first draw",
+                    ));
+            }
+            let ceiling = self
+                .max_draws_per_pass
+                .min(u32::try_from(MAX_DRAWS_PER_PASS).unwrap_or(u32::MAX));
+            if list.draw_count() > ceiling as usize {
+                return Err(capability_error("render_draw_count_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(u64::try_from(list.draw_count()).unwrap_or(u64::MAX)),
+                    )
+                    .with_field("maximum", FieldValue::Unsigned(u64::from(ceiling))));
+            }
+        }
+        // Every draw of every render entry, as the single-draw pass it states
+        // (`ComputeTrace::render_draw_passes`): the pass-level checks below run
+        // once per draw of a list — they read the pass state, which every draw
+        // of one list shares — and the per-draw checks run once per draw.
+        for (pass_index, pass) in trace.render_draw_passes() {
             if pass.color_attachments.len() > self.max_color_attachments as usize {
                 return Err(capability_error("color_attachment_limit")
                     .with_field(
@@ -11782,7 +12210,7 @@ impl ProviderCapabilities {
                 // rather than bounded on a guess (`research/docs/23` §92,
                 // R9k). The rail that owns the registries re-asks the pair
                 // with the resolved bytes before it records any device work.
-                .validate_against(pass, None)
+                .validate_against(pass.as_ref(), None)
                 .map_err(contract_error_refusal)?;
             // The vertex formats and strides the layout asks for are the last
             // bits only this snapshot can answer: the pass already agreed with
@@ -11831,10 +12259,7 @@ impl ProviderCapabilities {
     /// samples render-side textures at all, how many it admits, and in which
     /// formats.
     fn admit_render_texture_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        for (pass_index, entry) in trace.passes.iter().enumerate() {
-            let Some(pass) = entry.as_render() else {
-                continue;
-            };
+        for (pass_index, pass) in trace.render_draw_passes() {
             if pass.textures.is_empty() {
                 continue;
             }
@@ -12077,10 +12502,7 @@ impl ProviderCapabilities {
     /// `[[sampler(n)]]` argument that stated the space. A pass that states only
     /// the normalized space — every pre-increment frame — never enters it.
     fn admit_render_pixel_samplers(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        for (pass_index, entry) in trace.passes.iter().enumerate() {
-            let Some(pass) = entry.as_render() else {
-                continue;
-            };
+        for (pass_index, pass) in trace.render_draw_passes() {
             for sampler in &pass.samplers {
                 if !sampler.coordinates.is_pixel() {
                     continue;
@@ -12176,10 +12598,7 @@ impl ProviderCapabilities {
     /// buffers, because a stage buffer's bytes come from the same three
     /// [`BufferSource`] arms.
     fn admit_render_stage_buffer_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        for (pass_index, entry) in trace.passes.iter().enumerate() {
-            let Some(pass) = entry.as_render() else {
-                continue;
-            };
+        for (pass_index, pass) in trace.render_draw_passes() {
             if pass.stage_buffers.is_empty() {
                 continue;
             }
@@ -12632,6 +13051,15 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::AttachmentLimitExceeded { .. } => (
             ProviderErrorClass::Capability,
             "attachment_count_unsupported",
+        ),
+        // One pass carrying more draws than the contract's ceiling is the
+        // multi-draw arm's own bound (`research/docs/23` §3.3, G3-B/B-2): the
+        // pass is refused whole rather than truncated to the ceiling, so the
+        // refusal is a capability narrowing of a shape the contract names, not
+        // a caller-fixable structure.
+        E::DrawsPerPassLimitExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_draw_count_limit",
         ),
         // The declared viewport's own rule (`research/docs/23` §3.1, v100): a
         // rect that reaches outside the raster is the first-increment
@@ -14316,6 +14744,15 @@ pub enum ContractError {
         requested: usize,
         maximum: usize,
     },
+    /// One render pass declares more draws than the contract's ceiling
+    /// (`research/docs/23` §3.3, G3-B/B-2). The pass is refused whole: a rail
+    /// that executed the first [`MAX_DRAWS_PER_PASS`] draws and dropped the rest
+    /// would lose draws silently, which is the shape the limit exists to make
+    /// impossible.
+    DrawsPerPassLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
     UnsupportedAttachmentFormat(AttachmentFormat),
     UnsupportedAttachmentLoadOp(LoadOp),
     UnsupportedAttachmentStoreOp(StoreOp),
@@ -15394,6 +15831,10 @@ impl fmt::Display for ContractError {
             Self::AttachmentLimitExceeded { requested, maximum } => write!(
                 formatter,
                 "render pass declares {requested} colour attachments, exceeding {maximum}"
+            ),
+            Self::DrawsPerPassLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "render pass declares {requested} draws, exceeding {maximum} draws per pass"
             ),
             Self::UnsupportedAttachmentFormat(format) => write!(
                 formatter,
@@ -17309,8 +17750,7 @@ mod tests {
             .iter_mut()
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
-                TracePass::Compute(_) => None,
-                TracePass::Landing(_) => None,
+                TracePass::Compute(_) | TracePass::RenderDraws(_) | TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass")
     }
@@ -17512,6 +17952,8 @@ mod tests {
             supports_indirect_command_buffers: false,
             max_indirect_commands: 0,
             supported_indirect_commands: Vec::new(),
+            supports_render_multi_draw: false,
+            max_draws_per_pass: 0,
         }
     }
 
@@ -24282,8 +24724,9 @@ mod tests {
                 let mut entry = render_pass_into(attachment_into(index, index));
                 match &mut entry {
                     TracePass::Render(descriptor) => descriptor.pipeline = pipeline_id,
-                    TracePass::Compute(_) => unreachable!("built as a render entry"),
-                    TracePass::Landing(_) => unreachable!("built as a render entry"),
+                    TracePass::Compute(_) | TracePass::RenderDraws(_) | TracePass::Landing(_) => {
+                        unreachable!("built as a render entry")
+                    }
                 }
                 value.passes.push(entry);
             }
@@ -26002,6 +26445,169 @@ mod tests {
             .expect("the pre-v51 raster keeps admitting without a declaration");
     }
 
+    /// The attachment fixture whose render entry is a **draw list** of `draws`
+    /// draws, the head included (`research/docs/23` §3.3, G3-B/B-2).
+    fn attachment_draws_trace(draws: usize) -> ComputeTrace {
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        let Some(TracePass::Render(head)) = value.passes.pop() else {
+            panic!("the fixture's last entry is a render pass");
+        };
+        let mut tail = Vec::new();
+        for _ in 1..draws {
+            tail.push(head.draw());
+        }
+        value
+            .passes
+            .push(TracePass::RenderDraws(RenderDrawsDescriptor { head, tail }));
+        value
+    }
+
+    /// The render bits plus the multi-draw declaration
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    fn multi_draw_capabilities() -> ProviderCapabilities {
+        let mut provider = render_capabilities();
+        provider.supports_render_multi_draw = true;
+        provider.max_draws_per_pass = MAX_DRAWS_PER_PASS as u32;
+        provider
+    }
+
+    /// The list's one-draw shape is today's single-draw pass, byte for byte
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn a_draw_list_of_one_is_the_single_draw_pass_it_states() {
+        let head = match render_pass_into(attachment_into(7, 9)) {
+            TracePass::Render(pass) => pass,
+            other => panic!("built as a render pass: {other:?}"),
+        };
+        let list = RenderDrawsDescriptor {
+            head: head.clone(),
+            tail: Vec::new(),
+        };
+        assert_eq!(list.draw_count(), 1);
+        let materialized = list.materialize();
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(
+            materialized[0], head,
+            "the list of one materializes to the very pass it states"
+        );
+        list.validate()
+            .expect("one draw is the single-draw shape, unchanged");
+        assert_eq!(list.pipelines().collect::<Vec<_>>(), vec![head.pipeline]);
+        // And the two arms are the same declaration: the head's own per-draw
+        // half reads back out of the list's head.
+        assert_eq!(list.head.draw(), head.draw());
+    }
+
+    /// Every draw of a list is held to the rules the single-draw arm states for
+    /// its own pass (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn a_draw_list_validates_every_draw_it_carries() {
+        let Some(TracePass::Render(head)) = render_pass_into(attachment_into(7, 9)).into() else {
+            unreachable!("built as a render pass");
+        };
+        let mut broken = head.draw();
+        broken.instance_count = 0;
+        let list = RenderDrawsDescriptor {
+            head: head.clone(),
+            tail: vec![head.draw(), broken],
+        };
+        assert_eq!(
+            list.validate().unwrap_err(),
+            ContractError::ZeroLength("render instance count"),
+            "the third draw's own rule is the one that refuses the list"
+        );
+        // The list itself admits the same draws when the third states one
+        // instance, so the refusal above is the draw's rule and not the list's.
+        let mut repaired = head.draw();
+        repaired.instance_count = 2;
+        RenderDrawsDescriptor {
+            head,
+            tail: vec![repaired],
+        }
+        .validate()
+        .expect("every draw states a legal per-draw declaration");
+    }
+
+    /// A list above the contract's ceiling is refused whole, never truncated
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn a_draw_list_refuses_more_draws_than_the_ceiling() {
+        let Some(TracePass::Render(head)) = render_pass_into(attachment_into(7, 9)).into() else {
+            unreachable!("built as a render pass");
+        };
+        let draw = head.draw();
+        let over = RenderDrawsDescriptor {
+            head: head.clone(),
+            tail: vec![draw.clone(); MAX_DRAWS_PER_PASS],
+        };
+        assert_eq!(over.draw_count(), MAX_DRAWS_PER_PASS + 1);
+        assert_eq!(
+            over.validate().unwrap_err(),
+            ContractError::DrawsPerPassLimitExceeded {
+                requested: MAX_DRAWS_PER_PASS + 1,
+                maximum: MAX_DRAWS_PER_PASS,
+            }
+        );
+        let at_ceiling = RenderDrawsDescriptor {
+            head,
+            tail: vec![draw; MAX_DRAWS_PER_PASS - 1],
+        };
+        assert_eq!(at_ceiling.draw_count(), MAX_DRAWS_PER_PASS);
+        at_ceiling
+            .validate()
+            .expect("the ceiling itself is admitted");
+    }
+
+    /// A snapshot that never declared the arm refuses a list **by name**, and
+    /// one that declared it judges the list against its own window
+    /// (`research/docs/23` §3.3, G3-B/B-2).
+    #[test]
+    fn multi_draw_admission_refuses_by_name_and_by_the_snapshots_window() {
+        let value = attachment_draws_trace(3);
+        value.validate().expect("the fixture is structurally valid");
+        // The declaration needs both readings: a bit with no window bounds
+        // nothing, and a window with no bit says nothing about the arm.
+        assert!(!render_capabilities().declares_render_multi_draw_support());
+        let mut bit_only = render_capabilities();
+        bit_only.supports_render_multi_draw = true;
+        assert!(!bit_only.declares_render_multi_draw_support());
+        let mut window_only = render_capabilities();
+        window_only.max_draws_per_pass = 8;
+        assert!(!window_only.declares_render_multi_draw_support());
+        assert!(multi_draw_capabilities().declares_render_multi_draw_support());
+        assert!(multi_draw_capabilities().declares_render_support());
+        multi_draw_capabilities()
+            .admit(&value, &vertex_input_resources())
+            .expect("a snapshot that declares the arm admits the list");
+
+        // The bit a snapshot answers on its own comes first: a snapshot without
+        // it refuses the list by name rather than reporting a detail about a
+        // draw it would not execute.
+        assert_eq!(
+            render_capabilities()
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "render_multi_draw_unsupported"
+        );
+        // Then the list's own ceiling against the snapshot's window.
+        let mut narrow = multi_draw_capabilities();
+        narrow.max_draws_per_pass = 2;
+        assert_eq!(
+            narrow
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "render_draw_count_limit"
+        );
+        // A list the window covers keeps its admission.
+        let mut wide_enough = multi_draw_capabilities();
+        wide_enough.max_draws_per_pass = 3;
+        wide_enough
+            .admit(&value, &vertex_input_resources())
+            .expect("the window covers the list's three draws");
+    }
+
     #[test]
     fn depth_resolve_bits_gate_the_pass_and_the_filter() {
         let value = depth_resolve_trace();
@@ -26863,8 +27469,7 @@ mod tests {
             .iter_mut()
             .filter_map(|pass| match pass {
                 TracePass::Render(render) => Some(render.textures.as_mut_slice()),
-                TracePass::Compute(_) => None,
-                TracePass::Landing(_) => None,
+                TracePass::Compute(_) | TracePass::RenderDraws(_) | TracePass::Landing(_) => None,
             })
             .find(|textures| !textures.is_empty())
             .and_then(|textures| textures.first_mut())
@@ -27267,8 +27872,9 @@ mod tests {
             let mut pass = render_pass();
             pass.color_attachments[0].format = format;
             pass.color_attachments[0].load = LoadOp::Clear(one_texel_clear(format));
+            let pass = &pass;
             contract
-                .validate_against(&pass, None)
+                .validate_against(pass, None)
                 .expect("a pipeline compiles for the attachment it renders into");
             // The pass keeps its own shape rules; agreement does not replace
             // them.

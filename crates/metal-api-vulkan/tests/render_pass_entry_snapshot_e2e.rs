@@ -466,7 +466,9 @@ fn trace_for(
         let pipeline = match pass {
             TracePass::Compute(pass) => pass.pipeline,
             TracePass::Render(pass) => pass.pipeline,
-            TracePass::Landing(_) => continue,
+            // The fixture builds single-draw passes: the list arm names its
+            // pipelines in its own draws, and this walk has none to declare.
+            TracePass::RenderDraws(_) | TracePass::Landing(_) => continue,
         };
         if pipelines.iter().any(
             |declared: &metal_api_core::provider::CompiledComputePipeline| {

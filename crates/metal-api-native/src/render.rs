@@ -5126,6 +5126,17 @@ pub(crate) fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), 
                     render_written.entry(attachment.view_id).or_insert(index);
                 }
             }
+            // A render pass that carries an ordered list of draws writes the
+            // same colour attachments a single-draw pass does — the list
+            // states them once, in its head — so the ordering walk registers
+            // them exactly as the single-draw arm's. The arm itself is refused
+            // by name in this rail's own plan gate
+            // (`research/docs/23` §3.3, G3-B/B-2).
+            TracePass::RenderDraws(list) => {
+                for attachment in &list.head.color_attachments {
+                    render_written.entry(attachment.view_id).or_insert(index);
+                }
+            }
             // A landing-only entry writes the owner's window, not a view of
             // this trace's pool, so it registers nothing for the ordering walk
             // below (`research/docs/23` §115 之后的增量，E-TX14/R4b). It is the
@@ -5500,6 +5511,29 @@ pub(crate) fn plan_trace_with_leases<'a>(
                 "a landing-only entry writes a frame the provider kept into an owner's \
                  registered window; this rail has no owner-window write route, so it refuses \
                  the entry instead of landing it somewhere else",
+            ));
+    }
+    // A render pass that carries an ordered list of draws has no channel on
+    // this rail (`research/docs/23` §3.3, G3-B/B-2). This rail plans one Metal
+    // render pass per trace entry — one draw's own declaration, bound once —
+    // and it would have to read the list's head to fill that shape, which is
+    // exactly the silent draw loss the arm's contract forbids. Core admission
+    // already refuses the arm for a snapshot that does not declare it
+    // (`render_multi_draw_unsupported`, and this snapshot's capability frame
+    // never declares it); this is the rail's own restatement for a
+    // directly-constructed plan, stated before the early return below so a
+    // list-bearing trace cannot walk out of here as "nothing to plan".
+    if let Some(list) = trace.render_draw_lists().next() {
+        return Err(capability_refusal("render_multi_draw_unsupported")
+            .with_field(
+                "draws",
+                FieldValue::Unsigned(u64::try_from(list.draw_count()).unwrap_or(u64::MAX)),
+            )
+            .with_field("pipeline", FieldValue::Unsigned(list.head.pipeline.get()))
+            .with_detail(
+                "a render pass that carries more than one draw is executed by the rails that \
+                 declare `supports_render_multi_draw`; this rail has no multi-draw channel, so \
+                 the pass is refused by name instead of being executed as its first draw",
             ));
     }
     if !trace.has_render_passes() {
@@ -11068,6 +11102,11 @@ mod tests {
             supports_indirect_command_buffers: false,
             max_indirect_commands: 0,
             supported_indirect_commands: Vec::new(),
+            // The native rail has no multi-draw channel: the arm is refused by
+            // name, and these two readings are the declaration that says so
+            // (`research/docs/23` §3.3, G3-B/B-2).
+            supports_render_multi_draw: false,
+            max_draws_per_pass: 0,
         }
     }
 
@@ -11493,6 +11532,10 @@ mod tests {
                     }
                 }
                 TracePass::Landing(_) => {}
+                // The fixture is a single-draw trace: a draw list has no
+                // vertex streams of its own to lease here
+                // (`research/docs/23` §3.3, G3-B/B-2).
+                TracePass::RenderDraws(_) => {}
                 TracePass::Render(pass) => {
                     for view in &mut pass.vertex_buffers {
                         if view.view_id == QUAD_VERTEX_VIEW {
@@ -12613,6 +12656,35 @@ mod tests {
         assert_eq!(refused.slug, "render_depth_resolve_filter_unsupported");
     }
 
+    /// A render pass that carries an ordered list of draws has no channel on
+    /// this rail, and the refusal is by name
+    /// (`research/docs/23` §3.3, G3-B/B-2): the plan walks read one draw per
+    /// entry, so a list that reached them would be planned as its head.
+    #[test]
+    fn plan_trace_refuses_a_draw_list_by_name() {
+        let mut trace = depth_store_trace(Some(DepthStoreOp::Store));
+        let index = trace
+            .passes
+            .iter()
+            .position(|pass| matches!(pass, TracePass::Render(_)))
+            .expect("the depth trace carries one render pass");
+        let head = match trace.passes.remove(index) {
+            TracePass::Render(head) => head,
+            other => panic!("the walk above found a render pass, not {other:?}"),
+        };
+        trace.passes.insert(
+            index,
+            TracePass::RenderDraws(metal_api_core::provider::RenderDrawsDescriptor {
+                head,
+                tail: Vec::new(),
+            }),
+        );
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let refused = plan_trace(&trace, &pool, &contracts, 0, 0).unwrap_err();
+        assert_eq!(refused.slug, "render_multi_draw_unsupported");
+    }
+
     /// The two shapes that state no store keep the surface rail-owned: no
     /// landing is resolved, and a readback that carries no depth texels adds no
     /// second writeback — the pre-v43 byte shape exactly
@@ -12631,8 +12703,7 @@ mod tests {
             .iter_mut()
             .find_map(|pass| match pass {
                 TracePass::Render(pass) => Some(pass),
-                TracePass::Compute(_) => None,
-                TracePass::Landing(_) => None,
+                TracePass::Compute(_) | TracePass::RenderDraws(_) | TracePass::Landing(_) => None,
             })
             .expect("the fixture carries a render pass");
         pass.color_attachments[0].store = StoreOp::DontCare;
@@ -14311,6 +14382,10 @@ mod tests {
         for pass in &mut trace.passes {
             match pass {
                 TracePass::Landing(_) => {}
+                // The fixture states single-draw passes: a draw list carries no
+                // vertex stream at this level to re-source
+                // (`research/docs/23` §3.3, G3-B/B-2).
+                TracePass::RenderDraws(_) => {}
                 TracePass::Compute(pass) => {
                     for view in &mut pass.buffers {
                         if view.view_id == QUAD_VERTEX_VIEW {

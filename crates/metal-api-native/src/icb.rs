@@ -416,6 +416,11 @@ mod tests {
             // defaults the reviewed render rail keeps (2026-09-19, census
             // v43's `texture_state` axis among them).
             supports_render_pixel_coordinate_sampler: false,
+            // The native rail has no multi-draw channel either: the arm is
+            // refused by name, and these two readings are the declaration that
+            // says so (`research/docs/23` §3.3, G3-B/B-2).
+            supports_render_multi_draw: false,
+            max_draws_per_pass: 0,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,

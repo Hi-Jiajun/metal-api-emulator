@@ -80,6 +80,47 @@ impl WrittenRect {
     }
 }
 
+/// The smallest rectangle covering both of two written rectangles
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// A render pass that carries an ordered list of draws writes the union of its
+/// draws' rectangles, and the trimmed readback stages one rectangle per
+/// attachment. A *superset* of that union is safe where the union itself is not
+/// always a rectangle: every texel the box covers and no draw wrote holds the
+/// load op's own bytes, which is exactly the seed the frame rebuilds those
+/// texels from, so a box carries the same bytes a whole-extent readback would
+/// have carried. The alternative — falling back to the whole extent whenever a
+/// pass carries more than one draw — is what this replaces, and it would throw
+/// the trimming arm away for exactly the passes the list arm exists for.
+///
+/// An empty rectangle draws nothing, so it is the cover's identity: a draw
+/// whose viewport and scissor do not intersect adds no texel to the region its
+/// pass can have written.
+pub(crate) fn covering_rect(first: WrittenRect, second: WrittenRect) -> WrittenRect {
+    if first.is_empty() {
+        return second;
+    }
+    if second.is_empty() {
+        return first;
+    }
+    let left = first.x.min(second.x);
+    let top = first.y.min(second.y);
+    let right = first
+        .x
+        .saturating_add(first.width)
+        .max(second.x.saturating_add(second.width));
+    let bottom = first
+        .y
+        .saturating_add(first.height)
+        .max(second.y.saturating_add(second.height));
+    WrittenRect {
+        x: left,
+        y: top,
+        width: right.saturating_sub(left),
+        height: bottom.saturating_sub(top),
+    }
+}
+
 /// Why one attachment's readback cannot be narrowed to its written rectangle.
 ///
 /// Each arm is a fact about the pass, not a severity: the answer to every one of

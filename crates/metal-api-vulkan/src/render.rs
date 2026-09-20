@@ -8778,35 +8778,50 @@ impl RenderInputRetains {
         leases: Option<&RenderLeaseContext<'_>>,
         request: &OffscreenRenderRequest<'_>,
     ) -> Result<Option<Self>, ProviderError> {
+        Self::retain_all(leases, std::slice::from_ref(request))
+    }
+
+    /// [`Self::retain`] for a pass that carries several draws
+    /// (`research/docs/23` §3.3, G3-B/B-2): every draw's no-copy inputs are
+    /// held for the **one** submission the whole pass makes, so the holds are
+    /// collected across the draws and retired together by the pass's own fence.
+    fn retain_all(
+        leases: Option<&RenderLeaseContext<'_>>,
+        requests: &[OffscreenRenderRequest<'_>],
+    ) -> Result<Option<Self>, ProviderError> {
         let mut lease_ids = Vec::new();
-        for stream in &request.vertex_streams {
-            lease_ids.extend(stream.source.borrowed_leases());
-        }
-        if let Some(index) = &request.index_stream {
-            lease_ids.extend(index.source.borrowed_leases());
-        }
-        // A loading attachment whose previous contents come from an owner's
-        // mapping is the third input of the same shape (`research/docs/23`
-        // §74, R5b): the imported transfer source reads the owner's pages, so
-        // the hold covers it exactly like a stream's.
-        for attachment in &request.attachments {
-            if let Some(source) = &attachment.previous {
-                lease_ids.extend(source.borrowed_leases());
+        for request in requests {
+            for stream in &request.vertex_streams {
+                lease_ids.extend(stream.source.borrowed_leases());
             }
-        }
-        // A sampled texture whose bytes come from an owner's mapping is the
-        // fourth (`research/docs/23` §75, R5c), one hold per window: the
-        // imported transfer source reads those pages until the pass's fence
-        // signals, so a pass that binds several textures retains each lease
-        // once per window it appears in.
-        for texture in &request.textures {
-            lease_ids.extend(texture.source.borrowed_leases());
-        }
-        // A stage buffer whose bytes come from an owner's mapping is the
-        // fifth (`research/docs/23` §3.3, v83): it resolves through the same
-        // channel, so its imported window is held exactly like a stream's.
-        for stage in &request.stage_buffers {
-            lease_ids.extend(stage.source.borrowed_leases());
+            if let Some(index) = &request.index_stream {
+                lease_ids.extend(index.source.borrowed_leases());
+            }
+            // A loading attachment whose previous contents come from an owner's
+            // mapping is the third input of the same shape (`research/docs/23`
+            // §74, R5b): the imported transfer source reads the owner's pages, so
+            // the hold covers it exactly like a stream's. Every draw of one list
+            // states the same attachments, so the pass states this input once
+            // per draw and the registry de-duplicates the repeated holds.
+            for attachment in &request.attachments {
+                if let Some(source) = &attachment.previous {
+                    lease_ids.extend(source.borrowed_leases());
+                }
+            }
+            // A sampled texture whose bytes come from an owner's mapping is the
+            // fourth (`research/docs/23` §75, R5c), one hold per window: the
+            // imported transfer source reads those pages until the pass's fence
+            // signals, so a pass that binds several textures retains each lease
+            // once per window it appears in.
+            for texture in &request.textures {
+                lease_ids.extend(texture.source.borrowed_leases());
+            }
+            // A stage buffer whose bytes come from an owner's mapping is the
+            // fifth (`research/docs/23` §3.3, v83): it resolves through the same
+            // channel, so its imported window is held exactly like a stream's.
+            for stage in &request.stage_buffers {
+                lease_ids.extend(stage.source.borrowed_leases());
+            }
         }
         if lease_ids.is_empty() {
             return Ok(None);
@@ -9047,6 +9062,12 @@ type ReadbackDecisions = Vec<Option<ReadbackDecision>>;
 fn plan_readback_decisions<'a>(
     context: &VulkanContext,
     request: &'a OffscreenRenderRequest<'a>,
+    // The draws that follow this pass's own declaration
+    // (`research/docs/23` §3.3, G3-B/B-2): empty for a single-draw pass, and
+    // each entry's own viewport and scissor widen the region the pass can have
+    // written. A pass that read only its head's rectangle would stage a frame
+    // the later draws' texels never reach.
+    extra_draws: &[OffscreenRenderRequest<'a>],
 ) -> Result<ReadbackDecisions, ProviderError> {
     // The control arm: `METAL_API_VULKAN_FULL_READBACK` asks for the
     // pre-increment path for this whole process, which is what lets one round
@@ -9084,20 +9105,40 @@ fn plan_readback_decisions<'a>(
             }
             LoadOp::Resident | LoadOp::DontCare => ReadbackBaseArm::None,
         };
+        let previous_is_exact = attachment
+            .previous
+            .as_ref()
+            .is_some_and(|source| source.len() as u64 == extent_bytes);
         let decision = if forced {
             Err(RectRefusal::Multisample)
         } else {
-            written_rect(
-                request.extent,
-                request.viewport,
-                request.scissor,
-                multisampled,
-                attachment.load,
-                attachment
-                    .previous
-                    .as_ref()
-                    .is_some_and(|source| source.len() as u64 == extent_bytes),
-            )
+            // Every draw of the pass writes inside its own viewport∩scissor, so
+            // the region the pass can have written is the **cover** of those
+            // rectangles: the head's own first, then one per draw that follows
+            // it. A single-draw pass — every pass written before the list arm —
+            // walks the same expression with nothing to add, which is what
+            // keeps its rectangle exactly what it always was
+            // (`docs/WRITTEN-RECT-READBACK.md`; G3-B/B-2).
+            (|| -> Result<WrittenRect, RectRefusal> {
+                let mut cover: Option<WrittenRect> = None;
+                for (viewport, scissor) in std::iter::once((request.viewport, request.scissor))
+                    .chain(extra_draws.iter().map(|draw| (draw.viewport, draw.scissor)))
+                {
+                    let rect = written_rect(
+                        request.extent,
+                        viewport,
+                        scissor,
+                        multisampled,
+                        attachment.load,
+                        previous_is_exact,
+                    )?;
+                    cover = Some(match cover {
+                        Some(cover) => crate::readback_rect::covering_rect(cover, rect),
+                        None => rect,
+                    });
+                }
+                Ok(cover.expect("a render pass carries at least one draw"))
+            })()
         };
         let rect = match decision {
             Ok(rect) if !rect.is_whole(request.extent) && base != ReadbackBaseArm::None => {
@@ -9338,6 +9379,13 @@ struct PreparedOffscreenPass<'a, 'ctx> {
     /// the attachment list are read from after the fence.
     request: &'a OffscreenRenderRequest<'a>,
     objects: Option<OffscreenObjects<'ctx>>,
+    /// The per-draw device objects of the draws that follow this pass's own
+    /// declaration (`research/docs/23` §3.3, G3-B/B-2). Empty for a
+    /// single-draw pass. They are held here rather than in a local because
+    /// their pipelines, descriptor sets and uploaded streams are read by the
+    /// command buffer until the pass's fence has signalled; each entry's own
+    /// `Drop` tears them down with the pass's objects.
+    extra_draws: Vec<OffscreenObjects<'ctx>>,
     /// The readback decision of every stored attachment, in location order.
     /// Owned rather than borrowed, which is what lets a batch hold one per
     /// member across its fence.
@@ -9375,62 +9423,22 @@ impl<'a, 'ctx> PreparedOffscreenPass<'a, 'ctx> {
     }
 }
 
-fn prepare_offscreen_render_pass<'a, 'ctx>(
-    context: &'ctx VulkanContext,
+/// The fragment module a draw's pipeline is built from, and its entry point
+/// (`research/docs/23` §3.3, v100).
+///
+/// The reviewed registrations derive the module from the contract's colour
+/// format list; a translated registration hands over the module its own
+/// reflection came from, and the gathered-fetch sibling is the one shape whose
+/// module is neither. The decision is **per draw**, because the module a
+/// pipeline is built from is a function of the draw's own fragment stage — and
+/// with it the reviewed pair's texture-binding agreement, which is why that
+/// check travels here: a draw that binds a texture its stage does not read (or
+/// a stage that reads one the draw does not bind) is refused by name for the
+/// draw that states it.
+fn resolve_render_fragment_stage<'a>(
     request: &'a OffscreenRenderRequest<'a>,
-    retains: Option<RenderInputRetains>,
-    queue_index: usize,
-    layouts: Option<PassLayouts<'a>>,
-    inherits_resident: bool,
-) -> Result<PreparedOffscreenPass<'a, 'ctx>, ProviderError> {
-    // The render half's own split (`crate::phase_profile`), disjoint region by
-    // disjoint region: everything before the recording is setup, the recording
-    // and the submission/wait are charged where they happen, and the mapped
-    // copies come last. All `None` — one relaxed load each, no clock read —
-    // when `METAL_API_VULKAN_PHASE_PROFILE` is off, which is the default.
-    let _render_setup = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderSetup);
-    // The setup bar's own split (`crate::phase_profile`): the regions below are
-    // disjoint and enclose nothing but themselves, so their sum is bounded by
-    // `render_setup_us` and the difference is the seam between them.
-    let setup_admits = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupAdmits);
-    // The attachment count is the rail's own gate, re-run on the request so a
-    // hand-built request cannot skip `prepare_render_request`'s admission.
-    if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
-        return Err(mrt_attachment_count_refusal(request.attachments.len()));
-    }
-    // `docs/23` §3.6, v19: core admission refuses an all-discarded pass as
-    // `AllRenderAttachmentsDiscarded`, and the rail re-asserts the same
-    // at-least-one-store rule for a directly-constructed request. Discarding
-    // every attachment would turn "nothing landed" into a blank proof of
-    // "landed correctly" — but the depth attachment is a landing too from v43
-    // on, so the depth-only shape (every colour attachment discards, the pass
-    // keeps its depth surface) is the one exception (`docs/23` §3.3, v45).
-    let stored_depth = request
-        .depth
-        .as_ref()
-        .is_some_and(OffscreenDepthAttachment::storing);
-    if !stored_depth
-        && request
-            .attachments
-            .iter()
-            .all(|attachment| attachment.store == StoreOp::DontCare)
-    {
-        return Err(render_all_attachments_discarded_refusal());
-    }
-    let formats = request
-        .attachments
-        .iter()
-        .map(|attachment| attachment.format)
-        .collect::<Vec<_>>();
-    // A translated registration's fragment stage is the module the translation
-    // produced, so the pipeline binds exactly the module the reflection gate
-    // checked (`request.translated_fragment`). A reviewed registration names no
-    // fragment module: the format list does, and the refusal covers the
-    // dual-combination and count shapes before any device call. The instanced
-    // and depth fixtures own reviewed module pairs of their own
-    // (`research/docs/23` §3.3, v31/v36): their vertex stages select the
-    // fragment module that stores the varying they forward, and every other
-    // vertex stage keeps the format list's solid module.
+    formats: &[AttachmentFormat],
+) -> Result<(&'a [u8], &'a str), ProviderError> {
     let (fragment_spirv, fragment_entry_name) = match &request.translated_fragment {
         Some(fragment) => {
             // A translated fragment stage's image bindings are part of the
@@ -9482,7 +9490,7 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
             {
                 (GATHERED_FETCH_FRAG_SPV, SOLID_FRAGMENT_ENTRY)
             } else {
-                reviewed_fragment_stage(&request.vertex.entry, request.vertex.spirv, &formats)?
+                reviewed_fragment_stage(&request.vertex.entry, request.vertex.spirv, formats)?
             }
         }
     };
@@ -9516,6 +9524,73 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
             );
         }
     }
+    Ok((fragment_spirv, fragment_entry_name))
+}
+
+fn prepare_offscreen_render_pass<'a, 'ctx>(
+    context: &'ctx VulkanContext,
+    request: &'a OffscreenRenderRequest<'a>,
+    retains: Option<RenderInputRetains>,
+    queue_index: usize,
+    layouts: Option<PassLayouts<'a>>,
+    inherits_resident: bool,
+    // The draws that follow this pass's own declaration inside the same render
+    // pass instance (`research/docs/23` §3.3, G3-B/B-2): empty for every
+    // single-draw pass, which is every pass written before the list arm. Each
+    // entry is a fully resolved draw request — one materialized draw of the
+    // list — and this function builds that draw's own device objects against
+    // the render pass the head created.
+    extra_draws: &[OffscreenRenderRequest<'_>],
+) -> Result<PreparedOffscreenPass<'a, 'ctx>, ProviderError> {
+    // The render half's own split (`crate::phase_profile`), disjoint region by
+    // disjoint region: everything before the recording is setup, the recording
+    // and the submission/wait are charged where they happen, and the mapped
+    // copies come last. All `None` — one relaxed load each, no clock read —
+    // when `METAL_API_VULKAN_PHASE_PROFILE` is off, which is the default.
+    let _render_setup = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderSetup);
+    // The setup bar's own split (`crate::phase_profile`): the regions below are
+    // disjoint and enclose nothing but themselves, so their sum is bounded by
+    // `render_setup_us` and the difference is the seam between them.
+    let setup_admits = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupAdmits);
+    // The attachment count is the rail's own gate, re-run on the request so a
+    // hand-built request cannot skip `prepare_render_request`'s admission.
+    if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
+        return Err(mrt_attachment_count_refusal(request.attachments.len()));
+    }
+    // `docs/23` §3.6, v19: core admission refuses an all-discarded pass as
+    // `AllRenderAttachmentsDiscarded`, and the rail re-asserts the same
+    // at-least-one-store rule for a directly-constructed request. Discarding
+    // every attachment would turn "nothing landed" into a blank proof of
+    // "landed correctly" — but the depth attachment is a landing too from v43
+    // on, so the depth-only shape (every colour attachment discards, the pass
+    // keeps its depth surface) is the one exception (`docs/23` §3.3, v45).
+    let stored_depth = request
+        .depth
+        .as_ref()
+        .is_some_and(OffscreenDepthAttachment::storing);
+    if !stored_depth
+        && request
+            .attachments
+            .iter()
+            .all(|attachment| attachment.store == StoreOp::DontCare)
+    {
+        return Err(render_all_attachments_discarded_refusal());
+    }
+    let formats = request
+        .attachments
+        .iter()
+        .map(|attachment| attachment.format)
+        .collect::<Vec<_>>();
+    // A translated registration's fragment stage is the module the translation
+    // produced, so the pipeline binds exactly the module the reflection gate
+    // checked (`request.translated_fragment`). A reviewed registration names no
+    // fragment module: the format list does, and the refusal covers the
+    // dual-combination and count shapes before any device call. The instanced
+    // and depth fixtures own reviewed module pairs of their own
+    // (`research/docs/23` §3.3, v31/v36): their vertex stages select the
+    // fragment module that stores the varying they forward, and every other
+    // vertex stage keeps the format list's solid module.
+    let (fragment_spirv, fragment_entry_name) = resolve_render_fragment_stage(request, &formats)?;
     // The stage buffers and the pass's bindings are one decision
     // (`research/docs/23` §3.3, v83/v84); the present rail asks the same
     // question before it opens its target (R9i), so the judgement lives in one
@@ -10188,7 +10263,7 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
     let decisions = {
         let _readback_shape =
             crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackShape);
-        plan_readback_decisions(context, request)?
+        plan_readback_decisions(context, request, extra_draws)?
     };
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
     for (attachment, decision) in request.attachments.iter().zip(&decisions) {
@@ -10247,6 +10322,16 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupCommandPool);
     objects.create_command_pool(queue_index)?;
     drop(setup_command_pool);
+    // The draws that follow the pass's own declaration build their own device
+    // objects here — after the render pass and the framebuffer exist, because a
+    // graphics pipeline is created *against* the render pass it will be
+    // recorded into, and before the recording below, because every draw of the
+    // list is issued inside the one render pass instance that recording opens
+    // (`research/docs/23` §3.3, G3-B/B-2).
+    let mut extra_objects = Vec::with_capacity(extra_draws.len());
+    for extra in extra_draws {
+        extra_objects.push(build_draw_objects(context, &objects, extra, &formats)?);
+    }
     drop(_render_setup);
     let _render_record =
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRecord);
@@ -10272,6 +10357,9 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
         request.viewport,
         width,
         height,
+        // The draws that follow this pass's own declaration, empty for every
+        // pass that carries one draw (`research/docs/23` §3.3, G3-B/B-2).
+        &extra_objects,
     )?;
     drop(_render_record);
     // Hand the recorded state back: the pass is not submitted yet, so the
@@ -10281,6 +10369,10 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
     Ok(PreparedOffscreenPass {
         request,
         objects: Some(objects),
+        // The list arm's own draws hold device objects of their own until the
+        // pass's fence has signalled: the prepared pass owns them for exactly
+        // the lifetime it owns its own objects.
+        extra_draws: extra_objects,
         decisions,
         readback_mappings,
         depth_byte_length,
@@ -10288,6 +10380,212 @@ fn prepare_offscreen_render_pass<'a, 'ctx>(
         retains,
         layouts: resident_layouts,
     })
+}
+
+/// Build one extra draw's own device objects against the render pass the
+/// pass's head created (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// The steps are the head's own per-draw steps in the head's own order:
+/// sampled textures first (their descriptor set layout is what the pipeline is
+/// built with), then the stage buffers, then the pipeline, then the vertex
+/// streams and the index window, and finally the dynamic state this draw
+/// states. The pass-level objects — attachments, the render pass, the
+/// framebuffer, the readback destinations and the command buffer — are *not*
+/// built here: they belong to the pass and the head built them once.
+///
+/// The returned value owns everything it created and destroys it on drop, so
+/// the pass can hold the list's draws beside its own objects and tear both down
+/// after its fence has signalled.
+fn build_draw_objects<'ctx>(
+    context: &'ctx VulkanContext,
+    pass: &OffscreenObjects<'ctx>,
+    request: &OffscreenRenderRequest<'_>,
+    formats: &[AttachmentFormat],
+) -> Result<OffscreenObjects<'ctx>, ProviderError> {
+    let mut objects = OffscreenObjects::new(context);
+    // The render pass a graphics pipeline is created against is the one it will
+    // be recorded into, and every draw of one list shares the head's.
+    objects.render_pass = pass.render_pass;
+    objects.extent = pass.extent;
+    // The colour blend state a pipeline is built with is indexed by colour
+    // location, and `create_pipeline` reads the *count* of that list from this
+    // object's own attachments. A draw of a list shares the pass's attachments
+    // — it binds and writes the very images the head created — so it carries
+    // one borrowed placeholder per location, the same shape a present pass
+    // pushes for the provider's own target: the handles are null and both
+    // ownership flags are false, so the draw's `Drop` destroys nothing of the
+    // pass's. Without the placeholders a draw whose pipeline states blending
+    // would be built with an empty blend-attachment list, which is a pipeline
+    // that blends nothing.
+    for attachment in &pass.attachments {
+        objects.attachments.push(AttachmentObjects {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            samples: attachment.samples,
+            resolve: None,
+            load_op: attachment.load_op,
+            store_op: attachment.store_op,
+            initial_layout: attachment.initial_layout,
+            seed: None,
+            owns_image: false,
+            owns_resolve: false,
+            publishes: false,
+            previous: RenderUploadBuffer::null(),
+        });
+    }
+    objects.create_render_textures(&request.textures)?;
+    objects.create_stage_buffers(&request.stage_buffers)?;
+    let (fragment_spirv, fragment_entry_name) = resolve_render_fragment_stage(request, formats)?;
+    let vertex_words = spirv_words(request.vertex.spirv)
+        .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
+    let fragment_words = spirv_words(fragment_spirv)
+        .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
+    let vertex_entry = stage_entry_cstring("vertex", &request.vertex.entry)?;
+    let fragment_entry = stage_entry_cstring("fragment", fragment_entry_name)?;
+    objects.create_pipeline(
+        &vertex_words,
+        &fragment_words,
+        &vertex_entry,
+        &fragment_entry,
+        &request.vertex_streams,
+        request.depth.as_ref(),
+        request.stencil.as_ref(),
+        request.cull,
+        request.blend.as_ref(),
+    )?;
+    // The render pass this draw is recorded into is the pass's own object, and
+    // this draw only *reads* it — a pipeline is created against the render pass
+    // it will be used with. The handle is cleared here so the draw's own `Drop`
+    // cannot destroy it: the pass owns that one, and a second
+    // `vkDestroyRenderPass` on the same handle is a use-after-free
+    // (`research/docs/23` §3.3, G3-B/B-2). Nothing else in the draw's lifetime
+    // reads it — recording binds the pipeline, not the render pass.
+    objects.render_pass = vk::RenderPass::null();
+    objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
+    objects.draw = request.draw;
+    objects.instance_count = request.instance_count;
+    objects.base_vertex = request.base_vertex;
+    objects.viewport = request.viewport;
+    objects.scissor = request.scissor;
+    Ok(objects)
+}
+
+/// Execute one render pass that carries an ordered list of draws: one render
+/// pass instance, one command buffer, one submission and one fence
+/// (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// Every entry of `draws` is one materialized draw of the list — the same
+/// `OffscreenRenderRequest` a single-draw pass would have been given — and the
+/// rail takes the **pass state** from the first entry: the contract states
+/// attachments, load/store, clear, render area, multisample raster, depth and
+/// stencil surfaces and the present action once per pass, so every draw of one
+/// list states the same values and the rail re-states that agreement here
+/// before it builds anything.
+///
+/// The draws after the first are built into objects of their own
+/// ([`build_draw_objects`]) and recorded in declaration order inside the render
+/// pass the head opens, which is the whole point of the arm: the pass's fixed
+/// cost — the render pass instance, the framebuffer, the attachments, the
+/// readbacks and the command buffer — is paid once for N draws instead of once
+/// per draw.
+pub(crate) fn execute_offscreen_render_draws<'a>(
+    context: &VulkanContext,
+    draws: &[OffscreenBatchInputs<'a>],
+    leases: Option<&RenderLeaseContext<'_>>,
+    depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
+    policy: SpirvFeaturePolicy,
+    produced: Option<&'a ProducedTraceViews<'a>>,
+) -> Result<OffscreenReadback, ProviderError> {
+    if draws.is_empty() {
+        return Err(contract_refusal(
+            "a multi-draw render pass carries at least one draw",
+        ));
+    }
+    let mut requests: Vec<OffscreenRenderRequest<'a>> = Vec::with_capacity(draws.len());
+    for input in draws {
+        let _prepare = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPrepare);
+        refuse_attachment_extent(context, input.pass)?;
+        requests.push(prepare_render_request_with_resident(
+            input.stages,
+            input.pass,
+            input.previous,
+            input.landings,
+            input.resident,
+            leases,
+            produced,
+            depth_resolve_modes,
+            stencil_resolve_modes,
+            policy,
+        )?);
+    }
+    // The pass state is stated once and shared: a list whose entries disagree
+    // about the attachments, the raster, the depth or stencil surface or the
+    // present action is refused by name rather than executed with the first
+    // draw's state standing in for the rest. The contract makes the agreement
+    // structural (`RenderDrawsDescriptor` carries one pass state), and this walk
+    // is the rail's own defence for a hand-built request.
+    for (index, request) in requests.iter().enumerate().skip(1) {
+        let head = &requests[0];
+        let agrees = request.attachments.len() == head.attachments.len()
+            && request.extent == head.extent
+            && request.multisample == head.multisample
+            && request.depth.is_some() == head.depth.is_some()
+            && request.stencil.is_some() == head.stencil.is_some()
+            && request.depth_resolve == head.depth_resolve
+            && request.stencil_resolve == head.stencil_resolve
+            && request
+                .attachments
+                .iter()
+                .zip(&head.attachments)
+                .all(|(draw, first)| {
+                    draw.format == first.format
+                        && draw.load == first.load
+                        && draw.store == first.store
+                        && draw.seed == first.seed
+                        && draw.resident.is_some() == first.resident.is_some()
+                        && draw.landing.is_some() == first.landing.is_some()
+                });
+        if !agrees {
+            return Err(capability_refusal("render_multi_draw_pass_state_mismatch")
+                .with_field("draw", FieldValue::Unsigned(index as u64))
+                .with_detail(
+                    "every draw of one render pass shares the pass state (attachments, load/store \
+                     and clear decisions, render area, multisample raster, depth and stencil \
+                     surfaces); a draw whose request states another pass state is refused rather \
+                     than executed against the first draw's",
+                ));
+        }
+    }
+    // One settlement for the whole work — the queue, the fence and one wait —
+    // exactly as the single-pass path states it, with the pass state taken from
+    // the head's request.
+    let queue_index = select_graphics_queue(context)?;
+    let retains = RenderInputRetains::retain_all(leases, &requests)?;
+    let borrowed: Vec<&OffscreenRenderRequest<'a>> = requests.iter().collect();
+    let mut layouts = BatchResidentLayouts::acquire(&borrowed[..1]);
+    let declared = layouts.declared_for(&requests[0]);
+    let mut prepared = vec![prepare_offscreen_render_pass(
+        context,
+        &requests[0],
+        retains,
+        queue_index,
+        Some(PassLayouts::Batched(declared)),
+        false,
+        &requests[1..],
+    )?];
+    if let Err(error) = submit_prepared_offscreen_passes(context, queue_index, &mut prepared) {
+        let reached_queue = prepared.iter().any(|pass| {
+            pass.objects
+                .as_ref()
+                .is_some_and(|objects| objects.submitted)
+        });
+        layouts.publish(!reached_queue);
+        return Err(fail_prepared_offscreen_passes(&mut prepared, error));
+    }
+    layouts.publish(true);
+    finish_prepared_offscreen_pass(context, &mut prepared[0])
 }
 
 /// Execute one offscreen render pass: record it, submit it alone and wait for
@@ -10310,6 +10608,7 @@ fn execute_offscreen_render_with_retains(
         queue_index,
         None,
         false,
+        &[],
     )?];
     if let Err(error) = submit_prepared_offscreen_passes(context, queue_index, &mut prepared) {
         return Err(fail_prepared_offscreen_passes(&mut prepared, error));
@@ -10508,7 +10807,13 @@ fn finish_prepared_offscreen_pass<'a, 'ctx>(
     // in the same order it had: after the fence, after the readback, and after
     // the input retains retired.
     let _teardown = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTeardown);
+    // The draws that followed the head own device objects of their own — their
+    // pipelines, descriptor sets, uploaded streams and sampled textures — and
+    // they retire with the same fence, inside the same named region
+    // (`research/docs/23` §3.3, G3-B/B-2).
+    let extra_draws = std::mem::take(&mut pass.extra_draws);
     drop(objects);
+    drop(extra_draws);
     drop(_teardown);
     readback
 }
@@ -10646,6 +10951,9 @@ pub(crate) fn execute_offscreen_render_batch<'a>(
             // pass states the memory dependency that makes them visible
             // (`OffscreenObjects::batch_inherits_resident`).
             index > 0,
+            // A batch member is one draw: the list arm is its own submission
+            // scope (`execute_offscreen_render_draws`).
+            &[],
         )?;
         layouts.advance(request);
         prepared.push(pass);
@@ -11342,6 +11650,9 @@ pub(crate) fn execute_present_render<'a>(
         request.viewport,
         width,
         height,
+        // The present rail executes exactly one draw: a present action beside a
+        // draw list is refused before this point (`research/docs/24` §3.5).
+        &[],
     )?;
     match objects.submit_and_wait(queue_index) {
         Ok(()) => {
@@ -11579,6 +11890,15 @@ struct OffscreenObjects<'a> {
     /// How the draw issues: the milestone triangle, a vertex-buffer draw or an
     /// indexed one. An indirect replay replaces it.
     draw: DrawShape,
+    /// The viewport this pass's own draw rasterizes through
+    /// (`research/docs/23` §3.3, v100). The single-draw arm states it in its
+    /// request and passes it to `record`; a pass that carries a draw list
+    /// stores each of its draws' own rect here, so the loop that records the
+    /// list reads one shape from every member (`G3-B/B-2`).
+    viewport: [u32; 4],
+    /// The scissor this pass's own draw is clipped to, or `None` for the whole
+    /// render area. Per draw for the same reason the viewport is.
+    scissor: Option<[u32; 4]>,
     /// Instances a direct draw runs (`research/docs/23` §3.3, v31); `1` for
     /// every pre-v31 pass.
     instance_count: u32,
@@ -12292,6 +12612,8 @@ impl<'a> OffscreenObjects<'a> {
             reusable: None,
             input_index: RenderUploadBuffer::null(),
             draw: DrawShape::Milestone,
+            viewport: [0, 0, 0, 0],
+            scissor: None,
             instance_count: 1,
             base_vertex: 0,
             input_index_type: vk::IndexType::UINT16,
@@ -16571,6 +16893,38 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// The binding **this** pass's own draw states, with the viewport and
+    /// scissor it rasterizes through (`research/docs/23` §3.3, G3-B/B-2).
+    ///
+    /// A single-draw pass hands its request's rects in; a draw of a list hands
+    /// its own. Both then go through one `record_draw_binding`, so a list's draw
+    /// and a lone pass's draw are recorded by the same code.
+    fn draw_binding(
+        &self,
+        viewport: [u32; 4],
+        scissor: Option<[u32; 4]>,
+        width: u32,
+        height: u32,
+    ) -> DrawBinding<'_> {
+        DrawBinding {
+            pipeline: self.pipeline,
+            pipeline_layout: self.pipeline_layout,
+            descriptor_set: self.descriptor_set,
+            stage_buffer_sets: &self.stage_buffer_sets,
+            vertex_inputs: &self.vertex_inputs,
+            index: &self.index,
+            indirect: &self.indirect,
+            input_index: &self.input_index,
+            input_index_type: self.input_index_type,
+            draw: self.draw,
+            instance_count: self.instance_count,
+            base_vertex: self.base_vertex,
+            viewport,
+            scissor,
+            extent: [width, height],
+        }
+    }
+
     /// Record clear → draw → copy-out on the one command buffer, once per
     /// attachment.
     ///
@@ -16595,6 +16949,11 @@ impl<'a> OffscreenObjects<'a> {
         viewport: [u32; 4],
         width: u32,
         height: u32,
+        // The draws that follow this pass's own declaration inside the same
+        // render pass instance (`research/docs/23` §3.3, G3-B/B-2). Empty for
+        // every single-draw pass, which is every pass written before the list
+        // arm and every pass a trace states as its own entry.
+        extra_draws: &[OffscreenObjects<'_>],
     ) -> Result<(), ProviderError> {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -16740,38 +17099,6 @@ impl<'a> OffscreenObjects<'a> {
             .framebuffer(self.framebuffer)
             .render_area(render_area)
             .clear_values(&clear_values);
-        // The viewport is the pass's own rect (`research/docs/23` §3.3, v100):
-        // `vk::Viewport`'s x/y offset and width/height are the same four
-        // numbers the contract carries, and the covering default a pre-v100
-        // pass states is the rect this rail used to build from the extent
-        // alone. The offset is a `f32` in Vulkan, and every extent a snapshot
-        // admits is far below `2^24`, so the conversion is exact.
-        let [viewport_x, viewport_y, viewport_width, viewport_height] = viewport;
-        let viewport = vk::Viewport {
-            x: viewport_x as f32,
-            y: viewport_y as f32,
-            width: viewport_width as f32,
-            height: viewport_height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        // The scissor is dynamic pipeline state, so the pass's own rectangle (or
-        // the whole render area for a pass that declares none) is recorded here
-        // (`research/docs/23` §3.3, v29).
-        let [scissor_x, scissor_y, scissor_width, scissor_height] =
-            scissor.unwrap_or([0, 0, width, height]);
-        let scissor = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: i32::try_from(scissor_x)
-                    .map_err(|_| contract_refusal("render scissor origin reaches beyond i32"))?,
-                y: i32::try_from(scissor_y)
-                    .map_err(|_| contract_refusal("render scissor origin reaches beyond i32"))?,
-            },
-            extent: vk::Extent2D {
-                width: scissor_width,
-                height: scissor_height,
-            },
-        };
         // A loading attachment fills its image before the render pass opens:
         // the previous bytes travel through a host-visible staging buffer, land
         // in the image with `vkCmdCopyBufferToImage`, and the image is then
@@ -17129,185 +17456,37 @@ impl<'a> OffscreenObjects<'a> {
                 &pass_begin,
                 vk::SubpassContents::INLINE,
             );
-            self.context.device.cmd_bind_pipeline(
-                self.command,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
-            self.context
-                .device
-                .cmd_set_viewport(self.command, 0, std::slice::from_ref(&viewport));
-            self.context
-                .device
-                .cmd_set_scissor(self.command, 0, std::slice::from_ref(&scissor));
-            // The sampled textures are bound before the draw, in the one
-            // descriptor set the pipeline layout carries
-            // (`research/docs/23` §3.3, v70).
-            if self.descriptor_set != vk::DescriptorSet::null() {
-                self.context.device.cmd_bind_descriptor_sets(
+        }
+        // The pass's own declaration is its first draw (`research/docs/23`
+        // §3.3, G3-B/B-2): a single-draw pass — every pass written before the
+        // list arm — records exactly the one binding below, and a pass that
+        // carries a list records one binding per draw, in declaration order,
+        // inside this same render pass instance. The viewport and scissor are
+        // *dynamic* state, so each draw states its own before its own draw.
+        record_draw_binding(
+            self.context,
+            self.command,
+            &self.draw_binding(viewport, scissor, width, height),
+        )?;
+        if !extra_draws.is_empty() {
+            // The list arm's own nested bar (`crate::phase_profile`,
+            // fourth cut): the draws *after* the head, measured together. The
+            // bar is entered only when the pass really carries draws beyond its
+            // head, so a single-draw pass — every pass written before this
+            // increment — charges nothing here and its `render_record_us` is
+            // what it always was.
+            let _draws_loop =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderDrawsLoop);
+            for draw in extra_draws {
+                record_draw_binding(
+                    self.context,
                     self.command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    0,
-                    std::slice::from_ref(&self.descriptor_set),
-                    &[],
-                );
+                    &draw.draw_binding(draw.viewport, draw.scissor, draw.extent[0], draw.extent[1]),
+                )?;
             }
-            // The stage-buffer sets follow, each at its own set number, in the
-            // same order the pipeline layout declared them
-            // (`research/docs/23` §3.3, v83/v84): the reviewed pair's sets 1
-            // and 2, or the sets a translated module's reflection names. A
-            // pass that binds no stage buffer has none, exactly as it had
-            // before this increment.
-            for entry in &self.stage_buffer_sets {
-                self.context.device.cmd_bind_descriptor_sets(
-                    self.command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    entry.set,
-                    std::slice::from_ref(&entry.descriptor_set),
-                    &[],
-                );
-            }
-            // Caller-held streams first (`research/docs/23` §3.3): they are the
-            // shape this increment adds, and they cannot be combined with an
-            // indirect replay (the pass's own bindings are the direct draw's).
-            if !self.vertex_inputs.is_empty() {
-                let buffers = self
-                    .vertex_inputs
-                    .iter()
-                    .map(|input| input.buffer)
-                    .collect::<Vec<_>>();
-                // The pool upload puts each view's bytes at offset zero of its
-                // own buffer, so the bind offsets are zero by construction.
-                let offsets = vec![0_u64; buffers.len()];
-                self.context
-                    .device
-                    .cmd_bind_vertex_buffers(self.command, 0, &buffers, &offsets);
-                match self.draw {
-                    DrawShape::Indexed { index_count } => {
-                        self.context.device.cmd_bind_index_buffer(
-                            self.command,
-                            self.input_index.buffer,
-                            0,
-                            self.input_index_type,
-                        );
-                        self.context.device.cmd_draw_indexed(
-                            self.command,
-                            index_count,
-                            self.instance_count,
-                            0,
-                            i32::try_from(self.base_vertex).unwrap_or(i32::MAX),
-                            0,
-                        );
-                    }
-                    DrawShape::Vertices { vertex_count } => {
-                        self.context.device.cmd_draw(
-                            self.command,
-                            vertex_count,
-                            self.instance_count,
-                            0,
-                            0,
-                        );
-                    }
-                    // The milestone shape binds no stream, and an indirect
-                    // replay is a separate arm below.
-                    DrawShape::Milestone => {
-                        return Err(contract_refusal(
-                            "a vertex-buffer draw reached the rail without a draw shape",
-                        ));
-                    }
-                }
-            } else if !self.input_index.is_null() {
-                // An indexed draw whose vertex stage reads no `[[stage_in]]` at
-                // all (`research/docs/23` §92, R9k): the reviewed stage-buffer
-                // vertex stage takes its positions from a descriptor, so the
-                // draw binds no vertex stream and the index window is the only
-                // draw input. The arm used to be unreachable because only a
-                // vertex-stream draw could be indexed; the resolved-index
-                // increment is what makes the shape executable, and the bound
-                // the contract stated for it was read from this same window.
-                self.context.device.cmd_bind_index_buffer(
-                    self.command,
-                    self.input_index.buffer,
-                    0,
-                    self.input_index_type,
-                );
-                match self.draw {
-                    DrawShape::Indexed { index_count } => {
-                        self.context.device.cmd_draw_indexed(
-                            self.command,
-                            index_count,
-                            self.instance_count,
-                            0,
-                            i32::try_from(self.base_vertex).unwrap_or(i32::MAX),
-                            0,
-                        );
-                    }
-                    // A non-indexed draw binds no index window, so this arm is
-                    // the indexed one's alone; anything else here is a draw the
-                    // rail never prepared.
-                    DrawShape::Milestone | DrawShape::Vertices { .. } => {
-                        return Err(contract_refusal(
-                            "an index window reached the rail without an indexed draw",
-                        ));
-                    }
-                }
-            } else if !self.index.is_null() {
-                // An indexed indirect replay binds the rail's own `[0, 1, 2]`
-                // index buffer and reads its counts from the `INDIRECT_BUFFER`
-                // the CPU encoded above. `stride` is the struct size because
-                // the first increment writes exactly one command.
-                self.context.device.cmd_bind_index_buffer(
-                    self.command,
-                    self.index.buffer,
-                    0,
-                    vk::IndexType::UINT32,
-                );
-                self.context.device.cmd_draw_indexed_indirect(
-                    self.command,
-                    self.indirect.buffer,
-                    0,
-                    1,
-                    std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
-                );
-            } else if self.indirect.is_null() {
-                // The `vertex_id` shape instances the same way the
-                // vertex-buffer arms do (`research/docs/23` §3.3, v31): the
-                // reviewed triangle is replayed once per instance, so a pass
-                // that asks for more than one keeps its own count here too.
-                // The vertex count is the trace's own as well (2026-09-19,
-                // census v45's `vertex_span` bucket): `Milestone` states the
-                // three-vertex triangle, and a wider layout-free count arrives
-                // as `Vertices` with the number the trace named, which the
-                // module's `vertex_id` arithmetic resolves vertex by vertex.
-                let vertex_count = match self.draw {
-                    DrawShape::Milestone => FULL_SCREEN_TRIANGLE_VERTICES,
-                    DrawShape::Vertices { vertex_count } => vertex_count,
-                    // A layout-free draw reaches this arm with no index window
-                    // bound, so an indexed shape here is a record the rail
-                    // never prepared.
-                    DrawShape::Indexed { .. } => {
-                        return Err(contract_refusal(
-                            "an indexed draw reached the rail without an index window",
-                        ));
-                    }
-                };
-                self.context
-                    .device
-                    .cmd_draw(self.command, vertex_count, self.instance_count, 0, 0);
-            } else {
-                // The indirect replay reads its counts from the buffer the CPU
-                // encoded above; `stride` is the struct size because the first
-                // increment writes exactly one command.
-                self.context.device.cmd_draw_indirect(
-                    self.command,
-                    self.indirect.buffer,
-                    0,
-                    1,
-                    std::mem::size_of::<vk::DrawIndirectCommand>() as u32,
-                );
-            }
+            drop(_draws_loop);
+        }
+        unsafe {
             self.context.device.cmd_end_render_pass(self.command);
         }
 
@@ -17594,6 +17773,260 @@ impl<'a> OffscreenObjects<'a> {
         self.context.record_queue_retirement(queue_index);
         Ok(())
     }
+}
+
+/// The device objects and dynamic state **one draw** inside a render pass
+/// binds (`research/docs/23` §3.3, G3-B/B-2).
+///
+/// Every field is per draw, and both arms state the same list of them: a
+/// single-draw pass binds its own objects once, and a pass that carries a draw
+/// list binds one such set per draw — its pipeline, its descriptor sets, its
+/// vertex streams and its own viewport and scissor — before issuing that draw.
+/// That is what makes the list arm's draws independent of each other: nothing a
+/// previous draw bound survives into the next one except the pass state the
+/// contract keeps on the pass (attachments, load/store, clear, render area).
+struct DrawBinding<'a> {
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set: vk::DescriptorSet,
+    stage_buffer_sets: &'a [StageBufferDescriptorSet],
+    vertex_inputs: &'a [RenderUploadBuffer],
+    index: &'a RenderUploadBuffer,
+    indirect: &'a RenderUploadBuffer,
+    input_index: &'a RenderUploadBuffer,
+    input_index_type: vk::IndexType,
+    draw: DrawShape,
+    instance_count: u32,
+    base_vertex: u32,
+    viewport: [u32; 4],
+    scissor: Option<[u32; 4]>,
+    /// The render area the scissor defaults to when the draw states none: the
+    /// pass's own extent, which every draw of one list shares.
+    extent: [u32; 2],
+}
+
+/// Record one draw inside an open render pass: bind its pipeline, its
+/// descriptor sets and its vertex streams, state its viewport and scissor, and
+/// issue its `vkCmdDraw*`.
+///
+/// The body was `OffscreenObjects::record`'s own draw block; it takes the
+/// binding as a parameter so the single-draw arm and a pass that carries a
+/// draw list record their draws through one implementation
+/// (`research/docs/23` §3.3, G3-B/B-2).
+fn record_draw_binding(
+    context: &VulkanContext,
+    command: vk::CommandBuffer,
+    draw: &DrawBinding<'_>,
+) -> Result<(), ProviderError> {
+    // The viewport is the draw's own rect (`research/docs/23` §3.3, v100):
+    // `vk::Viewport`'s x/y offset and width/height are the same four numbers
+    // the contract carries, and the covering default a pre-v100 pass states is
+    // the rect this rail used to build from the extent alone. The offset is a
+    // `f32` in Vulkan, and every extent a snapshot admits is far below `2^24`,
+    // so the conversion is exact.
+    let [viewport_x, viewport_y, viewport_width, viewport_height] = draw.viewport;
+    let viewport = vk::Viewport {
+        x: viewport_x as f32,
+        y: viewport_y as f32,
+        width: viewport_width as f32,
+        height: viewport_height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    // The scissor is dynamic pipeline state, so the draw's own rectangle (or
+    // the whole render area for a draw that declares none) is recorded here
+    // (`research/docs/23` §3.3, v29).
+    let [scissor_x, scissor_y, scissor_width, scissor_height] =
+        draw.scissor
+            .unwrap_or([0, 0, draw.extent[0], draw.extent[1]]);
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D {
+            x: i32::try_from(scissor_x)
+                .map_err(|_| contract_refusal("render scissor origin reaches beyond i32"))?,
+            y: i32::try_from(scissor_y)
+                .map_err(|_| contract_refusal("render scissor origin reaches beyond i32"))?,
+        },
+        extent: vk::Extent2D {
+            width: scissor_width,
+            height: scissor_height,
+        },
+    };
+    unsafe {
+        context
+            .device
+            .cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, draw.pipeline);
+        context
+            .device
+            .cmd_set_viewport(command, 0, std::slice::from_ref(&viewport));
+        context
+            .device
+            .cmd_set_scissor(command, 0, std::slice::from_ref(&scissor));
+        // The sampled textures are bound before the draw, in the one
+        // descriptor set the pipeline layout carries
+        // (`research/docs/23` §3.3, v70).
+        if draw.descriptor_set != vk::DescriptorSet::null() {
+            context.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                draw.pipeline_layout,
+                0,
+                std::slice::from_ref(&draw.descriptor_set),
+                &[],
+            );
+        }
+        // The stage-buffer sets follow, each at its own set number, in the
+        // same order the pipeline layout declared them
+        // (`research/docs/23` §3.3, v83/v84): the reviewed pair's sets 1
+        // and 2, or the sets a translated module's reflection names. A
+        // pass that binds no stage buffer has none, exactly as it had
+        // before this increment.
+        for entry in draw.stage_buffer_sets {
+            context.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                draw.pipeline_layout,
+                entry.set,
+                std::slice::from_ref(&entry.descriptor_set),
+                &[],
+            );
+        }
+        // Caller-held streams first (`research/docs/23` §3.3): they are the
+        // shape this increment adds, and they cannot be combined with an
+        // indirect replay (the pass's own bindings are the direct draw's).
+        if !draw.vertex_inputs.is_empty() {
+            let buffers = draw
+                .vertex_inputs
+                .iter()
+                .map(|input| input.buffer)
+                .collect::<Vec<_>>();
+            // The pool upload puts each view's bytes at offset zero of its
+            // own buffer, so the bind offsets are zero by construction.
+            let offsets = vec![0_u64; buffers.len()];
+            context
+                .device
+                .cmd_bind_vertex_buffers(command, 0, &buffers, &offsets);
+            match draw.draw {
+                DrawShape::Indexed { index_count } => {
+                    context.device.cmd_bind_index_buffer(
+                        command,
+                        draw.input_index.buffer,
+                        0,
+                        draw.input_index_type,
+                    );
+                    context.device.cmd_draw_indexed(
+                        command,
+                        index_count,
+                        draw.instance_count,
+                        0,
+                        i32::try_from(draw.base_vertex).unwrap_or(i32::MAX),
+                        0,
+                    );
+                }
+                DrawShape::Vertices { vertex_count } => {
+                    context
+                        .device
+                        .cmd_draw(command, vertex_count, draw.instance_count, 0, 0);
+                }
+                // The milestone shape binds no stream, and an indirect
+                // replay is a separate arm below.
+                DrawShape::Milestone => {
+                    return Err(contract_refusal(
+                        "a vertex-buffer draw reached the rail without a draw shape",
+                    ));
+                }
+            }
+        } else if !draw.input_index.is_null() {
+            // An indexed draw whose vertex stage reads no `[[stage_in]]` at
+            // all (`research/docs/23` §92, R9k): the reviewed stage-buffer
+            // vertex stage takes its positions from a descriptor, so the
+            // draw binds no vertex stream and the index window is the only
+            // draw input. The arm used to be unreachable because only a
+            // vertex-stream draw could be indexed; the resolved-index
+            // increment is what makes the shape executable, and the bound
+            // the contract stated for it was read from this same window.
+            context.device.cmd_bind_index_buffer(
+                command,
+                draw.input_index.buffer,
+                0,
+                draw.input_index_type,
+            );
+            match draw.draw {
+                DrawShape::Indexed { index_count } => {
+                    context.device.cmd_draw_indexed(
+                        command,
+                        index_count,
+                        draw.instance_count,
+                        0,
+                        i32::try_from(draw.base_vertex).unwrap_or(i32::MAX),
+                        0,
+                    );
+                }
+                // A non-indexed draw binds no index window, so this arm is
+                // the indexed one's alone; anything else here is a draw the
+                // rail never prepared.
+                DrawShape::Milestone | DrawShape::Vertices { .. } => {
+                    return Err(contract_refusal(
+                        "an index window reached the rail without an indexed draw",
+                    ));
+                }
+            }
+        } else if !draw.index.is_null() {
+            // An indexed indirect replay binds the rail's own `[0, 1, 2]`
+            // index buffer and reads its counts from the `INDIRECT_BUFFER`
+            // the CPU encoded above. `stride` is the struct size because
+            // the first increment writes exactly one command.
+            context.device.cmd_bind_index_buffer(
+                command,
+                draw.index.buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
+            context.device.cmd_draw_indexed_indirect(
+                command,
+                draw.indirect.buffer,
+                0,
+                1,
+                std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+            );
+        } else if draw.indirect.is_null() {
+            // The `vertex_id` shape instances the same way the
+            // vertex-buffer arms do (`research/docs/23` §3.3, v31): the
+            // reviewed triangle is replayed once per instance, so a pass
+            // that asks for more than one keeps its own count here too.
+            // The vertex count is the trace's own as well (2026-09-19,
+            // census v45's `vertex_span` bucket): `Milestone` states the
+            // three-vertex triangle, and a wider layout-free count arrives
+            // as `Vertices` with the number the trace named, which the
+            // module's `vertex_id` arithmetic resolves vertex by vertex.
+            let vertex_count = match draw.draw {
+                DrawShape::Milestone => FULL_SCREEN_TRIANGLE_VERTICES,
+                DrawShape::Vertices { vertex_count } => vertex_count,
+                // A layout-free draw reaches this arm with no index window
+                // bound, so an indexed shape here is a record the rail
+                // never prepared.
+                DrawShape::Indexed { .. } => {
+                    return Err(contract_refusal(
+                        "an indexed draw reached the rail without an index window",
+                    ));
+                }
+            };
+            context
+                .device
+                .cmd_draw(command, vertex_count, draw.instance_count, 0, 0);
+        } else {
+            // The indirect replay reads its counts from the buffer the CPU
+            // encoded above; `stride` is the struct size because the first
+            // increment writes exactly one command.
+            context.device.cmd_draw_indirect(
+                command,
+                draw.indirect.buffer,
+                0,
+                1,
+                std::mem::size_of::<vk::DrawIndirectCommand>() as u32,
+            );
+        }
+    }
+    Ok(())
 }
 
 impl<'a> Drop for OffscreenObjects<'a> {

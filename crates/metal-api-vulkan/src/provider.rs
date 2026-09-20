@@ -601,6 +601,22 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
             IndirectCommandKind::DrawIndexed,
             IndirectCommandKind::Dispatch,
         ],
+        // The multi-draw render pass is executed (G3-B/B-2): `render.rs`
+        // records one `vkCmdBeginRenderPass` … `vkCmdEndRenderPass` and issues
+        // every draw of the list inside it, rebuilding (or reusing) each draw's
+        // pipeline and rebinding its descriptor sets and vertex streams before
+        // its own `vkCmdDraw*`. Evidence: `tests/render_many_draws_e2e.rs` reads
+        // the same frame bytes a pass-per-draw trace reads for N = 1, 2, 3 and
+        // 8, plus the order-observable pair whose second draw is the one that
+        // lands.
+        //
+        // The ceiling is the contract's own (`MAX_DRAWS_PER_PASS`, the value
+        // the engine track's unified `BATCH_MAX_DRAWS` states): this rail has no
+        // narrower device fact to clamp it with, because the list is recorded as
+        // N `vkCmdDraw*` calls inside one pass and holds no per-draw resource
+        // the rail allocates ahead of time.
+        supports_render_multi_draw: true,
+        max_draws_per_pass: metal_api_core::provider::MAX_DRAWS_PER_PASS as u32,
     }
 }
 
