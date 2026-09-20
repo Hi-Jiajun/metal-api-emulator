@@ -60,6 +60,18 @@
 //!   teardown_named_us=... render_release_reuse_us=... render_release_pool_us=...
 //!   render_release_import_us=... render_release_uploads_us=... render_retire_us=...
 //!   td_image_n=... td_view_n=... td_sampler_n=... td_buffer_n=... td_memory_n=...
+//!   rb_pipeline_us=... rb_pipeline_n=... rb_buffer_us=... rb_buffer_n=...
+//!   rb_image_us=... rb_image_n=... rb_view_us=... rb_view_n=...
+//!   rb_sampler_us=... rb_sampler_n=... rb_descriptor_us=... rb_descriptor_n=...
+//!   rb_indirect_us=... rb_indirect_n=... rb_named_us=... submit_teardown_us=...
+//!   submit_td_sync_us=... submit_td_sync_n=... submit_td_pipeline_us=...
+//!   submit_td_pipeline_n=... submit_td_buffers_us=... submit_td_buffers_n=...
+//!   submit_td_textures_us=... submit_td_textures_n=... submit_td_retains_us=...
+//!   submit_td_retains_n=... submit_td_named_us=... submit_lock_us=...
+//!   submit_bookkeep_us=... submit_merge_us=... submit_validate_us=...
+//!   submit_seam_us=... wait_submit_n=... wait_render_n=... wait_landing_n=...
+//!   wait_present_n=... wait_queue_n=... wait_timeline_n=... wait_ahead_sum=...
+//!   wait_ahead_n=...
 //!   ```
 //!
 //! and, beside the disjoint fields, the aggregate readings the nested splits
@@ -166,6 +178,43 @@
 //!   images, image views, samplers, buffers and memories the window's teardowns
 //!   really destroyed (a null handle charges no count). A family whose count is
 //!   zero is a region the pools already emptied.
+//!
+//! The fifth round splits what the first four left unnamed, and it is two cuts
+//! rather than one:
+//!
+//! * `rb_pipeline_us`, `rb_buffer_us`, `rb_image_us`, `rb_view_us`,
+//!   `rb_sampler_us`, `rb_descriptor_us` and `rb_indirect_us` divide
+//!   `resource_build` by the object families its create sites name — one bar
+//!   per object rather than per family, so the `rb_*_n` count printed beside
+//!   each is that family's population in the window and its microseconds can be
+//!   read per object. The printed `rb_named_us` is their sum, so
+//!   `sum(rb_*) <= resource_build_us` and the difference is the validation,
+//!   sizing and pool-key registration the families do not own.
+//! * `submit_teardown_us` names the compute half's own teardown
+//!   (`ExecutionResources::drop`), which the first four cuts left inside the
+//!   enclosing `total` — the counterpart of the render half's `render_teardown`
+//!   and, before this cut, the largest unnamed region of a submission.
+//!   `submit_td_sync_us`, `submit_td_pipeline_us`, `submit_td_buffers_us`,
+//!   `submit_td_textures_us` and `submit_td_retains_us` divide it in the order
+//!   the drop works through them, with `submit_td_named_us` as their printed
+//!   sum and the same `_n` counts beside them.
+//!
+//! The remaining seam — the executor and queue locks, the per-submission plan
+//! between `pool` and `resource_build`, the merge of the two halves'
+//! writebacks and the terminal contract validation — is `submit_lock_us`,
+//! `submit_bookkeep_us`, `submit_merge_us` and `submit_validate_us`, printed
+//! with `submit_seam_us` as their sum. They are disjoint from the disjoint sum
+//! rather than part of it: `sum(disjoint) + sum(seam) <= total_us`, and what
+//! remains is the function-call boundary between them.
+//!
+//! The same round answers "what is a wait waiting on": `wait_submit_n`,
+//! `wait_render_n`, `wait_landing_n` and `wait_present_n` count every fence the
+//! window waited on by whose completion it is, `wait_queue_n` and
+//! `wait_timeline_n` are the two kinds this provider does not have (they stay
+//! zero, which is the evidence for "binary completion fences only"), and
+//! `wait_ahead_sum` / `wait_ahead_n` read how much *earlier* work the waited
+//! queue still held when the wait began — the difference between waiting for
+//! one's own submission on an idle queue and waiting behind others.
 //!
 //! The accumulator is **thread-local**, and a line is emitted by the thread that
 //! filled its own window. That is what makes each line self-consistent: with one
@@ -469,9 +518,95 @@ pub(crate) enum Phase {
     /// before its first import being released once the fence has proven the
     /// device done with the owner's pages (`RenderInputRetains::retire`).
     RenderRetire,
+    /// Inside `resource_build`: the pipeline-shaped objects one compute
+    /// pipeline needs (`PipelineObjects::create`) — the two shader modules, the
+    /// pipeline layout and the pipeline. Charged once per pipeline, so the
+    /// printed `rb_pipeline_n` is how many pipelines one submission built.
+    ///
+    /// This bar and the six below it divide `resource_build` itself, so they
+    /// are *nested* inside [`Phase::ResourceBuild`] rather than beside it:
+    /// `sum(rb_*) <= resource_build_us`, and the difference is the bookkeeping
+    /// the named families do not own — the argument validation, the shared/heap
+    /// sizing passes and the pool-key registrations that run between the device
+    /// calls. The families are the ones the create sites actually name; a
+    /// framebuffer or a render pass is not among them because the compute half
+    /// builds neither (the render rail's are `setup_render_pass` and
+    /// `teardown_passes`).
+    RbPipeline,
+    /// Inside `resource_build`: one host-visible device buffer and the memory
+    /// bound to it, upload included (`create_owned_backing`, the heap slab, the
+    /// indirect replay's buffer pair). Charged once per buffer.
+    RbBuffer,
+    /// Inside `resource_build`: one sampled or storage image with its memory
+    /// and, for the sampled arm, the texels' own trip into it
+    /// (`allocate_image_backing`). Charged once per image.
+    RbImage,
+    /// Inside `resource_build`: one image view
+    /// (`create_color_image_view` / `create_depth_image_view`).
+    RbView,
+    /// Inside `resource_build`: one `vkCreateSampler` — a declaration's own
+    /// sampler or a pipeline's static sampler.
+    RbSampler,
+    /// Inside `resource_build`: one pass's descriptor set — the layout, the
+    /// pool, the set and the writes that fill it (`create_descriptors`).
+    RbDescriptor,
+    /// Inside `resource_build`: one indirect replay's command buffer and its
+    /// memory (`create_indirect_dispatch`). A direct dispatch builds none and
+    /// charges nothing here.
+    RbIndirect,
+    /// The compute half's own teardown (`ExecutionResources::drop` under the
+    /// destroying policy): the fence, the pools, the pipeline objects, the
+    /// buffers, the images, the samplers and the borrowed retains a submission
+    /// built or took, destroyed once the fence has proven the device done with
+    /// them.
+    ///
+    /// It is a *disjoint* bar of the submission rather than a child of
+    /// `resource_build`: it runs at the end of the submission, after the
+    /// readback, and it is the compute half's counterpart of the render half's
+    /// `render_teardown`. Placing the two halves' teardowns in one reading is
+    /// what makes "what does one submission's teardown cost" answerable.
+    ///
+    /// Like the render half's, this bar emits one [`Phase::Total`] window per
+    /// measured submission, so a line whose `n` counts submissions counts
+    /// teardowns with them.
+    SubmitTeardown,
+    /// Inside `submit_teardown`: the submission's own synchronisation and pool
+    /// objects — the completion fence, the command pool and the descriptor
+    /// pool.
+    SubmitTdSync,
+    /// Inside `submit_teardown`: the pipeline-shaped objects
+    /// (`PipelineObjects::drop`: the pipeline, its layout and the two shader
+    /// modules).
+    SubmitTdPipeline,
+    /// Inside `submit_teardown`: every buffer with its memory — the owned and
+    /// shared backings, the heap slab's buffers, the storage images' transfer
+    /// buffers and the indirect replay's pair.
+    SubmitTdBuffers,
+    /// Inside `submit_teardown`: the sampled and storage declarations' own
+    /// samplers, views, images and memories.
+    SubmitTdTextures,
+    /// Inside `submit_teardown`: retiring the borrowed leases the submission's
+    /// guest-run gathers took, which is what lets the owner's pages go.
+    SubmitTdRetains,
+    /// The seam between the submission's disjoint bars on the compute side: the
+    /// executor lock, the queue pick, the queue lock and the arena admission a
+    /// submission takes before its resources can be built.
+    SubmitLock,
+    /// The seam between `pool` and `resource_build`: the per-submission plan —
+    /// the translated-artifact list and `plan_pipeline_sequence` — taken inside
+    /// `PendingExecution::submit` before the first device object exists.
+    SubmitBookkeep,
+    /// The seam after the render half: merging the two halves' writebacks into
+    /// one keyed map (`BTreeMap::insert` per written view).
+    SubmitMerge,
+    /// The seam after the merge: `ProviderSubmission::validate_for_trace`, the
+    /// terminal contract validation of the merged writeback list against the
+    /// exact submitted trace. Before this cut it was charged to `writebacks`
+    /// only because that bar's guard happened to be alive across it.
+    SubmitValidate,
 }
 
-const PHASE_COUNT: usize = Phase::RenderRetire as usize + 1;
+const PHASE_COUNT: usize = Phase::SubmitValidate as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -544,6 +679,23 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "render_release_import",
     "render_release_uploads",
     "render_retire",
+    "rb_pipeline",
+    "rb_buffer",
+    "rb_image",
+    "rb_view",
+    "rb_sampler",
+    "rb_descriptor",
+    "rb_indirect",
+    "submit_teardown",
+    "submit_td_sync",
+    "submit_td_pipeline",
+    "submit_td_buffers",
+    "submit_td_textures",
+    "submit_td_retains",
+    "submit_lock",
+    "submit_bookkeep",
+    "submit_merge",
+    "submit_validate",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -650,6 +802,67 @@ const LANDING_SLOTS: [usize; 8] = [
 /// The bars that are a fence wait, and therefore carry the idle/blocked split.
 const WAIT_SLOTS: [usize; 2] = [Phase::FenceWait as usize, Phase::RenderWait as usize];
 
+/// The nested split of `resource_build`, added by the fifth cut: the object
+/// families the create sites name, one bar per object. `resource_build` stays
+/// their enclosing bar, so `sum(RESOURCE_BUILD_SLOTS) <= resource_build_us` and
+/// the difference is the validation, sizing and registration the families do
+/// not own. The printed `rb_named_us` is this set's sum.
+///
+/// Each member is entered once per object rather than once per family, so the
+/// call count the line prints beside it (`rb_*_n`) is that family's population
+/// in the window — the reading a pooling decision needs.
+const RESOURCE_BUILD_SLOTS: [usize; 7] = [
+    Phase::RbPipeline as usize,
+    Phase::RbBuffer as usize,
+    Phase::RbImage as usize,
+    Phase::RbView as usize,
+    Phase::RbSampler as usize,
+    Phase::RbDescriptor as usize,
+    Phase::RbIndirect as usize,
+];
+
+/// The nested split of `submit_teardown`, the compute half's counterpart of the
+/// render half's `teardown_*` cut: the sync objects, the pipeline-shaped
+/// objects, the buffers, the textures and the borrowed retains, in the order
+/// `ExecutionResources::drop` works through them. `submit_teardown` stays their
+/// enclosing bar, so `sum(SUBMIT_TEARDOWN_SLOTS) <= submit_teardown_us`. The
+/// printed `submit_td_named_us` is this set's sum.
+const SUBMIT_TEARDOWN_SLOTS: [usize; 5] = [
+    Phase::SubmitTdSync as usize,
+    Phase::SubmitTdPipeline as usize,
+    Phase::SubmitTdBuffers as usize,
+    Phase::SubmitTdTextures as usize,
+    Phase::SubmitTdRetains as usize,
+];
+
+/// The named regions of the seam the disjoint bars leave — the enclosing
+/// `total`'s own residual. They are disjoint from each other and from every bar
+/// of the disjoint sum, so `sum(SUBMIT_SEAM_SLOTS) <= total_us -
+/// sum(disjoint bars)`, and the difference is the function-call boundary that
+/// remains. The printed `submit_seam_us` is this set's sum.
+const SUBMIT_SEAM_SLOTS: [usize; 5] = [
+    Phase::SubmitTeardown as usize,
+    Phase::SubmitLock as usize,
+    Phase::SubmitBookkeep as usize,
+    Phase::SubmitMerge as usize,
+    Phase::SubmitValidate as usize,
+];
+
+/// The teardown groups whose *call count* is printed beside their
+/// microseconds: each is entered once per region it names — per destroyed
+/// object inside the three object loops and once per submission for the two
+/// whole-group regions — so the count is that group's population in the window.
+/// The `resource_build` families take their counts from
+/// [`note_build_object`] instead, because their bars are whole-call regions and
+/// a region count is not an object count.
+const COUNTED_SLOTS: [usize; 5] = [
+    Phase::SubmitTdSync as usize,
+    Phase::SubmitTdPipeline as usize,
+    Phase::SubmitTdBuffers as usize,
+    Phase::SubmitTdTextures as usize,
+    Phase::SubmitTdRetains as usize,
+];
+
 /// Submissions per emitted line, and therefore the `n=` field.
 const EVERY_DEFAULT: u64 = 256;
 
@@ -663,6 +876,48 @@ const EVERY_DEFAULT: u64 = 256;
 /// printed, so a reader who disagrees with the cut can still see the raw sums
 /// (and move it with `METAL_API_VULKAN_PHASE_IDLE_NS`).
 const IDLE_NS_DEFAULT: u64 = 100_000;
+
+/// The object a wait blocked on.
+///
+/// A wait's idle/blocked split says how much of it was device latency, but not
+/// what the wait was behind. On this provider every wait is `vkWaitForFences`
+/// on one **binary completion fence**, so the honest answer to "is the wait for
+/// a submission count, a queue or a timeline semaphore" is "none of them, it is
+/// a fence" — and that answer is only checkable if the populations are counted
+/// apart. The four kinds below partition every fence wait the provider performs
+/// (`wait_queue_n` and `wait_timeline_n` are printed beside them and stay zero
+/// for as long as that is true).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// The shared `Fence` suffix is the reading, not a naming accident: every object
+// this provider waits on is a completion fence, and the prefix is what tells
+// the four populations apart.
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum WaitObject {
+    /// The compute submission's own completion fence
+    /// (`PendingExecution::wait`), inside the `fence_wait` bar.
+    SubmitFence,
+    /// The render half's completion fence (`OffscreenObjects::submit_and_wait`),
+    /// inside the `render_wait` bar — where a pass's copy-out executes.
+    RenderFence,
+    /// A kept-frame landing's completion fence, inside the `landing_wait` bar.
+    LandingFence,
+    /// The present rail's sentinel fence, whose wait is inside the present
+    /// entry's own residual region.
+    PresentFence,
+}
+
+const WAIT_OBJECT_COUNT: usize = WaitObject::PresentFence as usize + 1;
+
+/// The printed field-name stem of each wait object, in slot order.
+const WAIT_OBJECT_NAMES: [&str; WAIT_OBJECT_COUNT] =
+    ["wait_submit", "wait_render", "wait_landing", "wait_present"];
+
+impl WaitObject {
+    #[inline]
+    fn slot(self) -> usize {
+        self as usize
+    }
+}
 
 /// The readback region one stored attachment was published through
 /// (`docs/WRITTEN-RECT-READBACK.md` §2), as an emitted line counts it.
@@ -894,6 +1149,21 @@ struct Local {
     /// Waits with no fence to wait for (`PendingExecution::wait`'s `!submitted`
     /// early return): the only waits that are exactly free.
     fence_skipped_calls: u64,
+    /// Every fence wait the window performed, by what it waited on. The four
+    /// partition the waits; `wait_queue_calls` and `wait_timeline_calls` are the
+    /// two kinds this provider does not have, printed so that "it waits on
+    /// binary fences only" is a reading rather than a claim.
+    wait_object_calls: [u64; WAIT_OBJECT_COUNT],
+    wait_queue_calls: u64,
+    wait_timeline_calls: u64,
+    /// How much earlier work was still in flight on the waited queue when the
+    /// wait began: the sum over the window's waits of every *other* submission
+    /// the queue had not retired yet, and how many of those waits began with at
+    /// least one. Divide the sum by the waits to get the mean depth — the
+    /// difference between waiting for one's own work on an idle queue and
+    /// waiting behind earlier submissions.
+    wait_ahead_sum: u64,
+    wait_ahead_calls: u64,
     /// `total` bars closed since the last emitted line.
     window: u64,
     /// The stored attachments this window's submissions read back, by region.
@@ -946,6 +1216,18 @@ struct Local {
     td_sampler_n: u64,
     td_buffer_n: u64,
     td_memory_n: u64,
+    /// The device objects this window's `resource_build` regions created, by
+    /// family — the population behind the `rb_*` bars
+    /// ([`BuildObject`]).
+    build_objects: [u64; BUILD_OBJECT_COUNT],
+    /// How many enclosing `total` bars this thread has open right now. The
+    /// compute half's teardown is the one region that can run *outside* a
+    /// submission — a deferred object API retires its resources from `wait` —
+    /// and a bar charged there would land in a window whose `total` never
+    /// contained it, which is exactly what the identity a reader checks must
+    /// not allow. The depth is therefore what
+    /// [`Bar::enter_in_submission`] reads to decide whether to charge at all.
+    depth: u32,
 }
 
 /// An empty window, spelled out because the slot tables are longer than the
@@ -963,6 +1245,11 @@ impl Default for Local {
             wait_blocked_calls: [0; PHASE_COUNT],
             wait_timeout_calls: [0; PHASE_COUNT],
             fence_skipped_calls: 0,
+            wait_object_calls: [0; WAIT_OBJECT_COUNT],
+            wait_queue_calls: 0,
+            wait_timeline_calls: 0,
+            wait_ahead_sum: 0,
+            wait_ahead_calls: 0,
             window: 0,
             readback: ReadbackCounts::default(),
             reuse_hit_n: 0,
@@ -996,6 +1283,8 @@ impl Default for Local {
             td_sampler_n: 0,
             td_buffer_n: 0,
             td_memory_n: 0,
+            build_objects: [0; BUILD_OBJECT_COUNT],
+            depth: 0,
         }
     }
 }
@@ -1015,7 +1304,14 @@ impl Local {
     /// the queue had already retired the work, and the microseconds that remain
     /// here buy no GPU time.
     #[inline]
-    fn note_fence_wait(&mut self, phase: Phase, ns: u64, timed_out: bool) {
+    fn note_fence_wait(
+        &mut self,
+        phase: Phase,
+        ns: u64,
+        timed_out: bool,
+        object: WaitObject,
+        ahead: usize,
+    ) {
         self.charge(phase, ns);
         let slot = phase as usize;
         if ns < idle_ns() {
@@ -1027,6 +1323,23 @@ impl Local {
         }
         if timed_out {
             self.wait_timeout_calls[slot] += 1;
+        }
+        self.note_wait_object(object, ahead);
+    }
+
+    /// Bank the *identity* of one fence wait that is timed by another bar.
+    ///
+    /// A landing's wait is its own region (`landing_wait`) and the present
+    /// rail's sentinel is inside the present entry's residual, so their
+    /// microseconds must not also land in `fence_wait`; their populations still
+    /// belong in the window's answer to "what does this submission wait on",
+    /// which is what this counts.
+    #[inline]
+    fn note_wait_object(&mut self, object: WaitObject, ahead: usize) {
+        self.wait_object_calls[object.slot()] += 1;
+        self.wait_ahead_sum += ahead as u64;
+        if ahead > 0 {
+            self.wait_ahead_calls += 1;
         }
     }
 
@@ -1051,9 +1364,12 @@ impl Local {
         let mut readback_named_ns = 0u64;
         let mut landing_named_ns = 0u64;
         let mut teardown_named_ns = 0u64;
+        let mut rb_named_ns = 0u64;
+        let mut submit_td_named_ns = 0u64;
+        let mut submit_seam_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
-            self.calls[slot] = 0;
+            let calls = std::mem::replace(&mut self.calls[slot], 0);
             if PLAN_SETTLE_SLOTS.contains(&slot) {
                 plan_settle_ns += ns;
             }
@@ -1075,6 +1391,15 @@ impl Local {
             if TEARDOWN_SLOTS.contains(&slot) {
                 teardown_named_ns += ns;
             }
+            if RESOURCE_BUILD_SLOTS.contains(&slot) {
+                rb_named_ns += ns;
+            }
+            if SUBMIT_TEARDOWN_SLOTS.contains(&slot) {
+                submit_td_named_ns += ns;
+            }
+            if SUBMIT_SEAM_SLOTS.contains(&slot) {
+                submit_seam_ns += ns;
+            }
             if WAIT_SLOTS.contains(&slot) {
                 let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
                 let idle_us = micros(std::mem::take(&mut self.wait_idle_ns[slot]));
@@ -1087,6 +1412,13 @@ impl Local {
                      {name}_timeout_n={timed_out}",
                     micros(ns)
                 ));
+                continue;
+            }
+            // The family and teardown bars are entered once per object, so the
+            // count beside them is that family's population rather than the
+            // window's submission count.
+            if COUNTED_SLOTS.contains(&slot) {
+                fields.push_str(&format!(" {name}_us={:.3} {name}_n={calls}", micros(ns)));
                 continue;
             }
             fields.push_str(&format!(" {name}_us={:.3}", micros(ns)));
@@ -1124,6 +1456,12 @@ impl Local {
         let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
         let td_buffer_n = std::mem::take(&mut self.td_buffer_n);
         let td_memory_n = std::mem::take(&mut self.td_memory_n);
+        let wait_object_calls = std::mem::take(&mut self.wait_object_calls);
+        let wait_queue_calls = std::mem::take(&mut self.wait_queue_calls);
+        let wait_timeline_calls = std::mem::take(&mut self.wait_timeline_calls);
+        let wait_ahead_sum = std::mem::take(&mut self.wait_ahead_sum);
+        let wait_ahead_calls = std::mem::take(&mut self.wait_ahead_calls);
+        let build_objects = std::mem::take(&mut self.build_objects);
         self.window = 0;
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
@@ -1132,6 +1470,24 @@ impl Local {
         let readback_named_us = micros(readback_named_ns);
         let landing_named_us = micros(landing_named_ns);
         let teardown_named_us = micros(teardown_named_ns);
+        let rb_named_us = micros(rb_named_ns);
+        let submit_td_named_us = micros(submit_td_named_ns);
+        let submit_seam_us = micros(submit_seam_ns);
+        let mut wait_fields = String::with_capacity(200);
+        for (object_slot, object_name) in WAIT_OBJECT_NAMES.iter().enumerate() {
+            wait_fields.push_str(&format!(
+                " {object_name}_n={}",
+                wait_object_calls[object_slot]
+            ));
+        }
+        wait_fields.push_str(&format!(
+            " wait_queue_n={wait_queue_calls} wait_timeline_n={wait_timeline_calls} \
+             wait_ahead_sum={wait_ahead_sum} wait_ahead_n={wait_ahead_calls}"
+        ));
+        let mut build_fields = String::with_capacity(200);
+        for (object_slot, object_name) in BUILD_OBJECT_NAMES.iter().enumerate() {
+            build_fields.push_str(&format!(" {object_name}_n={}", build_objects[object_slot]));
+        }
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
@@ -1140,6 +1496,8 @@ impl Local {
              readback_named_us={readback_named_us:.3} \
              landing_named_us={landing_named_us:.3} \
              teardown_named_us={teardown_named_us:.3} \
+             rb_named_us={rb_named_us:.3} submit_td_named_us={submit_td_named_us:.3} \
+             submit_seam_us={submit_seam_us:.3}{build_fields}{wait_fields} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
@@ -1209,6 +1567,60 @@ pub(crate) fn note_staging_memory(cached: bool) {
     });
 }
 
+/// One device object a `resource_build` family created.
+///
+/// The bars the fifth cut adds to `resource_build` are *regions* — a whole
+/// create call for the pipeline objects, the buffers, the descriptor sets and
+/// the indirect replay, and one object's own backing for the images, views and
+/// samplers of the sampled declarations — so a region count is not an object
+/// count. These are the object counts, taken at the same sites the bars are
+/// (a null handle counts nothing, exactly as the teardown census does), and
+/// they are what a per-object cost is read with:
+///
+/// ```text
+/// per object = rb_<family>_us / rb_<family>_n
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BuildObject {
+    /// A pipeline-shaped object group: the pipeline, its layout and the two
+    /// shader modules.
+    Pipeline,
+    /// One `vkCreateBuffer`, whatever it carries (a pooled view's backing, a
+    /// heap slab's placement, a storage image's transfer buffer, an indirect
+    /// replay's command buffer, an imported host window).
+    Buffer,
+    /// One `vkCreateImage` (a sampled declaration's linear image or a storage
+    /// declaration's optimal-tiling one).
+    Image,
+    /// One `vkCreateImageView`.
+    View,
+    /// One `vkCreateSampler` — a declaration's own or a pipeline's static one.
+    Sampler,
+    /// One descriptor set allocated (`vkAllocateDescriptorSets`), which is one
+    /// recorded pass's own immutable set.
+    Descriptor,
+    /// One indirect replay's command buffer.
+    Indirect,
+    /// One `vkAllocateMemory`, counted beside whichever family the backing it
+    /// belongs to was charged to. A round that wants the allocation's own share
+    /// of a family divides that family's bar by this count.
+    Memory,
+}
+
+const BUILD_OBJECT_COUNT: usize = BuildObject::Memory as usize + 1;
+
+/// The printed field-name stem of each build object, in slot order.
+const BUILD_OBJECT_NAMES: [&str; BUILD_OBJECT_COUNT] = [
+    "rb_pipeline",
+    "rb_buffer",
+    "rb_image",
+    "rb_view",
+    "rb_sampler",
+    "rb_descriptor",
+    "rb_indirect",
+    "rb_memory",
+];
+
 /// One device object a teardown really destroyed (the handle was not null, so
 /// the count is the population the `teardown_*` bars were spent on — not the
 /// slots the drop walked past).
@@ -1243,6 +1655,22 @@ pub(crate) fn note_teardown_object(object: TeardownObject) {
             TeardownObject::Memory => local.td_memory_n += 1,
         }
     });
+}
+
+/// Count one device object a `resource_build` region created ([`BuildObject`]).
+///
+/// Counted at the creation site rather than derived from a bar's call count:
+/// the `rb_*` bars are whole-call regions for the pipeline objects, the
+/// buffers, the descriptor sets and the indirect replay, so only an explicit
+/// count can say how many objects those regions made. A round divides the
+/// family's bar by this to get one object's cost, which is the reading a
+/// pooling decision is made from.
+#[inline]
+pub(crate) fn note_build_object(object: BuildObject) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| local.borrow_mut().build_objects[object as usize] += 1);
 }
 
 /// Whether the profile is on, read once from the process environment.
@@ -1300,6 +1728,29 @@ impl Bar {
         if !enabled() {
             return None;
         }
+        if phase == Phase::Total {
+            LOCAL.with(|local| local.borrow_mut().depth += 1);
+        }
+        Some(Self {
+            slot: phase,
+            started: Instant::now(),
+        })
+    }
+
+    /// Enter a bar that is only charged while a submission's enclosing `total`
+    /// bar is open: a deferred object API retires a submission's resources from
+    /// `wait`, outside any `total`, and charging that region to the window of
+    /// the call that happened to retire it would make `sum(fields) <= total`
+    /// untrue without saying so. Resolving to `None` outside a submission keeps
+    /// the window's fields a partition of its own `total`.
+    #[inline]
+    pub(crate) fn enter_in_submission(phase: Phase) -> Option<Self> {
+        if !enabled() {
+            return None;
+        }
+        if LOCAL.with(|local| local.borrow().depth) == 0 {
+            return None;
+        }
         Some(Self {
             slot: phase,
             started: Instant::now(),
@@ -1307,12 +1758,18 @@ impl Bar {
     }
 
     #[inline]
-    pub(crate) fn enter_fence_wait(phase: Phase) -> Option<FenceWaitBar> {
+    pub(crate) fn enter_fence_wait(
+        phase: Phase,
+        object: WaitObject,
+        ahead: usize,
+    ) -> Option<FenceWaitBar> {
         if !enabled() {
             return None;
         }
         Some(FenceWaitBar {
             phase,
+            object,
+            ahead,
             started: Instant::now(),
             timed_out: false,
         })
@@ -1328,6 +1785,10 @@ impl Drop for Bar {
             let mut local = local.borrow_mut();
             if phase == Phase::Total {
                 local.note_total(ns);
+                // The enclosing bar is the one that closes the depth the
+                // teardown bar's own guard reads; children have already
+                // dropped, so this is the last thing in the submission.
+                local.depth = local.depth.saturating_sub(1);
             } else {
                 local.charge(phase, ns);
             }
@@ -1339,6 +1800,10 @@ impl Drop for Bar {
 /// blocked split instead of a plain charge.
 pub(crate) struct FenceWaitBar {
     phase: Phase,
+    object: WaitObject,
+    /// How many *other* submissions the waited queue had not retired when this
+    /// wait began: zero is a wait for one's own work on an idle queue.
+    ahead: usize,
     started: Instant,
     timed_out: bool,
 }
@@ -1348,8 +1813,14 @@ impl Drop for FenceWaitBar {
     fn drop(&mut self) {
         let ns = elapsed_ns(self.started.elapsed());
         let phase = self.phase;
+        let object = self.object;
+        let ahead = self.ahead;
         let timed_out = self.timed_out;
-        LOCAL.with(|local| local.borrow_mut().note_fence_wait(phase, ns, timed_out));
+        LOCAL.with(|local| {
+            local
+                .borrow_mut()
+                .note_fence_wait(phase, ns, timed_out, object, ahead)
+        });
     }
 }
 
@@ -1370,6 +1841,19 @@ pub(crate) fn note_fence_wait_skipped() {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().fence_skipped_calls += 1);
+}
+
+/// Count one fence wait whose microseconds belong to another bar.
+///
+/// Called where the wait's own region is already named (`landing_wait`, the
+/// present rail's sentinel) so that the window's wait-object census covers
+/// every fence the provider waits on while no microsecond is counted twice.
+#[inline]
+pub(crate) fn note_fence_wait_object(object: WaitObject, ahead: usize) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| local.borrow_mut().note_wait_object(object, ahead));
 }
 
 #[inline]
@@ -1519,10 +2003,22 @@ mod tests {
     #[test]
     fn the_fence_wait_buckets_partition_the_wait() {
         let mut local = Local::default();
-        local.note_fence_wait(Phase::FenceWait, 1_000, false);
-        local.note_fence_wait(Phase::FenceWait, IDLE_NS_DEFAULT, false);
-        local.note_fence_wait(Phase::FenceWait, 5_000_000, true);
-        local.note_fence_wait(Phase::RenderWait, 7, false);
+        local.note_fence_wait(Phase::FenceWait, 1_000, false, WaitObject::SubmitFence, 0);
+        local.note_fence_wait(
+            Phase::FenceWait,
+            IDLE_NS_DEFAULT,
+            false,
+            WaitObject::SubmitFence,
+            2,
+        );
+        local.note_fence_wait(
+            Phase::FenceWait,
+            5_000_000,
+            true,
+            WaitObject::SubmitFence,
+            0,
+        );
+        local.note_fence_wait(Phase::RenderWait, 7, false, WaitObject::RenderFence, 1);
         let slot = Phase::FenceWait as usize;
         let total = local.ns[Phase::FenceWait as usize];
         assert_eq!(
@@ -1540,6 +2036,81 @@ mod tests {
         assert_eq!(local.ns[render], 7);
         assert_eq!(local.wait_idle_calls[render], 1);
         assert_eq!(local.calls[render], 1);
+        // The wait-object census partitions those same waits by what they
+        // blocked on, and the depth reading separates "my own work on an idle
+        // queue" from "behind earlier submissions".
+        assert_eq!(local.wait_object_calls[WaitObject::SubmitFence.slot()], 3);
+        assert_eq!(local.wait_object_calls[WaitObject::RenderFence.slot()], 1);
+        assert_eq!(local.wait_object_calls[WaitObject::LandingFence.slot()], 0);
+        assert_eq!(local.wait_object_calls[WaitObject::PresentFence.slot()], 0);
+        assert_eq!(local.wait_ahead_sum, 3);
+        assert_eq!(local.wait_ahead_calls, 2);
+        assert_eq!(
+            local.wait_queue_calls + local.wait_timeline_calls,
+            0,
+            "this provider waits on binary fences only"
+        );
+    }
+
+    /// The fifth cut's two nested splits stay nested, and the seam slots stay
+    /// outside the disjoint sum: a family bar inside the disjoint sum would
+    /// make `sum(fields) <= total` untrue, and a seam slot inside
+    /// `resource_build` or `submit_teardown` would be counted twice by a reader
+    /// who summed both.
+    #[test]
+    fn the_fifth_cut_stays_inside_what_it_divides() {
+        for slot in RESOURCE_BUILD_SLOTS {
+            assert_ne!(slot, Phase::ResourceBuild as usize);
+            assert!(!SUBMIT_SEAM_SLOTS.contains(&slot));
+            assert!(!SUBMIT_TEARDOWN_SLOTS.contains(&slot));
+            assert!(
+                !COUNTED_SLOTS.contains(&slot),
+                "a family bar's call count is a region count, not an object count"
+            );
+        }
+        // Each family bar has an object counter of the same name, so a round
+        // divides the field by the count that sits beside it.
+        assert_eq!(BUILD_OBJECT_NAMES.len(), BUILD_OBJECT_COUNT);
+        assert_eq!(BUILD_OBJECT_NAMES.len(), RESOURCE_BUILD_SLOTS.len() + 1);
+        for (object_slot, name) in BUILD_OBJECT_NAMES.iter().enumerate() {
+            if *name == "rb_memory" {
+                continue;
+            }
+            assert_eq!(
+                PHASE_NAMES[RESOURCE_BUILD_SLOTS[object_slot]], *name,
+                "the object census and the family bars must line up slot for slot"
+            );
+        }
+        for slot in SUBMIT_TEARDOWN_SLOTS {
+            assert_ne!(slot, Phase::SubmitTeardown as usize);
+            assert!(SUBMIT_SEAM_SLOTS.contains(&(Phase::SubmitTeardown as usize)));
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+            assert!(!TEARDOWN_SLOTS.contains(&slot));
+            assert!(!RESOURCE_BUILD_SLOTS.contains(&slot));
+        }
+        // `render_teardown` and `submit_teardown` are two halves of one
+        // reading, so neither may appear in the other's nested set.
+        assert!(!TEARDOWN_SLOTS.contains(&(Phase::SubmitTeardown as usize)));
+        for slot in SUBMIT_SEAM_SLOTS {
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+            assert!(!RESOURCE_BUILD_SLOTS.contains(&slot));
+            assert!(!TEARDOWN_SLOTS.contains(&slot));
+            assert!(!LANDING_SLOTS.contains(&slot));
+            assert!(!COUNTED_SLOTS.contains(&slot));
+        }
+        assert_eq!(PHASE_NAMES[Phase::RbPipeline as usize], "rb_pipeline");
+        assert_eq!(
+            PHASE_NAMES[Phase::SubmitValidate as usize],
+            "submit_validate",
+            "the seam split's last slot is the terminal contract validation"
+        );
+        assert_eq!(
+            PHASE_NAMES[Phase::SubmitTeardown as usize],
+            "submit_teardown"
+        );
+        assert_eq!(WAIT_OBJECT_NAMES.len(), WAIT_OBJECT_COUNT);
     }
 
     /// A window drains on the `total` bar that fills it, and a drained window

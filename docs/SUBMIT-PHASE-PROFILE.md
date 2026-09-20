@@ -61,6 +61,18 @@ teardown_readbacks_us=... teardown_buffers_us=... teardown_previous_us=...
 teardown_named_us=... render_release_reuse_us=... render_release_pool_us=...
 render_release_import_us=... render_retire_us=...
 td_image_n=... td_view_n=... td_sampler_n=... td_buffer_n=... td_memory_n=...
+rb_pipeline_us=... rb_buffer_us=... rb_image_us=... rb_view_us=...
+rb_sampler_us=... rb_descriptor_us=... rb_indirect_us=... rb_named_us=...
+submit_teardown_us=... submit_td_sync_us=... submit_td_sync_n=...
+submit_td_pipeline_us=... submit_td_pipeline_n=... submit_td_buffers_us=...
+submit_td_buffers_n=... submit_td_textures_us=... submit_td_textures_n=...
+submit_td_retains_us=... submit_td_retains_n=... submit_td_named_us=...
+submit_lock_us=... submit_bookkeep_us=... submit_merge_us=...
+submit_validate_us=... submit_seam_us=...
+rb_pipeline_n=... rb_buffer_n=... rb_image_n=... rb_view_n=... rb_sampler_n=...
+rb_descriptor_n=... rb_indirect_n=... rb_memory_n=...
+wait_submit_n=... wait_render_n=... wait_landing_n=... wait_present_n=...
+wait_queue_n=... wait_timeline_n=... wait_ahead_sum=... wait_ahead_n=...
 ```
 
 Every µs field is a **sum over that line's own window**, not a mean, with three
@@ -71,13 +83,17 @@ identity checkable:
 ```text
 admit + plan + pool + resource_build + record + queue_submit + fence_wait
       + read_updates + render_setup + render_record + render_submit
-      + render_wait + render_readback + writebacks + settle  <=  total
+      + render_wait + render_readback + writebacks + settle
+      + submit_teardown + submit_lock + submit_bookkeep
+      + submit_merge + submit_validate  <=  total
 ```
 
 The difference is the seam between the bars — plain function calls, `Arc`
-clones, the queue lock — and is reported as the residual rather than hidden in
-one of the fields. `total` and `render_total` are the enclosing bars; the others
-are disjoint regions, so no field to be summed can contain another. The render
+clones, the function-call boundary — and is reported as the residual rather than
+hidden in one of the fields. The five `submit_*` seam fields above name most of
+that residual and their sum is printed as `submit_seam_us`; what is left after
+them is the boundary itself. `total` and `render_total` are the enclosing bars;
+the others are disjoint regions, so no field to be summed can contain another. The render
 half has its own identity, `render_setup + render_record + render_submit +
 render_wait + render_readback <= render_total`, whose difference is the work of
 a render path this split does not name (the present and indirect-replay paths
@@ -155,6 +171,19 @@ have their own setup and readback).
 | `landing_fetch` | inside `render_landing`: the host read of the copied frame — the part a landing shares with the readback channel |
 | `landing_write` | inside `render_landing`: the write into the owner's live pages |
 | `landing_release` | inside `render_landing`: destroying the fence, the command pool, the mapping, the buffer and its memory |
+| `rb_pipeline` | inside `resource_build`: the pipeline-shaped objects one compute pipeline needs — `create_pipeline_objects`, one bar per pipeline |
+| `rb_buffer` | inside `resource_build`: every device buffer the submission builds with its memory bound and uploaded — `create_buffers` as one region (owned backings, the heap slab's placements, the imported host windows, the storage image's transfer buffer) |
+| `rb_image` | inside `resource_build`: one sampled or storage image's backing — `allocate_image_backing` plus, for the sampled arm, the texels' trip into it (`create_textures` / `create_storage_texture`, one bar per image) |
+| `rb_view` | inside `resource_build`: one image view (`create_color_image_view` in the compute texture paths, one bar per view) |
+| `rb_sampler` | inside `resource_build`: the static samplers of the translated modules (`create_static_samplers`) and each sampled declaration's own sampler, one bar per sampler |
+| `rb_descriptor` | inside `resource_build`: one pass's immutable descriptor set — the pool, the set layouts, the allocation and the writes (`create_descriptors`, one region per submission that builds sets) |
+| `rb_indirect` | inside `resource_build`: the indirect replay's command buffer and the memory bound to it (`create_indirect_dispatch`; a direct dispatch builds none) |
+| `submit_teardown` | the compute half's own teardown (`ExecutionResources::drop`) — the fence, the pools, the pipeline objects, the buffers, the images, the samplers and the borrowed retains, destroyed once the fence proved the device done with them. The counterpart of the render half's `render_teardown`, and charged only while the submission's own `total` bar is open |
+| `submit_td_sync` / `submit_td_pipeline` / `submit_td_buffers` / `submit_td_textures` / `submit_td_retains` | inside `submit_teardown`: the computation fence, the command pool and the descriptor pool; the pipeline-shaped objects; every buffer with its memory; the sampled and storage declarations' samplers, views, images and memories; and retiring the borrowed leases the submission's gathers took — in the order the drop works through them |
+| `submit_lock` | the submission's executor lock, queue pick, queue lock and arena admission, before the compute half's first bar |
+| `submit_bookkeep` | between `pool` and `resource_build`: the translated-artifact list and `plan_pipeline_sequence` |
+| `submit_merge` | between the halves: the keyed merge of the compute and render writebacks |
+| `submit_validate` | the terminal `ProviderSubmission::validate_for_trace` of the merged writeback list |
 
 The ten `setup_*` fields are the one nested split in the line: they divide
 `render_setup` itself, so `sum(setup_*) <= render_setup_us` and the difference is
@@ -216,6 +245,58 @@ is part of the disjoint sum either:
   readback arm paid, which is what named the memory both mappings point at as
   the third cut's subject (`docs/READBACK-MEMORY.md`).
 
+The fifth cut's two splits and its seam are read like the ones above them. The
+seven `rb_*` fields divide `resource_build` by the object families the create
+sites name, with `rb_named_us` printed as their sum, so `sum(rb_*) <=
+resource_build_us` — the difference is the argument validation, the shared and
+heap sizing passes and the pool-key registrations the families do not own. The
+population behind each family is the `rb_*_n` counter printed beside the family
+in the same line (`rb_memory_n` counts every `vkAllocateMemory`, whichever
+family's backing it belongs to), and the two together are the reading a pooling
+decision is made from:
+
+```text
+per object = rb_<family>_us / rb_<family>_n
+```
+
+A family bar is a **region**, not an object: the pipeline, buffer and descriptor
+bars cover their whole create call, so their call count is a submission count
+and only the `rb_*_n` counter says how many objects the region made. Those three
+are also the families where "the same shape again" is the poolable thing, which
+is why the count is printed beside the microseconds rather than left to be
+divided by `n`.
+
+`submit_teardown` is the compute half's counterpart of `render_teardown`, and it
+is a disjoint bar of the submission rather than a child of `resource_build`
+because it runs at the end of the call, after the readback. Before this cut it
+ran inside the enclosing `total` and inside no other field, so it was invisible
+to every reading above. Its five children divide it in the order
+`ExecutionResources::drop` walks, with `submit_td_named_us` as their sum and the
+same `_n` counts beside the three object groups. Those counts are populations
+with one caveat each: the pipeline and texture groups are entered once per
+destroyed object, the sync and retain groups once per submission, and the buffer
+group once per buffer **plus** once for the heap slab's own memory and once for
+the indirect replay's pair — so `submit_td_buffers_n` is an upper bound on the
+destroyed buffers by at most two entries per submission. A round that wants one
+buffer's cost reads it from the build side (`rb_buffer_us / rb_buffer_n`) or
+subtracts the per-submission entries: the g3a round read 85 825 buffer-group
+entries against 43 329 buffers built and 42 496 submissions, i.e. one buffer
+created and destroyed per submission. One boundary is worth stating:
+a deferred object API retires its resources from `wait`, outside any submission,
+and those microseconds belong to no submission's window — the teardown bars
+therefore resolve to nothing when no `total` bar is open, so a window's fields
+stay a partition of its own `total` in both the synchronous and the deferred
+arm. The reclamation of the rail's own arm happens inside `submit`, and that is
+where these bars read.
+
+`submit_lock`, `submit_bookkeep`, `submit_merge` and `submit_validate` name the
+rest of the seam the disjoint bars leave, and `submit_seam_us` is the sum of
+those four with `submit_teardown`. `submit_bookkeep` is deliberately *not* part
+of `plan`: it is the part of a submission that happens after the pool is
+resolved and before the first device object exists — the pipeline plan and the
+translated-artifact table — which is exactly the region a cached plan would
+remove from a submission while a pool would not.
+
 `staging_cached_n` and `staging_plain_n` count the readback staging buffers a
 window's submissions allocated, by which memory type the selection took
 (`crate::readback_memory`): the first for a buffer backed by the device's
@@ -276,6 +357,26 @@ first real round the `immediate` population still averaged ~85 µs per call
 against ~406 µs for the blocked ones — a driver call is not free on this box,
 which is why the default sits at 100 µs rather than at 1 µs, and why the raw
 bucket sums are printed beside the counts.
+
+The same cut says *what* a wait was waiting on, which the idle/blocked split
+cannot: a wait that blocks because the queue is deep and one that blocks because
+its own work is long are the same number there. Four kinds partition every fence
+the provider waits on, and two more are printed to make "none of them" a reading
+rather than a claim:
+
+| field | meaning |
+|---|---|
+| `wait_submit_n` | waits on the compute submission's own completion fence (inside `fence_wait`) |
+| `wait_render_n` | waits on a render pass's completion fence (inside `render_wait`) |
+| `wait_landing_n` | waits on a kept-frame landing's fence (inside `landing_wait`) |
+| `wait_present_n` | waits on the present rail's sentinel fence |
+| `wait_queue_n` | waits on a queue rather than on one submission's completion — **always zero here**, and printed so a round can see that |
+| `wait_timeline_n` | waits on a `VkSemaphore` timeline — **always zero here**, for the same reason |
+| `wait_ahead_sum` / `wait_ahead_n` | the sum over the window's waits of how many *other* submissions the waited queue still held when the wait began, and how many of those waits began with at least one. Divide by the waits for the mean depth: `0` is a wait for one's own work on an idle queue, `n > 0` is a wait behind earlier submissions |
+
+This provider's only wait is `vkWaitForFences` on a binary completion fence, and
+the depth is read from the queue's own in-flight counter at the moment the wait
+starts — it is a snapshot of what stood ahead, not a difference of two totals.
 
 The accumulator is thread-local because a line has to describe one population.
 A process-wide table would put two submitting threads' bars in the same window,

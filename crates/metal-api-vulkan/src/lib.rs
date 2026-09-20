@@ -2453,6 +2453,20 @@ impl VulkanContext {
         }
     }
 
+    /// How many submissions the queue holds that it has not retired yet.
+    ///
+    /// Recorded at submit, cleared at retirement, so a wait that reads it holds
+    /// the number of submissions the waited queue still owed at that moment —
+    /// its own included. The submission profile reads it once per wait to say
+    /// whether the wait was for the caller's own work (`1`) or behind earlier
+    /// ones (`n > 1`); nothing else in the provider depends on it.
+    pub(crate) fn queue_in_flight(&self, index: usize) -> usize {
+        self.queue_in_flight
+            .get(index)
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
     }
@@ -3292,6 +3306,15 @@ impl PendingExecution {
         dispatches: &[BoundDispatch],
         tail: SequenceTail<'_>,
     ) -> Result<Self, ProviderError> {
+        // The seam between the `pool` bar and the `resource_build` bar: the
+        // submission's own plan, taken before the first device object exists
+        // (`crate::phase_profile`, `submit_bookkeep`). It is a disjoint bar of
+        // the submission rather than a child of `resource_build`, because the
+        // plan is CPU bookkeeping the rail could cache and the build is device
+        // calls it could pool; keeping them apart is what lets a round tell
+        // which of the two a change moved.
+        let _bookkeep =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SubmitBookkeep);
         let mut resources = ExecutionResources::new(Arc::clone(context));
         resources.set_borrowed_leases(tail.borrowed);
         let translated = artifacts
@@ -3332,6 +3355,7 @@ impl PendingExecution {
                 writable_pool_keys: BTreeSet::new(),
             });
         }
+        drop(_bookkeep);
         // The submission profile's three device-side bars. They are disjoint
         // (`resource_build` ends where `record` starts, and `record` where
         // `queue_submit` does), so their sum against the enclosing `total` bar
@@ -3339,16 +3363,28 @@ impl PendingExecution {
         // three resolve to `None` after one relaxed load when the profile is
         // off, and none of them reads a clock in that case.
         let _build = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ResourceBuild);
-        resources
-            .create_pipeline_objects(&translated, plans)
-            .map_err(|error| {
-                error.into_provider(
-                    ProviderPhase::Compile,
-                    ProviderErrorClass::Compile,
-                    "vulkan-pipeline-create",
-                    CompletionDisposition::NotSubmitted,
-                )
-            })?;
+        {
+            // The fifth cut divides `resource_build` by object family
+            // (`crate::phase_profile`): each bar below is one family's region,
+            // and the `rb_*_n` count the line prints beside the family is how
+            // many device objects of it the window created. Pipeline objects,
+            // buffers, descriptors and the indirect replay are whole-call
+            // regions here; the sampled declarations' images, views and
+            // samplers are split inside `create_textures`, where one call
+            // mixes the three.
+            let _pipelines =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbPipeline);
+            resources
+                .create_pipeline_objects(&translated, plans)
+                .map_err(|error| {
+                    error.into_provider(
+                        ProviderPhase::Compile,
+                        ProviderErrorClass::Compile,
+                        "vulkan-pipeline-create",
+                        CompletionDisposition::NotSubmitted,
+                    )
+                })?;
+        }
         let encode_error = |error: ExecutionFailure| {
             error.into_provider(
                 ProviderPhase::Encode,
@@ -3357,17 +3393,30 @@ impl PendingExecution {
                 CompletionDisposition::NotSubmitted,
             )
         };
-        resources.create_buffers(buffers).map_err(encode_error)?;
+        {
+            let _buffers = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbBuffer);
+            resources.create_buffers(buffers).map_err(encode_error)?;
+        }
         resources
             .create_textures(tail.textures, dispatches)
             .map_err(encode_error)?;
-        resources
-            .create_static_samplers(&translated)
-            .map_err(encode_error)?;
-        resources
-            .create_descriptors(&translated, dispatches)
-            .map_err(encode_error)?;
+        {
+            let _samplers =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbSampler);
+            resources
+                .create_static_samplers(&translated)
+                .map_err(encode_error)?;
+        }
+        {
+            let _descriptors =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbDescriptor);
+            resources
+                .create_descriptors(&translated, dispatches)
+                .map_err(encode_error)?;
+        }
         if let Some(threadgroups) = tail.indirect_dispatch {
+            let _indirect =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbIndirect);
             resources
                 .create_indirect_dispatch(threadgroups)
                 .map_err(encode_error)?;
@@ -5519,6 +5568,7 @@ impl ExecutionResources {
                 translated.reflection(),
                 std::slice::from_ref(plan),
             )?;
+            crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Pipeline);
             self.pipeline_objects.push(objects);
         }
         Ok(())
@@ -5804,6 +5854,7 @@ impl ExecutionResources {
                     )
                 },
             )?;
+            crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Buffer);
             let requirements =
                 unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
             let alignment = usize::try_from(requirements.alignment).unwrap_or(usize::MAX);
@@ -5858,6 +5909,7 @@ impl ExecutionResources {
                 ));
             }
         };
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
         let mapped = match unsafe {
             self.context
                 .device
@@ -6008,12 +6060,25 @@ impl ExecutionResources {
                 .usage(vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            // One sampled declaration's own backing: the image, the memory
+            // bound to it and the texels' trip into it are the `rb_image`
+            // region, and the view and the sampler below get their own bars —
+            // the three families `create_textures` mixes in one call
+            // (`crate::phase_profile`).
+            let _image = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbImage);
             let (image, memory, requirements) = allocate_image_backing(
                 &self.context,
                 &image_info,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 "texture",
             )?;
+            // The build census counts what *this* half built
+            // (`crate::phase_profile::BuildObject`): `allocate_image_backing` is
+            // shared with the render rail's attachments, so the counts are
+            // taken here rather than inside the helper, where the render half's
+            // images would land in `resource_build`'s families.
+            crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Image);
+            crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
             let mapped = match unsafe {
                 self.context.device.map_memory(
                     memory,
@@ -6091,7 +6156,18 @@ impl ExecutionResources {
                 }
             }
             unsafe { self.context.device.unmap_memory(memory) };
-            let view = match create_color_image_view(&self.context, image, vk_format, "texture") {
+            drop(_image);
+            let created_view = {
+                let _view = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbView);
+                let created = create_color_image_view(&self.context, image, vk_format, "texture");
+                if created.is_ok() {
+                    crate::phase_profile::note_build_object(
+                        crate::phase_profile::BuildObject::View,
+                    );
+                }
+                created
+            };
+            let view = match created_view {
                 Ok(view) => view,
                 Err(error) => {
                     unsafe {
@@ -6108,7 +6184,18 @@ impl ExecutionResources {
                 .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                 .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                 .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-            let sampler = match unsafe { self.context.device.create_sampler(&sampler_info, None) } {
+            let created_sampler = {
+                let _sampler =
+                    crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbSampler);
+                let created = unsafe { self.context.device.create_sampler(&sampler_info, None) };
+                if created.is_ok() {
+                    crate::phase_profile::note_build_object(
+                        crate::phase_profile::BuildObject::Sampler,
+                    );
+                }
+                created
+            };
+            let sampler = match created_sampler {
                 Ok(sampler) => sampler,
                 Err(error) => {
                     unsafe {
@@ -6272,7 +6359,17 @@ impl ExecutionResources {
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             "storage image",
         )?;
-        let view = match create_color_image_view(&self.context, image, vk_format, "storage image") {
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Image);
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
+        let created_view = {
+            let _view = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RbView);
+            let created = create_color_image_view(&self.context, image, vk_format, "storage image");
+            if created.is_ok() {
+                crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::View);
+            }
+            created
+        };
+        let view = match created_view {
             Ok(view) => view,
             Err(error) => {
                 unsafe {
@@ -6303,6 +6400,7 @@ impl ExecutionResources {
                 ));
             }
         };
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Buffer);
         let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
         let memory_type = match self.context.memory_type(
             requirements.memory_type_bits,
@@ -6338,6 +6436,7 @@ impl ExecutionResources {
                 ));
             }
         };
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
         let cleanup = |context: &VulkanContext| unsafe {
             context.device.destroy_buffer(buffer, None);
             context.device.free_memory(buffer_memory, None);
@@ -6494,6 +6593,7 @@ impl ExecutionResources {
             unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
                 ExecutionFailure::vulkan(error, format!("create buffer {}: {error}", index))
             })?;
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Buffer);
         let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
         let memory_type = match self.context.memory_type(
             requirements.memory_type_bits,
@@ -6518,6 +6618,7 @@ impl ExecutionResources {
                 ));
             }
         };
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
         if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
             unsafe {
                 self.context.device.destroy_buffer(buffer, None);
@@ -6592,6 +6693,7 @@ impl ExecutionResources {
             unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
                 ExecutionFailure::vulkan(error, format!("create buffer {index}: {error}"))
             })?;
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Buffer);
         let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
         let capacity = u64::try_from(capacity).unwrap_or(u64::MAX);
         if requirements.size > capacity {
@@ -6645,6 +6747,7 @@ impl ExecutionResources {
                 ));
             }
         };
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
         if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
             unsafe {
                 self.context.device.destroy_buffer(buffer, None);
@@ -6761,6 +6864,7 @@ impl ExecutionResources {
                         ExecutionFailure::vulkan(error, format!("create static sampler: {error}"))
                     },
                 )?;
+                crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Sampler);
                 self.static_samplers.push(GpuStaticSampler {
                     binding: descriptor.binding,
                     sampler,
@@ -6838,6 +6942,9 @@ impl ExecutionResources {
             .map_err(|error| {
                 ExecutionFailure::vulkan(error, format!("allocate descriptor sets: {error}"))
             })?;
+        for _ in &self.descriptor_sets {
+            crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Descriptor);
+        }
 
         // Each recorded pass owns a distinct immutable set. Updating a single
         // shared set here would make every dispatch observe the last mapping.
@@ -7026,6 +7133,7 @@ impl ExecutionResources {
             unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
                 ExecutionFailure::vulkan(error, format!("create indirect buffer: {error}"))
             })?;
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Indirect);
         let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
         let memory_type = match self.context.memory_type(
             requirements.memory_type_bits,
@@ -7050,6 +7158,7 @@ impl ExecutionResources {
                 ));
             }
         };
+        crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Memory);
         if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
             unsafe {
                 self.context.device.destroy_buffer(buffer, None);
@@ -7456,9 +7565,20 @@ impl ExecutionResources {
         // The one fence wait this submission performs, classified by how long
         // the driver call itself took: a wait that returns immediately means the
         // queue had already retired the work, and those microseconds are driver
-        // overhead rather than device latency.
-        let mut _fence_wait =
-            crate::phase_profile::Bar::enter_fence_wait(crate::phase_profile::Phase::FenceWait);
+        // overhead rather than device latency. The wait's *object* is the
+        // submission's own binary completion fence, and the depth read here says
+        // how much earlier work the queue still held when the wait began: the
+        // submission itself is already recorded, so `n - 1` is what stood
+        // ahead of it.
+        let ahead = self
+            .context
+            .queue_in_flight(self.queue_index)
+            .saturating_sub(1);
+        let mut _fence_wait = crate::phase_profile::Bar::enter_fence_wait(
+            crate::phase_profile::Phase::FenceWait,
+            crate::phase_profile::WaitObject::SubmitFence,
+            ahead,
+        );
         let wait = self.context.wait_for_fence(self.fence, timeout_ns);
         match wait {
             Ok(()) => {
@@ -7586,6 +7706,7 @@ impl ExecutionResources {
 
 impl Drop for ExecutionResources {
     fn drop(&mut self) {
+        use crate::phase_profile::{Bar, Phase};
         // A retained in-flight submission may still read or write borrowed
         // owner memory, so only a destroying drop retires its retains.
         if resource_drop_policy(self.submitted, self.completed, self.device_lost)
@@ -7609,37 +7730,66 @@ impl Drop for ExecutionResources {
             }
             return;
         }
+        // The compute half's own teardown, named by the fifth cut
+        // (`crate::phase_profile`): before it, the destruction below ran inside
+        // the enclosing `total` bar and inside no other, which is why the
+        // submission's largest unnamed region was its own teardown. The groups
+        // below are the ones this drop works through, each with its own bar and
+        // its own object count, exactly as the render half's `teardown_*` cut
+        // splits `OffscreenObjects::drop`.
+        // Only inside a submission: a deferred retirement runs outside any
+        // `total`, and its microseconds belong to no submission's window
+        // (`crate::phase_profile::Bar::enter_in_submission`).
+        let _teardown = Bar::enter_in_submission(Phase::SubmitTeardown);
         if self.submitted && !self.completed {
             self.context.record_queue_retirement(self.queue_index);
         }
-        if let Some((registry, lease_ids)) = self.borrowed.take() {
-            registry.retire_all(&lease_ids);
+        {
+            // Retiring the retains is what lets the owner's pages go, and it
+            // goes through the lease channel rather than the device: it is the
+            // one group here that is not a Vulkan destroy call.
+            let _retains = Bar::enter_in_submission(Phase::SubmitTdRetains);
+            if let Some((registry, lease_ids)) = self.borrowed.take() {
+                registry.retire_all(&lease_ids);
+            }
         }
         unsafe {
-            if self.fence != vk::Fence::null() {
-                self.context.device.destroy_fence(self.fence, None);
+            {
+                let _sync = Bar::enter_in_submission(Phase::SubmitTdSync);
+                if self.fence != vk::Fence::null() {
+                    self.context.device.destroy_fence(self.fence, None);
+                }
+                if self.command_pool != vk::CommandPool::null() {
+                    self.context
+                        .device
+                        .destroy_command_pool(self.command_pool, None);
+                }
+                if self.descriptor_pool != vk::DescriptorPool::null() {
+                    self.context
+                        .device
+                        .destroy_descriptor_pool(self.descriptor_pool, None);
+                }
             }
-            if self.command_pool != vk::CommandPool::null() {
-                self.context
-                    .device
-                    .destroy_command_pool(self.command_pool, None);
+            // One pipeline-shaped object group per pipeline the submission
+            // built: draining keeps the count meaningful where `clear()` would
+            // charge all of them to one bar entry.
+            for objects in self.pipeline_objects.drain(..) {
+                let _pipeline = Bar::enter_in_submission(Phase::SubmitTdPipeline);
+                drop(objects);
             }
-            if self.descriptor_pool != vk::DescriptorPool::null() {
-                self.context
-                    .device
-                    .destroy_descriptor_pool(self.descriptor_pool, None);
-            }
-            self.pipeline_objects.clear();
             for buffer in &self.buffers {
+                let _buffers = Bar::enter_in_submission(Phase::SubmitTdBuffers);
                 self.context.device.destroy_buffer(buffer.buffer, None);
                 if buffer.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(buffer.memory, None);
                 }
             }
             if let Some(memory) = self.heap_memory {
+                let _buffers = Bar::enter_in_submission(Phase::SubmitTdBuffers);
                 self.context.device.free_memory(memory, None);
             }
             for texture in &self.textures {
+                let _textures = Bar::enter_in_submission(Phase::SubmitTdTextures);
                 if texture.sampler != vk::Sampler::null() {
                     self.context.device.destroy_sampler(texture.sampler, None);
                 }
@@ -7653,11 +7803,13 @@ impl Drop for ExecutionResources {
                 }
             }
             for sampler in &self.static_samplers {
+                let _textures = Bar::enter_in_submission(Phase::SubmitTdTextures);
                 self.context.device.destroy_sampler(sampler.sampler, None);
             }
             // The indirect buffer is unbound by construction (its memory is
             // freed right after), so destroy before free, matching the render
             // rail's `create_indirect_draw` teardown.
+            let _buffers = Bar::enter_in_submission(Phase::SubmitTdBuffers);
             if self.indirect_buffer != vk::Buffer::null() {
                 self.context
                     .device
