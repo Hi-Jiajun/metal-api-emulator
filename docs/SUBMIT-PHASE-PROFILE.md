@@ -302,11 +302,53 @@ where these bars read.
 
 `submit_lock`, `submit_bookkeep`, `submit_merge` and `submit_validate` name the
 rest of the seam the disjoint bars leave, and `submit_seam_us` is the sum of
-those four with `submit_teardown`. `submit_bookkeep` is deliberately *not* part
+those four with `submit_teardown` and `submit_release`. `submit_bookkeep` is deliberately *not* part
 of `plan`: it is the part of a submission that happens after the pool is
 resolved and before the first device object exists — the pipeline plan and the
 translated-artifact table — which is exactly the region a cached plan would
 remove from a submission while a pool would not.
+
+The sixth cut adds the seam's last unnamed region and splits the largest bar
+that was already named:
+
+* `submit_release` is the **tail of the call**: `total` is the first binding in
+  `submit`, so it is the last to drop, and the values declared after it — the
+  pooled bindings with their own copies of the views' bytes, the serial
+  resource pool, the texture views, the per-pass dispatch list, the heap plan,
+  the render plan and the pipeline artifacts — drop *after* the `settle` guard
+  that was declared last. Those microseconds are inside `total` and inside no
+  other field, which is why the fifth cut's seam read as `total_us` minus the
+  disjoint bars and the sp13 round could only call the remainder unnamed: the
+  sp16 round read that remainder at 170.6 µs/submission before this cut and
+  2.7 µs after it. The three children divide it —
+  `submit_release_bindings_us` (the pooled bindings),
+  `submit_release_views_us` (the resource pool and the texture views) and
+  `submit_release_plan_us` (the dispatch list, the heap plan, the render plan
+  and the artifacts) — with `submit_release_named_us` as their printed sum. The
+  bar is entered only while the profile is on, and the branch that drops the
+  tail values with it is skipped when the profile is off, so those values drop
+  exactly where they dropped before the cut.
+* `submit_validate_derive_us` and `submit_validate_check_us` divide
+  `submit_validate`: the two pool derivations the terminal validation takes for
+  itself (`ComputeTrace::serial_resources`, which re-validates the trace and
+  walks every compute pass's declaration list, and
+  `serial_texture_resources`) and the walk that reads them, with
+  `submit_validate_named_us` as their sum. The sp16 round read the derivation at
+  185.4 of the bar's 229.1 µs/submission — but that bar's mean is a host-stall
+  tail rather than per-submission work (`docs/COMPUTE-PIPELINE-REUSE.md` §6
+  measured the derivations a cut would remove at ≈4.9 µs, 0.2 % of a
+  submission), which is why this cut reads the split and does not cut it.
+
+`submit_binding_copies_n` / `submit_binding_copies_bytes` and
+`submit_binding_borrows_n` / `submit_binding_borrows_bytes` say how the window's
+submissions filled their pooled bindings with the *trace's own* snapshot bytes:
+as a copy the submission made for itself, or — with the sixth cut's mechanism on
+(`METAL_API_VULKAN_SUBMIT_BINDING_BORROW`, off by default) — as a borrow of the
+serial resource pool that already holds them. The other two binding sources are
+always owned and are counted in neither: a staged lease's bytes are copied out
+of the staging registry's lock and a gathered run list is built by the gather
+itself. The pair is the mechanism's own reading, and
+`docs/SUBMIT-BINDING-BORROW.md` carries the A/B that prices it.
 
 `staging_cached_n` and `staging_plain_n` count the readback staging buffers a
 window's submissions allocated, by which memory type the selection took

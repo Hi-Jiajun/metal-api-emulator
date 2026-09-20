@@ -243,7 +243,10 @@
 //!   `submit_validate_named_us` as their printed sum. The two halves are the
 //!   reading a cut of that bar needs: the derivations are what the submission
 //!   has already paid for once (`plan` derived the resource pool, `pool` the
-//!   texture views), and the walk is the contract check the call exists for.
+//!   texture views) and the walk is the contract check the call exists for. The
+//!   `g3dprobe` round measured the derivations a cut would remove at ≈4.9 µs a
+//!   submission (0.2 %) and declined to widen the contract for them
+//!   (`docs/COMPUTE-PIPELINE-REUSE.md` §6), so this bar is read and not cut.
 //!
 //! The same round answers "what is a wait waiting on": `wait_submit_n`,
 //! `wait_render_n`, `wait_landing_n` and `wait_present_n` count every fence the
@@ -1549,6 +1552,17 @@ struct Local {
     /// memory type the selection took.
     staging_cached_n: u64,
     staging_plain_n: u64,
+    /// The bytes the window's submissions moved into their pooled bindings,
+    /// split by which way they arrived: a copy the submission made for itself
+    /// (the trace's own snapshot bytes with the sixth cut's mechanism off) or a
+    /// borrow of the table it already holds (with the mechanism on). The other
+    /// two binding sources — a staged lease's copy and a gathered run list —
+    /// are always owned and are counted in neither
+    /// (`crate::submit_binding_borrow`).
+    binding_copy_calls: u64,
+    binding_copy_bytes: u64,
+    binding_borrow_calls: u64,
+    binding_borrow_bytes: u64,
     /// The device objects the window's teardowns actually destroyed, by family.
     /// They are the population behind the `teardown_*` bars: a bar's
     /// microseconds divided by its own family's count is one object's cost, and
@@ -1645,6 +1659,10 @@ impl Default for Local {
             landing_bytes: 0,
             staging_cached_n: 0,
             staging_plain_n: 0,
+            binding_copy_calls: 0,
+            binding_copy_bytes: 0,
+            binding_borrow_calls: 0,
+            binding_borrow_bytes: 0,
             td_image_n: 0,
             td_view_n: 0,
             td_sampler_n: 0,
@@ -1851,6 +1869,10 @@ impl Local {
         let landing_bytes = std::mem::take(&mut self.landing_bytes);
         let staging_cached_n = std::mem::take(&mut self.staging_cached_n);
         let staging_plain_n = std::mem::take(&mut self.staging_plain_n);
+        let binding_copy_calls = std::mem::take(&mut self.binding_copy_calls);
+        let binding_copy_bytes = std::mem::take(&mut self.binding_copy_bytes);
+        let binding_borrow_calls = std::mem::take(&mut self.binding_borrow_calls);
+        let binding_borrow_bytes = std::mem::take(&mut self.binding_borrow_bytes);
         let td_image_n = std::mem::take(&mut self.td_image_n);
         let td_view_n = std::mem::take(&mut self.td_view_n);
         let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
@@ -1945,6 +1967,10 @@ impl Local {
              render_batch_broken_load_n={render_batch_broken_load_n} \
              landing_n={landing_n} landing_bytes={landing_bytes} \
              staging_cached_n={staging_cached_n} staging_plain_n={staging_plain_n} \
+             submit_binding_copies_n={binding_copy_calls} \
+             submit_binding_copies_bytes={binding_copy_bytes} \
+             submit_binding_borrows_n={binding_borrow_calls} \
+             submit_binding_borrows_bytes={binding_borrow_bytes} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
              td_buffer_n={td_buffer_n} td_memory_n={td_memory_n}",
             readback.rect_n,
@@ -1993,6 +2019,37 @@ pub(crate) fn note_staging_memory(cached: bool) {
         } else {
             local.staging_plain_n += 1;
         }
+    });
+}
+
+/// One pooled binding's bytes the submission *copied* for itself: the trace's
+/// own snapshot bytes, cloned into the binding's own vector
+/// (`crate::submit_binding_borrow`). The other two binding sources are always
+/// owned and are not counted here.
+#[inline]
+pub(crate) fn note_binding_copy(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.binding_copy_calls += 1;
+        local.binding_copy_bytes += bytes;
+    });
+}
+
+/// The same bytes the sixth cut's mechanism *borrowed* from the table the
+/// submission already holds. A round reads the pair of counters to say how many
+/// bytes the mechanism took off `pool` and the release.
+#[inline]
+pub(crate) fn note_binding_borrow(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.binding_borrow_calls += 1;
+        local.binding_borrow_bytes += bytes;
     });
 }
 
