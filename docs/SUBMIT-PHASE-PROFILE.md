@@ -51,6 +51,8 @@ import_return_n=... import_drop_n=... buffer_hit_n=... buffer_miss_n=...
 buffer_disabled_n=... buffer_return_n=... buffer_drop_n=...
 compute_buffer_hit_n=... compute_buffer_miss_n=... compute_buffer_disabled_n=...
 compute_buffer_return_n=... compute_buffer_drop_n=...
+compute_pipeline_hit_n=... compute_pipeline_miss_n=... compute_pipeline_mismatch_n=...
+compute_pipeline_disabled_n=... compute_pipeline_return_n=... compute_pipeline_drop_n=...
 render_offscreen_n=... render_present_n=...
 readback_rect_us=... readback_full_us=... readback_seed_us=...
 readback_surfaces_us=... readback_shape_us=... readback_named_us=...
@@ -175,7 +177,7 @@ have their own setup and readback).
 | `landing_fetch` | inside `render_landing`: the host read of the copied frame — the part a landing shares with the readback channel |
 | `landing_write` | inside `render_landing`: the write into the owner's live pages |
 | `landing_release` | inside `render_landing`: destroying the fence, the command pool, the mapping, the buffer and its memory |
-| `rb_pipeline` | inside `resource_build`: the pipeline-shaped objects one compute pipeline needs — `create_pipeline_objects`, one bar per pipeline |
+| `rb_pipeline` | inside `resource_build`: the pipeline-shaped objects one compute pipeline needs — `create_pipeline_objects`, one bar per compute pass, enclosing the module, the descriptor-set layout, the pipeline layout and the pipelines. The bar covers the shape table's lookup too, on either arm; `rb_pipeline_n` counts only the groups the window **built**, so a group the table handed over is a smaller bar and a population that `compute_pipeline_hit_n` names (`docs/COMPUTE-PIPELINE-REUSE.md`) |
 | `rb_buffer` | inside `resource_build`: every device buffer the submission builds with its memory bound and uploaded — `create_buffers` as one region (owned backings, the heap slab's placements, the imported host windows, the storage image's transfer buffer). A creation of a shape the compute pool holds takes the pool's pair instead of building one (`docs/COMPUTE-BUFFER-POOL.md`), which is exactly what `compute_buffer_hit_n` counts; the family's own `rb_buffer_n` counts the buffers the window really built, so a hit arm's region is smaller than its population |
 | `rb_image` | inside `resource_build`: one sampled or storage image's backing — `allocate_image_backing` plus, for the sampled arm, the texels' trip into it (`create_textures` / `create_storage_texture`, one bar per image) |
 | `rb_view` | inside `resource_build`: one image view (`create_color_image_view` in the compute texture paths, one bar per view) |
@@ -183,7 +185,7 @@ have their own setup and readback).
 | `rb_descriptor` | inside `resource_build`: one pass's immutable descriptor set — the pool, the set layouts, the allocation and the writes (`create_descriptors`, one region per submission that builds sets) |
 | `rb_indirect` | inside `resource_build`: the indirect replay's command buffer and the memory bound to it (`create_indirect_dispatch`; a direct dispatch builds none) |
 | `submit_teardown` | the compute half's own teardown (`ExecutionResources::drop`) — the fence, the pools, the pipeline objects, the buffers, the images, the samplers and the borrowed retains, destroyed once the fence proved the device done with them. The counterpart of the render half's `render_teardown`, and charged only while the submission's own `total` bar is open |
-| `submit_td_sync` / `submit_td_pipeline` / `submit_td_buffers` / `submit_td_textures` / `submit_td_retains` | inside `submit_teardown`: the computation fence, the command pool and the descriptor pool; the pipeline-shaped objects; every buffer with its memory; the sampled and storage declarations' samplers, views, images and memories; and retiring the borrowed leases the submission's gathers took — in the order the drop works through them. The buffer group's per-buffer region is either the destroy the fresh path always stated or the unmap-and-hand-back of a pooled pair, so the pool's own counters (`compute_buffer_return_n`, `compute_buffer_drop_n`) say which of the two a window's entries were |
+| `submit_td_sync` / `submit_td_pipeline` / `submit_td_buffers` / `submit_td_textures` / `submit_td_retains` | inside `submit_teardown`: the computation fence, the command pool and the descriptor pool; the pipeline-shaped objects; every buffer with its memory; the sampled and storage declarations' samplers, views, images and memories; and retiring the borrowed leases the submission's gathers took — in the order the drop works through them. The pipeline group's per-group region is either the destroy the fresh path always stated or the hand-back of a shape-decided group (`compute_pipeline_return_n`, `compute_pipeline_drop_n`, `docs/COMPUTE-PIPELINE-REUSE.md`), and the buffer group's per-buffer region the same choice for a pooled pair (`compute_buffer_return_n`, `compute_buffer_drop_n`), so a window's entry in either region names which of the two it was |
 | `submit_lock` | the submission's executor lock, queue pick, queue lock and arena admission, before the compute half's first bar |
 | `submit_bookkeep` | between `pool` and `resource_build`: the translated-artifact list and `plan_pipeline_sequence` |
 | `submit_merge` | between the halves: the keyed merge of the compute and render writebacks |
@@ -339,6 +341,17 @@ the submission's own staged bytes, its shared backing, and the indirect
 replay's twelve-byte command — and one `return` is one pair handed back after
 the submission's fence was observed; the five partition the same population
 `rb_buffer_n` counts on the build side.
+The `compute_pipeline_*` fields are the same reading one level up
+(`docs/COMPUTE-PIPELINE-REUSE.md`): the compute half's *shape-decided* objects —
+the shader module, the descriptor-set layout, the pipeline layout and the
+compute pipelines — which a submission of the same shape takes instead of
+rebuilding. `hit`/`miss`/`mismatch`/`disabled` partition every creation,
+`return`/`drop` every hand-back of a submission whose fence was observed, and
+the six are a separate group from the render half's `reuse_*_n` because the two
+rails carry their own switch. A served creation is not also a build, so
+`rb_pipeline_n` — which counts the groups a window really built — falls with
+`compute_pipeline_hit_n` rising; the two are two readings of one population and
+must be read together.
 `render_offscreen_n` and `render_present_n` count the render passes a window's
 submissions executed, by shape: the five `render_*` children divide the
 offscreen executor, so a reading of them beside a present count would otherwise

@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod compute_buffer_pool;
+mod compute_pipeline_reuse;
 mod compute_provider;
 mod phase_profile;
 mod provider;
@@ -47,6 +48,7 @@ mod render_setup_reuse;
 mod render_texture_pool;
 
 pub use compute_buffer_pool::ComputeBufferPoolCounts;
+pub use compute_pipeline_reuse::ComputePipelineReuseCounts;
 pub use compute_provider::{
     CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
     ResidentTargetRetirement, TranslatedRenderPipelineRequest, VulkanComputeProvider,
@@ -1040,6 +1042,37 @@ impl VulkanExecutor {
         self.context.clear_compute_buffer_pool();
     }
 
+    /// What the compute half's shape-decided pipeline reuse has seen
+    /// (`crate::compute_pipeline_reuse`): how many creations the table served
+    /// and how many built their own objects, how many digest collisions the
+    /// full comparison refused, how many were asked while the switch was off,
+    /// and how many groups the table kept, evicted or dropped.
+    #[doc(hidden)]
+    pub fn compute_pipeline_reuse_counts(&self) -> ComputePipelineReuseCounts {
+        self.context.compute_pipeline_reuse_counts()
+    }
+
+    /// Whether the compute half's shape-decided pipeline reuse is on for this
+    /// executor.
+    #[doc(hidden)]
+    pub fn compute_pipeline_reuse_enabled(&self) -> bool {
+        self.context.compute_pipeline_reuse_enabled()
+    }
+
+    /// Turn the compute half's shape-decided pipeline reuse on or off, dropping
+    /// what it held when it goes off.
+    #[doc(hidden)]
+    pub fn set_compute_pipeline_reuse(&self, enabled: bool) {
+        self.context.set_compute_pipeline_reuse(enabled);
+    }
+
+    /// Drop every reusable compute pipeline group: the contract surface they
+    /// were built from moved.
+    #[doc(hidden)]
+    pub fn clear_compute_pipeline_reuse(&self) {
+        self.context.clear_compute_pipeline_reuse();
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1752,6 +1785,12 @@ pub(crate) struct VulkanContext {
     /// allocation, and the indirect replay's own command. On by default, off
     /// with `METAL_API_VULKAN_COMPUTE_BUFFER_POOL=0`.
     compute_buffer_pool: Mutex<compute_buffer_pool::ComputeBufferPool>,
+    /// The shape-decided pipeline objects one compute submission may hand the
+    /// next submission of the same shape (`crate::compute_pipeline_reuse`):
+    /// the shader module, the descriptor-set layout, the pipeline layout over
+    /// it and one compute pipeline per local size. On by default, off with
+    /// `METAL_API_VULKAN_COMPUTE_PIPELINE_REUSE=0`.
+    compute_pipeline_reuse: Mutex<compute_pipeline_reuse::ComputePipelineReuse>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -2015,6 +2054,11 @@ impl VulkanContext {
         // own switch, their own empty table, built before the literal takes
         // `device`.
         let compute_buffer_pool = compute_buffer_pool::ComputeBufferPool::new(device.clone());
+        // The compute half's own shape-decided pipeline objects read the same
+        // way: their own switch, their own empty table, built before the
+        // literal takes `device`.
+        let compute_pipeline_reuse =
+            compute_pipeline_reuse::ComputePipelineReuse::new(device.clone());
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
@@ -2051,6 +2095,7 @@ impl VulkanContext {
             render_import_pool: Mutex::new(render_import_pool),
             render_buffer_pool: Mutex::new(render_buffer_pool),
             compute_buffer_pool: Mutex::new(compute_buffer_pool),
+            compute_pipeline_reuse: Mutex::new(compute_pipeline_reuse),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -2341,6 +2386,65 @@ impl VulkanContext {
     /// built from moved.
     pub(crate) fn clear_compute_buffer_pool(&self) {
         self.lock_compute_buffer_pool().clear();
+    }
+
+    /// The compute half's own shape-decided pipeline objects
+    /// (`crate::compute_pipeline_reuse`). A poisoned lock is recovered for the
+    /// same reason the pool's is: the table's state is a list of device
+    /// handles, and a panic elsewhere must not turn a reusable group into a
+    /// refusal.
+    fn lock_compute_pipeline_reuse(
+        &self,
+    ) -> MutexGuard<'_, compute_pipeline_reuse::ComputePipelineReuse> {
+        self.compute_pipeline_reuse
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pipeline objects a creation of this shape may take, and what the
+    /// table answered.
+    pub(crate) fn take_compute_pipeline(
+        &self,
+        key: &compute_pipeline_reuse::ComputePipelineKey,
+    ) -> (
+        Option<compute_pipeline_reuse::ReusablePipelineGroup>,
+        compute_pipeline_reuse::ComputePipelineOutcome,
+    ) {
+        self.lock_compute_pipeline_reuse().take(key)
+    }
+
+    /// Hand a completed submission's pipeline objects back, or destroy them
+    /// when the mechanism is off or the cap cannot hold them.
+    pub(crate) fn give_compute_pipeline_back(
+        &self,
+        key: compute_pipeline_reuse::ComputePipelineKey,
+        group: compute_pipeline_reuse::ReusablePipelineGroup,
+    ) -> compute_pipeline_reuse::ComputePipelineOutcome {
+        self.lock_compute_pipeline_reuse().give(key, group)
+    }
+
+    /// The compute pipeline-reuse counters one reading reports.
+    pub(crate) fn compute_pipeline_reuse_counts(
+        &self,
+    ) -> compute_pipeline_reuse::ComputePipelineReuseCounts {
+        self.lock_compute_pipeline_reuse().counts()
+    }
+
+    /// Whether the compute pipeline reuse is on for this device.
+    pub(crate) fn compute_pipeline_reuse_enabled(&self) -> bool {
+        self.lock_compute_pipeline_reuse().enabled()
+    }
+
+    /// Turn the compute pipeline reuse on or off, and drop what it holds when
+    /// it goes off.
+    pub(crate) fn set_compute_pipeline_reuse(&self, enabled: bool) {
+        self.lock_compute_pipeline_reuse().set_enabled(enabled);
+    }
+
+    /// Drop every reusable compute pipeline: the contract surface they were
+    /// built from moved.
+    pub(crate) fn clear_compute_pipeline_reuse(&self) {
+        self.lock_compute_pipeline_reuse().clear();
     }
 
     /// The selected device's own limits, for the render rail's attachment
@@ -5207,12 +5311,23 @@ struct GpuStaticSampler {
 
 /// A pass owns every object derived from its shader's reflection. Keeping this
 /// ownership separate prevents using one shader's layout for a later shader.
+///
+/// The group is shape-decided, so a submission whose kernel, layout, push
+/// constants and local sizes the device has already built takes the objects
+/// back from the table instead of minting them again
+/// ([`crate::compute_pipeline_reuse`]); what stays per submission is the
+/// descriptor pool, the descriptor sets, the command buffer and every buffer.
 struct PipelineObjects {
     context: Arc<VulkanContext>,
-    set_layout: vk::DescriptorSetLayout,
-    pipeline_layout: vk::PipelineLayout,
-    shader: vk::ShaderModule,
-    pipelines: BTreeMap<[u32; 3], vk::Pipeline>,
+    /// The four device objects, carrying the device handle that releases them
+    /// when the submission that holds them fails before its fence.
+    group: compute_pipeline_reuse::ReusablePipelineGroup,
+    /// The shape this group was keyed with, which is what a completed
+    /// submission hands it back under. `None` until `create` states one.
+    key: Option<compute_pipeline_reuse::ComputePipelineKey>,
+    /// What the last creation came to, so the caller can count the pipeline
+    /// objects the submission really built.
+    outcome: Option<compute_pipeline_reuse::ComputePipelineOutcome>,
 }
 
 struct ExecutionResources {
@@ -5447,13 +5562,41 @@ impl SubmissionFailure {
 
 impl PipelineObjects {
     fn new(context: Arc<VulkanContext>) -> Self {
+        // The empty group is armed from the start: a creation that fails
+        // half-way releases exactly the handles it managed to mint.
+        let group = compute_pipeline_reuse::ReusablePipelineGroup::empty(context.device.clone());
         Self {
             context,
-            set_layout: vk::DescriptorSetLayout::null(),
-            pipeline_layout: vk::PipelineLayout::null(),
-            shader: vk::ShaderModule::null(),
-            pipelines: BTreeMap::new(),
+            group,
+            key: None,
+            outcome: None,
         }
+    }
+
+    /// Whether the last creation minted the objects itself rather than taking
+    /// them from the table (`crate::compute_pipeline_reuse`). Only a creation
+    /// that minted them counts as one the submission built, so a **hit** is the
+    /// one outcome that does not: a miss, a refused digest collision and a
+    /// creation that ran with the switch off all built what they ran.
+    fn built(&self) -> bool {
+        !matches!(
+            self.outcome,
+            Some(compute_pipeline_reuse::ComputePipelineOutcome::Hit)
+        )
+    }
+
+    /// The group, and the shape a completed submission hands it back under.
+    ///
+    /// The key is `None` for a creation that never reached the point of
+    /// stating one; such a group has nothing to be reused by and is released
+    /// by the caller.
+    fn into_group(
+        self,
+    ) -> (
+        Option<compute_pipeline_reuse::ComputePipelineKey>,
+        compute_pipeline_reuse::ReusablePipelineGroup,
+    ) {
+        (self.key, self.group)
     }
 
     fn create(
@@ -5469,11 +5612,6 @@ impl PipelineObjects {
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
             .collect::<Vec<_>>();
-        let shader_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        self.shader = unsafe { self.context.device.create_shader_module(&shader_info, None) }
-            .map_err(|error| {
-                ExecutionFailure::vulkan(error, format!("create shader module: {error}"))
-            })?;
 
         let mut layout_bindings = reflection
             .bindings
@@ -5488,18 +5626,6 @@ impl PipelineObjects {
             })
             .collect::<Vec<_>>();
         layout_bindings.sort_by_key(|binding| binding.binding);
-        let set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
-        self.set_layout = unsafe {
-            self.context
-                .device
-                .create_descriptor_set_layout(&set_layout_info, None)
-        }
-        .map_err(|error| {
-            ExecutionFailure::vulkan(error, format!("create descriptor-set layout: {error}"))
-        })?;
-
-        let set_layouts = [self.set_layout];
         let contract = reflection
             .kernel_dispatch
             .expect("validated kernel dispatch");
@@ -5510,10 +5636,54 @@ impl PipelineObjects {
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(range.offset)
             .size(range.size)];
+        // The key states exactly the structures below are about to be handed
+        // to the driver: the module's own words, the ordered bindings of the
+        // set layout, the push-constant range of the pipeline layout, and the
+        // local sizes this creation is about to build a pipeline for
+        // (`crate::compute_pipeline_reuse`).
+        let key = compute_pipeline_reuse::ComputePipelineKey::new(
+            &words,
+            &layout_bindings
+                .iter()
+                .map(compute_pipeline_reuse::LayoutBinding::of)
+                .collect::<Vec<_>>(),
+            compute_pipeline_reuse::PushConstantRange::of(&push_ranges[0]),
+            plans
+                .iter()
+                .flat_map(|plan| &plan.regions)
+                .map(|region| region.local_size)
+                .collect::<Vec<_>>(),
+        );
+        let (taken, outcome) = self.context.take_compute_pipeline(&key);
+        crate::phase_profile::note_compute_pipeline_reuse(outcome);
+        self.outcome = Some(outcome);
+        self.key = Some(key);
+        if let Some(group) = taken {
+            self.group = group;
+            return Ok(());
+        }
+
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(&words);
+        self.group.shader = unsafe { self.context.device.create_shader_module(&shader_info, None) }
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create shader module: {error}"))
+            })?;
+        let set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
+        self.group.set_layout = unsafe {
+            self.context
+                .device
+                .create_descriptor_set_layout(&set_layout_info, None)
+        }
+        .map_err(|error| {
+            ExecutionFailure::vulkan(error, format!("create descriptor-set layout: {error}"))
+        })?;
+
+        let set_layouts = [self.group.set_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_ranges);
-        self.pipeline_layout = unsafe {
+        self.group.pipeline_layout = unsafe {
             self.context
                 .device
                 .create_pipeline_layout(&pipeline_layout_info, None)
@@ -5523,11 +5693,11 @@ impl PipelineObjects {
         })?;
 
         for region in plans.iter().flat_map(|plan| &plan.regions) {
-            if self.pipelines.contains_key(&region.local_size) {
+            if self.group.pipelines.contains_key(&region.local_size) {
                 continue;
             }
             let pipeline = self.create_compute_pipeline(region.local_size)?;
-            self.pipelines.insert(region.local_size, pipeline);
+            self.group.pipelines.insert(region.local_size, pipeline);
         }
         Ok(())
     }
@@ -5557,12 +5727,12 @@ impl PipelineObjects {
             .data(&data);
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(self.shader)
+            .module(self.group.shader)
             .name(&main)
             .specialization_info(&specialization);
         let info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
-            .layout(self.pipeline_layout)];
+            .layout(self.group.pipeline_layout)];
         match unsafe {
             self.context
                 .device
@@ -5577,29 +5747,6 @@ impl PipelineObjects {
                     error,
                     format!("create compute pipeline: {error}"),
                 ))
-            }
-        }
-    }
-}
-
-impl Drop for PipelineObjects {
-    fn drop(&mut self) {
-        unsafe {
-            for pipeline in self.pipelines.values().copied() {
-                self.context.device.destroy_pipeline(pipeline, None);
-            }
-            if self.pipeline_layout != vk::PipelineLayout::null() {
-                self.context
-                    .device
-                    .destroy_pipeline_layout(self.pipeline_layout, None);
-            }
-            if self.set_layout != vk::DescriptorSetLayout::null() {
-                self.context
-                    .device
-                    .destroy_descriptor_set_layout(self.set_layout, None);
-            }
-            if self.shader != vk::ShaderModule::null() {
-                self.context.device.destroy_shader_module(self.shader, None);
             }
         }
     }
@@ -5681,7 +5828,14 @@ impl ExecutionResources {
                 translated.reflection(),
                 std::slice::from_ref(plan),
             )?;
-            crate::phase_profile::note_build_object(crate::phase_profile::BuildObject::Pipeline);
+            // A group the table handed over minted nothing, so only a creation
+            // that built its own counts as an object this submission made
+            // (`crate::compute_pipeline_reuse`).
+            if objects.built() {
+                crate::phase_profile::note_build_object(
+                    crate::phase_profile::BuildObject::Pipeline,
+                );
+            }
             self.pipeline_objects.push(objects);
         }
         Ok(())
@@ -7085,7 +7239,7 @@ impl ExecutionResources {
         let layouts = self
             .pipeline_objects
             .iter()
-            .map(|objects| objects.set_layout)
+            .map(|objects| objects.group.set_layout)
             .collect::<Vec<_>>();
         let allocation = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -7529,7 +7683,7 @@ impl ExecutionResources {
                 self.context.device.cmd_bind_descriptor_sets(
                     self.command,
                     vk::PipelineBindPoint::COMPUTE,
-                    objects.pipeline_layout,
+                    objects.group.pipeline_layout,
                     reflection.descriptor_layout.set,
                     &[self.descriptor_sets[pass_index]],
                     &[],
@@ -7556,7 +7710,7 @@ impl ExecutionResources {
                     );
                 }
                 for region in &plan.regions {
-                    let pipeline = objects.pipelines[&region.local_size];
+                    let pipeline = objects.group.pipelines[&region.local_size];
                     self.context.device.cmd_bind_pipeline(
                         self.command,
                         vk::PipelineBindPoint::COMPUTE,
@@ -7569,7 +7723,7 @@ impl ExecutionResources {
                         .collect::<Vec<_>>();
                     self.context.device.cmd_push_constants(
                         self.command,
-                        objects.pipeline_layout,
+                        objects.group.pipeline_layout,
                         vk::ShaderStageFlags::COMPUTE,
                         offset,
                         &bytes,
@@ -7959,9 +8113,28 @@ impl Drop for ExecutionResources {
             }
             // One pipeline-shaped object group per pipeline the submission
             // built: draining keeps the count meaningful where `clear()` would
-            // charge all of them to one bar entry.
+            // charge all of them to one bar entry. A group the table minted for
+            // an earlier submission of the same shape goes back instead of
+            // being destroyed (`crate::compute_pipeline_reuse`); the give is
+            // inside this same region, so a round reads "this region on the
+            // fresh path" against "this region with the table on" on one
+            // definition, exactly as the compute buffer pool's hand-back is.
             for objects in self.pipeline_objects.drain(..) {
                 let _pipeline = Bar::enter_in_submission(Phase::SubmitTdPipeline);
+                if returning_buffers {
+                    let (key, group) = objects.into_group();
+                    match key {
+                        Some(key) => {
+                            let outcome = self.context.give_compute_pipeline_back(key, group);
+                            crate::phase_profile::note_compute_pipeline_reuse(outcome);
+                        }
+                        // A creation that never stated a shape has nothing to
+                        // be reused by: it is released here, exactly as the
+                        // fresh path always released it.
+                        None => drop(group),
+                    }
+                    continue;
+                }
                 drop(objects);
             }
             for buffer in &self.buffers {
