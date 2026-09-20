@@ -33,6 +33,7 @@ pub mod sender;
 pub mod transport;
 
 pub mod shared;
+pub mod statement;
 
 #[cfg(unix)]
 pub use transport::unix;

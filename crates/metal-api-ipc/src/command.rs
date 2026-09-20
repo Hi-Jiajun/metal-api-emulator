@@ -1414,6 +1414,7 @@ mod tests {
         MAX_SUPPORTED_HEAP_STORAGE_MODES, MAX_SUPPORTED_INDIRECT_COMMANDS,
         MAX_SUPPORTED_PRESENT_MODES, MAX_TAGGED_TRACE_PASSES,
     };
+    use crate::statement;
     /// The bytes a command frame spends before its payload: the magic, the
     /// frame kind and the payload's length. Tests that talk about "the payload"
     /// slice from here rather than repeating the number.
@@ -10360,6 +10361,129 @@ mod tests {
         eprintln!(
             "unpaired sampler state refused: slug={} fields={:?}",
             refusal.slug, refusal.fields
+        );
+    }
+
+    /// The account the codec hands back is **the frame it came from, tiled**:
+    /// the six sections sum to the payload, the payload is the frame minus its
+    /// nine-byte header, the views are a roll-up inside the pass table that
+    /// carries them, and the frame still decodes to the request it was written
+    /// from.
+    ///
+    /// This is the judgement `openspec/changes/render-statement-economy` §2
+    /// (W1) is decided on — "which section are the bytes in" — so the reading
+    /// is pinned against the bytes rather than against a second walk of the
+    /// values.
+    #[test]
+    fn a_statement_account_tiles_the_payload_it_was_read_from() {
+        let request = CommandRequest::Submit {
+            trace: mixed_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let (payload, account) = CommandCodec::encode_request_payload_accounted(&request).unwrap();
+        assert_eq!(
+            payload.as_slice(),
+            &frame[FRAME_HEADER..],
+            "the accounted entry point writes the same payload the plain one does"
+        );
+        assert_eq!(account.frames, 1);
+        assert_eq!(account.total_bytes, payload.len() as u64);
+        assert_eq!(
+            account.residual_bytes(),
+            0,
+            "the six sections tile the payload: {account:?}"
+        );
+        assert_eq!(
+            account.frames * FRAME_HEADER as u64 + account.total_bytes,
+            frame.len() as u64
+        );
+        assert_eq!(account.tag_bytes, 1, "one request tag");
+        assert_eq!(
+            account.trace_header_bytes, 26,
+            "schema (2) + epoch (8) + operation (8) + pipeline count (8)"
+        );
+        assert!(
+            account.pipeline_table_bytes > 0,
+            "the fixture states a pipeline"
+        );
+        assert!(
+            account.pass_table_bytes > 0,
+            "the fixture states two passes"
+        );
+        assert_eq!(
+            account.tail_bytes, 1,
+            "the completion policy is the whole tail in this posture"
+        );
+        assert_eq!(
+            account.resource_table_bytes,
+            16 + 24,
+            "two counts (8 each) and one 24-byte allocation"
+        );
+        // The views are inside the pass table, not a tile beside it.
+        assert_eq!(account.views_n, 1);
+        assert!(account.view_bytes > 0);
+        assert!(
+            account.view_bytes <= account.pass_table_bytes,
+            "the view roll-up cannot exceed the table that carries it"
+        );
+        assert_eq!(
+            account.view_payload_bytes, 4,
+            "the one view carries four owned bytes"
+        );
+        assert_eq!(account.view_declared_bytes, 4);
+        assert_eq!(account.textures_n, 0);
+        // And the bytes the account was read from are the bytes the provider reads.
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        eprintln!(
+            "statement account: frames={} total={} tag={} header={} pipelines={} passes={} resources={} tail={} views_n={} view_bytes={} view_payload={}",
+            account.frames,
+            account.total_bytes,
+            account.tag_bytes,
+            account.trace_header_bytes,
+            account.pipeline_table_bytes,
+            account.pass_table_bytes,
+            account.resource_table_bytes,
+            account.tail_bytes,
+            account.views_n,
+            account.view_bytes,
+            account.view_payload_bytes,
+        );
+    }
+
+    /// The switch is a reading and not a shape: the same fixture encoded with
+    /// the account off and with it on is the same frame byte for byte, the off
+    /// arm records nothing at all, and the on arm banks exactly the sections
+    /// the accounted entry point reports for the same request.
+    #[test]
+    fn arming_the_account_changes_no_byte_of_a_frame() {
+        let request = CommandRequest::Submit {
+            trace: mixed_trace(),
+            resources: resources(),
+        };
+
+        statement::set_enabled(false);
+        statement::reset();
+        let unpriced = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(
+            statement::take(),
+            statement::StatementAccount::default(),
+            "the off arm is one relaxed load and records nothing"
+        );
+
+        statement::set_enabled(true);
+        let priced = CommandCodec::encode_request(&request).unwrap();
+        let banked = statement::take();
+        statement::set_enabled(false);
+
+        assert_eq!(
+            unpriced, priced,
+            "pricing a statement must not change one byte of it"
+        );
+        let (_, expected) = CommandCodec::encode_request_payload_accounted(&request).unwrap();
+        assert_eq!(
+            banked, expected,
+            "the running arm banks the same account the single-frame arm returns"
         );
     }
 }

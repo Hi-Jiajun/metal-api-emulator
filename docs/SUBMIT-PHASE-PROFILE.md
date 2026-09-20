@@ -520,6 +520,65 @@ submissions made while the guest was still settling, and a window whose `n` is
 smaller than the configured every-count is the tail of a round rather than a
 quiet window.
 
+## What one statement is made of
+
+The phase line above prices the *call*. It cannot say what the owner→provider
+statement that call carries is made of, because the statement is encoded on the
+rail's side of the wire and its sections are a property of the bytes rather
+than of the provider's time. That reading has a line of its own: the rail's
+`frame_span`, where the encoder's own offsets are printed beside the frame they
+were read from.
+
+The sections are measured inside `metal_api_ipc::statement`, at the same
+`CommandCodec::encode_request_payload` that writes them, so a field is a
+function of the bytes that were written and cannot disagree with the frame it
+is reported beside. **Off by default**: unset, the switch
+`METAL_API_IPC_STATEMENT_ACCOUNTING` costs one relaxed load per encoded payload
+and changes no byte of any frame (two unit tests pin that — the payload is
+identical with the account on and off, and a priced frame decodes to the request
+it was written from). The owner rail arms it when its own frame profile is on
+(`REIMS_VGPU_FRAME_PROFILE`), so a round sets the switch it already sets.
+
+Six positional fields tile the payload, in the order the encoder writes it:
+
+| field | section |
+|---|---|
+| `stmt_tag_bytes` | the request tag that selects the submission's shape |
+| `stmt_trace_bytes` | the trace header: schema (2), device epoch (8), operation id (8), pipeline count (8) |
+| `stmt_pipeline_bytes` | the pipeline table behind that count |
+| `stmt_pass_bytes` | the dispatch type, the pass count and every pass |
+| `stmt_resources_bytes` | the allocation and lease-reservation table |
+| `stmt_tail_bytes` | the completion policy and any heap/ICB tail |
+
+so that a window's line closes on itself:
+
+```text
+stmt_total_bytes == stmt_tag_bytes + stmt_trace_bytes + stmt_pipeline_bytes
+                  + stmt_pass_bytes + stmt_resources_bytes + stmt_tail_bytes
+wire_bytes       == stmt_total_bytes + 9 * stmt_total_n
+```
+
+`stmt_total_n` is the count the other statement fields are divided by — the
+statements the window's frames were built from — and the `wire_bytes` and
+`wire_frames` fields beside it are the same frames counted whole, nine-byte
+frame header included.
+
+The views are **not** a seventh tile, because a view sits inside whichever pass,
+stage-buffer block or vertex input states it. They are roll-ups within
+`stmt_pass_bytes`, each with its own count:
+
+| field | meaning |
+|---|---|
+| `stmt_views_n` / `stmt_views_bytes` | every `BufferView`, and the bytes it took from its `view_id` to the end of its source |
+| `stmt_view_payload_bytes` | the part of that which was the view's own `OwnedBytes` payload — the batch of bytes the provider then copies, uploads and releases, and the reading the statement-economy change is judged against |
+| `stmt_view_declared_bytes` | the sum of those views' declared `length`s: a zero-filled payload is its view's `length` by construction, so this is the extent a zero-fill declaration may stand in for |
+| `stmt_textures_n` / `stmt_textures_bytes` / `stmt_texture_payload_bytes` | the same three readings for `TextureView`s |
+
+Like every other field on that line, these are **per-frame means over the
+window's `frames`**, differenced at the same present the wire counters are, so a
+statement that straddles a report boundary stays whole and the sections and the
+frame they came from are never split across two windows.
+
 ## Boundaries
 
 The profile reports wall time inside one call. It does not say which draw paid
