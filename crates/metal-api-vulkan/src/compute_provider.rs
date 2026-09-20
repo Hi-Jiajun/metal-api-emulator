@@ -16,12 +16,13 @@ use metal_api_core::provider::{
     BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken,
     ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
     FunctionSource, GuestRun, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind,
-    KeptFrame, KeptFrameLanding, LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest,
-    PipelineContract, PipelineId, PipelineProvider, PresentDescriptor, ProviderCapabilities,
-    ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
-    QueuePriority, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
-    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
-    SubmissionId, TerminalState, TracePass, ValidatedComputeTrace, ViewId,
+    KeptFrame, KeptFrameLanding, LeaseId, LeaseImporter, LeaseRegistry, LoadOp,
+    PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+    ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, StoreOp, SubmissionId, TerminalState, TextureSource, TracePass,
+    ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -440,6 +441,177 @@ fn build_provider_capabilities(executor: &VulkanExecutor) -> ProviderCapabilitie
         capabilities.storage_modes.push(StorageMode::BorrowedNoCopy);
     }
     capabilities
+}
+
+/// One offscreen pass's declaration surface, resolved before the render rail is
+/// handed it.
+///
+/// The references are the pool's and the plan's own; the resident images are the
+/// provider's, held for as long as the resolution lives. A resolution holds no
+/// device object: the rail builds those when the pass is prepared, so a batch can
+/// resolve every member before the first of them runs.
+struct ResolvedOffscreenPass<'a> {
+    stages: Arc<render::RenderStages>,
+    pass: &'a RenderPassDescriptor,
+    previous: Vec<Option<&'a BufferView>>,
+    landings: Vec<Option<&'a BufferView>>,
+    resident: Vec<Option<Arc<render::ProviderTargetImage>>>,
+    views: Vec<Option<&'a BufferView>>,
+    resident_identities: Vec<(AllocationId, ViewId)>,
+    rekept_identities: Vec<(AllocationId, ViewId)>,
+    depth_view: Option<&'a BufferView>,
+    stencil_view: Option<&'a BufferView>,
+}
+
+/// Whether one offscreen pass may *open* a run of passes a single submission
+/// can carry (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// The head of a run is a pass that keeps its frame: every colour attachment
+/// stores into the provider's own image (`StoreOp::Resident`), so the pass
+/// after it may load those bytes without their ever leaving the device. A trace
+/// that carries an indirect replay is never a run — the replay states exactly
+/// one render pass — and neither is a pass that samples a view the trace's own
+/// earlier passes produced, because those bytes only exist once the producing
+/// pass's readback has run, which is exactly what a batch defers past its fence.
+fn offscreen_batch_candidate(pass: &RenderPassDescriptor, trace: &ComputeTrace) -> bool {
+    trace.indirect.is_none()
+        && pass.present.is_none()
+        && !samples_trace_production(pass)
+        && pass
+            .color_attachments
+            .iter()
+            .all(|attachment| attachment.store == StoreOp::Resident)
+}
+
+/// Whether a pass samples a view the trace's own earlier passes produced
+/// (`TextureSource::TraceView`, `research/docs/23` §110, E-TX3).
+fn samples_trace_production(pass: &RenderPassDescriptor) -> bool {
+    pass.textures
+        .iter()
+        .any(|texture| matches!(texture.source, TextureSource::TraceView))
+}
+
+/// The offscreen passes resolved so far that may run inside one submission
+/// scope (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// The run is assembled one member at a time and executed when the plan says
+/// the run has ended — the next entry continues it, or it does not. Two things
+/// have to be true across those iterations that neither a single pass nor a
+/// single function scope states:
+///
+/// * the identities the run's earlier members will define are marked defined
+///   *before* the member that loads them resolves, because the pass that stores
+///   the frame has not run yet: the run is one submission, and the provider's
+///   registry is asked "would you load this image?" before the image exists;
+/// * those claims are given back — marked undefined again — unless the whole
+///   run completes, which is [`Drop`]'s job: every early return between the
+///   claim and the run's completion leaves the identities exactly as a refused
+///   pass does.
+struct OffscreenRun<'p, 'a> {
+    provider: &'p VulkanComputeProvider,
+    members: Vec<ResolvedOffscreenPass<'a>>,
+    /// The resident identities the run's earlier members were claimed against.
+    claimed: Vec<(AllocationId, ViewId)>,
+    /// Whether the claims are still outstanding. Cleared when the run completes.
+    armed: bool,
+}
+
+impl<'p, 'a> OffscreenRun<'p, 'a> {
+    fn new(provider: &'p VulkanComputeProvider) -> Self {
+        Self {
+            provider,
+            members: Vec::new(),
+            claimed: Vec::new(),
+            armed: false,
+        }
+    }
+
+    /// Whether the pass after the run's last member continues it: every colour
+    /// attachment of the new pass loads the provider's own image and names
+    /// exactly the identity the member before it stored into, for the same
+    /// format and extent, in the same location order.
+    fn continues(&self, next: &RenderPassDescriptor) -> bool {
+        let Some(last) = self.members.last() else {
+            return false;
+        };
+        let previous = last.pass;
+        if next.present.is_some()
+            || samples_trace_production(next)
+            || next.color_attachments.len() != previous.color_attachments.len()
+        {
+            return false;
+        }
+        next.color_attachments
+            .iter()
+            .zip(&previous.color_attachments)
+            .all(|(next, previous)| {
+                previous.store == StoreOp::Resident
+                    && next.load == LoadOp::Resident
+                    && next.allocation_id == previous.allocation_id
+                    && next.view_id == previous.view_id
+                    && next.format == previous.format
+                    && next.width == previous.width
+                    && next.height == previous.height
+            })
+    }
+
+    /// Claim the identities the run's last member will define, before the next
+    /// member is resolved against them.
+    fn claim_next(&mut self) -> Result<(), ProviderError> {
+        let Some(last) = self.members.last() else {
+            return Ok(());
+        };
+        if last.resident_identities.is_empty() {
+            return Ok(());
+        }
+        self.provider
+            .note_resident_targets(&last.resident_identities, true)?;
+        self.claimed
+            .extend(last.resident_identities.iter().copied());
+        self.armed = true;
+        Ok(())
+    }
+
+    /// Execute the run's members and publish what each of them read back.
+    fn flush(
+        &mut self,
+        trace: &ComputeTrace,
+        writebacks: &mut Vec<BufferWriteback>,
+        produced_latest: &mut BTreeMap<(AllocationId, ViewId), usize>,
+        leases: &render::RenderLeaseContext<'_>,
+        host_readback: bool,
+    ) -> Result<(), ProviderError> {
+        if self.members.is_empty() {
+            return Ok(());
+        }
+        let members = std::mem::take(&mut self.members);
+        let result = self.provider.execute_offscreen_run(
+            members,
+            trace,
+            writebacks,
+            produced_latest,
+            leases,
+            host_readback,
+        );
+        if result.is_ok() {
+            // Every member completed: the identities they claimed are defined
+            // by their own passes, and the claim is the pass's own statement.
+            self.armed = false;
+            self.claimed.clear();
+        }
+        result
+    }
+}
+
+impl Drop for OffscreenRun<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // An early return between the claim and the run's completion: the
+            // pass that would have defined these identities never ran, so they
+            // are undefined again — the same disposition a refused pass states.
+            let _ = self.provider.note_resident_targets(&self.claimed, false);
+        }
+    }
 }
 
 impl VulkanComputeProvider {
@@ -1205,6 +1377,531 @@ impl VulkanComputeProvider {
     /// consumers need no second path. An attachment that no buffer view covers
     /// has no such landing rail and is refused instead of being executed and
     /// dropped. A presenting pass keeps the pre-MRT single-attachment shape.
+    /// Resolve one offscreen pass's declaration surface, before any device
+    /// object exists for it.
+    ///
+    /// Every view, source and identity the pass states, in the order the
+    /// executor reads them (`research/docs/23` §74/§76/§114/§115): the landing
+    /// view and the previous-contents declaration of every colour attachment,
+    /// the provider's own image for the attachments that declare it, the
+    /// identities this pass's completion defines or re-arms, and the landing
+    /// views of the depth and stencil surfaces.
+    ///
+    /// Split out of the executor loop so a *batch* can resolve N passes before
+    /// the first of them runs (`REIMS_VGPU_RENDER_BATCH`): the pass that keeps a
+    /// frame and the pass that loads it are one submission, so both have to be
+    /// resolved — and neither has any device object — before the rail is handed
+    /// either.
+    fn resolve_offscreen_pass<'a>(
+        &self,
+        planned: &'a PlannedRenderPass,
+        pool: &'a [BufferView],
+        host_readback: bool,
+    ) -> Result<ResolvedOffscreenPass<'a>, ProviderError> {
+        // The offscreen shape: resolve one landing view and one
+        // previous-contents declaration per attachment, in location order,
+        // then hand the render rail the whole list and publish one
+        // writeback per attachment that has a landing. The declaration is
+        // what the rail resolves into bytes, so a lease-backed attachment
+        // load is imported (or refused by name) inside the rail rather
+        // than being snapshotted here (`research/docs/23` §74, R5b).
+        //
+        // Everything below, up to the rail call, is one region of the
+        // render half's residual (`crate::phase_profile`): it is the outer
+        // loop's own resolution of the declarations, the resident targets
+        // and the produced-bytes context the pass is handed.
+        let _resolve = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderResolve);
+        let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
+        let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
+        // The landing views the second owner-window arm carries
+        // (`research/docs/23` §115 之后的增量，E-TX13), one entry per
+        // attachment: the identity the store names, resolved against the
+        // same serial view list the attachment's own declaration comes
+        // from. `None` is the shape whose store is not that arm.
+        let mut landings = Vec::with_capacity(planned.pass.color_attachments.len());
+        // The provider-resident targets this pass declares, in location
+        // order (`research/docs/23` §76, R7). The identity is the
+        // attachment's own pair, so the registry and the contract cannot
+        // disagree about *which* target a pass means.
+        let mut resident = Vec::with_capacity(planned.pass.color_attachments.len());
+        let mut resident_identities = Vec::new();
+        // The identities this pass *re-arms* (`research/docs/23` §115
+        // 之后的增量，E-TX14/R4b): a `StoreOp::Resident` store defines a new
+        // frame in the identity's image, so an identity a landing had
+        // consumed becomes deliverable again once this pass completes.
+        let mut rekept_identities = Vec::new();
+        for attachment in &planned.pass.color_attachments {
+            let declared = pool.iter().find(|view| {
+                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
+            });
+            // A resident target is resolved — or refused by name — before
+            // any device object exists: the registry decides whether the
+            // identity holds bytes a load may read, and a pass that renders
+            // into a resident identity without declaring it is refused
+            // rather than silently overwriting the provider's bytes.
+            if attachment.declares_resident_target() {
+                let identity = (attachment.allocation_id, attachment.view_id);
+                let image = self.resident_target(attachment, attachment.loads_resident_target())?;
+                resident_identities.push(identity);
+                if attachment.store == metal_api_core::provider::StoreOp::Resident {
+                    rekept_identities.push(identity);
+                }
+                resident.push(Some(image));
+            } else {
+                if self.resident_target_identity_is_resident(
+                    attachment.allocation_id,
+                    attachment.view_id,
+                ) {
+                    return Err(refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "resident_target_undeclared",
+                    )
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "the provider holds this identity's image and the pass declares \
+                             neither `LoadOp::Resident` nor `StoreOp::Resident` for it, so the \
+                             trace would be reading or overwriting bytes it never named",
+                    ));
+                }
+                resident.push(None);
+            }
+            // The landing view is the writeback channel's declaration, and
+            // `LoadOp::Load` uploads the trace's own bytes through it. A
+            // resident store has neither: its bytes stay in the provider's
+            // image and the pass publishes no writeback for it, so it needs
+            // no landing view even when the trace asks for a host readback
+            // (`research/docs/23` §76, R7). Every other store arm keeps the
+            // pre-R7 rule unchanged.
+            //
+            // The owner-window store (`research/docs/23` §114, E-TX8) is
+            // the exception on the other side: the window it lands in *is*
+            // the declaration's own source arm, so the view is required
+            // whatever the completion policy asks for — a trace that
+            // publishes no readback still has to name the guest's pages the
+            // frame lands in.
+            let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
+            // Only the *borrowed* arm takes its window from this
+            // declaration; the landing-view arm beside it takes its own
+            // from the second declaration resolved below, so an attachment
+            // that loads from the caller's bytes with no readback needs no
+            // own-view declaration for the landing (`research/docs/23` §115
+            // 之后的增量，E-TX13).
+            let borrowing = attachment.store == metal_api_core::provider::StoreOp::Borrowed;
+            let landing_needed = borrowing
+                || (host_readback
+                    && attachment.store != metal_api_core::provider::StoreOp::Resident);
+            let view = if landing_needed || loading {
+                Some(declared.ok_or_else(|| {
+                    refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "render_attachment_landing_unsupported",
+                    )
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "attachment bytes land through the buffer writeback channel and \
+                             `LoadOp::Load` uploads the trace's own bytes, and this trace \
+                             declares no buffer view covering the attachment",
+                    )
+                })?)
+            } else {
+                None
+            };
+            // The rail reads this slice as the attachment's own
+            // declaration: the previous contents for a `Load`, and the
+            // window a *borrowed* store lands in. One declaration serves
+            // both because the contract names the attachment by one
+            // identity.
+            //
+            // The landing-view arm (`research/docs/23` §115 之后的增量，
+            // E-TX13) is the exception this slice cannot answer: its window
+            // is the *second* declaration the store carries, so the view is
+            // resolved here by that identity and travels beside the
+            // attachment's own slice. A store that names a landing view this
+            // trace never declares is refused by the rail by name.
+            let landing_view = match attachment.store {
+                metal_api_core::provider::StoreOp::BorrowedLanding(named) => {
+                    pool.iter().find(|view| {
+                        view.view_id == named.view_id && view.allocation_id == named.allocation_id
+                    })
+                }
+                _ => None,
+            };
+            previous.push(view.filter(|_| loading || borrowing));
+            landings.push(landing_view);
+            views.push(view);
+        }
+        // The stored depth attachment's landing view, resolved before the
+        // pass runs for the same reason the colour ones are: the bytes it
+        // receives have to be named by the trace, and a storing surface
+        // without a declaration is refused instead of executed
+        // (`research/docs/23` §3.3, v43).
+        let depth_view = match planned.pass.depth.as_ref() {
+            Some(depth) => match (depth.store, depth.identity) {
+                (Some(metal_api_core::provider::DepthStoreOp::Store), Some(identity)) => {
+                    if !host_readback {
+                        // A trace that publishes no readback keeps its depth
+                        // texels on the device, exactly as a colour
+                        // attachment does, and needs no landing view.
+                        None
+                    } else {
+                        Some(
+                            pool.iter()
+                                .find(|view| {
+                                    view.view_id == identity.view_id
+                                        && view.allocation_id == identity.allocation_id
+                                })
+                                .ok_or_else(|| {
+                                    refusal(
+                                    ProviderPhase::Resolve,
+                                    ProviderErrorClass::Capability,
+                                    "render_depth_landing_unsupported",
+                                )
+                                .with_field(
+                                    "view",
+                                    FieldValue::Unsigned(identity.view_id.get()),
+                                )
+                                .with_field(
+                                    "allocation",
+                                    FieldValue::Unsigned(identity.allocation_id.get()),
+                                )
+                                .with_detail(
+                                    "a stored depth attachment's texels land through the buffer \
+                                     writeback channel, and this trace declares no buffer view \
+                                     covering the attachment",
+                                )
+                                })?,
+                        )
+                    }
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        // The stored stencil attachment's landing view, resolved the same
+        // way the depth one is (`research/docs/23` §3.3, v49): the bytes it
+        // receives have to be named by the trace, and a storing surface
+        // without a declaration is refused instead of executed.
+        let stencil_view = match planned.pass.stencil.as_ref() {
+            Some(stencil) => match (stencil.store, stencil.identity) {
+                (Some(metal_api_core::provider::StoreOp::Store), Some(identity)) => {
+                    if !host_readback {
+                        // A trace that publishes no readback keeps its
+                        // stencil texels on the device, exactly as a colour
+                        // or depth landing does, and needs no landing view.
+                        None
+                    } else {
+                        Some(
+                            pool.iter()
+                                .find(|view| {
+                                    view.view_id == identity.view_id
+                                        && view.allocation_id == identity.allocation_id
+                                })
+                                .ok_or_else(|| {
+                                    refusal(
+                                    ProviderPhase::Resolve,
+                                    ProviderErrorClass::Capability,
+                                    "render_stencil_landing_unsupported",
+                                )
+                                .with_field(
+                                    "view",
+                                    FieldValue::Unsigned(identity.view_id.get()),
+                                )
+                                .with_field(
+                                    "allocation",
+                                    FieldValue::Unsigned(identity.allocation_id.get()),
+                                )
+                                .with_detail(
+                                    "a stored stencil attachment's texels land through the buffer \
+                                     writeback channel, and this trace declares no buffer view \
+                                     covering the attachment",
+                                )
+                                })?,
+                        )
+                    }
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        Ok(ResolvedOffscreenPass {
+            stages: Arc::clone(&planned.stages),
+            pass: &planned.pass,
+            previous,
+            landings,
+            resident,
+            views,
+            resident_identities,
+            rekept_identities,
+            depth_view,
+            stencil_view,
+        })
+    }
+
+    /// Hand one resolved offscreen pass to the rail and return what it read
+    /// back.
+    ///
+    /// The pre-batch execution shape: one pass, one submission, one fence. It
+    /// is also the shape a *run* of one member takes, so the batch machinery
+    /// cannot change what a pass nobody may batch does.
+    fn execute_offscreen_pass<'a>(
+        &self,
+        trace: &ComputeTrace,
+        resolved: &ResolvedOffscreenPass<'a>,
+        writebacks: &[BufferWriteback],
+        produced_latest: &BTreeMap<(AllocationId, ViewId), usize>,
+        leases: &render::RenderLeaseContext<'_>,
+    ) -> Result<render::OffscreenReadback, ProviderError> {
+        let executor = self.lock_executor()?;
+        // The resident slice the rail borrows for this pass, in location order:
+        // `Some` exactly for the attachments whose declaration named the
+        // provider's image (`research/docs/23` §76, R7).
+        let resident_refs: Vec<_> = resolved
+            .resident
+            .iter()
+            .map(|image| image.as_deref())
+            .collect();
+        // What this pass may sample from the trace's own production
+        // (`research/docs/23` §110, E-TX3), beside the resident slice the R7
+        // arm borrows: the same two contexts the offscreen rail resolves every
+        // render input against.
+        let produced = render::ProducedTraceViews::new(writebacks, produced_latest);
+        match trace.indirect.as_deref() {
+            Some(payload) => {
+                let outcome = render::execute_indirect_render_pass(
+                    &executor.context,
+                    &resolved.stages,
+                    resolved.pass,
+                    &payload.command,
+                    &resolved.previous,
+                    &resolved.landings,
+                    &resident_refs,
+                    Some(leases),
+                    Some(&produced),
+                );
+                if outcome.is_ok() {
+                    // Publish what was actually replayed: the command kind, the
+                    // range and the one command the first increment encodes
+                    // (`research/docs/25` §5.1).
+                    self.publish_icb_observation(
+                        payload.command.kind(),
+                        payload.range.start,
+                        payload.range.count,
+                        1,
+                    );
+                }
+                outcome
+            }
+            None => render::execute_render_pass(
+                &executor.context,
+                &resolved.stages,
+                resolved.pass,
+                &resolved.previous,
+                &resolved.landings,
+                &resident_refs,
+                Some(leases),
+                Some(&produced),
+            ),
+        }
+    }
+
+    /// Publish what one offscreen pass's outcome means: the identities it
+    /// defined or re-armed, the writebacks its landings carried in location
+    /// order, and the stage-buffer and depth/stencil landings that follow them.
+    ///
+    /// The error arm returns the rail's refusal after marking the pass's
+    /// identities undefined, and publishes nothing: a refused pass charges no
+    /// publication and lands no bytes.
+    fn publish_offscreen_readback<'a>(
+        &self,
+        resolved: ResolvedOffscreenPass<'a>,
+        outcome: Result<render::OffscreenReadback, ProviderError>,
+        writebacks: &mut Vec<BufferWriteback>,
+        produced_latest: &mut BTreeMap<(AllocationId, ViewId), usize>,
+        host_readback: bool,
+    ) -> Result<(), ProviderError> {
+        // The pass has returned: everything the delivery of its bytes costs
+        // from here — the resident and re-kept identities, the writeback pushes
+        // in location order, the stage-buffer and depth/stencil landings — is
+        // one region of the render half's residual (`crate::phase_profile`).
+        let _publish = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPublish);
+        let readback = match outcome {
+            Ok(readback) => {
+                // The pass completed, so the bytes the resident targets hold
+                // are the ones this pass left there: a later `LoadOp::Resident`
+                // for those identities resolves instead of being refused as
+                // undefined.
+                self.note_resident_targets(&resolved.resident_identities, true)?;
+                self.note_kept_frames_rekept(&resolved.rekept_identities)?;
+                readback
+            }
+            Err(error) => {
+                // A pass that was refused or failed defines nothing: the
+                // identities it named stay unloadable until a later pass renders
+                // them again, rather than serving bytes of unknown state
+                // (`research/docs/23` §76, R7).
+                self.note_resident_targets(&resolved.resident_identities, false)?;
+                return Err(error);
+            }
+        };
+        for (view, texels) in resolved.views.into_iter().zip(readback.attachments) {
+            // `None` is the discarded attachment: no bytes, no writeback,
+            // whatever the view resolution above produced (`docs/23` §3.6,
+            // v19).
+            let Some(bytes) = texels else { continue };
+            if let Some(view) = view {
+                // The landing is also this trace's own production of the view's
+                // identity, which is what a later `TextureSource::TraceView`
+                // declaration samples (`research/docs/23` §110, E-TX3). A later
+                // store of the same identity replaces the index, exactly as the
+                // trace's own order makes the latest write visible.
+                let position = writebacks.len();
+                writebacks.push(BufferWriteback {
+                    view_id: view.view_id,
+                    allocation_id: view.allocation_id,
+                    offset: view.offset,
+                    bytes,
+                });
+                produced_latest.insert((view.allocation_id, view.view_id), position);
+            }
+        }
+        // A writable stage buffer is a landing like a stored attachment
+        // (`research/docs/23` §3.3, v86): one complete writeback for the view
+        // the trace declared, in the same byte-keyed channel and in the pass's
+        // canonical binding order. The bytes are only published when the trace
+        // asked for a host readback — the same rule the attachment landings
+        // follow, and the reason the rail reads them unconditionally is that
+        // the read is a mapping the bytes already live in.
+        if host_readback {
+            for landing in readback.stage_buffers {
+                let view = resolved.pass.stage_buffers.iter().find(|stage| {
+                    stage.stage == landing.stage && stage.view.metal_binding == landing.index
+                });
+                // The pair rules held every readable or writable stage buffer
+                // to a declaration, so a landing without its view is a rail
+                // state the contract cannot produce; skipping it would publish
+                // a partial set of writebacks, which is why the lookup is an
+                // expectation rather than a filter.
+                let view = view.expect("every stage buffer landing has its own view");
+                writebacks.push(BufferWriteback {
+                    view_id: view.view.view_id,
+                    allocation_id: view.view.allocation_id,
+                    offset: view.view.offset,
+                    bytes: landing.bytes,
+                });
+            }
+        }
+        // The depth landing follows the colour ones, in the same channel and in
+        // the same (allocation, view) order the writeback contract states
+        // (`research/docs/23` §3.3, v43).
+        if let (Some(view), Some(texels)) = (resolved.depth_view, readback.depth) {
+            writebacks.push(BufferWriteback {
+                view_id: view.view_id,
+                allocation_id: view.allocation_id,
+                offset: view.offset,
+                bytes: texels,
+            });
+        }
+        // The stencil landing follows the depth one, one byte per texel, in the
+        // same channel and the same (allocation, view) order the writeback
+        // contract states (`research/docs/23` §3.3, v49).
+        if let (Some(view), Some(texels)) = (resolved.stencil_view, readback.stencil) {
+            writebacks.push(BufferWriteback {
+                view_id: view.view_id,
+                allocation_id: view.allocation_id,
+                offset: view.offset,
+                bytes: texels,
+            });
+        }
+        Ok(())
+    }
+
+    /// Execute one pending run of offscreen passes.
+    ///
+    /// One member is the pre-batch shape: resolve, execute alone, publish. Two
+    /// or more are **one** submission scope — one `vkQueueSubmit`, one fence,
+    /// one wait (`REIMS_VGPU_RENDER_BATCH`) — which is the increment's whole
+    /// point. Either way the run is fail-closed: a refusal or a submission
+    /// failure lands none of the run's members.
+    fn execute_offscreen_run<'a>(
+        &self,
+        mut run: Vec<ResolvedOffscreenPass<'a>>,
+        trace: &ComputeTrace,
+        writebacks: &mut Vec<BufferWriteback>,
+        produced_latest: &mut BTreeMap<(AllocationId, ViewId), usize>,
+        leases: &render::RenderLeaseContext<'_>,
+        host_readback: bool,
+    ) -> Result<(), ProviderError> {
+        if run.len() < 2 {
+            let Some(resolved) = run.pop() else {
+                return Ok(());
+            };
+            let outcome =
+                self.execute_offscreen_pass(trace, &resolved, writebacks, produced_latest, leases);
+            return self.publish_offscreen_readback(
+                resolved,
+                outcome,
+                writebacks,
+                produced_latest,
+                host_readback,
+            );
+        }
+        // The residents the members borrow, and the declaration surface the
+        // batch is handed: both are derived from the run itself, so nothing
+        // here can name an attachment the resolution did not.
+        let resident_refs: Vec<Vec<Option<&render::ProviderTargetImage>>> = run
+            .iter()
+            .map(|resolved| {
+                resolved
+                    .resident
+                    .iter()
+                    .map(|image| image.as_deref())
+                    .collect()
+            })
+            .collect();
+        let inputs: Vec<render::OffscreenBatchInputs<'_>> = run
+            .iter()
+            .zip(&resident_refs)
+            .map(|(resolved, resident)| render::OffscreenBatchInputs {
+                stages: resolved.stages.as_ref(),
+                pass: resolved.pass,
+                previous: &resolved.previous,
+                landings: &resolved.landings,
+                resident: Some(resident),
+            })
+            .collect();
+        let executor = self.lock_executor()?;
+        let readbacks = render::execute_offscreen_render_batch(
+            &executor.context,
+            &inputs,
+            Some(leases),
+            executor.context.admitted_depth_resolve_modes(),
+            executor.context.admitted_stencil_resolve_modes(),
+            executor.context.spirv_feature_policy(),
+        );
+        drop(executor);
+        let readbacks = readbacks?;
+        for (resolved, readback) in run.into_iter().zip(readbacks) {
+            self.publish_offscreen_readback(
+                resolved,
+                Ok(readback),
+                writebacks,
+                produced_latest,
+                host_readback,
+            )?;
+        }
+        Ok(())
+    }
+
     fn execute_render_passes(
         &self,
         trace: &ComputeTrace,
@@ -1309,6 +2006,12 @@ impl VulkanComputeProvider {
         // already run publish into it, so a pass can only read what the
         // trace's own order produced before it.
         let mut produced_latest = BTreeMap::<(AllocationId, ViewId), usize>::new();
+        // The run of offscreen passes a batch would carry, assembled across the
+        // plan's own order (`REIMS_VGPU_RENDER_BATCH`). It holds nothing for a
+        // plan the switch is off for, and every entry that cannot be a member
+        // flushes it first, so the pre-batch path is the same path with a run
+        // that is always empty.
+        let mut run = OffscreenRun::new(self);
         for planned in plan {
             // A landing-only entry takes its own step in the render group's
             // order (`research/docs/23` §115 之后的增量，E-TX14/R4b): the kept
@@ -1318,6 +2021,15 @@ impl VulkanComputeProvider {
             let planned = match planned {
                 PlannedRenderEntry::Pass(pass) => pass,
                 PlannedRenderEntry::Landing(landing) => {
+                    // A landing resolves a frame a *completed* pass kept, and a
+                    // pending run's passes have not run yet: the run ends here.
+                    run.flush(
+                        trace,
+                        &mut writebacks,
+                        &mut produced_latest,
+                        &leases,
+                        host_readback,
+                    )?;
                     // A landing-only entry runs in the plan's own order rather
                     // than through the rail, so it is its own region of the
                     // render half's residual (`crate::phase_profile`).
@@ -1329,6 +2041,16 @@ impl VulkanComputeProvider {
                 }
             };
             if let Some(present) = &planned.pass.present {
+                // A present action hands its target on outside this trace's
+                // readback channel, and the pass that carries it is never a
+                // batch member: the run ends before it.
+                run.flush(
+                    trace,
+                    &mut writebacks,
+                    &mut produced_latest,
+                    &leases,
+                    host_readback,
+                )?;
                 // The present rail's resolution and its own pass are two more
                 // regions of the render half's residual
                 // (`crate::phase_profile`): the five `render_*` children divide
@@ -1454,393 +2176,73 @@ impl VulkanComputeProvider {
                 continue;
             }
 
-            // The offscreen shape: resolve one landing view and one
-            // previous-contents declaration per attachment, in location order,
-            // then hand the render rail the whole list and publish one
-            // writeback per attachment that has a landing. The declaration is
-            // what the rail resolves into bytes, so a lease-backed attachment
-            // load is imported (or refused by name) inside the rail rather
-            // than being snapshotted here (`research/docs/23` §74, R5b).
-            //
-            // Everything below, up to the rail call, is one region of the
-            // render half's residual (`crate::phase_profile`): it is the outer
-            // loop's own resolution of the declarations, the resident targets
-            // and the produced-bytes context the pass is handed.
-            let _resolve =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderResolve);
-            let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
-            let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
-            // The landing views the second owner-window arm carries
-            // (`research/docs/23` §115 之后的增量，E-TX13), one entry per
-            // attachment: the identity the store names, resolved against the
-            // same serial view list the attachment's own declaration comes
-            // from. `None` is the shape whose store is not that arm.
-            let mut landings = Vec::with_capacity(planned.pass.color_attachments.len());
-            // The provider-resident targets this pass declares, in location
-            // order (`research/docs/23` §76, R7). The identity is the
-            // attachment's own pair, so the registry and the contract cannot
-            // disagree about *which* target a pass means.
-            let mut resident = Vec::with_capacity(planned.pass.color_attachments.len());
-            let mut resident_identities = Vec::new();
-            // The identities this pass *re-arms* (`research/docs/23` §115
-            // 之后的增量，E-TX14/R4b): a `StoreOp::Resident` store defines a new
-            // frame in the identity's image, so an identity a landing had
-            // consumed becomes deliverable again once this pass completes.
-            let mut rekept_identities = Vec::new();
-            for attachment in &planned.pass.color_attachments {
-                let declared = pool.iter().find(|view| {
-                    view.view_id == attachment.view_id
-                        && view.allocation_id == attachment.allocation_id
-                });
-                // A resident target is resolved — or refused by name — before
-                // any device object exists: the registry decides whether the
-                // identity holds bytes a load may read, and a pass that renders
-                // into a resident identity without declaring it is refused
-                // rather than silently overwriting the provider's bytes.
-                if attachment.declares_resident_target() {
-                    let identity = (attachment.allocation_id, attachment.view_id);
-                    let image =
-                        self.resident_target(attachment, attachment.loads_resident_target())?;
-                    resident_identities.push(identity);
-                    if attachment.store == metal_api_core::provider::StoreOp::Resident {
-                        rekept_identities.push(identity);
-                    }
-                    resident.push(Some(image));
-                } else {
-                    if self.resident_target_identity_is_resident(
-                        attachment.allocation_id,
-                        attachment.view_id,
-                    ) {
-                        return Err(refusal(
-                            ProviderPhase::Resolve,
-                            ProviderErrorClass::Capability,
-                            "resident_target_undeclared",
-                        )
-                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
-                        .with_field(
-                            "allocation",
-                            FieldValue::Unsigned(attachment.allocation_id.get()),
-                        )
-                        .with_detail(
-                            "the provider holds this identity's image and the pass declares \
-                             neither `LoadOp::Resident` nor `StoreOp::Resident` for it, so the \
-                             trace would be reading or overwriting bytes it never named",
-                        ));
-                    }
-                    resident.push(None);
+            // The offscreen shape. A pass that keeps its frame is a *batch
+            // candidate*: its execution is deferred so that a run of two or
+            // more members — the pass that kept the frame and every pass that
+            // loads it — can be submitted as one scope
+            // (`REIMS_VGPU_RENDER_BATCH`). Everything else runs the pre-batch
+            // way, and any pending run is flushed first: the plan's order is the
+            // trace's order, and a pass that loads a kept frame may only
+            // resolve once the pass that kept it has completed.
+            if render::render_batch_requested() {
+                // A pass that continues the run joins it whichever store arm it
+                // states: the run's middle members keep their frames and its
+                // last one publishes, and `continues` is what decides which of
+                // those this pass is.
+                if run.continues(&planned.pass) {
+                    // The earlier members are one submission with this one, so
+                    // they have not run yet: the identity this pass loads is
+                    // claimed before it resolves.
+                    run.claim_next()?;
+                    run.members
+                        .push(self.resolve_offscreen_pass(planned, pool, host_readback)?);
+                    continue;
                 }
-                // The landing view is the writeback channel's declaration, and
-                // `LoadOp::Load` uploads the trace's own bytes through it. A
-                // resident store has neither: its bytes stay in the provider's
-                // image and the pass publishes no writeback for it, so it needs
-                // no landing view even when the trace asks for a host readback
-                // (`research/docs/23` §76, R7). Every other store arm keeps the
-                // pre-R7 rule unchanged.
-                //
-                // The owner-window store (`research/docs/23` §114, E-TX8) is
-                // the exception on the other side: the window it lands in *is*
-                // the declaration's own source arm, so the view is required
-                // whatever the completion policy asks for — a trace that
-                // publishes no readback still has to name the guest's pages the
-                // frame lands in.
-                let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
-                // Only the *borrowed* arm takes its window from this
-                // declaration; the landing-view arm beside it takes its own
-                // from the second declaration resolved below, so an attachment
-                // that loads from the caller's bytes with no readback needs no
-                // own-view declaration for the landing (`research/docs/23` §115
-                // 之后的增量，E-TX13).
-                let borrowing = attachment.store == metal_api_core::provider::StoreOp::Borrowed;
-                let landing_needed = borrowing
-                    || (host_readback
-                        && attachment.store != metal_api_core::provider::StoreOp::Resident);
-                let view = if landing_needed || loading {
-                    Some(declared.ok_or_else(|| {
-                        refusal(
-                            ProviderPhase::Resolve,
-                            ProviderErrorClass::Capability,
-                            "render_attachment_landing_unsupported",
-                        )
-                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
-                        .with_field(
-                            "allocation",
-                            FieldValue::Unsigned(attachment.allocation_id.get()),
-                        )
-                        .with_detail(
-                            "attachment bytes land through the buffer writeback channel and \
-                             `LoadOp::Load` uploads the trace's own bytes, and this trace \
-                             declares no buffer view covering the attachment",
-                        )
-                    })?)
-                } else {
-                    None
-                };
-                // The rail reads this slice as the attachment's own
-                // declaration: the previous contents for a `Load`, and the
-                // window a *borrowed* store lands in. One declaration serves
-                // both because the contract names the attachment by one
-                // identity.
-                //
-                // The landing-view arm (`research/docs/23` §115 之后的增量，
-                // E-TX13) is the exception this slice cannot answer: its window
-                // is the *second* declaration the store carries, so the view is
-                // resolved here by that identity and travels beside the
-                // attachment's own slice. A store that names a landing view this
-                // trace never declares is refused by the rail by name.
-                let landing_view = match attachment.store {
-                    metal_api_core::provider::StoreOp::BorrowedLanding(named) => {
-                        pool.iter().find(|view| {
-                            view.view_id == named.view_id
-                                && view.allocation_id == named.allocation_id
-                        })
-                    }
-                    _ => None,
-                };
-                previous.push(view.filter(|_| loading || borrowing));
-                landings.push(landing_view);
-                views.push(view);
-            }
-            // The stored depth attachment's landing view, resolved before the
-            // pass runs for the same reason the colour ones are: the bytes it
-            // receives have to be named by the trace, and a storing surface
-            // without a declaration is refused instead of executed
-            // (`research/docs/23` §3.3, v43).
-            let depth_view = match planned.pass.depth.as_ref() {
-                Some(depth) => match (depth.store, depth.identity) {
-                    (Some(metal_api_core::provider::DepthStoreOp::Store), Some(identity)) => {
-                        if !host_readback {
-                            // A trace that publishes no readback keeps its depth
-                            // texels on the device, exactly as a colour
-                            // attachment does, and needs no landing view.
-                            None
-                        } else {
-                            Some(
-                                pool.iter()
-                                    .find(|view| {
-                                        view.view_id == identity.view_id
-                                            && view.allocation_id == identity.allocation_id
-                                    })
-                                    .ok_or_else(|| {
-                                        refusal(
-                                    ProviderPhase::Resolve,
-                                    ProviderErrorClass::Capability,
-                                    "render_depth_landing_unsupported",
-                                )
-                                .with_field(
-                                    "view",
-                                    FieldValue::Unsigned(identity.view_id.get()),
-                                )
-                                .with_field(
-                                    "allocation",
-                                    FieldValue::Unsigned(identity.allocation_id.get()),
-                                )
-                                .with_detail(
-                                    "a stored depth attachment's texels land through the buffer \
-                                     writeback channel, and this trace declares no buffer view \
-                                     covering the attachment",
-                                )
-                                    })?,
-                            )
-                        }
-                    }
-                    _ => None,
-                },
-                None => None,
-            };
-            // The stored stencil attachment's landing view, resolved the same
-            // way the depth one is (`research/docs/23` §3.3, v49): the bytes it
-            // receives have to be named by the trace, and a storing surface
-            // without a declaration is refused instead of executed.
-            let stencil_view = match planned.pass.stencil.as_ref() {
-                Some(stencil) => match (stencil.store, stencil.identity) {
-                    (Some(metal_api_core::provider::StoreOp::Store), Some(identity)) => {
-                        if !host_readback {
-                            // A trace that publishes no readback keeps its
-                            // stencil texels on the device, exactly as a colour
-                            // or depth landing does, and needs no landing view.
-                            None
-                        } else {
-                            Some(
-                                pool.iter()
-                                    .find(|view| {
-                                        view.view_id == identity.view_id
-                                            && view.allocation_id == identity.allocation_id
-                                    })
-                                    .ok_or_else(|| {
-                                        refusal(
-                                    ProviderPhase::Resolve,
-                                    ProviderErrorClass::Capability,
-                                    "render_stencil_landing_unsupported",
-                                )
-                                .with_field(
-                                    "view",
-                                    FieldValue::Unsigned(identity.view_id.get()),
-                                )
-                                .with_field(
-                                    "allocation",
-                                    FieldValue::Unsigned(identity.allocation_id.get()),
-                                )
-                                .with_detail(
-                                    "a stored stencil attachment's texels land through the buffer \
-                                     writeback channel, and this trace declares no buffer view \
-                                     covering the attachment",
-                                )
-                                    })?,
-                            )
-                        }
-                    }
-                    _ => None,
-                },
-                None => None,
-            };
-            let executor = self.lock_executor()?;
-            // The resident slice the rail borrows for this pass, in location
-            // order: `Some` exactly for the attachments whose declaration
-            // named the provider's image (`research/docs/23` §76, R7).
-            let resident_refs: Vec<_> = resident.iter().map(|image| image.as_deref()).collect();
-            // What this pass may sample from the trace's own production
-            // (`research/docs/23` §110, E-TX3), beside the resident slice the
-            // R7 arm borrows: the same two contexts the offscreen rail
-            // resolves every render input against.
-            let produced = render::ProducedTraceViews::new(&writebacks, &produced_latest);
-            drop(_resolve);
-            let outcome = match trace.indirect.as_deref() {
-                Some(payload) => {
-                    let outcome = render::execute_indirect_render_pass(
-                        &executor.context,
-                        &planned.stages,
-                        &planned.pass,
-                        &payload.command,
-                        &previous,
-                        &landings,
-                        &resident_refs,
-                        Some(&leases),
-                        Some(&produced),
-                    );
-                    if outcome.is_ok() {
-                        // Publish what was actually replayed: the command kind,
-                        // the range and the one command the first increment
-                        // encodes (`research/docs/25` §5.1).
-                        self.publish_icb_observation(
-                            payload.command.kind(),
-                            payload.range.start,
-                            payload.range.count,
-                            1,
-                        );
-                    }
-                    outcome
-                }
-                None => render::execute_render_pass(
-                    &executor.context,
-                    &planned.stages,
-                    &planned.pass,
-                    &previous,
-                    &landings,
-                    &resident_refs,
-                    Some(&leases),
-                    Some(&produced),
-                ),
-            };
-            // The pass has returned: everything the delivery of its bytes
-            // costs from here — the resident and re-kept identities, the
-            // writeback pushes in location order, the stage-buffer and
-            // depth/stencil landings — is one region of the render half's
-            // residual (`crate::phase_profile`). The error arm returns instead,
-            // so a refused pass charges no publication.
-            let _publish =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPublish);
-            let readback = match outcome {
-                Ok(readback) => {
-                    // The pass completed, so the bytes the resident targets
-                    // hold are the ones this pass left there: a later
-                    // `LoadOp::Resident` for those identities resolves instead
-                    // of being refused as undefined.
-                    self.note_resident_targets(&resident_identities, true)?;
-                    self.note_kept_frames_rekept(&rekept_identities)?;
-                    readback
-                }
-                Err(error) => {
-                    // A pass that was refused or failed defines nothing: the
-                    // identities it named stay unloadable until a later pass
-                    // renders them again, rather than serving bytes of unknown
-                    // state (`research/docs/23` §76, R7).
-                    self.note_resident_targets(&resident_identities, false)?;
-                    return Err(error);
-                }
-            };
-            for (view, texels) in views.into_iter().zip(readback.attachments) {
-                // `None` is the discarded attachment: no bytes, no writeback,
-                // whatever the view resolution above produced (`docs/23`
-                // §3.6, v19).
-                let Some(bytes) = texels else { continue };
-                if let Some(view) = view {
-                    // The landing is also this trace's own production of the
-                    // view's identity, which is what a later
-                    // `TextureSource::TraceView` declaration samples
-                    // (`research/docs/23` §110, E-TX3). A later store of the
-                    // same identity replaces the index, exactly as the
-                    // trace's own order makes the latest write visible.
-                    let position = writebacks.len();
-                    writebacks.push(BufferWriteback {
-                        view_id: view.view_id,
-                        allocation_id: view.allocation_id,
-                        offset: view.offset,
-                        bytes,
-                    });
-                    produced_latest.insert((view.allocation_id, view.view_id), position);
+                run.flush(
+                    trace,
+                    &mut writebacks,
+                    &mut produced_latest,
+                    &leases,
+                    host_readback,
+                )?;
+                // The pass that *opens* a run keeps its frame for the pass
+                // after it; one that does not runs the pre-batch way below.
+                if offscreen_batch_candidate(&planned.pass, trace) {
+                    run.members
+                        .push(self.resolve_offscreen_pass(planned, pool, host_readback)?);
+                    continue;
                 }
             }
-            // A writable stage buffer is a landing like a stored attachment
-            // (`research/docs/23` §3.3, v86): one complete writeback for the
-            // view the trace declared, in the same byte-keyed channel and in
-            // the pass's canonical binding order. The bytes are only published
-            // when the trace asked for a host readback — the same rule the
-            // attachment landings follow, and the reason the rail reads them
-            // unconditionally is that the read is a mapping the bytes already
-            // live in.
-            if host_readback {
-                for landing in readback.stage_buffers {
-                    let view = planned.pass.stage_buffers.iter().find(|stage| {
-                        stage.stage == landing.stage && stage.view.metal_binding == landing.index
-                    });
-                    // The pair rules held every readable or writable stage
-                    // buffer to a declaration, so a landing without its view
-                    // is a rail state the contract cannot produce; skipping it
-                    // would publish a partial set of writebacks, which is why
-                    // the lookup is an expectation rather than a filter.
-                    let view = view.expect("every stage buffer landing has its own view");
-                    writebacks.push(BufferWriteback {
-                        view_id: view.view.view_id,
-                        allocation_id: view.view.allocation_id,
-                        offset: view.view.offset,
-                        bytes: landing.bytes,
-                    });
-                }
-            }
-            // The depth landing follows the colour ones, in the same channel
-            // and in the same (allocation, view) order the writeback contract
-            // states (`research/docs/23` §3.3, v43).
-            if let (Some(view), Some(texels)) = (depth_view, readback.depth) {
-                writebacks.push(BufferWriteback {
-                    view_id: view.view_id,
-                    allocation_id: view.allocation_id,
-                    offset: view.offset,
-                    bytes: texels,
-                });
-            }
-            // The stencil landing follows the depth one, one byte per texel,
-            // in the same channel and the same (allocation, view) order the
-            // writeback contract states (`research/docs/23` §3.3, v49).
-            if let (Some(view), Some(texels)) = (stencil_view, readback.stencil) {
-                writebacks.push(BufferWriteback {
-                    view_id: view.view_id,
-                    allocation_id: view.allocation_id,
-                    offset: view.offset,
-                    bytes: texels,
-                });
-            }
-            drop(_publish);
+            run.flush(
+                trace,
+                &mut writebacks,
+                &mut produced_latest,
+                &leases,
+                host_readback,
+            )?;
+            let resolved = self.resolve_offscreen_pass(planned, pool, host_readback)?;
+            let outcome = self.execute_offscreen_pass(
+                trace,
+                &resolved,
+                &writebacks,
+                &produced_latest,
+                &leases,
+            );
+            self.publish_offscreen_readback(
+                resolved,
+                outcome,
+                &mut writebacks,
+                &mut produced_latest,
+                host_readback,
+            )?;
         }
+        run.flush(
+            trace,
+            &mut writebacks,
+            &mut produced_latest,
+            &leases,
+            host_readback,
+        )?;
         Ok(writebacks)
     }
 

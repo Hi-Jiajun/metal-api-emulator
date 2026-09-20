@@ -90,6 +90,21 @@ pub fn stage_buffer_namespace_layout() -> DescriptorLayout {
     }
 }
 
+/// Whether `REIMS_VGPU_RENDER_BATCH` asked for one submission scope per run of
+/// resident-chain render passes (off by default).
+///
+/// The switch is one name both rails read: the rename rail decides whether to
+/// *assemble* a run of passes into one trace, and this provider decides whether
+/// to *submit* such a run as one scope. A round that wants the control arm sets
+/// it to `off` (or leaves it unset) and runs the same binaries again — the two
+/// arms' captures are then comparable byte for byte, exactly as
+/// `METAL_API_VULKAN_FULL_READBACK` and `METAL_API_VULKAN_PHASE_PROFILE` are
+/// read.
+#[doc(hidden)]
+pub fn render_batch_enabled() -> bool {
+    render::render_batch_requested()
+}
+
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 const MAX_SERIAL_DISPATCHES: usize = 8;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);

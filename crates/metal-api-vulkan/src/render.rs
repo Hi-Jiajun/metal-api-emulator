@@ -8967,9 +8967,75 @@ enum ReadbackBase<'a> {
     Previous(&'a [u8]),
 }
 
+impl<'a> AttachmentReadback<'a> {
+    /// The borrowed view of one planned decision.
+    ///
+    /// The seed bytes are read back out of the request's own declaration by
+    /// *arm* rather than carried inside the decision, which is what lets the
+    /// decision outlive the borrow it was planned under: a render batch
+    /// (`REIMS_VGPU_RENDER_BATCH`) holds one decision per member across its
+    /// single fence and re-derives each member's seed when it reads that
+    /// member back, instead of keeping every request borrowed for the whole
+    /// batch.
+    fn of(
+        request: &'a OffscreenRenderRequest<'a>,
+        index: usize,
+        decision: ReadbackDecision,
+    ) -> Option<Self> {
+        let attachment = request.attachments.get(index)?;
+        let base = match decision.base {
+            ReadbackBaseArm::None => None,
+            ReadbackBaseArm::Clear => match &attachment.load {
+                LoadOp::Clear(clear) => Some(ReadbackBase::Clear(clear.as_bytes())),
+                LoadOp::Load | LoadOp::Resident | LoadOp::DontCare => None,
+            },
+            ReadbackBaseArm::Previous => attachment
+                .previous
+                .as_ref()
+                .map(|source| ReadbackBase::Previous(source.proof_bytes())),
+        };
+        Some(Self {
+            rect: decision.rect,
+            base,
+            extent_bytes: decision.extent_bytes,
+            texels: decision.texels,
+        })
+    }
+}
+
+/// Where a trimmed readback's uncovered texels come from, by arm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadbackBaseArm {
+    /// The whole-extent arm, or a trimmed arm whose request states no seed.
+    None,
+    /// The pass clears the attachment, so the uncovered texels are that one
+    /// repeated texel.
+    Clear,
+    /// The pass loads its previous contents from its own declaration.
+    Previous,
+}
+
 /// One stored attachment's readback decision, in location order, `None` for a
 /// discarded attachment — the same shape the readback channel itself has.
-type ReadbackRegions<'a> = Vec<Option<AttachmentReadback<'a>>>;
+///
+/// The decision is owned: it names the seed arm rather than borrowing the bytes
+/// (`AttachmentReadback::of` reads them). One pass's `record` and its readback
+/// both read it, and a batch holds one per member.
+#[derive(Clone, Copy, Debug)]
+struct ReadbackDecision {
+    /// The rectangle the pass can have written, or `None` for the
+    /// whole-attachment copy.
+    rect: Option<WrittenRect>,
+    /// Which arm the uncovered texels' seed comes from.
+    base: ReadbackBaseArm,
+    /// The attachment's whole tightly packed extent, in bytes.
+    extent_bytes: u64,
+    /// The number of texels the attachment's extent covers.
+    texels: u64,
+}
+
+/// Every stored attachment's own decision, in location order.
+type ReadbackDecisions = Vec<Option<ReadbackDecision>>;
 
 /// Decide how every stored attachment of one pass is read back.
 ///
@@ -8978,10 +9044,10 @@ type ReadbackRegions<'a> = Vec<Option<AttachmentReadback<'a>>>;
 /// anything — and every fallback is counted, because "how much of the guest's
 /// traffic this saves" is only readable beside the shapes that keep the old
 /// cost (`VulkanExecutor::readback_region_counts`).
-fn plan_readback_regions<'a>(
+fn plan_readback_decisions<'a>(
     context: &VulkanContext,
     request: &'a OffscreenRenderRequest<'a>,
-) -> Result<ReadbackRegions<'a>, ProviderError> {
+) -> Result<ReadbackDecisions, ProviderError> {
     // The control arm: `METAL_API_VULKAN_FULL_READBACK` asks for the
     // pre-increment path for this whole process, which is what lets one round
     // compare the two arms' frames byte for byte.
@@ -9003,13 +9069,20 @@ fn plan_readback_regions<'a>(
         // construction (`resolve_attachment_load`), so the copy it feeds below
         // is the frame's own length. A `Clear` carries its payload in the same
         // memory order the pass clears with.
+        // The arm, not the bytes: `AttachmentReadback::of` is the one place
+        // that pairs an arm with the declaration it reads its seed from, so a
+        // decision planned here and one re-derived after a fence cannot
+        // disagree about where the seed lives.
         let base = match &attachment.load {
-            LoadOp::Clear(clear) => Some(ReadbackBase::Clear(clear.as_bytes())),
-            LoadOp::Load => attachment
-                .previous
-                .as_ref()
-                .map(|source| ReadbackBase::Previous(source.proof_bytes())),
-            LoadOp::Resident | LoadOp::DontCare => None,
+            LoadOp::Clear(_) => ReadbackBaseArm::Clear,
+            LoadOp::Load => {
+                if attachment.previous.is_some() {
+                    ReadbackBaseArm::Previous
+                } else {
+                    ReadbackBaseArm::None
+                }
+            }
+            LoadOp::Resident | LoadOp::DontCare => ReadbackBaseArm::None,
         };
         let decision = if forced {
             Err(RectRefusal::Multisample)
@@ -9027,7 +9100,9 @@ fn plan_readback_regions<'a>(
             )
         };
         let rect = match decision {
-            Ok(rect) if !rect.is_whole(request.extent) && base.is_some() => Some(rect),
+            Ok(rect) if !rect.is_whole(request.extent) && base != ReadbackBaseArm::None => {
+                Some(rect)
+            }
             Ok(_) => {
                 // A rectangle covering the whole attachment is the
                 // pre-increment readback with extra steps: it is counted as one
@@ -9057,10 +9132,10 @@ fn plan_readback_regions<'a>(
         // `Some` together. The attachment still lands its whole readback — it is
         // a stored attachment, not a discarded one.
         debug_assert!(
-            rect.is_none() || base.is_some(),
+            rect.is_none() || base != ReadbackBaseArm::None,
             "a written rectangle is only proven beside the seed the frame is rebuilt from"
         );
-        regions.push(Some(AttachmentReadback {
+        regions.push(Some(ReadbackDecision {
             rect,
             base,
             extent_bytes,
@@ -9138,7 +9213,7 @@ fn read_back_offscreen(
     context: &VulkanContext,
     request: &OffscreenRenderRequest<'_>,
     objects: &OffscreenObjects,
-    regions: &[Option<AttachmentReadback<'_>>],
+    decisions: &[Option<ReadbackDecision>],
     mappings: Vec<usize>,
     depth_byte_length: u64,
     stencil_byte_length: u64,
@@ -9152,11 +9227,17 @@ fn read_back_offscreen(
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReadback);
     let mut results = Vec::with_capacity(request.attachments.len());
     let mut mappings = mappings.into_iter();
-    for (attachment, region) in request.attachments.iter().zip(regions) {
-        let Some(region) = region else {
+    for (index, (attachment, decision)) in request.attachments.iter().zip(decisions).enumerate() {
+        let Some(decision) = decision else {
             results.push(None);
             continue;
         };
+        // The borrowed view of the decision: the seed bytes are read out of the
+        // request this readback is handed, which is the same request the
+        // decision was planned from and the same one the copy-out was recorded
+        // from.
+        let region = &AttachmentReadback::of(request, index, *decision)
+            .expect("a decision names an attachment of the request it was planned from");
         let mapping = mappings.next().expect("one readback per stored attachment");
         // Charged to no arm below: this is a shape check both arms take, and it
         // refuses before either of them runs.
@@ -9240,11 +9321,68 @@ fn read_back_offscreen(
     })
 }
 
-fn execute_offscreen_render_with_retains(
-    context: &VulkanContext,
-    request: &OffscreenRenderRequest<'_>,
-    mut retains: Option<RenderInputRetains>,
-) -> Result<OffscreenReadback, ProviderError> {
+/// One recorded, not-yet-submitted offscreen pass (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// Everything the pre-batch executor built up to and including `record` lives
+/// here: the objects the pass created, the readback decisions its copy-out was
+/// recorded from, the readback destinations, the input retains and the layout
+/// guards it holds. `record` is the last device call this state can make by
+/// itself; submission is a separate step
+/// ([`submit_prepared_offscreen_passes`]) so one `vkQueueSubmit` can carry N
+/// passes, and the readback is a third
+/// ([`finish_prepared_offscreen_pass`]) because it only runs once that one
+/// fence has signalled.
+struct PreparedOffscreenPass<'a, 'ctx> {
+    /// The pass's own request. The caller keeps the request alive for as long
+    /// as this state lives — it is the storage the readback's seed bytes and
+    /// the attachment list are read from after the fence.
+    request: &'a OffscreenRenderRequest<'a>,
+    objects: Option<OffscreenObjects<'ctx>>,
+    /// The readback decision of every stored attachment, in location order.
+    /// Owned rather than borrowed, which is what lets a batch hold one per
+    /// member across its fence.
+    decisions: ReadbackDecisions,
+    /// One readback destination per stored attachment, in location order.
+    readback_mappings: Vec<usize>,
+    depth_byte_length: u64,
+    stencil_byte_length: u64,
+    /// The no-copy retains the pass took for its own inputs. They outlive the
+    /// submission and are retired by the readback's own end.
+    retains: Option<RenderInputRetains>,
+    /// The layout guards this pass holds on the resident images it renders
+    /// into: its own (the single-pass shape) or the batch's running declaration
+    /// (a member of one).
+    layouts: PassLayouts<'a>,
+}
+
+impl<'a, 'ctx> PreparedOffscreenPass<'a, 'ctx> {
+    /// The command buffer this pass recorded into. The batch submits one
+    /// submission carrying every prepared pass's own buffer.
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.objects
+            .as_ref()
+            .expect("a prepared pass owns its objects until it is finished")
+            .command
+    }
+
+    /// State that the submission this pass was part of reached the queue. It is
+    /// the boundary the no-copy retain disposition keys on, exactly as it is
+    /// for one pass (`OffscreenObjects::submitted`).
+    fn mark_submitted(&mut self) {
+        if let Some(objects) = self.objects.as_mut() {
+            objects.submitted = true;
+        }
+    }
+}
+
+fn prepare_offscreen_render_pass<'a, 'ctx>(
+    context: &'ctx VulkanContext,
+    request: &'a OffscreenRenderRequest<'a>,
+    retains: Option<RenderInputRetains>,
+    queue_index: usize,
+    layouts: Option<PassLayouts<'a>>,
+    inherits_resident: bool,
+) -> Result<PreparedOffscreenPass<'a, 'ctx>, ProviderError> {
     // The render half's own split (`crate::phase_profile`), disjoint region by
     // disjoint region: everything before the recording is setup, the recording
     // and the submission/wait are charged where they happen, and the mapped
@@ -9833,7 +9971,6 @@ fn execute_offscreen_render_with_retains(
     drop(setup_admits);
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
-    let queue_index = select_graphics_queue(context)?;
     let vertex_words = spirv_words(request.vertex.spirv)
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
     let fragment_words = spirv_words(fragment_spirv)
@@ -9851,8 +9988,15 @@ fn execute_offscreen_render_with_retains(
     // opposite orders from interleaving their transitions.
     let setup_attachments =
         crate::phase_profile::Bar::enter(crate::phase_profile::Phase::SetupAttachments);
-    let mut resident_layouts = ResidentTargetLayouts::acquire(request);
+    let resident_layouts =
+        layouts.unwrap_or_else(|| PassLayouts::Owned(ResidentTargetLayouts::acquire(request)));
     let mut objects = OffscreenObjects::new(context);
+    // A batch member after the first reads bytes an earlier member of the same
+    // submission wrote, and this submission has no fence between them: the
+    // render pass states the external→subpass dependency that makes those
+    // writes available and visible to the load below
+    // (`REIMS_VGPU_RENDER_BATCH`).
+    objects.batch_inherits_resident = inherits_resident;
     // The colour attachments a sampled declaration snapshots
     // (`research/docs/23` §118, E-TX15): their images are the copy's own
     // source, so each one asks for `TRANSFER_SRC` beside the usages the store
@@ -10041,23 +10185,23 @@ fn execute_offscreen_render_with_retains(
     // `render_readback`: it is taken here, before any device object exists, so
     // a round can tell "the shapes did not qualify" from "the copy was slow"
     // (`crate::phase_profile::Phase::ReadbackShape`).
-    let regions = {
+    let decisions = {
         let _readback_shape =
             crate::phase_profile::Bar::enter(crate::phase_profile::Phase::ReadbackShape);
-        plan_readback_regions(context, request)?
+        plan_readback_decisions(context, request)?
     };
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
-    for (attachment, region) in request.attachments.iter().zip(&regions) {
-        let Some(region) = region else {
+    for (attachment, decision) in request.attachments.iter().zip(&decisions) {
+        let Some(decision) = decision else {
             continue;
         };
-        let staged = match region.rect {
+        let staged = match decision.rect {
             Some(rect) => {
                 let texel_bytes = attachment.format.bytes_per_texel();
                 rect.byte_length(texel_bytes)
                     .ok_or_else(|| contract_refusal("render readback rectangle overflows u64"))?
             }
-            None => region.extent_bytes,
+            None => decision.extent_bytes,
         };
         // A rectangle that covers nothing stages nothing — `record` skips its
         // copy entirely — but the buffer still has to exist, and a zero-sized
@@ -10115,7 +10259,7 @@ fn execute_offscreen_render_with_retains(
         // touches a few thousand texels of a 1920x1080 surface moves a few
         // thousand texels through the staging buffer
         // (`docs/WRITTEN-RECT-READBACK.md`).
-        &regions,
+        &decisions,
         // The resolve filter the subpass was built with; `record` reads the
         // same request field for its clear-value placeholder and copy-out
         // source (`research/docs/23` §3.3, v57).
@@ -10130,61 +10274,208 @@ fn execute_offscreen_render_with_retains(
         height,
     )?;
     drop(_render_record);
-    // The retained no-copy leases outlive the submission: the fence below is
-    // what proves the GPU can no longer read the owner's mapping
-    // (`research/docs/23` §71, R3c).
-    match objects.submit_and_wait(queue_index) {
+    // Hand the recorded state back: the pass is not submitted yet, so the
+    // command buffer keeps its contents and the retained no-copy leases keep
+    // the owner's mappings alive until the fence says the GPU is done with
+    // them (`research/docs/23` §71, R3c).
+    Ok(PreparedOffscreenPass {
+        request,
+        objects: Some(objects),
+        decisions,
+        readback_mappings,
+        depth_byte_length,
+        stencil_byte_length,
+        retains,
+        layouts: resident_layouts,
+    })
+}
+
+/// Execute one offscreen render pass: record it, submit it alone and wait for
+/// it, then read its bytes back.
+///
+/// The pre-batch shape, stated in terms of the three steps a batch shares
+/// ([`prepare_offscreen_render_pass`], [`submit_prepared_offscreen_passes`],
+/// [`finish_prepared_offscreen_pass`]) so the single-pass path and the batch
+/// path cannot drift apart in what they record or in what they hand back.
+fn execute_offscreen_render_with_retains(
+    context: &VulkanContext,
+    request: &OffscreenRenderRequest<'_>,
+    retains: Option<RenderInputRetains>,
+) -> Result<OffscreenReadback, ProviderError> {
+    let queue_index = select_graphics_queue(context)?;
+    let mut prepared = vec![prepare_offscreen_render_pass(
+        context,
+        request,
+        retains,
+        queue_index,
+        None,
+        false,
+    )?];
+    if let Err(error) = submit_prepared_offscreen_passes(context, queue_index, &mut prepared) {
+        return Err(fail_prepared_offscreen_passes(&mut prepared, error));
+    }
+    finish_prepared_offscreen_pass(context, &mut prepared[0])
+}
+
+/// Submit every prepared pass as **one** submission scope
+/// (`REIMS_VGPU_RENDER_BATCH`): one queue lock, one `vkQueueSubmit` carrying one
+/// command buffer per pass, one fence and one wait.
+///
+/// The passes keep their own command buffers and their own objects; what they
+/// share is the submission. That is the whole point of the increment — the
+/// device-side ordering between a resident store and the load that reads it is
+/// the queue's own submission order, and the memory dependency that makes those
+/// bytes *visible* to the next pass is stated by that pass's render pass
+/// (`OffscreenObjects::batch_inherits_resident`), because there is no fence
+/// between them any more.
+fn submit_prepared_offscreen_passes<'a, 'ctx>(
+    context: &'ctx VulkanContext,
+    queue_index: usize,
+    prepared: &mut [PreparedOffscreenPass<'a, 'ctx>],
+) -> Result<(), ProviderError> {
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    // The render half's submission, split the way the compute sequence's is
+    // (`crate::phase_profile`): the queue lock, the fence and `vkQueueSubmit`
+    // are one region, the wait for it is another, and the wait carries the
+    // same idle/blocked split. One bar covers the whole batch, which is why
+    // `wait_render_n` is a per-batch reading once this path is taken.
+    let _render_submit =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderSubmit);
+    let _execution = context
+        .lock_queue(queue_index)
+        .map_err(|_| submission_refusal("submit render pass", "queue lock is poisoned"))?;
+    context.notify_enqueue(queue_index);
+    let fence = unsafe {
+        context
+            .device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+    }
+    .map_err(|error| execution_refusal("create render fence", &error.to_string()))?;
+    let commands: Vec<vk::CommandBuffer> = prepared
+        .iter()
+        .map(PreparedOffscreenPass::command_buffer)
+        .collect();
+    let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+    if let Err(result) = context.submit_commands(queue_index, &submits, fence) {
+        // A submission the driver refused before it ran: no pass reached the
+        // queue, so every pass's `submitted` flag stays false and the fence is
+        // the batch's own to destroy.
+        unsafe { context.device.destroy_fence(fence, None) };
+        return Err(driver_refusal(
+            context,
+            ProviderPhase::Submit,
+            "submit render pass",
+            result,
+        ));
+    }
+    for pass in prepared.iter_mut() {
+        pass.mark_submitted();
+    }
+    context.record_queue_submission(queue_index);
+    drop(_render_submit);
+    // The wait's object is the batch's own binary completion fence, and the
+    // depth read here says how much of the graphics queue's earlier work the
+    // wait was behind (this submission is already recorded, so `n - 1` is what
+    // stood ahead of it) — `crate::phase_profile`.
+    let ahead = context.queue_in_flight(queue_index).saturating_sub(1);
+    let mut _render_wait = crate::phase_profile::Bar::enter_fence_wait(
+        crate::phase_profile::Phase::RenderWait,
+        crate::phase_profile::WaitObject::RenderFence,
+        ahead,
+    );
+    let waited = context.wait_for_fence(fence, crate::FENCE_TIMEOUT_NS);
+    unsafe { context.device.destroy_fence(fence, None) };
+    match waited {
         Ok(()) => {
-            // The pass completed, so every resident target is now in the
-            // layout the next submission starts from — and, for the provider's
-            // own bookkeeping, in a state a later `LoadOp::Resident` may read
-            // (`research/docs/23` §76, R7).
-            resident_layouts.publish(true);
-            // The pipeline-shaped objects have retired with the fence, so they
-            // go back to the shape cache before anything else in this pass
-            // reads the frame (`crate::render_setup_reuse`). The three returns
-            // are their own residual bars: "give it back" is only free if a
-            // reading says so, and a pool's eviction destroys objects inside
-            // the return (`crate::phase_profile`, fourth cut).
-            let _release_reuse =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseReuse);
-            objects.release_reusable();
-            drop(_release_reuse);
-            // The sampled textures' pooled backing retires with the same
-            // fence (`crate::render_texture_pool`).
-            let _release_pool =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleasePool);
-            objects.release_pooled_textures();
-            drop(_release_pool);
-            // The owner-window imports retire with the same fence
-            // (`crate::render_import_pool`).
-            let _release_import =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseImport);
-            objects.release_imported_windows();
-            drop(_release_import);
-            // The rail-owned host-visible upload buffers retire with the same
-            // fence (`crate::render_buffer_pool`).
-            let _release_uploads =
-                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseUploads);
-            objects.release_pooled_uploads();
-            drop(_release_uploads);
+            context.record_queue_retirement(queue_index);
+            Ok(())
         }
-        Err(error) => {
-            if let Some(retains) = retains.as_mut() {
-                retains.after_submission_failure(&error, objects.submitted);
+        Err(result) => {
+            if let Some(bar) = _render_wait.as_mut() {
+                bar.mark_timed_out();
             }
-            // A submission the driver refused before it ran leaves the image
-            // exactly as it was; a submission that reached the queue may have
-            // left any layout and any bytes behind, so the target states
-            // `UNDEFINED` — the one old layout that is always legal to
-            // declare — and the provider marks the identity undefined rather
-            // than letting a later resident load read an image of unknown
-            // state.
-            resident_layouts.publish(!objects.submitted);
-            return Err(error);
+            Err(driver_refusal(
+                context,
+                ProviderPhase::Wait,
+                "wait for render fence",
+                result,
+            ))
         }
     }
+}
 
+/// Fail every pass of a submission that did not complete, with the disposition
+/// the pre-batch single-pass path states for one pass.
+///
+/// A driver that refused the submission before it ran leaves every image
+/// exactly as it was; a submission that reached the queue may have left any
+/// layout and any bytes behind, so the targets state `UNDEFINED` — the one old
+/// layout that is always legal to declare — and the provider marks the
+/// identities undefined rather than letting a later resident load read an image
+/// of unknown state.
+fn fail_prepared_offscreen_passes<'a, 'ctx>(
+    prepared: &mut [PreparedOffscreenPass<'a, 'ctx>],
+    error: ProviderError,
+) -> ProviderError {
+    for pass in prepared.iter_mut() {
+        let submitted = pass
+            .objects
+            .as_ref()
+            .is_some_and(|objects| objects.submitted);
+        if let Some(retains) = pass.retains.as_mut() {
+            retains.after_submission_failure(&error, submitted);
+        }
+        pass.layouts.publish(!submitted);
+    }
+    error
+}
+
+/// Read one prepared pass's observable bytes back, retire its retains and tear
+/// its objects down — the work that follows the submission's own fence.
+fn finish_prepared_offscreen_pass<'a, 'ctx>(
+    context: &'ctx VulkanContext,
+    pass: &mut PreparedOffscreenPass<'a, 'ctx>,
+) -> Result<OffscreenReadback, ProviderError> {
+    // The pass completed, so every resident target is now in the layout the
+    // next submission starts from — and, for the provider's own bookkeeping,
+    // in a state a later `LoadOp::Resident` may read (`research/docs/23` §76,
+    // R7). A batch member holds no guard of its own; the batch publishes its
+    // own set before it calls this, so the call is a no-op there.
+    pass.layouts.publish(true);
+    let mut objects = pass
+        .objects
+        .take()
+        .expect("a prepared pass's objects are handed over exactly once");
+    // The pipeline-shaped objects have retired with the fence, so they go back
+    // to the shape cache before anything else in this pass reads the frame
+    // (`crate::render_setup_reuse`). The three returns are their own residual
+    // bars: "give it back" is only free if a reading says so, and a pool's
+    // eviction destroys objects inside the return (`crate::phase_profile`,
+    // fourth cut).
+    let _release_reuse =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseReuse);
+    objects.release_reusable();
+    drop(_release_reuse);
+    // The sampled textures' pooled backing retires with the same fence
+    // (`crate::render_texture_pool`).
+    let _release_pool =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleasePool);
+    objects.release_pooled_textures();
+    drop(_release_pool);
+    // The owner-window imports retire with the same fence
+    // (`crate::render_import_pool`).
+    let _release_import =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseImport);
+    objects.release_imported_windows();
+    drop(_release_import);
+    // The rail-owned host-visible upload buffers retire with the same fence
+    // (`crate::render_buffer_pool`).
+    let _release_uploads =
+        crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseUploads);
+    objects.release_pooled_uploads();
+    drop(_release_uploads);
     // The readback comes before the retains retire, and not the other way
     // around: a trimmed readback rebuilds the frame's uncovered texels from the
     // attachment's own seed, and a `Load` seed can be the owner's live window —
@@ -10193,15 +10484,15 @@ fn execute_offscreen_render_with_retains(
     // the pre-pass bytes by construction (`docs/WRITTEN-RECT-READBACK.md` §3).
     let readback = read_back_offscreen(
         context,
-        request,
+        pass.request,
         &objects,
-        &regions,
-        readback_mappings,
-        depth_byte_length,
-        stencil_byte_length,
+        &pass.decisions,
+        std::mem::take(&mut pass.readback_mappings),
+        pass.depth_byte_length,
+        pass.stencil_byte_length,
     );
     if readback.is_ok() {
-        if let Some(retains) = retains.as_mut() {
+        if let Some(retains) = pass.retains.as_mut() {
             let _retire =
                 crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderRetire);
             retains.retire();
@@ -10212,14 +10503,171 @@ fn execute_offscreen_render_with_retains(
     // so the render half's residual can *name* that teardown
     // (`crate::phase_profile::Phase::RenderTeardown`): `OffscreenObjects::drop`
     // destroys everything the pass built — its images, views, samplers,
-    // descriptor pools, framebuffers, render passes, readback buffers, fence
-    // and command pool — and that work was charged to no bar at all. The drop
-    // stays in the same order it had: after the fence, after the readback, and
-    // after the input retains retired.
+    // descriptor pools, framebuffers, render passes, readback buffers and
+    // command pool — and that work was charged to no bar at all. The drop stays
+    // in the same order it had: after the fence, after the readback, and after
+    // the input retains retired.
     let _teardown = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderTeardown);
     drop(objects);
     drop(_teardown);
     readback
+}
+
+/// One batch member's declaration surface, as the caller states it
+/// (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// The batch resolves every member's request from these before the first device
+/// object exists, so the shape the caller may batch is stated here rather than
+/// implied by the requests: a member whose inputs the trace's own earlier
+/// passes produced is not a member (its bytes only exist once a fence has
+/// delivered them — which is exactly what a batch defers).
+pub(crate) struct OffscreenBatchInputs<'a> {
+    pub(crate) stages: &'a RenderStages,
+    pub(crate) pass: &'a RenderPassDescriptor,
+    pub(crate) previous: &'a [Option<&'a BufferView>],
+    pub(crate) landings: &'a [Option<&'a BufferView>],
+    pub(crate) resident: Option<&'a [Option<&'a ProviderTargetImage>]>,
+}
+
+/// Resolve one batch member's request, with the same admissions and the same
+/// `render_prepare` bar the single-pass entry point runs.
+fn prepare_offscreen_batch_request<'a>(
+    context: &VulkanContext,
+    input: &OffscreenBatchInputs<'a>,
+    leases: Option<&RenderLeaseContext<'_>>,
+    depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
+    policy: SpirvFeaturePolicy,
+) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
+    let _prepare = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderPrepare);
+    refuse_attachment_extent(context, input.pass)?;
+    prepare_render_request_with_resident(
+        input.stages,
+        input.pass,
+        input.previous,
+        input.landings,
+        input.resident,
+        leases,
+        // A batch member never samples the trace's own production: those bytes
+        // are read back to the host by the pass that produced them, and a batch
+        // holds its members' readbacks back until its fence has signalled.
+        None,
+        depth_resolve_modes,
+        stencil_resolve_modes,
+        policy,
+    )
+}
+
+/// Whether `REIMS_VGPU_RENDER_BATCH` asks for one submission scope per run of
+/// resident-chain passes.
+///
+/// Off by default, and read once: the switch is the control arm a round runs
+/// the pre-batch path with, so the two arms' frames can be compared byte for
+/// byte (`docs/WRITTEN-RECT-READBACK.md` §4 is the same discipline for the
+/// readback shape). Both rails read this one name — the rename rail decides
+/// whether to *assemble* a run into one trace, and this provider decides
+/// whether to *submit* that run as one scope.
+pub(crate) fn render_batch_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_RENDER_BATCH")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "ON" | "true" | "yes")
+        )
+    })
+}
+
+/// Execute N offscreen render passes inside **one** submission scope
+/// (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// Every pass is recorded into its own command buffer with its own device
+/// objects, exactly as it would be alone; the N of them share the queue lock,
+/// the `vkQueueSubmit`, the fence and the wait. The batch is fail-closed: a
+/// refusal while preparing the k-th member drops the first k−1 members without
+/// submitting anything, and a submission that fails fails every member — no
+/// pass of a batch lands alone.
+///
+/// The requests are prepared and retained before the batch is submitted, so the
+/// whole declaration surface of the run is resolved with nothing on the queue.
+pub(crate) fn execute_offscreen_render_batch<'a>(
+    context: &VulkanContext,
+    inputs: &[OffscreenBatchInputs<'a>],
+    leases: Option<&RenderLeaseContext<'_>>,
+    depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
+    policy: SpirvFeaturePolicy,
+) -> Result<Vec<OffscreenReadback>, ProviderError> {
+    let mut requests: Vec<OffscreenRenderRequest<'a>> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        requests.push(prepare_offscreen_batch_request(
+            context,
+            input,
+            leases,
+            depth_resolve_modes,
+            stencil_resolve_modes,
+            policy,
+        )?);
+    }
+    let mut retains = Vec::with_capacity(requests.len());
+    for request in &requests {
+        retains.push(RenderInputRetains::retain(leases, request)?);
+    }
+    let queue_index = select_graphics_queue(context)?;
+    let borrowed: Vec<&OffscreenRenderRequest<'a>> = requests.iter().collect();
+    let mut layouts = BatchResidentLayouts::acquire(&borrowed);
+    let mut prepared = Vec::with_capacity(requests.len());
+    for (index, (request, retains)) in requests.iter().zip(retains).enumerate() {
+        // The pass-count reading stays a *pass* count: the single-pass entry
+        // states this for its one pass (`execute_render_pass`), and a batch owes
+        // the same statement for every member it carries, so `render_offscreen_n`
+        // is the passes a window ran however they were submitted.
+        crate::phase_profile::note_render_shape(crate::phase_profile::RenderShape::Offscreen);
+        // The first member opens every image from the layout the last
+        // submission published; every later member opens from where its
+        // predecessor left it, which is what the running layouts state.
+        let declared = layouts.declared_for(request);
+        let pass = prepare_offscreen_render_pass(
+            context,
+            request,
+            retains,
+            queue_index,
+            Some(PassLayouts::Batched(declared)),
+            // A member after the first reads bytes an earlier member of *this*
+            // submission wrote, and there is no fence between them: its render
+            // pass states the memory dependency that makes them visible
+            // (`OffscreenObjects::batch_inherits_resident`).
+            index > 0,
+        )?;
+        layouts.advance(request);
+        prepared.push(pass);
+    }
+    crate::phase_profile::note_render_batch(u64::try_from(prepared.len()).unwrap_or(u64::MAX));
+    if let Err(error) = submit_prepared_offscreen_passes(context, queue_index, &mut prepared) {
+        // The batch's own guards state the same disposition the members do — a
+        // submission the driver refused before it ran leaves the images exactly
+        // as they were, while one that reached the queue may have left any
+        // layout behind — and the members cannot state it themselves: a member
+        // holds no guard of its own.
+        let reached_queue = prepared.iter().any(|pass| {
+            pass.objects
+                .as_ref()
+                .is_some_and(|objects| objects.submitted)
+        });
+        layouts.publish(!reached_queue);
+        return Err(fail_prepared_offscreen_passes(&mut prepared, error));
+    }
+    // One fence for the whole batch: every image the batch guarded is terminal
+    // together, and every member's readback reads bytes that submission made
+    // visible.
+    layouts.publish(true);
+    let mut readbacks = Vec::with_capacity(prepared.len());
+    for pass in prepared.iter_mut() {
+        readbacks.push(finish_prepared_offscreen_pass(context, pass)?);
+    }
+    Ok(readbacks)
 }
 
 /// One provider-owned target image: the present rail's presentable target
@@ -11049,6 +11497,16 @@ struct OffscreenObjects<'a> {
     /// disposition keys on; a failure before it leaves nothing that could read
     /// them.
     submitted: bool,
+    /// Whether this pass is a member of a render batch that already recorded
+    /// bytes into the image it loads (`REIMS_VGPU_RENDER_BATCH`).
+    ///
+    /// Set by `prepare_offscreen_render_pass` for every batch member after the
+    /// first. A batch submits its members inside one `vkQueueSubmit` with no
+    /// fence between them, so the external→subpass dependency every render pass
+    /// states for its own seeds has to be widened to the colour writes of the
+    /// members before it: without that dependency the load reads bytes the
+    /// earlier pass's store is not yet visible to.
+    batch_inherits_resident: bool,
     /// The descriptor set layout the sampled pipeline is built from, or null
     /// for a pass that samples nothing.
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -11521,6 +11979,171 @@ impl<'a> ResidentTargetLayouts<'a> {
     }
 }
 
+/// The `initialLayout` declarations one pass states for the provider-owned
+/// images it renders into.
+///
+/// The single-pass shape is the pre-batch one: the pass acquired the guards
+/// itself and publishes the terminal layout through them once its own fence has
+/// signalled. A *batch member* (`REIMS_VGPU_RENDER_BATCH`) cannot do either —
+/// its guards belong to the batch, which holds one set for the whole submission
+/// scope, and the layout it opens an image from is what the batch's previous
+/// members left there. So a member carries the layouts it declared, and
+/// [`Self::publish`] is a no-op for it: the batch publishes once, after the one
+/// fence the whole batch waits on.
+enum PassLayouts<'a> {
+    /// One pass's own guards, acquired in attachment order by
+    /// [`ResidentTargetLayouts::acquire`].
+    Owned(ResidentTargetLayouts<'a>),
+    /// One batch member's declared layouts, in attachment order, taken from the
+    /// batch's running state before the member's render pass was created.
+    Batched(Vec<Option<vk::ImageLayout>>),
+}
+
+impl PassLayouts<'_> {
+    /// The layout the attachment at `index` opens from, or `UNDEFINED` for an
+    /// attachment that renders into an image of its own.
+    fn layout(&self, index: usize) -> vk::ImageLayout {
+        match self {
+            Self::Owned(owned) => owned.layout(index),
+            Self::Batched(declared) => declared
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(vk::ImageLayout::UNDEFINED),
+        }
+    }
+
+    /// Publish the terminal layout of every guard this pass *holds*. A batch
+    /// member holds none — the batch's own guards are published by the batch —
+    /// so this is a no-op for it.
+    fn publish(&mut self, completed: bool) {
+        if let Self::Owned(owned) = self {
+            owned.publish(completed);
+        }
+    }
+}
+
+/// The layout guards and running layouts one render batch holds
+/// (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// One guard per resident identity, taken in first-use order before the batch's
+/// first device object exists — the same serialization point
+/// [`ResidentTargetLayouts`] takes for one pass, and for the same reason: two
+/// submissions that name two resident targets in opposite orders must not
+/// interleave their transitions. A batch is one submission, so it takes the
+/// guards once and holds them across every member: a member that stores into an
+/// identity a later member loads from is the shape this increment exists for,
+/// and two guards on one image would deadlock before it ever ran.
+///
+/// The *running* layout beside each guard is what the next member declares as
+/// its `initialLayout`: a member's render pass leaves every resident image it
+/// stores in `TRANSFER_SRC_OPTIMAL` (`OffscreenObjects::attach_resident_target`
+/// states the store action unconditionally), so the member after it opens from
+/// that layout rather than from the value the guard held when the batch began.
+struct BatchResidentLayouts<'a> {
+    entries: Vec<BatchResidentEntry<'a>>,
+}
+
+struct BatchResidentEntry<'a> {
+    image: &'a ProviderTargetImage,
+    guard: std::sync::MutexGuard<'a, vk::ImageLayout>,
+    layout: vk::ImageLayout,
+}
+
+impl<'a> BatchResidentLayouts<'a> {
+    /// Take one guard per resident identity the batch's requests name.
+    fn acquire(requests: &[&'a OffscreenRenderRequest<'a>]) -> Self {
+        let mut entries: Vec<BatchResidentEntry<'a>> = Vec::new();
+        for request in requests {
+            for attachment in &request.attachments {
+                let Some(image) = attachment.resident else {
+                    continue;
+                };
+                if entries.iter().any(|entry| std::ptr::eq(entry.image, image)) {
+                    continue;
+                }
+                let guard = image.begin_target_pass();
+                let layout = *guard;
+                entries.push(BatchResidentEntry {
+                    image,
+                    guard,
+                    layout,
+                });
+            }
+        }
+        Self { entries }
+    }
+
+    /// The `initialLayout` every attachment of one member states, in attachment
+    /// order: `None` for an attachment rendering into an image of its own.
+    ///
+    /// The three arms are `OffscreenObjects::attach_resident_target`'s own: a
+    /// pass that uploads previous bytes states the attachment layout, a clear
+    /// opens from `UNDEFINED`, and a resident load keeps the bytes and so
+    /// declares the layout they are in *now* — which is the batch's running
+    /// value, not the one the batch began with.
+    fn declared_for(&self, request: &OffscreenRenderRequest<'_>) -> Vec<Option<vk::ImageLayout>> {
+        request
+            .attachments
+            .iter()
+            .map(|attachment| {
+                attachment.resident.map(|image| {
+                    let entry = self
+                        .entries
+                        .iter()
+                        .find(|entry| std::ptr::eq(entry.image, image))
+                        .expect("every resident image of a member was guarded by the batch");
+                    if attachment.previous.is_some() {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    } else if matches!(attachment.load, LoadOp::Clear(_)) {
+                        vk::ImageLayout::UNDEFINED
+                    } else {
+                        entry.layout
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Record where one member's render pass leaves the batch's images.
+    fn advance(&mut self, request: &OffscreenRenderRequest<'_>) {
+        for attachment in &request.attachments {
+            let Some(image) = attachment.resident else {
+                continue;
+            };
+            let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| std::ptr::eq(entry.image, image))
+            else {
+                continue;
+            };
+            // A resident attachment's store action is `STORE` whoever the
+            // contract's store arm is (`attach_resident_target`), and a batch
+            // member never carries a present action, so the render pass's
+            // `finalLayout` is `TRANSFER_SRC_OPTIMAL` — the same terminal
+            // layout `ResidentTargetLayouts::publish` states for a completed
+            // pass.
+            entry.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        }
+    }
+
+    /// Publish the terminal layout of every image the batch guarded: the layout
+    /// the next submission starts from once the batch completed, or `UNDEFINED`
+    /// when a submission that reached the queue failed and the images' state is
+    /// unknown.
+    fn publish(&mut self, completed: bool) {
+        let terminal = if completed {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        } else {
+            vk::ImageLayout::UNDEFINED
+        };
+        for entry in &mut self.entries {
+            *entry.guard = terminal;
+        }
+    }
+}
+
 /// The single-sample resolve target of one multisampled colour attachment
 /// (`research/docs/23` §3.3, v51).
 ///
@@ -11646,6 +12269,7 @@ impl<'a> OffscreenObjects<'a> {
             readbacks: Vec::new(),
             textures: Vec::new(),
             submitted: false,
+            batch_inherits_resident: false,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set: vk::DescriptorSet::null(),
@@ -13024,23 +13648,34 @@ impl<'a> OffscreenObjects<'a> {
         // states the write class the seed pass handed on as well as the
         // load's own read. Every unseeded pass keeps the availability-only
         // scope it always had, byte for byte.
-        let seeded = self
-            .attachments
-            .iter()
-            .any(|attachment| attachment.seed.is_some());
+        //
+        // A batch member after the first (`REIMS_VGPU_RENDER_BATCH`) states the
+        // same pair for a different reason: the bytes its resident load reads
+        // were written by an earlier member of the *same* submission, in
+        // another command buffer, with no fence in between. The write is made
+        // available by that member's `COLOR_ATTACHMENT_WRITE` and the load
+        // needs `COLOR_ATTACHMENT_READ` on top of the write the subpass
+        // performs, so one dependency covers both members — including the
+        // layout transition this pass performs from `TRANSFER_SRC_OPTIMAL`,
+        // which is ordered behind the earlier store by the same src scope.
+        let inherits = self.batch_inherits_resident
+            || self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.seed.is_some());
         let mut dependencies = vec![vk::SubpassDependency2::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(if seeded {
+            .src_access_mask(if inherits {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
             } else {
                 vk::AccessFlags::empty()
             })
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                    | if seeded {
+                    | if inherits {
                         vk::AccessFlags::COLOR_ATTACHMENT_READ
                     } else {
                         vk::AccessFlags::empty()
@@ -15944,10 +16579,10 @@ impl<'a> OffscreenObjects<'a> {
         attachments: &[OffscreenColorAttachment<'_>],
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
-        // The readback region of every stored attachment, in location order
-        // (`docs/WRITTEN-RECT-READBACK.md`): `Some` stages only that rectangle,
-        // `None` stages the whole extent.
-        written: &[Option<AttachmentReadback<'_>>],
+        // The readback decision of every stored attachment, in location order
+        // (`docs/WRITTEN-RECT-READBACK.md`): `Some` carries the rectangle the
+        // copy-out stages, `None` stages the whole extent.
+        written: &[Option<ReadbackDecision>],
         depth_resolve: Option<DepthResolveFilter>,
         stencil_resolve: Option<StencilResolveFilter>,
         scissor: Option<[u32; 4]>,
@@ -16734,8 +17369,8 @@ impl<'a> OffscreenObjects<'a> {
                 .resolve
                 .as_ref()
                 .map_or(attachment.image, |resolve| resolve.image);
-            let region = written.get(index).copied().flatten();
-            let copy = match region.and_then(|region| region.rect) {
+            let decision = written.get(index).copied().flatten();
+            let copy = match decision.and_then(|decision| decision.rect) {
                 Some(rect) if !rect.is_empty() => vk::BufferImageCopy::default()
                     .buffer_offset(0)
                     .buffer_row_length(0)
@@ -16884,6 +17519,13 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// Submit this pass's one command buffer and wait for it.
+    ///
+    /// The *present* rail keeps this shape: one pass, one submission, exactly
+    /// as it always was. The offscreen rail goes through
+    /// [`submit_prepared_offscreen_passes`] instead, which is the same
+    /// submission stated over the pass's prepared state — one command buffer
+    /// for one pass, N of them for a batch (`REIMS_VGPU_RENDER_BATCH`).
     fn submit_and_wait(&mut self, queue_index: usize) -> Result<(), ProviderError> {
         // The render half's submission, split the way the compute sequence's is
         // (`crate::phase_profile`): the queue lock, the fence and `vkQueueSubmit`
