@@ -28,15 +28,22 @@
 //! This cut makes one walk validate once, driven by
 //! `METAL_API_CORE_VALIDATE_ONCE`:
 //!
-//! * unset (the default), or any word that is not one of the four enable words:
-//!   off. Every region calls its own public entry and the trace is validated
-//!   three times, statement for statement as before.
-//! * `1` / `on` / `true` / `yes` (case-insensitive and whitespace-trimmed): on.
-//!   The first region keeps its `trace.validate()`, and the two later regions
+//! * unset (the default), or any word that is not one of the four control
+//!   words: on. The first region keeps its `trace.validate()`, and the two
+//!   later regions
 //!   call **crate-private** entries that are the very same bodies with that one
 //!   first line dropped
 //!   (`ComputeTrace::validate_serial_buffer_reuse_after_validate`,
 //!   `ResourceTableSnapshot::validate_trace_after_validate`).
+//!   The cut was flipped on once its round had priced it (the eleventh cut's
+//!   three arms: `serial_reuse` 25.672 → 2.075 µs per walk, `resources`
+//!   23.127 → 0.686, the walk 131.21 → 79.15 µs, against a 15.8 % spread
+//!   between the two identical control arms; the R side reads the same thing
+//!   independently at −39.4 % per frame).
+//! * `0` / `off` / `false` / `no` (case-insensitive and whitespace-trimmed):
+//!   off. Every region calls its own public entry and the trace is validated
+//!   three times, statement for statement as before — the control a round
+//!   compares against.
 //!
 //! # Why the answers cannot differ
 //!
@@ -75,10 +82,12 @@ static ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether one admission walk validates the trace once instead of three times.
 ///
-/// Read once from the process environment; **off unless a word turns it on** —
-/// the cut's own switch is spelled this way so an environment that says nothing
-/// (and every environment a round does not touch on purpose) keeps the
-/// statement-for-statement pre-cut path. Every call site is one relaxed load.
+/// Read once from the process environment; **on unless a control word turns it
+/// off** — the cut was flipped on once its round had priced it (`serial_reuse`
+/// 25.672 → 2.075 µs per walk, `resources` 23.127 → 0.686, the walk 131.21 →
+/// 79.15 µs, against a 15.8 % spread between the two identical control arms),
+/// and the control words keep the statement-for-statement pre-cut path
+/// reachable. Every call site is one relaxed load.
 #[inline]
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
@@ -117,9 +126,9 @@ pub(crate) fn set_arm(arm: Option<bool>) {
 
 /// The enable word, read exactly as a round's launcher spells it.
 fn parse_enabled(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "on" | "true" | "yes")
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -127,19 +136,19 @@ fn parse_enabled(value: Option<&str>) -> bool {
 mod tests {
     use super::parse_enabled;
 
-    /// Off is the default, and only the four enable words turn the cut on: a
-    /// word this cut does not know keeps the pre-cut path.
+    /// On is the default, and only the four control words turn the cut off: a
+    /// word this cut does not know keeps the cut's own path.
     #[test]
-    fn the_switch_is_off_unless_an_enable_word_turns_it_on() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_a_control_word_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("OFF")));
         assert!(!parse_enabled(Some("false")));
         assert!(!parse_enabled(Some("no")));
-        assert!(!parse_enabled(Some("nope")));
-        assert!(!parse_enabled(Some("2")));
+        assert!(parse_enabled(Some("nope")));
+        assert!(parse_enabled(Some("2")));
         assert!(parse_enabled(Some("1")));
         assert!(parse_enabled(Some("on")));
         assert!(parse_enabled(Some("ON")));
