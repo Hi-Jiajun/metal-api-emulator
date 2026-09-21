@@ -48,8 +48,13 @@
 //! # The switch and its reading
 //!
 //! `METAL_API_VULKAN_RENDER_TEXTURE_LINEAR_FALLBACK` (`1`, `on`, `ON`, `true`,
-//! `yes`) arms it; **off is the default**, because the increment lands before
-//! its production round has been read. Off is the pre-fix path byte for byte:
+//! `yes`) arms it; **unset is on**, because the increment was flipped once its
+//! device round had read it — the RTX 5060 round's own transcript shows the
+//! `1d`/`3d` + `LINEAR` shapes refused (`create=ERROR_FORMAT_NOT_SUPPORTED`)
+//! while every two-dimensional shape of the same formats, usages and extents
+//! creates, and the armed arm answers all six of the round's directed cases
+//! where the control arm fails the one-dimensional LUT by exit code. The
+//! control words `0`/`off`/`false`/`no` restore the pre-fix path byte for byte:
 //! the question below is not asked at all, no carrier moves, and every
 //! declaration is created exactly as it was.
 
@@ -69,14 +74,16 @@ pub(crate) fn enabled_from_env() -> bool {
     })
 }
 
-/// The switch's own reading: **off unless the variable arms it**. The
-/// mechanisms this one sits beside state both readings in their own modules
-/// (`crate::staging_borrow`'s is on-unless-turned-off, because its A/B had been
-/// priced); this one has not been priced yet, so unset stays off.
+/// The switch's own reading: **on unless the variable turns it off**. The
+/// fallback was flipped on once its device round had priced it (the RTX 5060
+/// transcript: the `1d`/`3d` + `LINEAR` shapes are refused, every 2D shape of
+/// the same formats creates; the armed arm passes the directed 1D LUT that the
+/// control arm fails, and its 141 captures are byte-identical to the base
+/// round's). The control words keep the pre-fix carrier reachable.
 fn parse_enabled(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -227,19 +234,19 @@ mod tests {
     use super::{parse_enabled, LinearAdmission};
     use ash::vk;
 
-    /// The switch is **off** for unset and for everything that is not one of
-    /// the four arming words, and on for each of them in the case the process
-    /// environment hands them over.
+    /// The switch is **on** for unset and for everything that is not one of
+    /// the four control words, and off for each of them in the case the
+    /// process environment hands them over.
     #[test]
-    fn the_switch_is_off_unless_the_variable_arms_it() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_a_control_word_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("no")));
         assert!(!parse_enabled(Some("false")));
         assert!(!parse_enabled(Some("OFF")));
-        assert!(!parse_enabled(Some("force")));
+        assert!(parse_enabled(Some("force")));
         assert!(parse_enabled(Some("1")));
         assert!(parse_enabled(Some("on")));
         assert!(parse_enabled(Some("ON")));
