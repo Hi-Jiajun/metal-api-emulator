@@ -3332,7 +3332,7 @@ mod tests {
             &quad,
             quad_pass(
                 quad.pipeline_id,
-                LoadOp::Clear,
+                LoadOp::Clear(ClearColor::new(RESIDENT_CLEAR)),
                 StoreOp::Store,
                 &quad_vertices(true),
             ),
