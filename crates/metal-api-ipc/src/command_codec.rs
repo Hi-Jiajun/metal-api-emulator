@@ -3243,6 +3243,16 @@ fn get_contract(decoder: &mut Decoder<'_>) -> Result<PipelineContract, CodecErro
     })
 }
 
+/// The buffer-source tag of the statement-economy zero-fill declaration
+/// ([`BufferSource::ZeroFill`], W2-A).
+///
+/// Appended after the guest-runs tag (`3`) rather than written into any
+/// existing source's layout: a frame that states no zero-fill declaration keeps
+/// its exact bytes, and a decoder that predates the arm answers
+/// [`CodecError::UnknownEnumValue`] for this tag instead of reading the `u64`
+/// payload that follows it as an owned byte blob.
+pub(crate) const BUFFER_SOURCE_ZERO_FILL: u8 = 4;
+
 fn put_view(encoder: &mut Encoder, view: &BufferView) {
     let mark = encoder.view_mark();
     encoder.u64(view.view_id.get());
@@ -3283,6 +3293,19 @@ fn put_view(encoder: &mut Encoder, view: &BufferView) {
             }
             0
         }
+        // The statement-economy zero-fill declaration (`BufferSource::ZeroFill`,
+        // W2-A): the view's bytes are `length` zero bytes and are **not** in the
+        // statement. The tag is appended after the guest-runs tag, so every
+        // earlier source keeps its byte-for-byte layout, and a decoder that
+        // predates the arm refuses the frame by name (`UnknownEnumValue`) rather
+        // than reading the length as an owned payload. The payload this view
+        // contributes to the statement is zero bytes: the declaration states a
+        // content, it does not carry one.
+        BufferSource::ZeroFill { length } => {
+            encoder.u8(BUFFER_SOURCE_ZERO_FILL);
+            encoder.u64(*length);
+            0
+        }
     };
     encoder.note_view(mark, view.length, payload);
 }
@@ -3315,6 +3338,9 @@ fn get_view(decoder: &mut Decoder<'_>) -> Result<BufferView, CodecError> {
             }
             BufferSource::GuestRuns(runs)
         }
+        BUFFER_SOURCE_ZERO_FILL => BufferSource::ZeroFill {
+            length: decoder.u64()?,
+        },
         value => {
             return Err(CodecError::UnknownEnumValue {
                 field: "buffer source",
@@ -8112,6 +8138,47 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The buffer-source block's newest tag is the zero-fill declaration
+    /// (`BufferSource::ZeroFill`, statement economy W2-A), and the block's own
+    /// fallback is what a decoder that predates the arm answers: the tag and
+    /// the field are named, and the `u64` that follows the tag is never read as
+    /// an owned blob.
+    #[test]
+    fn a_buffer_source_tag_a_decoder_does_not_know_is_refused_by_name() {
+        let view_block = |source_tag: u8| {
+            let mut encoder = Encoder::new();
+            encoder.u64(9); // view id
+            encoder.u32(0); // metal binding
+            encoder.u64(3); // allocation id
+            encoder.u64(0); // offset
+            encoder.u64(32); // length
+            encoder.u8(0); // read access
+            encoder.u8(0); // no attribute stride
+            encoder.u8(source_tag);
+            encoder.u64(32); // the arm's declared length
+            encoder.bytes.clone()
+        };
+
+        // The arm's own tag decodes to the length that follows it.
+        let bytes = view_block(BUFFER_SOURCE_ZERO_FILL);
+        let view = get_view(&mut Decoder::new(&bytes)).expect("the arm decodes");
+        assert_eq!(view.length, 32);
+        assert_eq!(view.source, BufferSource::zero_fill(32));
+
+        // One tag past it is what every earlier decoder answers for the arm:
+        // the block's own refuse-by-name arm, with the field and the value.
+        let bytes = view_block(BUFFER_SOURCE_ZERO_FILL + 1);
+        let refusal = get_view(&mut Decoder::new(&bytes))
+            .expect_err("a source tag this decoder does not know is refused");
+        assert!(matches!(
+            refusal,
+            CodecError::UnknownEnumValue {
+                field: "buffer source",
+                value,
+            } if value == BUFFER_SOURCE_ZERO_FILL + 1
+        ));
+    }
 
     /// The decoder's own half of the sampled-texture count rule
     /// (`research/docs/23` §3.3, E-TC1).

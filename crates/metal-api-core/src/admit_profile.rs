@@ -40,7 +40,7 @@
 //!   samplers_n=... color_attachments_n=... compute_views_n=...
 //!   vertex_buffers_n=... allocations_n=... leases_n=... owned_bytes_n=...
 //!   guest_runs_n=... guest_run_bytes_n=... borrowed_no_copy_n=...
-//!   staged_lease_n=... draw_list_materialize_n=...
+//!   staged_lease_n=... zero_fill_bytes_n=... draw_list_materialize_n=...
 //!   draw_list_materialize_passes=...
 //!   ```
 //!
@@ -56,8 +56,10 @@
 //! The `*_n` fields are the shape census of the same window: the number of
 //! passes, pipelines, stage buffers, textures, samplers and views the admitted
 //! traces carried, and what those declarations carry in *bytes* (`owned_bytes`
-//! and the gathered runs are the two arms that state any; an imported window
-//! states a handful of fields and is counted per source instead). They are what
+//! and the gathered runs are the two arms that state bytes the trace carries,
+//! `zero_fill_bytes` the arm that states bytes without carrying them, and an
+//! imported window states a handful of fields and is counted per source
+//! instead). They are what
 //! answers "is this pose's walk slower because it is called more, because each
 //! trace states more, or because the same number of declarations carries more
 //! bytes" — and they are sums over the window's walks, so dividing by `n` gives
@@ -185,7 +187,7 @@ const REGION_NAMES: [&str; REGION_COUNT] = [
 /// carried; the last two are the resource snapshot's own size. Together they
 /// are the denominator a bar reading needs: the same 18.9 ms is a different
 /// finding when it is 71.8 small traces a frame than when it is 12 large ones.
-const CENSUS_COUNT: usize = 22;
+const CENSUS_COUNT: usize = 23;
 const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
     "passes_n",
     "render_passes_n",
@@ -209,6 +211,7 @@ const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
     "texture_owned_bytes_n",
     "texture_borrowed_no_copy_n",
     "texture_staged_lease_n",
+    "zero_fill_bytes_n",
 ];
 
 /// The walk events the meter counts, beyond the shape census: things that
@@ -255,6 +258,13 @@ pub(crate) struct Census {
     pub texture_owned_bytes: u64,
     pub texture_borrowed_no_copy: u64,
     pub texture_staged_lease: u64,
+    /// The bytes the **zero-fill declarations** of this window stand for
+    /// (`BufferSource::ZeroFill`, statement economy W2-A). They sit beside
+    /// `owned_bytes` rather than inside it because the arm states a content it
+    /// does not carry: a round in which the two slots trade most of their bytes
+    /// is a round in which the same declarations were re-encoded, which is
+    /// exactly what W2-A's A arm does (`research/docs/23` §121).
+    pub zero_fill_bytes: u64,
 }
 
 /// One thread's window of the profile.
@@ -400,6 +410,7 @@ impl Drop for Window {
             local.census[site][19] += census.texture_owned_bytes;
             local.census[site][20] += census.texture_borrowed_no_copy;
             local.census[site][21] += census.texture_staged_lease;
+            local.census[site][22] += census.zero_fill_bytes;
             local.window[site] += 1;
             local.window[site] >= every()
         });

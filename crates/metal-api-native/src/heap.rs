@@ -107,7 +107,15 @@ pub(crate) fn plan_heap_placements(
     }
     let mut owned = BTreeSet::<AllocationId>::new();
     for resource in pool {
-        if matches!(resource.source, BufferSource::OwnedBytes(_)) {
+        // The zero-fill declaration is placed like the trace's own payloads,
+        // so a heap trace that states it is planned by the same rule the arm it
+        // replaced would take (`BufferSource::ZeroFill`, statement economy
+        // W2-A). The arm itself is refused later, by its own name, in the
+        // resolve walk rather than by this count.
+        if matches!(
+            resource.source,
+            BufferSource::OwnedBytes(_) | BufferSource::ZeroFill { .. }
+        ) {
             owned.insert(resource.allocation_id);
         }
     }

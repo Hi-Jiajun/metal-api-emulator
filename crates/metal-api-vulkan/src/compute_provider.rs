@@ -13,7 +13,8 @@ use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
-    allocate_device_epoch, AliasMode, AllocationId, AttachmentFormat, BufferSource, BufferView,
+    allocate_device_epoch, AliasMode, AllocationId, AttachmentFormat, BufferAccess, BufferSource,
+    BufferView,
     BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken,
     ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
     FunctionSource, GuestRun, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind,
@@ -3932,7 +3933,15 @@ impl VulkanComputeProvider {
         }
         let mut owned = BTreeSet::<u64>::new();
         for resource in pool {
-            if matches!(resource.view().source, BufferSource::OwnedBytes(_)) {
+            // A zero-fill declaration is placed like the trace's own payloads:
+            // the provider materializes it into the placement's own window, so
+            // a heap trace that states the arm places its allocation exactly as
+            // it places an `OwnedBytes` one (`BufferSource::ZeroFill`,
+            // statement economy W2-A).
+            if matches!(
+                resource.view().source,
+                BufferSource::OwnedBytes(_) | BufferSource::ZeroFill { .. }
+            ) {
                 owned.insert(resource.view().allocation_id.get());
             }
         }
@@ -4448,7 +4457,15 @@ impl ComputeProvider for VulkanComputeProvider {
         };
         let mut owned_per_allocation = BTreeMap::<AllocationId, usize>::new();
         for resource in pool.iter() {
-            if matches!(resource.view().source, BufferSource::OwnedBytes(_)) {
+            // The zero-fill declaration is an owned view like the trace's own
+            // payloads: the provider materializes it into its own backing, so a
+            // repeated allocation shares one buffer across its views exactly as
+            // it does for `OwnedBytes` (`BufferSource::ZeroFill`, statement
+            // economy W2-A).
+            if matches!(
+                resource.view().source,
+                BufferSource::OwnedBytes(_) | BufferSource::ZeroFill { .. }
+            ) {
                 *owned_per_allocation
                     .entry(resource.view().allocation_id)
                     .or_default() += 1;
@@ -4466,60 +4483,47 @@ impl ComputeProvider for VulkanComputeProvider {
             let access = resource.access();
             match &view.source {
                 BufferSource::OwnedBytes(bytes) => {
-                    // A heap-bearing trace binds every owned allocation into
-                    // the heap slab instead of its own device memory. The
-                    // allocation's buffer is bound at its placement offset and
-                    // the view still addresses its own window inside it
-                    // (`research/docs/25` §6 Step 3).
-                    if let Some(plan) = &heap_plan {
-                        if let Some(heap_offset) = plan.offsets.get(&view.allocation_id.get()) {
-                            let allocation_size = plan
-                                .sizes
-                                .get(&view.allocation_id.get())
-                                .copied()
-                                .ok_or_else(&overflow)?;
-                            buffers.push(PoolBinding::HeapOwned {
-                                index,
-                                allocation: view.allocation_id.get(),
-                                offset: usize::try_from(view.offset).map_err(|_| overflow())?,
-                                length: usize::try_from(view.length).map_err(|_| overflow())?,
-                                access,
-                                bytes: snapshot_binding_bytes(bytes),
-                                allocation_size: usize::try_from(allocation_size)
-                                    .map_err(|_| overflow())?,
-                                heap_offset: usize::try_from(*heap_offset)
-                                    .map_err(|_| overflow())?,
-                                heap_size: usize::try_from(plan.slab_size)
-                                    .map_err(|_| overflow())?,
-                            });
-                            continue;
-                        }
-                    }
-                    // A lone owned view keeps its exact-length buffer; only a
-                    // repeated allocation shares one backing across its views.
-                    if owned_per_allocation
-                        .get(&view.allocation_id)
-                        .copied()
-                        .unwrap_or(0)
-                        < 2
+                    // The rail's own arm (`crate::zero_fill_arm`): a round that
+                    // asks for it takes the zero-fill declaration's reading for
+                    // every payload that is exactly what that declaration
+                    // stands for, so the materialization is exercised over a
+                    // corpus that never states the arm. Off, this is one
+                    // relaxed load and the payload uploads as it always did.
+                    let bytes = if crate::zero_fill_arm::enabled()
+                        && crate::zero_fill_arm::stands_for(bytes)
                     {
-                        buffers.push(PoolBinding::Owned {
-                            index,
-                            bytes: snapshot_binding_bytes(bytes),
-                        });
-                        continue;
-                    }
-                    buffers.push(PoolBinding::SharedOwned {
+                        crate::BindingBytes::Copied(vec![0_u8; bytes.len()])
+                    } else {
+                        snapshot_binding_bytes(bytes)
+                    };
+                    push_owned_binding(
+                        &mut buffers,
+                        heap_plan.as_ref(),
+                        &owned_per_allocation,
                         index,
-                        allocation: view.allocation_id.get(),
-                        offset: usize::try_from(view.offset).map_err(|_| overflow())?,
-                        length: usize::try_from(view.length).map_err(|_| overflow())?,
-                        // A view that cannot read uploads nothing: its snapshot
-                        // bytes are never observable. Every other view copies
-                        // in exactly its own bytes (`research/docs/15` step 4).
+                        view,
                         access,
-                        bytes: snapshot_binding_bytes(bytes),
-                    });
+                        bytes,
+                    )?;
+                }
+                // The declaration whose bytes the statement does not carry
+                // (`BufferSource::ZeroFill`, statement economy W2-A): the
+                // provider materializes the zeros it states, at the view's own
+                // window and into the allocation the view names, exactly where
+                // the payload the arm replaced used to be copied in. Nothing
+                // downstream of this point can tell the two encodings apart.
+                BufferSource::ZeroFill { length } => {
+                    let materialized = crate::zero_fill_arm::materialize(*length)
+                        .ok_or_else(&overflow)?;
+                    push_owned_binding(
+                        &mut buffers,
+                        heap_plan.as_ref(),
+                        &owned_per_allocation,
+                        index,
+                        view,
+                        access,
+                        crate::BindingBytes::Copied(materialized),
+                    )?;
                 }
                 BufferSource::StagedLease(lease_id) => {
                     // The staged registry's window: the copy it makes out of its
@@ -5240,13 +5244,87 @@ fn snapshot_binding_bytes(bytes: &Vec<u8>) -> crate::BindingBytes<'_> {
     }
 }
 
+/// Push the pool binding one **owned** declaration takes: a view whose bytes
+/// the provider holds or materializes itself.
+///
+/// Three arms answer this walk — the trace's own payload
+/// ([`BufferSource::OwnedBytes`]) and the zero-fill declaration that replaced
+/// its all-zero payloads ([`BufferSource::ZeroFill`], statement economy W2-A).
+/// They differ in where the bytes come from and in nothing else, so they share
+/// the placement rules: a heap-bearing trace binds every owned allocation into
+/// the heap slab instead of its own device memory, and the allocation's buffer
+/// is bound at its placement offset while the view still addresses its own
+/// window inside it (`research/docs/25` §6 Step 3); a lone owned view keeps its
+/// exact-length buffer; only a repeated allocation shares one backing across
+/// its views, where a view that cannot read uploads nothing because its bytes
+/// are never observable (`research/docs/15` step 4).
+fn push_owned_binding<'a>(
+    buffers: &mut Vec<PoolBinding<'a>>,
+    heap_plan: Option<&HeapPlan>,
+    owned_per_allocation: &BTreeMap<AllocationId, usize>,
+    index: u32,
+    view: &BufferView,
+    access: BufferAccess,
+    bytes: crate::BindingBytes<'a>,
+) -> Result<(), ProviderError> {
+    let overflow = || {
+        refusal(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Resource,
+            "buffer_range_overflow",
+        )
+    };
+    if let Some(plan) = heap_plan {
+        if let Some(heap_offset) = plan.offsets.get(&view.allocation_id.get()) {
+            let allocation_size = plan
+                .sizes
+                .get(&view.allocation_id.get())
+                .copied()
+                .ok_or_else(&overflow)?;
+            buffers.push(PoolBinding::HeapOwned {
+                index,
+                allocation: view.allocation_id.get(),
+                offset: usize::try_from(view.offset).map_err(|_| overflow())?,
+                length: usize::try_from(view.length).map_err(|_| overflow())?,
+                access,
+                bytes,
+                allocation_size: usize::try_from(allocation_size).map_err(|_| overflow())?,
+                heap_offset: usize::try_from(*heap_offset).map_err(|_| overflow())?,
+                heap_size: usize::try_from(plan.slab_size).map_err(|_| overflow())?,
+            });
+            return Ok(());
+        }
+    }
+    if owned_per_allocation
+        .get(&view.allocation_id)
+        .copied()
+        .unwrap_or(0)
+        < 2
+    {
+        buffers.push(PoolBinding::Owned { index, bytes });
+        return Ok(());
+    }
+    buffers.push(PoolBinding::SharedOwned {
+        index,
+        allocation: view.allocation_id.get(),
+        offset: usize::try_from(view.offset).map_err(|_| overflow())?,
+        length: usize::try_from(view.length).map_err(|_| overflow())?,
+        access,
+        bytes,
+    });
+    Ok(())
+}
+
 /// The declared bytes one pool carries, and how many of its entries carry them.
 ///
 /// These are the bytes a derivation copies when it owns the table and lends
 /// when it does not: a view whose source is the trace's own snapshot. The other
-/// two sources (`StagedLease`, `GuestRuns`) carry no bytes of their own here —
-/// the staged registry and the gather own those — so they are neither copied
-/// nor lent by this table (`crate::serial_resources_borrow`).
+/// sources (`StagedLease`, `GuestRuns`) carry no bytes of their own here — the
+/// staged registry and the gather own those — so they are neither copied nor
+/// lent by this table (`crate::serial_resources_borrow`), and the zero-fill
+/// declaration (`BufferSource::ZeroFill`, statement economy W2-A) is the third
+/// of them: its bytes do not exist in the table at all, so a pool that states
+/// it has nothing to copy or lend on its behalf.
 fn pooled_declared_bytes(pool: &[SerialResource<'_>]) -> (u64, u64) {
     let mut views = 0_u64;
     let mut bytes = 0_u64;

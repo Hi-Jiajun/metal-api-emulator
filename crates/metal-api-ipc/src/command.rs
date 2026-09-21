@@ -3784,6 +3784,86 @@ mod tests {
         trace
     }
 
+    /// The zero-fill declaration (statement economy W2-A): the view's bytes
+    /// are its own `length` in zeros and the frame carries that length instead
+    /// of the payload every earlier owned arm would ship.
+    ///
+    /// The tag is new, so the four earlier source arms keep their own bytes —
+    /// which is what makes this frame's size the owned arm's minus exactly the
+    /// payload the arm stands for.
+    #[test]
+    fn a_zero_fill_source_round_trips_without_its_bytes() {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        let stream = |source: BufferSource| BufferView {
+            view_id: ViewId::new(9),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(3),
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source,
+        };
+        pass.vertex_buffers = vec![stream(BufferSource::zero_fill(16))];
+        let mut table = resources();
+        table
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(3),
+                owner_epoch: DeviceEpoch::new(7),
+                size: 16,
+            })
+            .unwrap();
+        let request = CommandRequest::Submit {
+            trace,
+            resources: table,
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(
+            CommandCodec::decode_request(&frame).unwrap(),
+            request,
+            "the declared length is what travels, and it decodes to the arm"
+        );
+        // The arm's own tag (the block's last one) and the declared length
+        // travel; the sixteen zeros do not.
+        let mut expected = vec![crate::command_codec::BUFFER_SOURCE_ZERO_FILL];
+        expected.extend_from_slice(&16_u64.to_be_bytes());
+        assert!(
+            frame
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "the frame carries the arm's tag and its length"
+        );
+
+        // The same submission stated as the payload the arm stands for: the
+        // two frames differ by exactly that payload and by nothing else.
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.vertex_buffers = vec![stream(BufferSource::OwnedBytes(vec![0; 16]))];
+        let mut table = resources();
+        table
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(3),
+                owner_epoch: DeviceEpoch::new(7),
+                size: 16,
+            })
+            .unwrap();
+        let owned = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace,
+            resources: table,
+        })
+        .unwrap();
+        assert_eq!(
+            owned.len(),
+            frame.len() + 16,
+            "the arm's frame is the owned frame minus the payload it stands for"
+        );
+    }
+
     /// The guest-runs source arm (`research/docs/23` §74, E-TX6): the view's
     /// bytes are an ordered list of owner windows, and the frame carries the
     /// triples rather than the bytes they describe.

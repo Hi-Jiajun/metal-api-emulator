@@ -6327,6 +6327,18 @@ pub(crate) enum RenderInputSource<'a> {
         bytes: Vec<u8>,
         leases: Vec<LeaseId>,
     },
+    /// The zero-fill declaration's content, materialized by the rail
+    /// (`BufferSource::ZeroFill`, statement economy W2-A): the view's bytes are
+    /// `length` zero bytes and the statement did not carry them, so the rail
+    /// writes them here, at the declaration's own window, exactly where the
+    /// payload the arm replaced used to be uploaded from.
+    ///
+    /// It is the one arm whose bytes come from neither the trace nor the owner:
+    /// the declaration states a content that is a function of its length alone,
+    /// which is why the arm needs no lease, no identity and no generation to be
+    /// resolved — and why every consumer below treats it as the provider's own
+    /// copy, beside [`Self::GatheredBytes`].
+    ZeroFillBytes(Vec<u8>),
     /// The pass's own colour attachment as it stands when the pass opens
     /// (`TextureSource::PassEntrySnapshot`, `research/docs/23` §118, E-TX15):
     /// the rail copies the attachment image's current contents into a
@@ -6357,6 +6369,7 @@ impl RenderInputSource<'_> {
             Self::Borrowed { window, .. } => window.len,
             Self::ProducedBytes(bytes) => bytes.len(),
             Self::GatheredBytes { bytes, .. } => bytes.len(),
+            Self::ZeroFillBytes(bytes) => bytes.len(),
             // The snapshot has no host bytes at all: its extent is the
             // attachment's, which `resolve_render_textures` has already held
             // the declaration to, and the copy is the device's own.
@@ -6378,6 +6391,7 @@ impl RenderInputSource<'_> {
             Self::StagedBytes(bytes) => bytes.as_slice(),
             Self::ProducedBytes(bytes) => bytes,
             Self::GatheredBytes { bytes, .. } => bytes,
+            Self::ZeroFillBytes(bytes) => bytes,
             // SAFETY: the window was resolved by the no-copy registry for an
             // imported lease, whose contract keeps the mapping readable over
             // exactly this window until the import is released.
@@ -6405,6 +6419,7 @@ impl RenderInputSource<'_> {
             Self::StagedBytes(bytes) => Some(bytes.as_slice()),
             Self::ProducedBytes(bytes) => Some(bytes),
             Self::GatheredBytes { bytes, .. } => Some(bytes),
+            Self::ZeroFillBytes(bytes) => Some(bytes),
             Self::Borrowed { .. } | Self::AttachmentSnapshot { .. } => None,
         }
     }
@@ -6416,6 +6431,7 @@ impl RenderInputSource<'_> {
             | Self::StagedBytes(_)
             | Self::ProducedBytes(_)
             | Self::GatheredBytes { .. }
+            | Self::ZeroFillBytes(_)
             | Self::AttachmentSnapshot { .. } => None,
             Self::Borrowed { lease, .. } => Some(*lease),
         }
@@ -6502,7 +6518,18 @@ fn resolve_render_input<'a>(
     slot: usize,
 ) -> Result<RenderInputSource<'a>, ProviderError> {
     match &view.source {
-        BufferSource::OwnedBytes(bytes) => Ok(RenderInputSource::TraceBytes(bytes)),
+        BufferSource::OwnedBytes(bytes) => {
+            // The rail's own arm (`crate::zero_fill_arm`): a round that asks for
+            // it takes the zero-fill declaration's reading for every payload
+            // that is exactly what that declaration stands for, so the
+            // materialization is exercised over a corpus that never states the
+            // arm. Off, this is one relaxed load and the payload uploads as it
+            // always did.
+            if crate::zero_fill_arm::enabled() && crate::zero_fill_arm::stands_for(bytes) {
+                return Ok(RenderInputSource::ZeroFillBytes(vec![0_u8; bytes.len()]));
+            }
+            Ok(RenderInputSource::TraceBytes(bytes))
+        }
         BufferSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
@@ -6574,6 +6601,18 @@ fn resolve_render_input<'a>(
                 bytes,
                 leases: runs.iter().map(|run| run.lease_id).collect(),
             })
+        }
+        // The declaration whose content is a function of its length alone
+        // (`BufferSource::ZeroFill`, statement economy W2-A): the rail writes
+        // the zeros the declaration states into its own upload, so the pass
+        // reads the same bytes it would have read out of the payload the arm
+        // replaced. No registry is consulted and no lease is held — there is
+        // nothing that could disagree, which is why this arm carries no
+        // identity and no generation.
+        BufferSource::ZeroFill { length } => {
+            let bytes = crate::zero_fill_arm::materialize(*length)
+                .ok_or_else(|| args_refusal("render_input_bytes_overflow"))?;
+            Ok(RenderInputSource::ZeroFillBytes(bytes))
         }
     }
 }
@@ -6870,6 +6909,19 @@ fn resolve_landing_windows(
                 "a landing writes the owner's own registered window; trace-owned bytes are the \
                  writeback channel's source, not a window an owner's ledger holds",
             )),
+            // The zero-fill declaration owns no window at all (`BufferSource`
+            // `::ZeroFill`, statement economy W2-A): it states a content, not a
+            // place, so there is no window a landing could write into. Refused
+            // by its own name rather than by the owned arm's, because the
+            // declaration carries no bytes whose landing could be a writeback.
+            BufferSource::ZeroFill { .. } => {
+                return Err(refusal(
+                    "zero_fill",
+                    "a landing writes the owner's own registered window; a zero-fill \
+                     declaration states a content rather than a window, and the frame that \
+                     lands has to reach an owner's pages",
+                ))
+            }
             BufferSource::StagedLease(_) => {
                 return Err(refusal(
                     "staged_lease",
@@ -14648,6 +14700,14 @@ impl<'a> OffscreenObjects<'a> {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
                     self.upload_render_texture_into(&texture.source, &target, texels, volume)?
                 }
+                // A zero-fill declaration's texels are the rail's own copy
+                // (`BufferSource::ZeroFill` beside the sampled-texture arms,
+                // statement economy W2-A): they upload through the same
+                // host-visible path the gathered and staged arms take.
+                RenderInputSource::ZeroFillBytes(bytes) => {
+                    let texels = texture.gathered.as_deref().unwrap_or(bytes);
+                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
+                }
                 // The pass-entry snapshot arm has no host bytes to upload
                 // (`research/docs/23` §118, E-TX15): the image is a
                 // device-local transfer destination the pre-pass copy fills,
@@ -15253,7 +15313,8 @@ impl<'a> OffscreenObjects<'a> {
                         RenderInputSource::TraceBytes(_)
                         | RenderInputSource::StagedBytes(_)
                         | RenderInputSource::ProducedBytes(_)
-                        | RenderInputSource::GatheredBytes { .. } => {
+                        | RenderInputSource::GatheredBytes { .. }
+                        | RenderInputSource::ZeroFillBytes(_) => {
                             StageBufferLanding {
                                 stage: stream.stage,
                                 index: stream.index,
@@ -16302,6 +16363,16 @@ impl<'a> OffscreenObjects<'a> {
             // staged and produced arms do, because the copy is what the rail
             // holds rather than the owner's mapping.
             RenderInputSource::GatheredBytes { bytes, .. } => self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                usage,
+                bytes,
+                name,
+            ),
+            // A zero-fill declaration's window is the rail's own materialized
+            // copy (`BufferSource::ZeroFill`, statement economy W2-A), so it
+            // creates and uploads a buffer of its own exactly as the gathered
+            // arm does.
+            RenderInputSource::ZeroFillBytes(bytes) => self.create_host_visible_buffer(
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 usage,
                 bytes,

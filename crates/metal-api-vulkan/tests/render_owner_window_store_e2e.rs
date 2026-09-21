@@ -405,6 +405,51 @@ fn writeback_baseline(load: LoadOp, bytes: Vec<u8>) -> Option<Vec<u8>> {
     ))
 }
 
+/// The statement-economy zero-fill declaration (`BufferSource::ZeroFill`,
+/// W2-A) is the *same declaration* as the all-zero payload it stands for: the
+/// declaring pass's view is the only field that differs between the two arms,
+/// and the frame the pass produces — and lands — is byte-identical.
+///
+/// The declaration under test is the one this file's `fixture` varies: the
+/// attachment's own view, which is the shape the render rail's two producers
+/// state on their `Clear` / `Resident` arms and on every in-flight production.
+/// One arm carries sixteen zero bytes; the other states the arm and lets the
+/// provider materialize them at the view's own window. `LoadOp::Load` is what
+/// makes the difference observable: the pass begins from whatever the
+/// declaration says the attachment holds, so a rail that materialized the
+/// wrong content (or nothing at all) could not land the same frame.
+#[test]
+fn a_zero_fill_declaration_stands_for_the_payload_it_replaces() {
+    // The payload arm: exactly the bytes the arm stands for.
+    let Some(payload) = writeback_baseline(LoadOp::Load, vec![0; 16]) else {
+        return;
+    };
+    let Some(arm) = (|| {
+        let fixture = fixture(BufferSource::zero_fill(16), LoadOp::Load, StoreOp::Store)?;
+        let provider = Arc::clone(&fixture.provider);
+        Some(attachment_frame(
+            &provider,
+            &fixture.trace,
+            &fixture.resources,
+        ))
+    })() else {
+        return;
+    };
+    assert_eq!(
+        arm, payload,
+        "the arm's frame is the payload's frame, byte for byte"
+    );
+    // The comparison is worth making only if the frame is not the zeros both
+    // arms begin from: the quad's own column has to be in it.
+    assert_ne!(arm, vec![0_u8; arm.len()], "the draw is in the frame");
+    eprintln!(
+        "zero-fill declaration: arm={} payload={} bytes={}",
+        hex(&arm),
+        hex(&payload),
+        arm.len()
+    );
+}
+
 #[test]
 fn a_borrowed_store_lands_the_frame_in_the_owners_windows() {
     let Some(owned) = writeback_baseline(LoadOp::Load, window_words()) else {

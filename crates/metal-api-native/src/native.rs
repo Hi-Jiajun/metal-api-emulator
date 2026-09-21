@@ -1007,6 +1007,26 @@ impl ComputeProvider for NativeMetalProvider {
         let resolve = |view: &BufferView| -> Result<ResolvedBuffer, ProviderError> {
             match &view.source {
                 BufferSource::OwnedBytes(bytes) => Ok(ResolvedBuffer::Owned(bytes.clone())),
+                // The statement-economy zero-fill declaration
+                // (`BufferSource::ZeroFill`, W2-A) is refused by name on this
+                // rail: the arm's reading is a *materialization* the provider
+                // performs into its own upload, and this rail has not flipped
+                // it. Stating the boundary keeps a native caller from getting
+                // zeros invented in place of the declaration instead of a
+                // refusal.
+                BufferSource::ZeroFill { length } => Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "zero_fill_declaration_unsupported",
+                )
+                .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+                .with_field("declared_bytes", FieldValue::Unsigned(*length))
+                .with_detail(
+                    "the declaration's bytes are its length in zero bytes and the statement \
+                     does not carry them; this rail does not materialize the zero-fill arm yet \
+                     (`research/docs/23` §121, W2-A), and the arm is executed by the Vulkan \
+                     rail",
+                )),
                 // The guest-runs arm's reading is the Vulkan rail's gather
                 // (`research/docs/23` §74, E-TX6); this rail states the
                 // boundary by name rather than reading the runs with a
@@ -3285,6 +3305,49 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The statement-economy zero-fill declaration (`BufferSource::ZeroFill`,
+    /// W2-A) is refused by name on this rail's compute half too.
+    ///
+    /// The arm's reading is the provider's own materialization of `length` zero
+    /// bytes at the view's window; this rail has not flipped it, so the
+    /// declaring pass's own binding is refused under the arm's own slug instead
+    /// of being executed with invented bytes. Device-gated like every provider
+    /// case in this file, so on a box without an eligible Metal device it skips:
+    /// the half that proves the refusal on this box is the render plan's
+    /// (`render.rs`'s
+    /// `a_zero_fill_declaration_is_refused_by_name_on_this_rail`).
+    #[test]
+    fn a_zero_fill_declaration_is_refused_by_name_on_the_compute_half() {
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native zero-fill refusal test: no eligible Metal device");
+            return;
+        };
+        let compute = declaration_pipeline(&provider);
+        let quad = register_quad_pipeline(&provider);
+        let (trace, resources) = resident_trace(
+            &provider,
+            &compute,
+            &quad,
+            quad_pass(quad.pipeline_id, LoadOp::Clear, StoreOp::Store, &quad_vertices(true)),
+            declared_attachment(16, BufferSource::zero_fill(16)),
+            16,
+        );
+        let error = submit(&provider, &trace, &resources)
+            .expect_err("this rail does not materialize the zero-fill arm yet");
+        eprintln!("zero fill: {error:?}");
+        assert_eq!(error.slug, "zero_fill_declaration_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("declared_bytes"),
+            Some(&FieldValue::Unsigned(16))
+        );
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(ATTACHMENT_VIEW.get()))
+        );
     }
 
     /// The resident chain end to end (`research/docs/23` §76, R7): two
