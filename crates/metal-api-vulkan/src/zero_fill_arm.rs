@@ -65,7 +65,17 @@ pub(crate) fn stands_for(bytes: &[u8]) -> bool {
 }
 
 /// The bytes the arm materializes for a declaration of `length` bytes.
+///
+/// `None` is a length this process cannot stand for: more than `isize::MAX`
+/// bytes is more than a `Vec` can hold, so the caller answers it with the range
+/// refusal it already has instead of attempting the allocation. (The check is
+/// the `Vec`'s own bound rather than `usize`'s, which is the same number on a
+/// 64-bit host and the difference between them on a 32-bit one.)
 pub(crate) fn materialize(length: u64) -> Option<Vec<u8>> {
+    let limit = u64::try_from(isize::MAX).unwrap_or(u64::MAX);
+    if length > limit {
+        return None;
+    }
     usize::try_from(length)
         .ok()
         .map(|length| vec![0_u8; length])
