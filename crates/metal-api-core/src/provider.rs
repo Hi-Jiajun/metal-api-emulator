@@ -10852,6 +10852,21 @@ fn admit_census(trace: &ComputeTrace, resources: &ResourceTableSnapshot) -> Cens
             TracePass::Compute(pass) => {
                 census.compute_passes += 1;
                 census.compute_views += pass.buffers.len() as u64;
+                // A compute pass's own views are where a render rail's
+                // *declaring* pass states an attachment (the statement
+                // economy's two producers do exactly that), so the zero-fill
+                // arm is charged here even though the bytes a compute pass
+                // otherwise carries are not: `owned_bytes_n` has been read
+                // without them since the tenth cut, and a new slot may not
+                // silently move an old reading. W2-A's own round is what found
+                // this: its slot read zero while the wire's section account
+                // priced the arm's declarations, because the walk never looked
+                // at the pass that states them.
+                for view in &pass.buffers {
+                    if let BufferSource::ZeroFill { length } = &view.source {
+                        census.zero_fill_bytes += *length;
+                    }
+                }
             }
             TracePass::Render(pass) => {
                 census.render_passes += 1;
@@ -17670,6 +17685,54 @@ mod tests {
         });
         assert_eq!(refusal.slug, "buffer_source_length_mismatch");
         assert_eq!(refusal.class, ProviderErrorClass::Args);
+    }
+
+    /// The census prices a **compute declaring pass's** zero-fill declarations
+    /// (statement economy W2-A).
+    ///
+    /// The render rail's declaring pass *is* a compute pass, and its views are
+    /// the attachment declarations: a census that never looked at them answered
+    /// zero for the arm's own slot while the wire's section account priced the
+    /// declarations travelling, which is what W2-A's own round found.
+    #[test]
+    fn the_census_prices_the_zero_fill_a_compute_declaring_pass_states() {
+        // The render rail's declaring pass is a *compute* pass whose views are
+        // the attachment declarations: W2-A's slot has to see them, or a round
+        // reads zero while the wire carries the drop (which is what the round
+        // did before the walk looked here).
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(7),
+            operation_id: OperationId::new(3),
+            pipelines: Vec::new(),
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![TracePass::Compute(ComputePass {
+                pipeline: PipelineId::new(1),
+                buffers: vec![
+                    sourced_buffer_view(BufferSource::zero_fill(4096), 4096),
+                    sourced_buffer_view(BufferSource::zero_fill(16), 16),
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            })],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let census = admit_census(&trace, &ResourceTableSnapshot::new());
+        assert_eq!(
+            census.zero_fill_bytes, 4112,
+            "both declarations' lengths, and nothing else"
+        );
+        assert_eq!(
+            census.owned_bytes, 0,
+            "and the old slot keeps reading what it always read: a compute \
+             declaring pass's payload bytes are not part of it"
+        );
     }
 
     /// The checked producer door: an all-zero payload becomes the arm, and a
