@@ -1801,6 +1801,13 @@ struct Local {
     resource_copy_bytes: u64,
     resource_borrow_views: u64,
     resource_borrow_bytes: u64,
+    /// The serial-resource-pool derivations this window's submissions made.
+    /// One submission derives its pool once in `plan` and once in
+    /// `submit_validate`, so this reads two per submission on the pre-cut path;
+    /// a submission that hands the plan's table to the validation
+    /// (`crate::submit_pool_once`) reads one. A count rather than a byte total,
+    /// because the reading has to answer for a submission whose pool is empty.
+    pool_derivations_n: u64,
     /// The device objects the window's teardowns actually destroyed, by family.
     /// They are the population behind the `teardown_*` bars: a bar's
     /// microseconds divided by its own family's count is one object's cost, and
@@ -1917,6 +1924,7 @@ impl Default for Local {
             resource_copy_bytes: 0,
             resource_borrow_views: 0,
             resource_borrow_bytes: 0,
+            pool_derivations_n: 0,
             td_image_n: 0,
             td_view_n: 0,
             td_sampler_n: 0,
@@ -2142,6 +2150,7 @@ impl Local {
         let resource_copy_bytes = std::mem::take(&mut self.resource_copy_bytes);
         let resource_borrow_views = std::mem::take(&mut self.resource_borrow_views);
         let resource_borrow_bytes = std::mem::take(&mut self.resource_borrow_bytes);
+        let pool_derivations_n = std::mem::take(&mut self.pool_derivations_n);
         let td_image_n = std::mem::take(&mut self.td_image_n);
         let td_view_n = std::mem::take(&mut self.td_view_n);
         let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
@@ -2263,6 +2272,7 @@ impl Local {
              submit_resource_copies_bytes={resource_copy_bytes} \
              submit_resource_borrows_n={resource_borrow_views} \
              submit_resource_borrows_bytes={resource_borrow_bytes} \
+             pool_derivations_n={pool_derivations_n} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
              td_buffer_n={td_buffer_n} td_memory_n={td_memory_n}",
             readback.rect_n,
@@ -2454,7 +2464,7 @@ static NEXT_SAMPLE_LANE: AtomicUsize = AtomicUsize::new(0);
 /// How many counters one sample line carries beside its bars. The array's
 /// length and the table's length are the same reading, checked by
 /// `shape_sources_fit_the_sample_array`.
-const SHAPE_COUNT: usize = 35;
+const SHAPE_COUNT: usize = 36;
 
 /// One counter the sample line reads out of the window's own table, named as
 /// the field it is printed as.
@@ -2547,6 +2557,10 @@ const SHAPE_SOURCES: &[ShapeSource] = &[
     ShapeSource {
         name: "views_bytes",
         read: |local| local.resource_borrow_bytes,
+    },
+    ShapeSource {
+        name: "pool_derivations_n",
+        read: |local| local.pool_derivations_n,
     },
     ShapeSource {
         name: "vcopies_n",
@@ -2831,6 +2845,21 @@ pub(crate) fn note_staging_window_share(bytes: u64) {
 }
 
 /// The declared bytes one **pool derivation** copied for itself: the views
+/// Count one derivation of a submission's serial resource pool.
+///
+/// Called where the derivation happens (`plan` and `submit_validate`), so the
+/// reading is the mechanism's own count rather than something inferred from the
+/// bytes a pool happened to declare: a submission derives twice off
+/// `crate::submit_pool_once` and once on it, and a submission with an empty pool
+/// reads the same two-then-one.
+#[inline]
+pub(crate) fn note_pool_derivation() {
+    if !recording() {
+        return;
+    }
+    LOCAL.with(|local| local.borrow_mut().pool_derivations_n += 1);
+}
+
 /// `ComputeTrace::serial_resources` cloned, by count and by byte
 /// (`crate::serial_resources_borrow`). One submission derives its pool twice —
 /// in `plan` and in `submit_validate` — so a submission that declares N bytes
@@ -3823,6 +3852,7 @@ mod tests {
                 "cb_miss_n",
                 "views_n",
                 "views_bytes",
+                "pool_derivations_n",
                 "vcopies_n",
                 "vcopies_bytes",
                 "wshare_n",

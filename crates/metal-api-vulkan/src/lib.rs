@@ -51,6 +51,7 @@ mod serial_resources_borrow;
 mod staging_borrow;
 mod statement_payload_table;
 mod submit_binding_borrow;
+mod submit_pool_once;
 mod zero_fill_arm;
 
 pub use compute_buffer_pool::ComputeBufferPoolCounts;
