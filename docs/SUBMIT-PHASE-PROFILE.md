@@ -572,6 +572,78 @@ snapshots move with that drain. Without that, the one submission after every
 drain would report the whole window's remainder as its own time; that is the
 pose this switch is read in, with both switches on.
 
+### What the submission was made of
+
+A distribution of microseconds says which bar the slow submissions spent their
+time in. It does not say what those submissions **were**, and the reading this
+line exists for is the one where the two are needed together: a tail whose top
+5% carries 40.6% of the total (`fs1`) is only actionable once its own shape is
+known — a bigger declaration, a wider readback, a first sight of a pipeline,
+more objects torn down. Two tables are therefore appended to every sample line,
+both read through the same snapshot subtraction the bars use:
+
+* **`CHILD_BARS`** — the 17 regions the named parents are made of, each charged
+  inside a parent the window line already prints, each carrying the window
+  line's own name for that phase (`<phase>_us`), so the two lines read side by
+  side without a translation table:
+
+  ```text
+  plan_resources_us admit_epoch_us admit_capabilities_us
+  submit_validate_derive_us submit_validate_check_us submit_validate_release_us
+  render_setup_us render_readback_us readback_rect_us readback_full_us
+  render_resolve_us render_teardown_us teardown_buffers_us
+  teardown_readbacks_us teardown_attachments_us teardown_textures_us
+  submit_teardown_us
+  ```
+
+  They are *nested* inside their parents exactly as their parents are nested
+  inside `total`: a reader compares them with the parent, not with each other.
+  They keep their **own** snapshot table, because a child can also be a member
+  of a parent's aggregate (`submit_validate_derive_us` is in
+  `SUBMIT_VALIDATE_SLOTS`, `submit_teardown_us` is in `SUBMIT_SEAM_SLOTS`) and
+  one table is spent by whoever reads it first.
+
+* **`SHAPE_SOURCES`** — 35 counters the window line already prints, at one
+  submission's resolution:
+
+  ```text
+  offscreen_n present_n batch_n batch_passes
+  reuse_hit_n reuse_miss_n reuse_unkeyed_n
+  pool_hit_n pool_miss_n buf_hit_n buf_miss_n
+  cp_hit_n cp_miss_n cb_hit_n cb_miss_n
+  views_n views_bytes vcopies_n vcopies_bytes
+  wshare_n wshare_bytes
+  rb_rect_n rb_rect_bytes rb_full_n rb_full_bytes rb_shape_n rb_bounds_n rb_whole_n
+  landing_bytes
+  td_buffer_n td_view_n td_image_n td_memory_n
+  staging_cached_n staging_plain_n
+  ```
+
+  The families answer the shape questions in the order they were asked: which
+  passes the submission ran (`offscreen_n` / `present_n`, the batch bands),
+  which pipeline family it decided (`reuse_*`, `cp_*`) and which pools it took
+  from (`pool_*`, `buf_*`, `cb_*`), how big its declaration was (`views_n` /
+  `views_bytes` — the bytes its two pool derivations moved, so one submission
+  reads two derivations' worth), how wide its readback was and by which decision
+  (`rb_rect_*` / `rb_full_*` / `rb_shape_n` / `rb_bounds_n` / `rb_whole_n`), and
+  how many device objects its teardown destroyed (`td_*_n`).
+
+  These are counters, not bars: they say how many, not how long. A round divides
+  a bar's microseconds by the counter behind it (a teardown's microseconds by
+  its own family's count, a readback's by its own regions) to get the cost of
+  one object, and reads the *distribution* of the counters across the tail to
+  say what the tail was made of.
+
+Neither table adds a charging site: they are the counters and slots that already
+exist, read once more per submission while the switch is on. With the switch off
+nothing reads them at all.
+
+One boundary worth naming: the census's `mid` (the rail's mapping id) is not on
+this line, because the provider's own namespaces are `(allocation_id, view_id)`
+and `gva`, not the rail's mapping ids. "Which surface was this" is answered here
+by the pass and readback counters, and on the rail's side by its own
+`linux_render_provider … mid=…` lines.
+
 ## Aligning the line with the rail's own bars
 
 The reims rail's `frame_span` line and this line measure the same call from two
