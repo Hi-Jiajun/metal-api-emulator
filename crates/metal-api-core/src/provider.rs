@@ -10833,6 +10833,9 @@ fn note_render_sources(census: &mut Census, pass: &RenderPassDescriptor) {
     for stage in &pass.stage_buffers {
         note_buffer_source(census, &stage.view.source);
     }
+    for texture in &pass.textures {
+        note_texture_source(census, &texture.source);
+    }
 }
 
 /// One buffer source's own bytes or its own kind, added to a census.
@@ -10845,6 +10848,22 @@ fn note_buffer_source(census: &mut Census, source: &BufferSource) {
         }
         BufferSource::BorrowedNoCopy(_) => census.borrowed_no_copy += 1,
         BufferSource::StagedLease(_) => census.staged_lease += 1,
+    }
+}
+
+/// One texture source's own bytes or its own kind, added to a census.
+///
+/// Kept apart from [`note_buffer_source`] because a texture's source carries
+/// more arms than a buffer's (`TextureSource` also names the trace's own GPU
+/// output), and because the two populations answer different questions: the
+/// buffer half is what a staged window is, the texture half is what a sampled
+/// declaration is.
+fn note_texture_source(census: &mut Census, source: &TextureSource) {
+    match source {
+        TextureSource::OwnedBytes(bytes) => census.texture_owned_bytes += bytes.len() as u64,
+        TextureSource::StagedLease(_) => census.texture_staged_lease += 1,
+        TextureSource::BorrowedNoCopy(_) => census.texture_borrowed_no_copy += 1,
+        _ => {}
     }
 }
 

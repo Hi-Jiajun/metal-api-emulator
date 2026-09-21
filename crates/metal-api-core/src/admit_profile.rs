@@ -185,7 +185,7 @@ const REGION_NAMES: [&str; REGION_COUNT] = [
 /// carried; the last two are the resource snapshot's own size. Together they
 /// are the denominator a bar reading needs: the same 18.9 ms is a different
 /// finding when it is 71.8 small traces a frame than when it is 12 large ones.
-const CENSUS_COUNT: usize = 19;
+const CENSUS_COUNT: usize = 22;
 const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
     "passes_n",
     "render_passes_n",
@@ -206,6 +206,9 @@ const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
     "guest_run_bytes_n",
     "borrowed_no_copy_n",
     "staged_lease_n",
+    "texture_owned_bytes_n",
+    "texture_borrowed_no_copy_n",
+    "texture_staged_lease_n",
 ];
 
 /// The walk events the meter counts, beyond the shape census: things that
@@ -244,6 +247,14 @@ pub(crate) struct Census {
     pub guest_run_bytes: u64,
     pub borrowed_no_copy: u64,
     pub staged_lease: u64,
+    /// The same accounting for the *sampled textures* a render entry declares:
+    /// their sources are the other place a declaration can carry real bytes
+    /// (`TextureSource::OwnedBytes`), and the statement's own section reading
+    /// puts them beside the buffer views (ST-W1: 0.73 MB of a 1.86 MB statement
+    /// is the texture payload).
+    pub texture_owned_bytes: u64,
+    pub texture_borrowed_no_copy: u64,
+    pub texture_staged_lease: u64,
 }
 
 /// One thread's window of the profile.
@@ -386,6 +397,9 @@ impl Drop for Window {
             local.census[site][16] += census.guest_run_bytes;
             local.census[site][17] += census.borrowed_no_copy;
             local.census[site][18] += census.staged_lease;
+            local.census[site][19] += census.texture_owned_bytes;
+            local.census[site][20] += census.texture_borrowed_no_copy;
+            local.census[site][21] += census.texture_staged_lease;
             local.window[site] += 1;
             local.window[site] >= every()
         });
