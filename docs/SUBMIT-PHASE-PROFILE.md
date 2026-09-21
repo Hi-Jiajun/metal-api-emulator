@@ -601,6 +601,31 @@ window's `frames`**, differenced at the same present the wire counters are, so a
 statement that straddles a report boundary stays whole and the sections and the
 frame they came from are never split across two windows.
 
+### The zero-fill arm's own reading
+
+Statement economy W2-A (`openspec/changes/render-statement-economy` §3) adds one
+arm to `BufferSource`: `ZeroFill { length }`, a declaration whose bytes are its
+own `length` in zeros and which the statement does **not** carry. The render
+rail's two producers of zero frames — a storing attachment's `Clear` /
+`Resident` arm and every in-flight production's declaration — state it when
+`REIMS_VGPU_ZERO_FILL_DECL=on` (default off); the provider materializes the same
+zeros at the view's own window, so no device-visible byte moves and the frame the
+pass lands is the frame it landed before.
+
+A round reads the cut off the pair of roll-ups above, which is why both are
+printed:
+
+| reading | arm off (shipped) | arm on |
+|---|---|---|
+| `stmt_view_payload_bytes` | the extent's bytes travel | that many fewer |
+| `stmt_view_declared_bytes` | the same extents | the same |
+
+beside the E side's `zero_fill_bytes_n`, the admission census' own slot for the
+bytes a declaration states rather than carries (`METAL_API_CORE_ADMIT_PROFILE=1`;
+it trades places with `owned_bytes_n` in the same window). Those three fields are
+the mechanism reading; a frame-interval difference of the same size as two
+identical arms' spread is noise, and is read as such.
+
 ## Boundaries
 
 The profile reports wall time inside one call. It does not say which draw paid
