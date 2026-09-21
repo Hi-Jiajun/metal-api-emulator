@@ -18509,6 +18509,7 @@ fn render_texture_source_name(source: &RenderInputSource<'_>) -> &'static str {
         RenderInputSource::Borrowed { .. } => "owner_window",
         RenderInputSource::ProducedBytes(_) => "produced_bytes",
         RenderInputSource::GatheredBytes { .. } => "gathered_bytes",
+        RenderInputSource::ZeroFillBytes(_) => "zero_fill_bytes",
         RenderInputSource::AttachmentSnapshot { .. } => "pass_entry_snapshot",
     }
 }
