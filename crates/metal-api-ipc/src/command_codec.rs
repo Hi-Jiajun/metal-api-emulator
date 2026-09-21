@@ -9,6 +9,7 @@
 
 use crate::codec::CodecError;
 use crate::command::{CommandRequest, CommandResponse};
+use crate::statement;
 use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
     AttachmentFormat, AttachmentLandingView, BlendAttachment, BlendFactor, BlendOperation,
@@ -1126,8 +1127,50 @@ impl CommandCodec {
     ///
     /// A transport that cannot fit the payload into [`MAX_COMMAND_FRAME`]
     /// splits it into chunk frames with `CommandCodec::write_chunk_frame`.
+    ///
+    /// While [`statement::enabled`] is on, a submission's own sections are also
+    /// priced into that module's accumulators — the reading a running round
+    /// takes with [`statement::take`]. The switch changes numbers and never
+    /// bytes: off it is one relaxed load here, and on, the payload is the
+    /// payload this writer would have produced for the same request.
     pub fn encode_request_payload(request: &CommandRequest) -> Result<Vec<u8>, CodecError> {
+        let (payload, account) = Self::encode_payload(request, statement::enabled())?;
+        if let Some(account) = account {
+            statement::record(account);
+        }
+        Ok(payload)
+    }
+
+    /// Encode one request payload and hand back the statement it is made of.
+    ///
+    /// Same bytes, on the same encoder path, as
+    /// [`Self::encode_request_payload`]; the difference is that this entry
+    /// point prices the payload whether or not [`statement::enabled`] is on,
+    /// and records into no process-wide accumulator — the account is this
+    /// request's own. A request that carries no statement (everything but a
+    /// submission) comes back with a default account, whose `frames` is zero.
+    pub fn encode_request_payload_accounted(
+        request: &CommandRequest,
+    ) -> Result<(Vec<u8>, statement::StatementAccount), CodecError> {
+        let (payload, account) = Self::encode_payload(request, true)?;
+        Ok((payload, account.unwrap_or_default()))
+    }
+
+    /// One request payload, written once for both entry points above.
+    ///
+    /// `price_sections` is the only thing that separates them: off, this is the
+    /// writer the crate had before the account existed; on, the same writer
+    /// also reads its own offset at each section boundary. Either way the bytes
+    /// are a function of the request alone, which is the property the byte
+    /// identity test pins.
+    fn encode_payload(
+        request: &CommandRequest,
+        price_sections: bool,
+    ) -> Result<(Vec<u8>, Option<statement::StatementAccount>), CodecError> {
         let mut encoder = Encoder::new();
+        if price_sections {
+            encoder.arm_statement();
+        }
         match request {
             CommandRequest::Capabilities => encoder.u8(CAPABILITIES_REQUEST),
             CommandRequest::Health => encoder.u8(HEALTH_REQUEST),
@@ -1156,6 +1199,11 @@ impl CommandCodec {
                 put_queue_priorities(&mut encoder, tiers)?;
             }
             CommandRequest::Submit { trace, resources } => {
+                // The statement's own account starts at the tag and is closed by
+                // the caller that takes it (`research/docs/23` 之后的本变更 W1,
+                // `openspec/changes/render-statement-economy` §2). Nothing here
+                // writes a byte that the arms below would not have written.
+                encoder.begin_statement();
                 // The frame tag is a function of the payload shape, so a
                 // compute-only trace whose table carries compute texture
                 // declarations takes a tag of its own rather than the
@@ -1170,7 +1218,9 @@ impl CommandCodec {
                 } else {
                     SUBMIT_REQUEST
                 });
+                encoder.begin_section(statement::Section::TraceHeader);
                 put_trace(&mut encoder, trace)?;
+                encoder.begin_section(statement::Section::ResourceTable);
                 put_resources(&mut encoder, resources);
             }
             CommandRequest::Wait { token, timeout } => {
@@ -1208,7 +1258,8 @@ impl CommandCodec {
                 put_token(&mut encoder, token);
             }
         }
-        Ok(encoder.bytes)
+        let account = encoder.take_statement();
+        Ok((encoder.bytes, account))
     }
 
     /// Decode one complete request frame.
@@ -1762,11 +1813,80 @@ fn read_payload<R: Read>(reader: &mut R, payload: &mut [u8]) -> Result<(), Codec
 
 struct Encoder {
     bytes: Vec<u8>,
+    /// Whether this encoder was asked to price a submission's sections.
+    ///
+    /// Set once, by the two payload entry points. Off, the marks below are a
+    /// branch each and the statement draft stays `None`, so an encoder that is
+    /// not pricing anything behaves exactly as it did before this field
+    /// existed — including the bytes it writes, which no reading touches.
+    price_sections: bool,
+    /// The statement under construction, present only between the request tag
+    /// of a priced submission and the account's own `take`.
+    statement: Option<statement::Draft>,
 }
 
 impl Encoder {
     fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            price_sections: false,
+            statement: None,
+        }
+    }
+
+    /// Ask this encoder for the sections of any submission it writes.
+    fn arm_statement(&mut self) {
+        self.price_sections = true;
+    }
+
+    /// Open a statement's account at the request tag.
+    fn begin_statement(&mut self) {
+        if self.price_sections {
+            self.statement = Some(statement::Draft::new());
+        }
+    }
+
+    /// Close the section being written and open `section` at this offset.
+    ///
+    /// One branch when nothing is being priced: the draft exists only inside a
+    /// priced submission, so a payload of any other shape never reads an
+    /// offset on this path.
+    fn begin_section(&mut self, section: statement::Section) {
+        if let Some(draft) = self.statement.as_mut() {
+            draft.begin(self.bytes.len(), section);
+        }
+    }
+
+    /// The offset a view's own bytes start at, or `None` when nothing is being
+    /// priced — the mark a view's roll-up is measured against, read before the
+    /// view is written rather than reconstructed from the values.
+    fn view_mark(&self) -> Option<usize> {
+        self.statement.as_ref().map(|_| self.bytes.len())
+    }
+
+    /// Note one buffer view written since `mark`: its declared `length` and the
+    /// `OwnedBytes` payload it carried.
+    fn note_view(&mut self, mark: Option<usize>, declared: u64, payload: u64) {
+        let end = self.bytes.len();
+        if let (Some(draft), Some(start)) = (self.statement.as_mut(), mark) {
+            draft.note_view(start, end, declared, payload);
+        }
+    }
+
+    /// Note one texture view written since `mark` and the `OwnedBytes` payload
+    /// it carried.
+    fn note_texture(&mut self, mark: Option<usize>, payload: u64) {
+        let end = self.bytes.len();
+        if let (Some(draft), Some(start)) = (self.statement.as_mut(), mark) {
+            draft.note_texture(start, end, payload);
+        }
+    }
+
+    /// Take the account of the statement written into this encoder, if it was
+    /// pricing one: the end of the payload is the end of its last section.
+    fn take_statement(&mut self) -> Option<statement::StatementAccount> {
+        let end = self.bytes.len();
+        self.statement.take().map(|draft| draft.finish(end))
     }
 
     fn u8(&mut self, value: u8) {
@@ -3124,6 +3244,7 @@ fn get_contract(decoder: &mut Decoder<'_>) -> Result<PipelineContract, CodecErro
 }
 
 fn put_view(encoder: &mut Encoder, view: &BufferView) {
+    let mark = encoder.view_mark();
     encoder.u64(view.view_id.get());
     encoder.u32(view.metal_binding);
     encoder.u64(view.allocation_id.get());
@@ -3131,18 +3252,21 @@ fn put_view(encoder: &mut Encoder, view: &BufferView) {
     encoder.u64(view.length);
     put_access(encoder, view.access);
     encoder.opt_u64(view.attribute_stride);
-    match &view.source {
+    let payload = match &view.source {
         BufferSource::OwnedBytes(bytes) => {
             encoder.u8(0);
             encoder.blob(bytes);
+            bytes.len() as u64
         }
         BufferSource::StagedLease(lease_id) => {
             encoder.u8(1);
             encoder.u64(lease_id.get());
+            0
         }
         BufferSource::BorrowedNoCopy(lease_id) => {
             encoder.u8(2);
             encoder.u64(lease_id.get());
+            0
         }
         // E-TX6 (`research/docs/23` §74): the guest-runs arm travels as its own
         // ordered list, each run a `(lease, offset, length)` triple. The tag is
@@ -3157,8 +3281,10 @@ fn put_view(encoder: &mut Encoder, view: &BufferView) {
                 encoder.u64(run.offset);
                 encoder.u64(run.length);
             }
+            0
         }
-    }
+    };
+    encoder.note_view(mark, view.length, payload);
 }
 
 fn get_view(decoder: &mut Decoder<'_>) -> Result<BufferView, CodecError> {
@@ -3469,6 +3595,7 @@ fn get_texture_source(decoder: &mut Decoder<'_>) -> Result<TextureSource, CodecE
 }
 
 fn put_texture(encoder: &mut Encoder, texture: &TextureView) {
+    let mark = encoder.view_mark();
     encoder.u64(texture.view_id.get());
     encoder.u32(texture.metal_binding);
     encoder.u64(texture.allocation_id.get());
@@ -3481,6 +3608,11 @@ fn put_texture(encoder: &mut Encoder, texture: &TextureView) {
     encoder.u64(texture.sample_count);
     put_texture_access(encoder, texture.access);
     put_texture_source(encoder, &texture.source);
+    let payload = match &texture.source {
+        TextureSource::OwnedBytes(bytes) => bytes.len() as u64,
+        _ => 0,
+    };
+    encoder.note_texture(mark, payload);
 }
 
 fn get_texture(decoder: &mut Decoder<'_>) -> Result<TextureView, CodecError> {
@@ -4012,6 +4144,10 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
     put_epoch(encoder, trace.device_epoch);
     encoder.u64(trace.operation_id.get());
     encoder.u64(trace.pipelines.len() as u64);
+    // The trace header ends at the pipeline count: everything after it is a
+    // table, and the tables are the sections the statement's own bytes are
+    // read against.
+    encoder.begin_section(statement::Section::PipelineTable);
     for pipeline in &trace.pipelines {
         if tagged {
             put_pipeline_tagged(encoder, pipeline)?;
@@ -4019,6 +4155,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
             put_pipeline(encoder, pipeline);
         }
     }
+    // The pass table opens at the dispatch type: the type and the pass count
+    // are the table's own header, and the views live below it.
+    encoder.begin_section(statement::Section::PassTable);
     put_dispatch_type(encoder, trace.encoder_dispatch_type);
     encoder.u64(trace.passes.len() as u64);
     for pass in &trace.passes {
@@ -4063,6 +4202,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
             }
         }
     }
+    // Whatever follows the last pass is the tail: reported rather than folded
+    // into a neighbour, so the six sections still tile the payload exactly.
+    encoder.begin_section(statement::Section::Tail);
     put_completion_policy(encoder, trace.completion_policy);
     if trace.has_heap_or_icb() {
         put_heap_icb_tail(encoder, trace)?;
