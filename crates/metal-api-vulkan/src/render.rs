@@ -10919,7 +10919,23 @@ fn finish_prepared_offscreen_pass<'a, 'ctx>(
     // pipelines, descriptor sets, uploaded streams and sampled textures — and
     // they retire with the same fence, inside the same named region
     // (`research/docs/23` §3.3, G3-B/B-2).
-    let extra_draws = std::mem::take(&mut pass.extra_draws);
+    let mut extra_draws = std::mem::take(&mut pass.extra_draws);
+    // The fence has retired the submission, so each member's own four pooled
+    // families are the device's no longer: they go back exactly as the pass's
+    // own set's did above, in the same order and for the same reason
+    // (`crate::draw_object_release`). With the switch off nothing here runs and
+    // the members drop as they always have.
+    if crate::draw_object_release::enabled_from_env() {
+        let _release_draws =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseDraws);
+        for draw in &mut extra_draws {
+            draw.release_reusable();
+            draw.release_pooled_textures();
+            draw.release_imported_windows();
+            draw.release_pooled_uploads();
+        }
+        drop(_release_draws);
+    }
     drop(objects);
     drop(extra_draws);
     drop(_teardown);

@@ -101,7 +101,7 @@
 //!
 //! and, beside the disjoint fields, the aggregate readings the nested splits
 //! imply: `render_us` (the five `render_*` children), `render_residual_us`
-//! (their thirteen siblings that divide what those five leave unnamed),
+//! (their fourteen siblings that divide what those five leave unnamed),
 //! `texture_named_us` (the six nested regions inside `setup_textures`) and
 //! `teardown_named_us` (the ten nested regions inside `render_teardown`). The
 //! aggregates are printed beside the fields they aggregate rather than added to
@@ -902,9 +902,27 @@ pub(crate) enum Phase {
     /// pool keys one `VkBuffer`/`VkDeviceMemory` pair, so a reading that wants
     /// to know what pooling a pair saves has to price the two halves apart.
     TeardownObjectMemory,
+    /// Inside the render half's residual: handing a draw list's *per-draw*
+    /// objects back — the four families [`Phase::RenderReleaseReuse`] to
+    /// [`Phase::RenderReleaseUploads`] hand back for the pass's own set, once
+    /// per member after the head (`crate::draw_object_release`).
+    ///
+    /// A bar of its own because it is a region the pre-cut path does not have:
+    /// with the switch off no member is released and this bar is never entered,
+    /// and with it on the bar is what says whether the hand-back paid for itself
+    /// or merely moved the cost. It sits beside the four siblings rather than
+    /// inside the teardown bar for the same reason they do — the destroy work
+    /// the release leaves behind is what `render_teardown` then measures.
+    ///
+    /// Its slot is at the end rather than beside the four siblings it belongs
+    /// to because appending leaves every earlier slot where it was: a slot in
+    /// the middle would renumber every phase after it, and the tables that read
+    /// these slots by index ([`PHASE_NAMES`], the sample line's own arrays) are
+    /// pinned against each other rather than against a number.
+    RenderReleaseDraws,
 }
 
-const PHASE_COUNT: usize = Phase::TeardownObjectMemory as usize + 1;
+const PHASE_COUNT: usize = Phase::RenderReleaseDraws as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -1012,6 +1030,7 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "td_view",
     "td_buffer",
     "td_memory",
+    "render_release_draws",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -1041,7 +1060,7 @@ const RENDER_SLOTS: [usize; 5] = [
 ///
 /// The list is a reading aid rather than a printed field; a tool that checks
 /// the identity reads it from here.
-const RENDER_RESIDUAL_SLOTS: [usize; 13] = [
+const RENDER_RESIDUAL_SLOTS: [usize; 14] = [
     Phase::RenderResolve as usize,
     Phase::RenderPresent as usize,
     Phase::RenderPublish as usize,
@@ -1055,6 +1074,7 @@ const RENDER_RESIDUAL_SLOTS: [usize; 13] = [
     Phase::RenderReleaseImport as usize,
     Phase::RenderReleaseUploads as usize,
     Phase::RenderRetire as usize,
+    Phase::RenderReleaseDraws as usize,
 ];
 
 /// The nested split of `render_teardown`, added by the fourth cut: the ten
@@ -2583,6 +2603,13 @@ impl Local {
                 buffer_unreturned_kind[kind_slot],
             ));
         }
+        // The sum the per-kind table implies, bound to a name rather than passed
+        // as a positional argument: the readback block below this point prints
+        // its fields positionally, and a leading `{}` here shifted every one of
+        // them by one slot (the E-CT2 first take, `ct2`, printed a window whose
+        // `readback_*` fields were its neighbour's value — corrected, and the
+        // round re-run as `ct2b`).
+        let td_unreturned_total: u64 = buffer_unreturned_kind.iter().sum();
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
@@ -2655,7 +2682,7 @@ impl Local {
              pool_derivations_n={pool_derivations_n} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
              td_buffer_n={td_buffer_n} td_memory_n={td_memory_n} \
-             td_unreturned_n={} buf_miss_empty_n={buffer_miss_empty_n} \
+             td_unreturned_n={td_unreturned_total} buf_miss_empty_n={buffer_miss_empty_n} \
              buf_miss_occupied_n={buffer_miss_occupied_n} \
              buf_miss_held_sum={buffer_miss_held_sum} \
              buf_miss_after_evict_n={buffer_miss_after_evict_n} \
@@ -2668,7 +2695,6 @@ impl Local {
              pool_miss_same_image_type_n={pool_miss_same_image_type_n} \
              pool_miss_same_view_type_n={pool_miss_same_view_type_n} \
              pool_miss_same_device_copy_n={pool_miss_same_device_copy_n}{pool_kind_fields}",
-            buffer_unreturned_kind.iter().sum::<u64>(),
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
