@@ -103,7 +103,7 @@ pub(crate) fn resolve_statement_payloads(
                     });
                 let bytes = match held {
                     Some(Some(bytes)) => bytes.to_vec(),
-                    Some(None) => return Err(slot_mismatch(&texture, slot, length, digest)),
+                    Some(None) => return Err(slot_mismatch(texture, slot, length, digest)),
                     None => match table.lookup(slot, digest, length) {
                         PayloadLookup::Hit(bytes) => {
                             counts.reference_bytes = counts.reference_bytes.saturating_add(length);
@@ -111,11 +111,11 @@ pub(crate) fn resolve_statement_payloads(
                         }
                         PayloadLookup::Unknown => {
                             counts.unknown_n = counts.unknown_n.saturating_add(1);
-                            return Err(slot_unknown(&texture, slot, length, digest));
+                            return Err(slot_unknown(texture, slot, length, digest));
                         }
                         PayloadLookup::Mismatch => {
                             counts.mismatch_n = counts.mismatch_n.saturating_add(1);
-                            return Err(slot_mismatch(&texture, slot, length, digest));
+                            return Err(slot_mismatch(texture, slot, length, digest));
                         }
                     },
                 };
