@@ -4506,15 +4506,19 @@ impl ComputeProvider for VulkanComputeProvider {
                     });
                 }
                 BufferSource::StagedLease(lease_id) => {
-                    let bytes = self.staging.view_bytes(
-                        *lease_id,
-                        view,
-                        self.device_epoch(),
-                        admitted.resources(),
-                    )?;
+                    // The staged registry's window: the copy it makes out of its
+                    // own lock (the pre-cut arm, and the default), or — with the
+                    // eighth cut's mechanism on — a handle on the bytes it
+                    // already holds (`crate::staging_borrow`).
                     buffers.push(PoolBinding::Owned {
                         index,
-                        bytes: crate::BindingBytes::Copied(bytes),
+                        bytes: crate::staging_borrow::resolve_view(
+                            &self.staging,
+                            *lease_id,
+                            view,
+                            self.device_epoch(),
+                            admitted.resources(),
+                        )?,
                     });
                 }
                 BufferSource::BorrowedNoCopy(lease_id) => {
@@ -5207,8 +5211,9 @@ fn map_writebacks(
 /// (`crate::phase_profile::note_binding_copy` / `note_binding_borrow`).
 ///
 /// The other two binding sources are always owned: a staged lease's bytes are
-/// copied out of the staging registry's lock, and gathered guest runs are built
-/// by the gather itself. Neither can be borrowed, so neither is counted here.
+/// copied out of the staging registry's lock (or, with the eighth cut's switch
+/// on, lent by handle — `crate::staging_borrow`), and gathered guest runs are
+/// built by the gather itself. Neither is counted here.
 fn snapshot_binding_bytes(bytes: &Vec<u8>) -> crate::BindingBytes<'_> {
     if crate::submit_binding_borrow::enabled_from_env() {
         crate::phase_profile::note_binding_borrow(bytes.len() as u64);

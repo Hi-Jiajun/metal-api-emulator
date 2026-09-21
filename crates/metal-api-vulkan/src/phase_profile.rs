@@ -725,9 +725,24 @@ pub(crate) enum Phase {
     /// `free`; on the tables are lent, so it is the release of a table of
     /// references (`crate::serial_resources_borrow`).
     SubmitValidateRelease,
+    /// The eighth cut's own region: resolving one **staged lease**'s window out
+    /// of the provider's staging registry. Off it is the region that copies the
+    /// window into a fresh `Vec` for the binding
+    /// ([`LeaseRegistry::view_bytes`](metal_api_core::provider::LeaseRegistry::view_bytes),
+    /// which the registry does while it holds its own lock); on it is the same
+    /// resolution handing back a handle on the registry's own bytes and copying
+    /// nothing (`crate::staging_borrow`).
+    ///
+    /// Like the fifth to seventh cuts' regions it is *nested*: a staged lease is
+    /// resolved inside [`Phase::Pool`] on the compute half and inside the render
+    /// half's own setup on the render half, so adding it to the disjoint sum
+    /// would charge the same microseconds twice. Its slot sits after the
+    /// submission seam's bars only because appending leaves every earlier slot
+    /// where it was — the field it prints is read beside the bar it divides.
+    StagingWindow,
 }
 
-const PHASE_COUNT: usize = Phase::SubmitValidateRelease as usize + 1;
+const PHASE_COUNT: usize = Phase::StagingWindow as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -827,6 +842,7 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "submit_validate_derive",
     "submit_validate_check",
     "submit_validate_release",
+    "staging_window",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -1009,6 +1025,13 @@ const SUBMIT_RELEASE_SLOTS: [usize; 3] = [
 /// there.
 #[cfg(test)]
 const SUBMIT_RELEASE_VIEWS_SLOTS: [usize; 1] = [Phase::SubmitReleasePool as usize];
+
+/// The eighth cut's one-member read-back set: the region that resolves a staged
+/// lease's window is nested inside whichever bar is open when a binding is
+/// built, so it is not a member of the disjoint sum and not a seam bar of its
+/// own. The set exists so the nesting is stated where the other splits are.
+#[cfg(test)]
+const STAGING_WINDOW_SLOTS: [usize; 1] = [Phase::StagingWindow as usize];
 
 /// The nested split of `submit_validate`: the two pool derivations the
 /// validation takes, the walk that reads them, and the release of the tables
@@ -1609,6 +1632,19 @@ struct Local {
     binding_copy_bytes: u64,
     binding_borrow_calls: u64,
     binding_borrow_bytes: u64,
+    /// The bytes this window's **staged leases** moved into their bindings: the
+    /// `Vec` the provider's staging registry copies for a view while it holds
+    /// its own lock, and the window's own count of those resolutions. The
+    /// registry's other arm hands the binding a handle on the same bytes and
+    /// copies nothing, so the same batch is counted there
+    /// (`crate::staging_borrow`).
+    staging_window_copies: u64,
+    staging_window_copy_bytes: u64,
+    /// The same batch of bytes on the cut's arm: the windows the registry lent
+    /// by handle (`LeaseWindowBytes`) instead of copying, and their total length
+    /// (`crate::staging_borrow`).
+    staging_window_shares: u64,
+    staging_window_share_bytes: u64,
     /// The declared bytes the window's *pool derivations* moved, split the same
     /// way: a copy the derivation made for itself (`ComputeTrace::serial_resources`,
     /// the pre-cut path) or a loan of the trace's own declarations
@@ -1720,6 +1756,10 @@ impl Default for Local {
             binding_copy_bytes: 0,
             binding_borrow_calls: 0,
             binding_borrow_bytes: 0,
+            staging_window_copies: 0,
+            staging_window_copy_bytes: 0,
+            staging_window_shares: 0,
+            staging_window_share_bytes: 0,
             resource_copy_views: 0,
             resource_copy_bytes: 0,
             resource_borrow_views: 0,
@@ -1934,6 +1974,10 @@ impl Local {
         let binding_copy_bytes = std::mem::take(&mut self.binding_copy_bytes);
         let binding_borrow_calls = std::mem::take(&mut self.binding_borrow_calls);
         let binding_borrow_bytes = std::mem::take(&mut self.binding_borrow_bytes);
+        let staging_window_copies = std::mem::take(&mut self.staging_window_copies);
+        let staging_window_copy_bytes = std::mem::take(&mut self.staging_window_copy_bytes);
+        let staging_window_shares = std::mem::take(&mut self.staging_window_shares);
+        let staging_window_share_bytes = std::mem::take(&mut self.staging_window_share_bytes);
         let resource_copy_views = std::mem::take(&mut self.resource_copy_views);
         let resource_copy_bytes = std::mem::take(&mut self.resource_copy_bytes);
         let resource_borrow_views = std::mem::take(&mut self.resource_borrow_views);
@@ -2036,6 +2080,10 @@ impl Local {
              submit_binding_copies_bytes={binding_copy_bytes} \
              submit_binding_borrows_n={binding_borrow_calls} \
              submit_binding_borrows_bytes={binding_borrow_bytes} \
+             staging_window_copies_n={staging_window_copies} \
+             staging_window_copies_bytes={staging_window_copy_bytes} \
+             staging_window_shares_n={staging_window_shares} \
+             staging_window_shares_bytes={staging_window_share_bytes} \
              submit_resource_copies_n={resource_copy_views} \
              submit_resource_copies_bytes={resource_copy_bytes} \
              submit_resource_borrows_n={resource_borrow_views} \
@@ -2119,6 +2167,47 @@ pub(crate) fn note_binding_borrow(bytes: u64) {
         let mut local = local.borrow_mut();
         local.binding_borrow_calls += 1;
         local.binding_borrow_bytes += bytes;
+    });
+}
+
+/// One staged lease's window the provider's staging registry **copied** into a
+/// binding: the registry clones the window while it holds its own lock, and the
+/// binding that uploads it owns the clone for the rest of the submission
+/// (`crate::staging_borrow`).
+///
+/// This is the third copy of the bytes the sixth and seventh cuts took off the
+/// submission: the same owner bytes, copied once more because a binding cannot
+/// borrow the registry's lock. The count and the bytes are what an eighth cut is
+/// ranked by; the microseconds sit in the region's own bar
+/// (`Phase::StagingWindow`).
+#[inline]
+pub(crate) fn note_staging_window_copy(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.staging_window_copies += 1;
+        local.staging_window_copy_bytes += bytes;
+    });
+}
+
+/// The same staged window the registry **lent** by handle instead of copying
+/// (`crate::staging_borrow`): one entry per resolved staged view or texture and
+/// the bytes the resolution did *not* have to move.
+///
+/// Read beside [`note_staging_window_copy`]: the two pairs partition every
+/// resolution, so a round sees the same batch of bytes change hands beside a
+/// copy count that falls to zero.
+#[inline]
+pub(crate) fn note_staging_window_share(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        local.staging_window_shares += 1;
+        local.staging_window_share_bytes += bytes;
     });
 }
 
@@ -2779,6 +2868,23 @@ mod tests {
             PHASE_NAMES[Phase::SubmitValidateRelease as usize],
             "submit_validate_release"
         );
+        // The eighth cut's region is nested the same way and read the same way:
+        // it is charged inside whichever bar is open when a binding is built, so
+        // it is neither a seam bar nor a member of any split that a reader adds.
+        assert_eq!(STAGING_WINDOW_SLOTS, [Phase::StagingWindow as usize]);
+        assert_eq!(PHASE_NAMES[Phase::StagingWindow as usize], "staging_window");
+        for slot in STAGING_WINDOW_SLOTS {
+            assert!(!SUBMIT_SEAM_SLOTS.contains(&slot));
+            assert!(!COUNTED_SLOTS.contains(&slot));
+            assert!(!SUBMIT_RELEASE_SLOTS.contains(&slot));
+            assert!(!SUBMIT_VALIDATE_SLOTS.contains(&slot));
+            assert!(!RESOURCE_BUILD_SLOTS.contains(&slot));
+            assert!(!SUBMIT_TEARDOWN_SLOTS.contains(&slot));
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+            assert!(!TEXTURE_SLOTS.contains(&slot));
+            assert!(!SUBMIT_RELEASE_VIEWS_SLOTS.contains(&slot));
+        }
         assert_eq!(PHASE_NAMES[Phase::PlanResources as usize], "plan_resources");
         // The seventh cut's three regions are nested exactly like the sixth
         // cut's: one inside `plan`, one inside `submit_validate` and one inside
