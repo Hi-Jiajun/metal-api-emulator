@@ -5697,6 +5697,15 @@ fn texture_source_name(source: &TextureSource) -> &'static str {
         TextureSource::BorrowedNoCopy(_) => "borrowed_no_copy",
         TextureSource::TraceView => "trace_view",
         TextureSource::PassEntrySnapshot => "pass_entry_snapshot",
+        // The statement payload table's two arms (statement economy W4, task
+        // E-SW3) are named here like every other arm, and for the same reason:
+        // a capture reads the arm in a refusal the way the wire spells it. On
+        // the path this rail executes they never reach a refusal —
+        // `VulkanComputeProvider::resolve_statement_payloads` has already
+        // turned both into `owned_bytes` — so a refusal naming one is a
+        // statement that was submitted without that resolution.
+        TextureSource::OwnedInSlot { .. } => "owned_in_slot",
+        TextureSource::SlottedBytes { .. } => "slotted_bytes",
     }
 }
 
@@ -7582,6 +7591,32 @@ fn resolve_render_texture_source<'a>(
              resolution carries no pass: the arm is answered by the pass's own texture walk, \
              which knows the attachment it copies",
         )),
+        // The statement payload table's two arms (statement economy W4, task
+        // E-SW3) are resolved by
+        // `VulkanComputeProvider::resolve_statement_payloads`, on the trace a
+        // wire reader just decoded — before any pass of it is planned. Reaching
+        // this walk with one means a trace arrived without that resolution, and
+        // neither arm can be answered here: the declaration arm's slot is the
+        // table's to file and the reference arm's bytes are the table's to
+        // state, so a rail that guessed would be sampling bytes the statement
+        // did not carry.
+        TextureSource::OwnedInSlot { .. } | TextureSource::SlottedBytes { .. } => {
+            Err(capability_refusal("render_texture_source_unsupported")
+                .with_field("binding", FieldValue::Unsigned(binding as u64))
+                .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+                .with_field("allocation", FieldValue::Unsigned(view.allocation_id.get()))
+                .with_field(
+                    "source",
+                    FieldValue::Text(texture_source_name(&view.source).to_owned()),
+                )
+                .with_detail(
+                    "the declaration belongs to the statement payload table, and this trace \
+                     reached a pass walk without the table's own resolution: a statement that \
+                     carries either arm is resolved once, on the decoded trace \
+                     (`VulkanComputeProvider::resolve_statement_payloads`), and a walk that \
+                     meets one has no table to answer it from",
+                ))
+        }
         TextureSource::StagedLease(lease_id) => {
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(

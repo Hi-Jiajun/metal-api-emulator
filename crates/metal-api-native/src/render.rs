@@ -2992,6 +2992,32 @@ fn resolve_render_texture_source<'a>(
              rail (`research/docs/23` §110), and the Apple-side reading its flip would owe \
              is a later increment",
         )),
+        // The statement payload table's two arms (the statement economy's W4,
+        // task E-SW3; `metal_api_core::statement_payload`) are refused by name
+        // on this rail for the reason every unflipped arm is: what they need is
+        // a payload table kept across the statements one device epoch admits,
+        // and this rail's plan resolves each declaration against the submission
+        // alone. The Vulkan rail keeps that table; a rail that does not must
+        // refuse the arm rather than upload bytes the statement did not state
+        // (`SlottedBytes` names a table entry, and this rail has none) or file
+        // bytes nothing would ever read back (`OwnedInSlot`).
+        TextureSource::OwnedInSlot { .. } => Err(texture_source_refusal(
+            binding,
+            view.view_id,
+            "owned_in_slot",
+            "the declaration states the trace's own bytes *and* the statement payload slot they \
+             are filed under, and this rail keeps no such table: the slot's only reader is a \
+             later `SlottedBytes` declaration, which this rail refuses beside this one, so \
+             filing it here would be bookkeeping nothing consumes",
+        )),
+        TextureSource::SlottedBytes { .. } => Err(texture_source_refusal(
+            binding,
+            view.view_id,
+            "slotted_bytes",
+            "the declaration names bytes an earlier statement filed in the provider's statement \
+             payload table, and this rail keeps no payload table: the bytes are not in the \
+             submission, so there is nothing here to upload",
+        )),
         // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15) is
         // refused by name for the reason every unflipped arm is, plus one of
         // its own: what the arm promises is a device-side image copy taken
@@ -7532,6 +7558,59 @@ mod tests {
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
     const EXPECTED_TEXEL_COMPONENTS: [f64; 4] = [64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0, 1.0];
+
+    /// The statement payload table's two arms (statement economy W4, task
+    /// E-SW3) are refused **by name** on this rail, without a device: the arm's
+    /// name is the `storage_mode` field, which is the vocabulary this rail's
+    /// texture refusals already publish (`trace_view` beside them), and the
+    /// slug is the one every unflipped texture arm takes here.
+    #[test]
+    fn the_statement_payload_table_arms_are_refused_by_name_on_this_rail() {
+        let payload = vec![0x5a; 64];
+        let digest = metal_api_core::statement_payload::payload_digest(&payload);
+        for (source, storage_mode) in [
+            (
+                TextureSource::OwnedInSlot {
+                    slot: 1,
+                    bytes: payload.clone(),
+                },
+                "owned_in_slot",
+            ),
+            (
+                TextureSource::SlottedBytes {
+                    slot: 1,
+                    length: 64,
+                    digest,
+                },
+                "slotted_bytes",
+            ),
+        ] {
+            let view = TextureView {
+                view_id: ViewId::new(7),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(8),
+                texture_type: TextureType::D2,
+                format: TextureFormat::Rgba8Unorm,
+                width: 16,
+                height: 1,
+                depth: 1,
+                array_length: 1,
+                sample_count: 1,
+                access: TextureAccess::Sampled,
+                source,
+            };
+            let refusal = resolve_render_texture_source(&view, None, 0)
+                .expect_err("this rail keeps no statement payload table");
+            assert_eq!(refusal.slug, TEXTURE_SLUG);
+            assert_eq!(refusal.class, ProviderErrorClass::Capability);
+            assert_eq!(
+                refusal.fields.get("storage_mode"),
+                Some(&FieldValue::Text(storage_mode.to_owned())),
+                "the arm is named in the refusal"
+            );
+            assert_eq!(refusal.fields.get("view"), Some(&FieldValue::Unsigned(7)));
+        }
+    }
 
     /// The milestone's pass: one 2x2 `Rgba8Unorm` attachment, stored, and drawn
     /// as the full-screen triangle.

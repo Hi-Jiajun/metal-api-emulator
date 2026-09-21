@@ -1905,6 +1905,13 @@ impl Encoder {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
+    /// One 128-bit value, big-endian like every other integer on this wire: the
+    /// width the statement payload table's digest needs (the statement
+    /// economy's W4).
+    fn u128(&mut self, value: u128) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
     fn i64(&mut self, value: i64) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
@@ -2006,6 +2013,12 @@ impl<'a> Decoder<'a> {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(self.take(8)?);
         Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn u128(&mut self) -> Result<u128, CodecError> {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(self.take(16)?);
+        Ok(u128::from_be_bytes(bytes))
     }
 
     fn i64(&mut self) -> Result<i64, CodecError> {
@@ -3603,6 +3616,29 @@ fn put_texture_source(encoder: &mut Encoder, source: &TextureSource) {
         TextureSource::PassEntrySnapshot => {
             encoder.u8(4);
         }
+        // The statement payload table's two arms (the statement economy's W4,
+        // task E-SW3; `metal_api_core::statement_payload`). The declaration arm
+        // carries the bytes the owned arm carries and adds the slot they are
+        // filed under; the reference arm carries the slot, the length and the
+        // digest instead of the payload. Both tags are appended after the five
+        // existing arms, so every older frame keeps its exact bytes and an
+        // older decoder refuses these tags as unknown texture sources rather
+        // than reading a declaration as another arm.
+        TextureSource::OwnedInSlot { slot, bytes } => {
+            encoder.u8(TEXTURE_SOURCE_OWNED_IN_SLOT);
+            encoder.u32(*slot);
+            encoder.blob(bytes);
+        }
+        TextureSource::SlottedBytes {
+            slot,
+            length,
+            digest,
+        } => {
+            encoder.u8(TEXTURE_SOURCE_SLOTTED_BYTES);
+            encoder.u32(*slot);
+            encoder.u64(*length);
+            encoder.u128(*digest);
+        }
     }
 }
 
@@ -3613,12 +3649,33 @@ fn get_texture_source(decoder: &mut Decoder<'_>) -> Result<TextureSource, CodecE
         2 => Ok(TextureSource::BorrowedNoCopy(LeaseId::new(decoder.u64()?))),
         3 => Ok(TextureSource::TraceView),
         4 => Ok(TextureSource::PassEntrySnapshot),
+        TEXTURE_SOURCE_OWNED_IN_SLOT => Ok(TextureSource::OwnedInSlot {
+            slot: decoder.u32()?,
+            bytes: decoder.blob()?,
+        }),
+        TEXTURE_SOURCE_SLOTTED_BYTES => Ok(TextureSource::SlottedBytes {
+            slot: decoder.u32()?,
+            length: decoder.u64()?,
+            digest: decoder.u128()?,
+        }),
         value => Err(CodecError::UnknownEnumValue {
             field: "texture source",
             value,
         }),
     }
 }
+
+/// The texture-source tag of the statement payload table's declaration arm
+/// (`TextureSource::OwnedInSlot`, the statement economy's W4): the five arms
+/// before it keep their exact bytes, and a decoder that predates it refuses the
+/// tag as an unknown source rather than reading the declaration as another arm.
+pub(crate) const TEXTURE_SOURCE_OWNED_IN_SLOT: u8 = 5;
+
+/// The texture-source tag of the statement payload table's reference arm
+/// (`TextureSource::SlottedBytes`, the statement economy's W4). Appended after
+/// the declaration arm for the same reason every arm here is appended: a
+/// renumbering would read an old frame as another arm.
+pub(crate) const TEXTURE_SOURCE_SLOTTED_BYTES: u8 = 6;
 
 fn put_texture(encoder: &mut Encoder, texture: &TextureView) {
     let mark = encoder.view_mark();
@@ -3635,7 +3692,11 @@ fn put_texture(encoder: &mut Encoder, texture: &TextureView) {
     put_texture_access(encoder, texture.access);
     put_texture_source(encoder, &texture.source);
     let payload = match &texture.source {
-        TextureSource::OwnedBytes(bytes) => bytes.len() as u64,
+        // The reference arm carries no payload: what it names is the table's,
+        // and the statement's own account reads the bytes it *carries*.
+        TextureSource::OwnedBytes(bytes) | TextureSource::OwnedInSlot { bytes, .. } => {
+            bytes.len() as u64
+        }
         _ => 0,
     };
     encoder.note_texture(mark, payload);
@@ -8177,6 +8238,84 @@ mod tests {
                 field: "buffer source",
                 value,
             } if value == BUFFER_SOURCE_ZERO_FILL + 1
+        ));
+    }
+
+    /// One texture view block, spelled by hand so a test can put a tag no
+    /// decoder knows in it: the field order is [`put_texture`]'s own.
+    fn texture_block(source: impl FnOnce(&mut Encoder)) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        encoder.u64(9); // view id
+        encoder.u32(0); // metal binding
+        encoder.u64(3); // allocation id
+        encoder.u8(2); // texture type: D2
+        encoder.u8(2); // format: Rgba8Unorm
+        encoder.u64(4); // width
+        encoder.u64(1); // height
+        encoder.u64(1); // depth
+        encoder.u64(1); // array length
+        encoder.u64(1); // sample count
+        encoder.u8(0); // access: Sampled
+        source(&mut encoder);
+        encoder.bytes
+    }
+
+    /// The texture-source block's two newest tags are the statement payload
+    /// table's arms (statement economy W4, task E-SW3), and the block's own
+    /// fallback is what a decoder that predates them answers: the tag and the
+    /// field are named, and the bytes that follow are never read as another
+    /// arm's payload.
+    #[test]
+    fn a_texture_source_tag_a_decoder_does_not_know_is_refused_by_name() {
+        let digest = metal_api_core::statement_payload::payload_digest(&[0x5a; 4]);
+
+        // The declaration arm: a slot and the payload the owned arm carries.
+        let bytes = texture_block(|encoder| {
+            encoder.u8(TEXTURE_SOURCE_OWNED_IN_SLOT);
+            encoder.u32(7);
+            encoder.blob(&[0x5a; 4]);
+        });
+        let view = get_texture(&mut Decoder::new(&bytes)).expect("the declaration arm decodes");
+        assert_eq!(
+            view.source,
+            TextureSource::OwnedInSlot {
+                slot: 7,
+                bytes: vec![0x5a; 4],
+            }
+        );
+
+        // The reference arm: the same slot, the length and the digest, and no
+        // payload at all.
+        let bytes = texture_block(|encoder| {
+            encoder.u8(TEXTURE_SOURCE_SLOTTED_BYTES);
+            encoder.u32(7);
+            encoder.u64(4);
+            encoder.u128(digest);
+        });
+        let view = get_texture(&mut Decoder::new(&bytes)).expect("the reference arm decodes");
+        assert_eq!(
+            view.source,
+            TextureSource::SlottedBytes {
+                slot: 7,
+                length: 4,
+                digest,
+            }
+        );
+
+        // One tag past them is what every earlier decoder answers for both:
+        // the block's own refuse-by-name arm, with the field and the value.
+        let bytes = texture_block(|encoder| {
+            encoder.u8(TEXTURE_SOURCE_SLOTTED_BYTES + 1);
+            encoder.u64(4);
+        });
+        let refusal = get_texture(&mut Decoder::new(&bytes))
+            .expect_err("a source tag this decoder does not know is refused");
+        assert!(matches!(
+            refusal,
+            CodecError::UnknownEnumValue {
+                field: "texture source",
+                value,
+            } if value == TEXTURE_SOURCE_SLOTTED_BYTES + 1
         ));
     }
 

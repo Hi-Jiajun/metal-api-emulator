@@ -20,6 +20,7 @@ mod admit_validate_once;
 pub mod completion;
 pub mod provider;
 pub mod provider_api;
+pub mod statement_payload;
 
 /// Opaque backend-owned compiled pipeline state.
 pub type PipelineArtifact = Arc<dyn Any + Send + Sync>;

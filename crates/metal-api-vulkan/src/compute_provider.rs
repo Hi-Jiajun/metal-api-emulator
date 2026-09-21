@@ -380,6 +380,13 @@ pub struct VulkanComputeProvider {
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
     borrowed: Arc<BorrowedLeaseRegistry>,
+    /// The statement payload table (statement economy W4, task E-SW3):
+    /// the payloads the statements this provider read filed, keyed by slot and
+    /// scoped to one device epoch (`crate::statement_payload_table`).
+    statement_payloads: Mutex<metal_api_core::statement_payload::PayloadTable>,
+    /// What the table has done over this provider's life, read by the rail's
+    /// counters and its tests.
+    statement_payload_counts: Mutex<crate::statement_payload_table::StatementPayloadCounts>,
 }
 
 /// One resident present target: the provider-owned image and the stamp that
@@ -836,6 +843,8 @@ impl VulkanComputeProvider {
             completion_outbox: None,
             staging: LeaseRegistry::new(),
             borrowed: Arc::new(BorrowedLeaseRegistry::new()),
+            statement_payloads: Mutex::new(metal_api_core::statement_payload::PayloadTable::new()),
+            statement_payload_counts: Mutex::new(Default::default()),
         })
     }
 
@@ -3892,6 +3901,54 @@ impl VulkanComputeProvider {
     /// Staged lease registry owned by this provider.
     pub fn lease_registry(&self) -> &LeaseRegistry {
         &self.staging
+    }
+
+    /// Resolve the statement payload table's two arms in one decoded statement
+    /// (statement economy W4, task E-SW3).
+    ///
+    /// The owner calls this with the trace its own wire reader just decoded,
+    /// which is where a provider's reader resolves what the frame carried: a
+    /// declaration arm files its bytes and becomes the ordinary owned arm, and
+    /// a reference arm is answered out of the table and becomes the owned arm
+    /// too, so nothing downstream of this call can tell either from the shape
+    /// every round before this increment used. A reference the table cannot
+    /// answer is a refusal by name
+    /// (`statement_payload_slot_unknown`/`statement_payload_slot_mismatch`).
+    ///
+    /// Returns whether the statement carried any of the arms, which is what a
+    /// caller reads to know whether anything was filed.
+    pub fn resolve_statement_payloads(
+        &self,
+        trace: &mut metal_api_core::provider::ComputeTrace,
+    ) -> Result<bool, ProviderError> {
+        let mut table = self
+            .statement_payloads
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        let mut counts = self
+            .statement_payload_counts
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        crate::statement_payload_table::resolve_statement_payloads(&mut table, trace, &mut counts)
+    }
+
+    /// What the statement payload table has done over this provider's life.
+    pub fn statement_payload_counts(
+        &self,
+    ) -> crate::statement_payload_table::StatementPayloadCounts {
+        self.statement_payload_counts
+            .lock()
+            .map(|counts| *counts)
+            .unwrap_or_default()
+    }
+
+    /// The slots this provider's table holds for the current epoch, and the
+    /// bytes they stand for.
+    pub fn statement_payload_table_size(&self) -> (usize, u64) {
+        self.statement_payloads
+            .lock()
+            .map(|table| (table.entries(), table.used_bytes()))
+            .unwrap_or((0, 0))
     }
 
     /// No-copy lease registry owned by this provider.
