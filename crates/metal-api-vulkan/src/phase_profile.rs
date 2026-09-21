@@ -3928,7 +3928,7 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "shape field names are unique");
-        let line_names: Vec<&str> = format_submit_sample(&SubmitSample {
+        let zeroed = format_submit_sample(&SubmitSample {
             lane: 0,
             n: 0,
             t_ms: 0.0,
@@ -3952,11 +3952,12 @@ mod tests {
             passes: 0,
             children: [0; CHILD_COUNT],
             shapes: [0; SHAPE_COUNT],
-        })
-        .split_whitespace()
-        .skip(1)
-        .map(|field| field.split_once('=').unwrap().0)
-        .collect();
+        });
+        let line_names: Vec<&str> = zeroed
+            .split_whitespace()
+            .skip(1)
+            .map(|field| field.split_once('=').unwrap().0)
+            .collect();
         for source in SHAPE_SOURCES {
             assert!(
                 line_names.iter().any(|name| *name == source.name),
