@@ -2863,6 +2863,24 @@ fn resolve_render_input<'a>(
 ) -> Result<PlannedInputSource<'a>, ProviderError> {
     match &view.source {
         BufferSource::OwnedBytes(bytes) => Ok(PlannedInputSource::Declared(bytes)),
+        // The statement-economy zero-fill declaration
+        // (`BufferSource::ZeroFill`, W2-A) is refused by name on this rail for
+        // the reason every unflipped arm is: the arm's reading is the
+        // provider's own materialization of `length` zero bytes into the buffer
+        // the declaration binds, and the Apple-side reading its flip would owe —
+        // a host plan that writes zeros at the view's window, plus the device
+        // evidence behind it — is a later increment. Refusing keeps a native
+        // caller from getting zeros invented in place of the declaration's own
+        // name.
+        BufferSource::ZeroFill { length } => Err(render_input_refusal(
+            role,
+            view.view_id,
+            "zero_fill_declaration",
+            "the bytes are the declaration's own length in zero bytes, and the statement does \
+             not carry them: this rail does not materialize the zero-fill arm yet \
+             (`research/docs/23` §121, W2-A), and the arm is executed by the Vulkan rail",
+        )
+        .with_field("declared_bytes", FieldValue::Unsigned(*length))),
         // The multi-window guest source (`research/docs/23` §74, E-TX6) is
         // refused by name on this rail for the reason every unflipped arm is:
         // the arm's reading is the gather the Vulkan rail performs out of the
@@ -3114,6 +3132,10 @@ fn storage_mode_name(source: &BufferSource) -> &'static str {
         // The guest-runs arm this rail refuses by name
         // (`research/docs/23` §74, E-TX6).
         BufferSource::GuestRuns(_) => "guest_runs",
+        // The statement-economy zero-fill declaration (`research/docs/23`
+        // §121, W2-A), which this rail refuses by the same name the refusal's
+        // own `storage_mode` field spells.
+        BufferSource::ZeroFill { .. } => "zero_fill_declaration",
     }
 }
 
@@ -13338,6 +13360,41 @@ mod tests {
         assert_eq!(
             error.fields.get("storage_mode"),
             Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+    }
+
+    /// The statement-economy zero-fill declaration (`BufferSource::ZeroFill`,
+    /// W2-A) is refused **by name** on this rail.
+    ///
+    /// The arm's reading is the provider's own materialization of `length` zero
+    /// bytes at the view's window; this rail has not flipped it, so it states
+    /// the boundary instead of inventing the bytes. The refusal keeps the role's
+    /// own slug — a capture still reads which input could not be read — and
+    /// names the arm in `storage_mode`, beside the length the declaration
+    /// stands for.
+    #[test]
+    fn a_zero_fill_declaration_is_refused_by_name_on_this_rail() {
+        let vertex_bytes = quad_vertex_bytes();
+        let declared = u64::try_from(vertex_bytes.len()).expect("stream length");
+        let mut pass = quad_pass();
+        pass.vertex_buffers[0].source = BufferSource::zero_fill(declared);
+        let error = plan(&quad_request(&pass, &quad_pipeline()), 0, 0)
+            .expect_err("the arm is the Vulkan rail's to materialize");
+        eprintln!("zero fill: {error:?}");
+        assert_eq!(error.slug, "render_vertex_buffer_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("zero_fill_declaration".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("declared_bytes"),
+            Some(&FieldValue::Unsigned(declared))
+        );
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(QUAD_VERTEX_VIEW.get()))
         );
     }
 

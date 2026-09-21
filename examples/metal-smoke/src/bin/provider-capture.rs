@@ -448,6 +448,11 @@ fn storage_mode_name(kind: BufferSourceKind) -> &'static str {
         BufferSourceKind::StagedLease => "staged_lease",
         BufferSourceKind::BorrowedNoCopy => "borrowed_no_copy",
         BufferSourceKind::GuestRuns => "guest_runs",
+        // The statement-economy zero-fill declaration (W2-A). Like the
+        // guest-runs arm it has no suite case yet — `buffer_storage_mode`
+        // refuses the name before any walk — so this arm only has to be total;
+        // the arm's own rails are the e2e's and the R fork's.
+        BufferSourceKind::ZeroFill => "zero_fill",
     }
 }
 
@@ -645,6 +650,17 @@ fn case_sources(
             BufferSourceKind::GuestRuns => {
                 return Err(format!(
                     "case {}: the guest-runs arm has no capture case yet",
+                    case.id
+                )
+                .into())
+            }
+            // The same refusal for the statement-economy zero-fill declaration
+            // (`BufferSourceKind::ZeroFill`, W2-A): the parser refuses the name
+            // first, so a suite cannot reach this walk, and a capture would have
+            // no comparator oracle for it.
+            BufferSourceKind::ZeroFill => {
+                return Err(format!(
+                    "case {}: the zero-fill declaration arm has no capture case yet",
                     case.id
                 )
                 .into())
@@ -7836,6 +7852,16 @@ fn resolved_stage_buffers(
             // (`stage_buffer_storage_mode`), exactly as the compute walk does.
             BufferSourceKind::GuestRuns => {
                 return Err(format!("{where_}: the guest-runs arm has no capture case yet").into())
+            }
+            // The same for the statement-economy zero-fill declaration
+            // (`BufferSourceKind::ZeroFill`, W2-A): the parser refuses the
+            // spelling before this walk, so a suite cannot reach the arm, and a
+            // capture would have no comparator oracle for it.
+            BufferSourceKind::ZeroFill => {
+                return Err(format!(
+                    "{where_}: the zero-fill declaration arm has no capture case yet"
+                )
+                .into())
             }
         };
         slots.push(ResolvedStageBuffer {

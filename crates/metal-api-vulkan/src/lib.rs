@@ -50,6 +50,7 @@ mod render_texture_pool;
 mod serial_resources_borrow;
 mod staging_borrow;
 mod submit_binding_borrow;
+mod zero_fill_arm;
 
 pub use compute_buffer_pool::ComputeBufferPoolCounts;
 pub use compute_pipeline_reuse::ComputePipelineReuseCounts;

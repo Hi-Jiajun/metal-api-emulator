@@ -571,15 +571,72 @@ pub enum BufferSource {
     /// what keeps the arm honest: the bytes the pass begins from are the bytes
     /// the owner holds when the pass runs.
     GuestRuns(Vec<GuestRun>),
+    /// The declaration's bytes are **`length` zero bytes**, and the statement
+    /// does not carry them (`research/docs/23` §121, statement economy W2-A).
+    ///
+    /// The arm exists because the render rail's two biggest declarations are
+    /// frames nothing in the submission reads as content: a storing
+    /// attachment's `Clear` / `Resident` arm and an in-flight production's own
+    /// declaration. Both used to travel as a `length`-byte
+    /// [`Self::OwnedBytes`] payload — 1.12 MB of a 1.86 MB statement, which is
+    /// what the statement's own section account measured — and both stand for
+    /// a content that is a pure function of the view's `length` alone.
+    /// Stating the function instead of the bytes keeps every device-visible
+    /// byte the same: the receiver materializes `length` zero bytes locally,
+    /// exactly the payload this arm replaced, at the same offset and into the
+    /// same allocation the view names.
+    ///
+    /// The arm states **one** content and no other. A payload that is not all
+    /// zero has no spelling here — a producer that means content carries it
+    /// ([`Self::OwnedBytes`]) or names an owner window
+    /// ([`Self::StagedLease`] / [`Self::BorrowedNoCopy`] / [`Self::GuestRuns`])
+    /// — and a producer that holds the bytes goes through the checked door
+    /// [`Self::zero_fill_of`], which refuses a nonzero payload by name instead
+    /// of declaring it as zeros.
+    ZeroFill {
+        /// How many zero bytes the declaration stands for. It MUST equal the
+        /// view's own `length` ([`BufferView::validate_shape`]).
+        length: u64,
+    },
 }
 
 impl BufferSource {
+    /// The zero-fill declaration of a view that is `length` bytes long
+    /// (`research/docs/23` §121, statement economy W2-A).
+    ///
+    /// The arm's `length` is checked against the view's own by
+    /// [`BufferView::validate_shape`], so this door only states the arm; the
+    /// one a producer that holds the payload takes is [`Self::zero_fill_of`].
+    pub const fn zero_fill(length: u64) -> Self {
+        Self::ZeroFill { length }
+    }
+
+    /// Declare `bytes` as a zero fill **without carrying them**: the checked
+    /// door for a producer that holds a payload rather than only its length.
+    ///
+    /// A payload that is not all zero is refused **by name**
+    /// ([`ContractError::NonZeroFillPayload`], the `zero_fill_payload_not_zero`
+    /// refusal) rather than declared as zeros: the receiver materializes this
+    /// arm's content itself, so the arm may never stand for bytes nobody
+    /// stated. An all-zero payload converts for free — the arm's `length` is
+    /// the payload's own — which is what makes the two encodings of "these
+    /// bytes are zero" interchangeable instead of one being a lossy shorthand
+    /// for the other.
+    pub fn zero_fill_of(bytes: &[u8]) -> Result<Self, ContractError> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| ContractError::ArithmeticOverflow("zero fill length"))?;
+        if bytes.iter().any(|byte| *byte != 0) {
+            return Err(ContractError::NonZeroFillPayload { bytes: length });
+        }
+        Ok(Self::ZeroFill { length })
+    }
+
     pub const fn lease_id(&self) -> Option<LeaseId> {
         match self {
             // A guest-runs source names several leases, so no single identity
             // answers here; the per-run checks are `validate_trace`'s
             // (`BufferSource::guest_runs`).
-            Self::OwnedBytes(_) | Self::GuestRuns(_) => None,
+            Self::OwnedBytes(_) | Self::GuestRuns(_) | Self::ZeroFill { .. } => None,
             Self::StagedLease(lease_id) | Self::BorrowedNoCopy(lease_id) => Some(*lease_id),
         }
     }
@@ -590,6 +647,7 @@ impl BufferSource {
             Self::StagedLease(_) => BufferSourceKind::StagedLease,
             Self::BorrowedNoCopy(_) => BufferSourceKind::BorrowedNoCopy,
             Self::GuestRuns(_) => BufferSourceKind::GuestRuns,
+            Self::ZeroFill { .. } => BufferSourceKind::ZeroFill,
         }
     }
 
@@ -598,7 +656,10 @@ impl BufferSource {
     pub fn guest_runs(&self) -> Option<&[GuestRun]> {
         match self {
             Self::GuestRuns(runs) => Some(runs),
-            Self::OwnedBytes(_) | Self::StagedLease(_) | Self::BorrowedNoCopy(_) => None,
+            Self::OwnedBytes(_)
+            | Self::StagedLease(_)
+            | Self::BorrowedNoCopy(_)
+            | Self::ZeroFill { .. } => None,
         }
     }
 }
@@ -642,6 +703,9 @@ pub enum BufferSourceKind {
     /// The runs [`BufferSource::GuestRuns`] carries (`research/docs/23` §74,
     /// E-TX6).
     GuestRuns,
+    /// The zero-fill declaration (`BufferSource::ZeroFill`, statement economy
+    /// W2-A): the one arm that states no bytes and no owner of any.
+    ZeroFill,
 }
 
 /// Texture formats admitted by the first texture increment
@@ -1585,6 +1649,20 @@ impl BufferView {
                     view: self.view_id,
                     expected: self.length,
                     actual,
+                });
+            }
+        }
+        // The zero-fill declaration (`BufferSource::ZeroFill`, statement
+        // economy W2-A) is the other arm whose stated length is checked against
+        // the view's own: the arm *is* the content, so a length that disagrees
+        // with the view is refused by name (`buffer_source_length_mismatch`)
+        // rather than truncated or padded into the view's range.
+        if let BufferSource::ZeroFill { length } = &self.source {
+            if *length != self.length {
+                return Err(ContractError::SourceLengthMismatch {
+                    view: self.view_id,
+                    expected: self.length,
+                    actual: *length,
                 });
             }
         }
@@ -10805,6 +10883,21 @@ fn admit_census(trace: &ComputeTrace, resources: &ResourceTableSnapshot) -> Cens
             TracePass::Compute(pass) => {
                 census.compute_passes += 1;
                 census.compute_views += pass.buffers.len() as u64;
+                // A compute pass's own views are where a render rail's
+                // *declaring* pass states an attachment (the statement
+                // economy's two producers do exactly that), so the zero-fill
+                // arm is charged here even though the bytes a compute pass
+                // otherwise carries are not: `owned_bytes_n` has been read
+                // without them since the tenth cut, and a new slot may not
+                // silently move an old reading. W2-A's own round is what found
+                // this: its slot read zero while the wire's section account
+                // priced the arm's declarations, because the walk never looked
+                // at the pass that states them.
+                for view in &pass.buffers {
+                    if let BufferSource::ZeroFill { length } = &view.source {
+                        census.zero_fill_bytes += *length;
+                    }
+                }
             }
             TracePass::Render(pass) => {
                 census.render_passes += 1;
@@ -10873,6 +10966,12 @@ fn note_render_sources(census: &mut Census, pass: &RenderPassDescriptor) {
 fn note_buffer_source(census: &mut Census, source: &BufferSource) {
     match source {
         BufferSource::OwnedBytes(bytes) => census.owned_bytes += bytes.len() as u64,
+        // The zero-fill arm states bytes without carrying them, so it is
+        // counted in its own slot: the two arms are read beside each other
+        // (declared bytes move from `owned_bytes_n` into `zero_fill_bytes_n`
+        // when a producer takes the arm) instead of being summed into a total
+        // that cannot say which encoding the walk met.
+        BufferSource::ZeroFill { length } => census.zero_fill_bytes += *length,
         BufferSource::GuestRuns(runs) => {
             census.guest_runs += runs.len() as u64;
             census.guest_run_bytes += runs.iter().map(|run| run.length).sum::<u64>();
@@ -12428,7 +12527,13 @@ impl ProviderCapabilities {
                     }
                 }
                 let storage_mode = match &buffer.source {
-                    BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
+                    // The zero-fill declaration is the owned-bytes mode: the
+                    // provider materializes the arm's content into its own
+                    // upload, so a device that runs the owned arm runs this one
+                    // (`BufferSource::ZeroFill`, statement economy W2-A).
+                    BufferSource::OwnedBytes(_) | BufferSource::ZeroFill { .. } => {
+                        StorageMode::OwnedBytes
+                    }
                     BufferSource::StagedLease(_) => StorageMode::StagedLease,
                     // A guest-runs source is read out of the owner's imported
                     // mappings by the provider (`research/docs/23` §74,
@@ -13296,7 +13401,12 @@ impl ProviderCapabilities {
             }
             for stage in &pass.stage_buffers {
                 let mode = match &stage.view.source {
-                    BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
+                    // The zero-fill declaration is the owned-bytes mode here
+                    // too: the stream's bytes are materialized by the provider
+                    // (`BufferSource::ZeroFill`, statement economy W2-A).
+                    BufferSource::OwnedBytes(_) | BufferSource::ZeroFill { .. } => {
+                        StorageMode::OwnedBytes
+                    }
                     BufferSource::StagedLease(_) => StorageMode::StagedLease,
                     // The guest-runs mapping is the compute arm's
                     // (`research/docs/23` §74, E-TX6): the runs are read out of
@@ -13669,6 +13779,13 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::SourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "buffer_source_length_mismatch")
         }
+        // The zero-fill arm's own refusal (statement economy W2-A): a producer
+        // asked the arm to stand for bytes that are not the zero fill it
+        // names, which is a caller-supplied shape rather than a capability.
+        E::NonZeroFillPayload { .. } => (
+            ProviderErrorClass::Args,
+            "zero_fill_payload_not_zero",
+        ),
         E::TextureSampleCountMismatch { .. }
         | E::TextureArrayLengthMismatch { .. }
         | E::TextureDimensionMismatch { .. } => {
@@ -15362,6 +15479,19 @@ pub enum ContractError {
         expected: u64,
         actual: u64,
     },
+    /// A producer handed [`BufferSource::zero_fill_of`] a payload that is not
+    /// all zero (statement economy W2-A, `research/docs/23` §121).
+    ///
+    /// The zero-fill arm's content is a function of its `length` alone, and
+    /// the receiver is the one that materializes it, so a payload with any
+    /// nonzero byte is refused **by name** rather than declared as zeros: the
+    /// refusal is the arm's own statement that it is not a way to state
+    /// content, and it is the only construction point a payload can be
+    /// checked at.
+    NonZeroFillPayload {
+        /// How many bytes the refused payload carried.
+        bytes: u64,
+    },
     TextureSampleCountMismatch {
         texture_type: TextureType,
         sample_count: u64,
@@ -16443,6 +16573,10 @@ impl fmt::Display for ContractError {
                 formatter,
                 "view {:?} source length {actual} does not match declared length {expected}",
                 view
+            ),
+            Self::NonZeroFillPayload { bytes } => write!(
+                formatter,
+                "a zero-fill declaration cannot stand for {bytes} bytes that are not all zero"
             ),
             Self::TextureSampleCountMismatch {
                 texture_type,
@@ -17527,6 +17661,139 @@ mod tests {
             access: TextureAccess::Sampled,
             source: TextureSource::OwnedBytes(case.bytes),
         }
+    }
+
+    /// One buffer view of `length` bytes carrying `source`, as the contract's
+    /// own shape rules see it.
+    fn sourced_buffer_view(source: BufferSource, length: u64) -> BufferView {
+        BufferView {
+            view_id: ViewId::new(1),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(1),
+            offset: 0,
+            length,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source,
+        }
+    }
+
+    /// The zero-fill declaration states the view's own length and nothing else
+    /// (statement economy W2-A): the arm's kind, its lease face and the length
+    /// rule that stands in for the payload an `OwnedBytes` arm would carry.
+    #[test]
+    fn a_zero_fill_declaration_states_the_views_length_and_no_bytes() {
+        let view = sourced_buffer_view(BufferSource::zero_fill(16), 16);
+        assert_eq!(
+            view.validate_shape()
+                .expect("the arm states the view's own length"),
+            16
+        );
+        assert_eq!(view.source.kind(), BufferSourceKind::ZeroFill);
+        assert_eq!(view.source.lease_id(), None);
+        assert_eq!(view.source.guest_runs(), None);
+        // The same view stated as the payload the arm stands for validates
+        // identically, which is what makes the two encodings interchangeable
+        // rather than one of them a looser shape.
+        let owned = sourced_buffer_view(BufferSource::OwnedBytes(vec![0; 16]), 16);
+        assert_eq!(owned.validate_shape().expect("the payload is the view"), 16);
+    }
+
+    /// A zero-fill declaration whose length disagrees with its view is refused
+    /// by name, and the name is the same one the owned arm's payload takes:
+    /// the contract refuses the disagreement instead of truncating or padding.
+    #[test]
+    fn a_zero_fill_declaration_that_disagrees_with_its_view_is_refused_by_name() {
+        let short = sourced_buffer_view(BufferSource::zero_fill(12), 16);
+        assert!(matches!(
+            short.validate_shape(),
+            Err(ContractError::SourceLengthMismatch {
+                expected: 16,
+                actual: 12,
+                ..
+            })
+        ));
+        let long = sourced_buffer_view(BufferSource::zero_fill(20), 16);
+        assert!(matches!(
+            long.validate_shape(),
+            Err(ContractError::SourceLengthMismatch {
+                expected: 16,
+                actual: 20,
+                ..
+            })
+        ));
+        let refusal = contract_error_refusal(ContractError::SourceLengthMismatch {
+            view: ViewId::new(1),
+            expected: 16,
+            actual: 12,
+        });
+        assert_eq!(refusal.slug, "buffer_source_length_mismatch");
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+    }
+
+    /// The census prices a **compute declaring pass's** zero-fill declarations
+    /// (statement economy W2-A).
+    ///
+    /// The render rail's declaring pass *is* a compute pass, and its views are
+    /// the attachment declarations: a census that never looked at them answered
+    /// zero for the arm's own slot while the wire's section account priced the
+    /// declarations travelling, which is what W2-A's own round found.
+    #[test]
+    fn the_census_prices_the_zero_fill_a_compute_declaring_pass_states() {
+        // The render rail's declaring pass is a *compute* pass whose views are
+        // the attachment declarations: W2-A's slot has to see them, or a round
+        // reads zero while the wire carries the drop (which is what the round
+        // did before the walk looked here).
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(7),
+            operation_id: OperationId::new(3),
+            pipelines: Vec::new(),
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![TracePass::Compute(ComputePass {
+                pipeline: PipelineId::new(1),
+                buffers: vec![
+                    sourced_buffer_view(BufferSource::zero_fill(4096), 4096),
+                    sourced_buffer_view(BufferSource::zero_fill(16), 16),
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            })],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let census = admit_census(&trace, &ResourceTableSnapshot::new());
+        assert_eq!(
+            census.zero_fill_bytes, 4112,
+            "both declarations' lengths, and nothing else"
+        );
+        assert_eq!(
+            census.owned_bytes, 0,
+            "and the old slot keeps reading what it always read: a compute \
+             declaring pass's payload bytes are not part of it"
+        );
+    }
+
+    /// The checked producer door: an all-zero payload becomes the arm, and a
+    /// payload with any nonzero byte is refused by name rather than declared as
+    /// zeros (statement economy W2-A).
+    #[test]
+    fn a_payload_that_is_not_all_zero_has_no_zero_fill_spelling() {
+        assert_eq!(
+            BufferSource::zero_fill_of(&[0, 0, 0, 0]).expect("an all-zero payload is the arm"),
+            BufferSource::ZeroFill { length: 4 }
+        );
+        let refused = BufferSource::zero_fill_of(&[0, 7, 0, 0])
+            .expect_err("a payload with a nonzero byte is not the arm");
+        assert_eq!(refused, ContractError::NonZeroFillPayload { bytes: 4 });
+        let refusal = contract_error_refusal(refused);
+        assert_eq!(refusal.slug, "zero_fill_payload_not_zero");
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
     }
 
     #[test]
