@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::admit_profile::Census;
 use crate::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
 
 /// Current version of the pure-value provider trace schema.
@@ -10674,6 +10675,65 @@ pub trait PipelineProvider: ComputeProvider {
 }
 
 /// Capabilities are captured once for a provider device context.
+/// The shape census one admission walk's window counts (`crate::admit_profile`).
+///
+/// Read off the trace and the resource snapshot the walk is about to walk, so
+/// every number is an *input*: how many passes of each kind the trace states,
+/// how many draws its render entries carry, and how many declarations each gate
+/// below has to read. They are what turns a bar reading into a finding — the
+/// same microseconds are a different fix when they are 71.8 small traces per
+/// frame rather than 12 large ones, and a pose whose traces carry declarations
+/// the other pose's do not is visible here before the gates are timed at all.
+///
+/// Nothing here is derived from the walk's answer, so the census can be taken
+/// before the gates run and cannot disagree with them about which trace was
+/// admitted.
+fn admit_census(trace: &ComputeTrace, resources: &ResourceTableSnapshot) -> Census {
+    let mut census = Census {
+        passes: trace.passes.len() as u64,
+        pipelines: trace.pipelines.len() as u64,
+        allocations: resources.allocations.len() as u64,
+        leases: resources.leases.len() as u64,
+        ..Census::default()
+    };
+    for pass in &trace.passes {
+        match pass {
+            TracePass::Compute(pass) => {
+                census.compute_passes += 1;
+                census.compute_views += pass.buffers.len() as u64;
+            }
+            TracePass::Render(pass) => {
+                census.render_passes += 1;
+                census.draws += 1;
+                note_render_shape(&mut census, pass);
+            }
+            TracePass::RenderDraws(list) => {
+                // The list is one pass carrying several draws (B-2): the pass
+                // state is the head's, and each tail draw brings its own vertex
+                // streams up with it. Counting the head once and the tail's
+                // streams per draw is the same convention `materialize` uses.
+                census.render_passes += 1;
+                census.draws += list.draw_count() as u64;
+                note_render_shape(&mut census, &list.head);
+                for draw in &list.tail {
+                    census.vertex_buffers += draw.vertex_buffers.len() as u64;
+                }
+            }
+            TracePass::Landing(_) => census.landings += 1,
+        }
+    }
+    census
+}
+
+/// The declaration counts one render pass states, added to a census.
+fn note_render_shape(census: &mut Census, pass: &RenderPassDescriptor) {
+    census.stage_buffers += pass.stage_buffers.len() as u64;
+    census.textures += pass.textures.len() as u64;
+    census.samplers += pass.samplers.len() as u64;
+    census.color_attachments += pass.color_attachments.len() as u64;
+    census.vertex_buffers += pass.vertex_buffers.len() as u64;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCapabilities {
     /// Provider policy, not a physical-device limit. Snapshot adapters may
@@ -11829,7 +11889,7 @@ impl ProviderCapabilities {
         trace: ComputeTrace,
         resources: ResourceTableSnapshot,
     ) -> Result<ValidatedComputeTrace, ProviderError> {
-        self.admit(&trace, &resources)?;
+        self.admit_on_route(crate::admit_profile::SITE_VALIDATE, &trace, &resources)?;
         Ok(ValidatedComputeTrace { trace, resources })
     }
 
@@ -11846,19 +11906,79 @@ impl ProviderCapabilities {
         trace: &ComputeTrace,
         resources: &ResourceTableSnapshot,
     ) -> Result<(), ProviderError> {
-        trace.validate().map_err(contract_error_refusal)?;
+        self.admit_on_route(crate::admit_profile::SITE_DIRECT, trace, resources)
+    }
+
+    /// The receiving owner's re-check of a trace a caller already froze.
+    ///
+    /// [`Self::admit`] with the profile's `submit` route, for the one caller
+    /// that is not a first admission: `metal-api-vulkan`'s `submit`, which
+    /// re-runs the walk because a `ValidatedComputeTrace` may have been
+    /// admitted against **another** snapshot. The route is named because the
+    /// two calls cost the same and only one of them is a contract the caller
+    /// needs the answer of — `METAL_API_CORE_ADMIT_PROFILE` prints them apart
+    /// (`crate::admit_profile`).
+    pub fn admit_for_submission(
+        &self,
+        trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<(), ProviderError> {
+        self.admit_on_route(crate::admit_profile::SITE_SUBMIT, trace, resources)
+    }
+
+    /// One admission walk on a named route, with the default-off profile's
+    /// enclosing bar around it.
+    fn admit_on_route(
+        &self,
+        site: usize,
+        trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<(), ProviderError> {
+        let mut window = crate::admit_profile::Window::enter(site);
+        if let Some(window) = window.as_mut() {
+            window.note_census(admit_census(trace, resources));
+        }
+        let result = self.admit_walk(site, trace, resources);
+        if result.is_err() {
+            if let Some(window) = window.as_mut() {
+                window.note_refused();
+            }
+        }
+        result
+    }
+
+    /// The walk itself: every gate, in the order the contract runs them.
+    fn admit_walk(
+        &self,
+        site: usize,
+        trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<(), ProviderError> {
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::TraceValidate);
+            trace.validate().map_err(contract_error_refusal)?;
+        }
 
         // Render admission is the first capability gate and precedes every
         // reservation the caller performs after a successful `admit`: a
         // provider that cannot render refuses the whole trace here, and a
         // compute-only trace never enters the walk (`docs/23` §4.2).
-        self.admit_render_passes(trace)?;
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::RenderPasses);
+            self.admit_render_passes(trace)?;
+        }
 
         // Kept-frame landing admission sits beside the render walk rather than
         // inside it (`research/docs/23` §115 之后的增量，E-TX14/R4b): a trace
         // whose only render-group entry is a landing carries no render pass, so
         // the walk above would answer `Ok` without ever reading the entry.
-        self.admit_kept_frame_landings(trace)?;
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Landings);
+            self.admit_kept_frame_landings(trace)?;
+        }
 
         // Render texture admission is the second render gate and sits in the
         // same walk (`research/docs/23` §3.3, v70): a pass that binds a
@@ -11866,7 +11986,13 @@ impl ProviderCapabilities {
         // of being executed with a cleared sampling result the trace did not
         // ask for. The pass's own access/shape rules already ran in
         // `trace.validate()` above.
-        self.admit_render_texture_inputs(trace)?;
+        {
+            let _bar = crate::admit_profile::Bar::enter(
+                site,
+                crate::admit_profile::Region::RenderTextures,
+            );
+            self.admit_render_texture_inputs(trace)?;
+        }
 
         // Runtime sampler admission is the state gate beside the texture walk
         // (2026-09-19, census v43's `texture_state` axis): a pass whose runtime
@@ -11874,7 +12000,11 @@ impl ProviderCapabilities {
         // declares that it executes the space, so a rail never reads a guest's
         // texel coordinates as fractions of the extent. The pass's own
         // canonical-order and index rules already ran in `trace.validate()`.
-        self.admit_render_pixel_samplers(trace)?;
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::PixelSamplers);
+            self.admit_render_pixel_samplers(trace)?;
+        }
 
         // Stage buffer admission is the third render gate and sits in the same
         // walk (`research/docs/23` §3.3, v83): a pass that binds bytes its
@@ -11884,7 +12014,11 @@ impl ProviderCapabilities {
         // pass's own canonical-order and read-only rules already ran in
         // `trace.validate()`, and the pipeline/pass pair rules ran in
         // `admit_render_passes` above.
-        self.admit_render_stage_buffer_inputs(trace)?;
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::StageBuffers);
+            self.admit_render_stage_buffer_inputs(trace)?;
+        }
 
         // Compute texture admission is the compute-side sibling of the render
         // sampler gate (`research/docs/26` §21.3): a compute pass that binds a
@@ -11892,14 +12026,24 @@ impl ProviderCapabilities {
         // of being executed against descriptor bytes nobody declared. The
         // pass's own pair rules (declared, bound, agreeing access/type/format,
         // stated reach) already ran in `trace.validate()` above.
-        self.admit_compute_texture_inputs(trace)?;
+        {
+            let _bar = crate::admit_profile::Bar::enter(
+                site,
+                crate::admit_profile::Region::ComputeTextures,
+            );
+            self.admit_compute_texture_inputs(trace)?;
+        }
 
         // Present admission is the next gate and sits just as early
         // (`research/docs/24` §4.2): Step 2 publishes the contract and the
         // refusal, Step 3 owns execution, so a snapshot that cannot present
         // refuses a present-bearing trace before any resource action instead of
         // running its render half and dropping the present.
-        self.admit_present_actions(trace)?;
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Present);
+            self.admit_present_actions(trace)?;
+        }
 
         // Heap and indirect-command admission are the third and fourth gates
         // and sit just as early (`research/docs/25-heaps与ICB设计.md` §4.5):
@@ -11909,36 +12053,53 @@ impl ProviderCapabilities {
         // questions are answered by Step 3/4 execution, so the neutral gate
         // leaves them open here and refuses only the capability and structural
         // halves.
-        self.admit_heap_payload(trace)?;
-        self.admit_indirect_payload(trace)?;
-
-        if trace.passes.len() > self.max_passes as usize {
-            return Err(capability_error("pass_count_limit")
-                .with_field("requested", FieldValue::Unsigned(trace.passes.len() as u64))
-                .with_field("maximum", FieldValue::Unsigned(self.max_passes as u64)));
+        {
+            let _bar = crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Heap);
+            self.admit_heap_payload(trace)?;
+        }
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Indirect);
+            self.admit_indirect_payload(trace)?;
         }
 
-        match trace.encoder_dispatch_type {
-            DispatchType::Serial if !self.supports_serial => {
-                return Err(capability_error("dispatch_type_unsupported"));
+        {
+            let _bar = crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Limits);
+            if trace.passes.len() > self.max_passes as usize {
+                return Err(capability_error("pass_count_limit")
+                    .with_field("requested", FieldValue::Unsigned(trace.passes.len() as u64))
+                    .with_field("maximum", FieldValue::Unsigned(self.max_passes as u64)));
             }
-            DispatchType::Concurrent if !self.supports_concurrent => {
-                return Err(capability_error("dispatch_type_unsupported"));
+
+            match trace.encoder_dispatch_type {
+                DispatchType::Serial if !self.supports_serial => {
+                    return Err(capability_error("dispatch_type_unsupported"));
+                }
+                DispatchType::Concurrent if !self.supports_concurrent => {
+                    return Err(capability_error("dispatch_type_unsupported"));
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        match trace.completion_policy {
-            CompletionPolicy::HostReadback if !self.host_readback => {
-                return Err(capability_error("host_readback_unsupported"));
+            match trace.completion_policy {
+                CompletionPolicy::HostReadback if !self.host_readback => {
+                    return Err(capability_error("host_readback_unsupported"));
+                }
+                CompletionPolicy::SubmitOnly if !self.submit_only => {
+                    return Err(capability_error("submit_only_unsupported"));
+                }
+                _ => {}
             }
-            CompletionPolicy::SubmitOnly if !self.submit_only => {
-                return Err(capability_error("submit_only_unsupported"));
-            }
-            _ => {}
         }
 
         let mut allocations = BTreeMap::<AllocationId, BTreeMap<ViewId, BufferRange>>::new();
         for pass in trace.compute_passes() {
+            // The compute-pass half is charged **per pass body**: a render-only
+            // trace — this rail's production shape, and the shape the sixth
+            // profile round measured — enters none, so the bar's own zero is
+            // the reading that says the walk has nothing to do here
+            // (`crate::admit_profile`).
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::ComputePasses);
             let contract = &trace
                 .pipeline(pass.pipeline)
                 .map_err(contract_error_refusal)?
@@ -12140,12 +12301,20 @@ impl ProviderCapabilities {
         // Capability admission intentionally precedes backing/lease admission:
         // a malformed or unsupported dispatch must not be masked by a stale
         // resource handle, and the order matches the provider contract gates.
-        trace
-            .validate_serial_buffer_reuse()
-            .map_err(contract_error_refusal)?;
-        resources
-            .validate_trace(trace)
-            .map_err(contract_error_refusal)?;
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::SerialReuse);
+            trace
+                .validate_serial_buffer_reuse()
+                .map_err(contract_error_refusal)?;
+        }
+        {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Resources);
+            resources
+                .validate_trace(trace)
+                .map_err(contract_error_refusal)?;
+        }
         Ok(())
     }
 

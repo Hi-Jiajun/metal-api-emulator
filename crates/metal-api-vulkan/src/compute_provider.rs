@@ -4266,17 +4266,33 @@ impl ComputeProvider for VulkanComputeProvider {
         let _total = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Total);
         let trace = admitted.trace();
         let _admit = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::Admit);
-        check_epoch(self.device_epoch(), trace.device_epoch)?;
+        // The admission bar's three regions, added by the tenth cut: what the
+        // owner re-checks *is* one call to the neutral walk, and naming the
+        // epoch check and the indirect resolve beside it is what makes
+        // `admit_us` read as `epoch + capabilities + indirect` with nothing
+        // left in the seam. The middle region's own interior is priced by
+        // `metal_api_core::admit_profile` on the same boot.
+        {
+            let _bar = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::AdmitEpoch);
+            check_epoch(self.device_epoch(), trace.device_epoch)?;
+        }
         // A ValidatedComputeTrace may have been admitted against another
         // capability snapshot. Only the receiving owner can authorize execution.
-        self.capabilities
-            .lock()
-            .map_err(|_| registry_poisoned())?
-            .admit(trace, admitted.resources())?;
+        {
+            let _bar =
+                crate::phase_profile::Bar::enter(crate::phase_profile::Phase::AdmitCapabilities);
+            self.capabilities
+                .lock()
+                .map_err(|_| registry_poisoned())?
+                .admit_for_submission(trace, admitted.resources())?;
+        }
         // The indirect dispatch the compute rail replays, resolved and shape
         // checked before any compute resource exists. The render rail owns the
         // draw half; `None` here means the compute sequence dispatches directly.
-        let indirect_dispatch = self.indirect_dispatch_threadgroups(trace)?;
+        let indirect_dispatch = {
+            let _bar = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::AdmitIndirect);
+            self.indirect_dispatch_threadgroups(trace)?
+        };
         drop(_admit);
         // What will run and onto what: the render plan, the registered
         // pipelines, the serial resource pool, the heap placement and the
