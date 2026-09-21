@@ -740,9 +740,36 @@ pub(crate) enum Phase {
     /// submission seam's bars only because appending leaves every earlier slot
     /// where it was — the field it prints is read beside the bar it divides.
     StagingWindow,
+    /// Inside `admit`: the owner's epoch check, before any capability answer is
+    /// read.
+    ///
+    /// The three `Admit*` slots divide [`Phase::Admit`], which the tenth cut
+    /// split because the sixth profile round made it the pose's largest
+    /// *unnamed* CPU region on this rail: on `sp24b` (production pose) it read
+    /// **171.6 µs/pass** against the census pose's 22.5, and nothing said whether
+    /// that was the epoch compare, the neutral walk or the indirect resolve.
+    ///
+    /// `admit` stays their enclosing bar, and the middle one is itself priced
+    /// from the inside by `metal_api_core::admit_profile` (the same boot prints
+    /// an `ADMIT` line per route), so the reading is
+    /// `admit_us ≈ admit_epoch + admit_capabilities + admit_indirect` with the
+    /// remainder the brackets' own seam.
+    AdmitEpoch,
+    /// Inside `admit`: the neutral capability walk,
+    /// `ProviderCapabilities::admit_for_submission`.
+    ///
+    /// This is the *second* run of the same walk for one submission: the caller
+    /// already had the trace admitted by `validate_trace` before it reserved
+    /// anything, and the owner re-runs it because a `ValidatedComputeTrace` may
+    /// have been admitted against another snapshot. A cut that proves the two
+    /// snapshots are the same one moves this bar and leaves its siblings.
+    AdmitCapabilities,
+    /// Inside `admit`: the indirect dispatch the compute rail replays, resolved
+    /// and shape checked (`indirect_dispatch_threadgroups`).
+    AdmitIndirect,
 }
 
-const PHASE_COUNT: usize = Phase::StagingWindow as usize + 1;
+const PHASE_COUNT: usize = Phase::AdmitIndirect as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -843,6 +870,9 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "submit_validate_check",
     "submit_validate_release",
     "staging_window",
+    "admit_epoch",
+    "admit_capabilities",
+    "admit_indirect",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -1048,6 +1078,23 @@ const SUBMIT_VALIDATE_SLOTS: [usize; 3] = [
     Phase::SubmitValidateDerive as usize,
     Phase::SubmitValidateCheck as usize,
     Phase::SubmitValidateRelease as usize,
+];
+
+/// The nested split of `admit`: the owner's epoch check, the neutral capability
+/// walk and the indirect resolve, in the order the call runs them. `admit` stays
+/// their enclosing bar, so `sum(ADMIT_SLOTS) <= admit_us`; the printed
+/// `admit_named_us` is this set's sum, and the difference is the brackets' own
+/// seam (the `_admit` guard, the capability lock's own acquisition and the two
+/// `drop`s).
+///
+/// The middle member is the second run of the walk the caller already had the
+/// trace admitted by, and `metal_api_core::admit_profile` divides it further on
+/// the same boot — so `admit_capabilities_us` here and the `ADMIT route=submit`
+/// line there measure the same call from its two ends.
+const ADMIT_SLOTS: [usize; 3] = [
+    Phase::AdmitEpoch as usize,
+    Phase::AdmitCapabilities as usize,
+    Phase::AdmitIndirect as usize,
 ];
 
 /// The teardown groups whose *call count* is printed beside their
@@ -1855,6 +1902,7 @@ impl Local {
         let mut submit_seam_ns = 0u64;
         let mut submit_release_named_ns = 0u64;
         let mut submit_validate_named_ns = 0u64;
+        let mut admit_named_ns = 0u64;
         for (slot, name) in PHASE_NAMES.iter().enumerate() {
             let ns = std::mem::take(&mut self.ns[slot]);
             let calls = std::mem::replace(&mut self.calls[slot], 0);
@@ -1893,6 +1941,9 @@ impl Local {
             }
             if SUBMIT_VALIDATE_SLOTS.contains(&slot) {
                 submit_validate_named_ns += ns;
+            }
+            if ADMIT_SLOTS.contains(&slot) {
+                admit_named_ns += ns;
             }
             if WAIT_SLOTS.contains(&slot) {
                 let idle_calls = std::mem::take(&mut self.wait_idle_calls[slot]);
@@ -2006,6 +2057,7 @@ impl Local {
         let submit_seam_us = micros(submit_seam_ns);
         let submit_release_named_us = micros(submit_release_named_ns);
         let submit_validate_named_us = micros(submit_validate_named_ns);
+        let admit_named_us = micros(admit_named_ns);
         let mut wait_fields = String::with_capacity(200);
         for (object_slot, object_name) in WAIT_OBJECT_NAMES.iter().enumerate() {
             wait_fields.push_str(&format!(
@@ -2032,7 +2084,8 @@ impl Local {
              rb_named_us={rb_named_us:.3} submit_td_named_us={submit_td_named_us:.3} \
              submit_seam_us={submit_seam_us:.3} \
              submit_release_named_us={submit_release_named_us:.3} \
-             submit_validate_named_us={submit_validate_named_us:.3}{build_fields}{wait_fields} \
+             submit_validate_named_us={submit_validate_named_us:.3} \
+             admit_named_us={admit_named_us:.3}{build_fields}{wait_fields} \
              readback_rect_n={} readback_rect_bytes={} readback_rect_extent_bytes={} \
              readback_full_n={} readback_full_bytes={} readback_switch_n={} \
              readback_shape_n={} readback_bounds_n={} readback_whole_n={} \
@@ -2914,6 +2967,51 @@ mod tests {
             assert!(!SUBMIT_RELEASE_SLOTS.contains(&slot));
             assert!(!SUBMIT_VALIDATE_SLOTS.contains(&slot));
         }
+    }
+
+    /// The tenth cut's three regions divide `admit` and nothing else: they are
+    /// nested inside a bar that is itself a member of neither the seam set nor
+    /// the disjoint sum, so `admit_named_us` is a share of `admit_us` rather
+    /// than a fourth bar a reader adds to the submission's fields.
+    #[test]
+    fn the_tenth_cut_stays_inside_the_bar_it_divides() {
+        assert_eq!(ADMIT_SLOTS.len(), 3);
+        for slot in ADMIT_SLOTS {
+            assert_ne!(slot, Phase::Admit as usize);
+            assert!(
+                !SUBMIT_SEAM_SLOTS.contains(&slot),
+                "a child of admit is not a seam bar of its own"
+            );
+            assert!(!SUBMIT_RELEASE_SLOTS.contains(&slot));
+            assert!(!SUBMIT_VALIDATE_SLOTS.contains(&slot));
+            assert!(!COUNTED_SLOTS.contains(&slot));
+            assert!(!RESOURCE_BUILD_SLOTS.contains(&slot));
+            assert!(!SUBMIT_TEARDOWN_SLOTS.contains(&slot));
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+            assert!(!STAGING_WINDOW_SLOTS.contains(&slot));
+        }
+        assert_eq!(PHASE_NAMES[Phase::AdmitEpoch as usize], "admit_epoch");
+        assert_eq!(
+            PHASE_NAMES[Phase::AdmitCapabilities as usize],
+            "admit_capabilities"
+        );
+        assert_eq!(PHASE_NAMES[Phase::AdmitIndirect as usize], "admit_indirect");
+        // The three are consecutive slots appended after the eighth cut's, so
+        // every earlier slot kept the index it had (the table's readers compare
+        // rounds by slot, not by name).
+        assert_eq!(
+            Phase::AdmitEpoch as usize,
+            Phase::StagingWindow as usize + 1
+        );
+        assert_eq!(
+            Phase::AdmitCapabilities as usize,
+            Phase::AdmitEpoch as usize + 1
+        );
+        assert_eq!(
+            Phase::AdmitIndirect as usize,
+            Phase::AdmitCapabilities as usize + 1
+        );
     }
 
     /// A window drains on the `total` bar that fills it, and a drained window

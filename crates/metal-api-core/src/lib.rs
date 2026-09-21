@@ -14,6 +14,8 @@ use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+mod admit_profile;
+mod admit_shared_draws;
 pub mod completion;
 pub mod provider;
 pub mod provider_api;
