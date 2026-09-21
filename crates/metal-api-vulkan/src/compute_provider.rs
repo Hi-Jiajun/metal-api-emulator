@@ -4854,11 +4854,20 @@ impl ComputeProvider for VulkanComputeProvider {
                 // and is the half no cut can remove: it is the contract check
                 // this block exists for.
                 //
+                // The eleventh cut adds the hand-over
+                // (`crate::submit_pool_once`): the table the *plan* derived is
+                // still alive here — the executor, the render rail and the
+                // pool's own geometry already read it — so with the switch on
+                // the walk below reads that table and the second derivation
+                // does not happen at all. Off, this block derives its own
+                // table exactly as the seventh cut left it.
+                //
                 // The owning arm's table is declared first, as it is in `plan`:
                 // the entries below borrow its views, so it has to outlive
                 // them.
                 let borrow_resources = crate::serial_resources_borrow::enabled_from_env();
-                let derived_owned_pool: Option<Vec<BufferView>> = if borrow_resources {
+                let pool_once = crate::submit_pool_once::enabled_from_env();
+                let derived_owned_pool: Option<Vec<BufferView>> = if borrow_resources || pool_once {
                     None
                 } else {
                     let _derive = crate::phase_profile::Bar::enter(
@@ -4869,19 +4878,41 @@ impl ComputeProvider for VulkanComputeProvider {
                             .with_detail(error.to_string())
                     })?)
                 };
-                let derived_resources: Vec<SerialResource<'_>> = match &derived_owned_pool {
-                    Some(views) => views.iter().map(SerialResource::from_derived).collect(),
-                    None => {
+                let derived_owned_table: Option<Vec<SerialResource<'_>>> = derived_owned_pool
+                    .as_ref()
+                    .map(|views| views.iter().map(SerialResource::from_derived).collect());
+                // The borrowing arm's own table, unless this cut hands the
+                // plan's over. `Some` here is the pre-cut path's second
+                // derivation, and with it the block's own bytes.
+                let derived_borrowed_table: Option<Vec<SerialResource<'_>>> =
+                    if derived_owned_pool.is_none() && !pool_once {
                         let _derive = crate::phase_profile::Bar::enter(
                             crate::phase_profile::Phase::SubmitValidateDerive,
                         );
-                        trace.serial_resources_ref().map_err(|error| {
+                        Some(trace.serial_resources_ref().map_err(|error| {
                             output_error(token, "writeback_contract_invalid")
                                 .with_detail(error.to_string())
-                        })?
-                    }
+                        })?)
+                    } else {
+                        None
+                    };
+                // What the walk below reads: this block's own table when it
+                // derived one, and the plan's otherwise. The plan's is the same
+                // table by construction (the same pure call over the same
+                // borrowed trace), so the switch changes who derived it rather
+                // than what it holds.
+                let derived_resources: &[SerialResource<'_>] =
+                    match (&derived_owned_table, &derived_borrowed_table) {
+                        (Some(owned), _) => owned.as_slice(),
+                        (None, Some(borrowed)) => borrowed.as_slice(),
+                        (None, None) => pool.as_slice(),
+                    };
+                // One derivation, one reading: with the hand-over the block
+                // derived nothing, so it books nothing and the window's
+                // `pool_derivations_n` reads one per submission.
+                if derived_owned_table.is_some() || derived_borrowed_table.is_some() {
+                    note_pool_derivation(derived_resources, borrow_resources);
                 };
-                note_pool_derivation(&derived_resources, borrow_resources);
                 let derived_textures = {
                     let _derive = crate::phase_profile::Bar::enter(
                         crate::phase_profile::Phase::SubmitValidateDerive,
@@ -4895,7 +4926,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     crate::phase_profile::Phase::SubmitValidateCheck,
                 );
                 let validated = output
-                    .validate_with_pools(trace, &derived_resources, &derived_textures)
+                    .validate_with_pools(trace, derived_resources, &derived_textures)
                     .map_err(|error| {
                         output_error(token, "writeback_contract_invalid")
                             .with_detail(error.to_string())
@@ -4911,10 +4942,15 @@ impl ComputeProvider for VulkanComputeProvider {
                     // freed before the bar closes. Off it is the third copy's
                     // `free`; on it is a table of references
                     // (`crate::phase_profile::Phase::SubmitValidateRelease`).
+                    // With this cut's hand-over both tables are `None`, so the
+                    // bar reads the texture table's own free and the switch
+                    // off the two it had before: the reading moves with the
+                    // mechanism rather than with the block's shape.
                     let _release = crate::phase_profile::Bar::enter(
                         crate::phase_profile::Phase::SubmitValidateRelease,
                     );
-                    drop(derived_resources);
+                    drop(derived_owned_table);
+                    drop(derived_borrowed_table);
                     drop(derived_textures);
                     drop(derived_owned_pool);
                 }
@@ -5405,6 +5441,10 @@ fn note_pool_derivation(pool: &[SerialResource<'_>], borrowed: bool) {
     if !crate::phase_profile::counting() {
         return;
     }
+    // The derivation itself, counted before the bytes: a submission whose pool
+    // is empty still derives it, and the count is what the eleventh cut's two
+    // arms compare (`crate::submit_pool_once`).
+    crate::phase_profile::note_pool_derivation();
     let (views, bytes) = pooled_declared_bytes(pool);
     if borrowed {
         crate::phase_profile::note_resource_borrow(views, bytes);
