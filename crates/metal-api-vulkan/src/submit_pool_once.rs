@@ -49,10 +49,11 @@
 //!
 //! # The switch and its counters
 //!
-//! `METAL_API_VULKAN_SUBMIT_POOL_ONCE=1` (also `on`, `ON`, `true`, `yes`)
-//! turns the mechanism on; **off is the default** and every other value —
-//! including unset — derives the validation's own table, which is the pre-cut
-//! path and the control arm a round compares against.
+//! **Unset is on** (flipped 2026-09-22 once the round's two arms had read it:
+//! `pool_derivations_n` 2.000 → 1.000 on every submission, `views_n` 2.014 →
+//! 1.004 and the tail's top-5 % `total` 21 143 → 17 417 µs). The control words
+//! `0` / `off` / `false` / `no` derive the validation's own table again — the
+//! pre-cut path a round compares against.
 //!
 //! Two counters read the mechanism beside the bars it moves:
 //!
@@ -83,13 +84,17 @@ pub(crate) fn enabled_from_env() -> bool {
     })
 }
 
-/// The switch's own reading: **off unless the variable turns it on**
-/// (`1`/`on`/`true`/`yes`), which is this cut's default — the mechanism is
-/// landed dark and a round reads it in two arms before anything ships.
+/// The switch's own reading: **on unless the variable turns it off**
+/// (`0`/`off`/`false`/`no`), the tenth cut's flip after its round read it:
+/// `pool_derivations_n` 2.000 → 1.000 on every submission, `views_n` 2.014 →
+/// 1.004, `submit_validate_derive` 247.1 → 0.6 µs a submission (−99.8 %) and
+/// the tail's top-5 % `total` 21 143 → 17 417 µs (−17.6 %), with the three
+/// untouched lanes moving 1.5–8 % on a host that differs 7 % between arms.
+/// The control words restore the pre-cut path byte for byte.
 fn parse_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some("1" | "on" | "ON" | "true" | "yes")
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -97,12 +102,12 @@ fn parse_enabled(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    /// Off unless the variable turns it on: the pre-cut path is the default and
-    /// stays reachable as the control arm.
+    /// On unless a control word turns it off: the pre-cut path stays reachable
+    /// as the control arm.
     #[test]
-    fn the_switch_is_off_unless_the_variable_turns_it_on() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_a_control_word_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("false")));
