@@ -278,8 +278,55 @@
 //! completion bookkeeping of both the synchronous and the deferred arm, and
 //! `writebacks` covers the mapping and the contract validation of the merged
 //! result. Every field is still a sum of disjoint time.
+//!
+//! # One line per submission: `METAL_API_VULKAN_SUBMIT_SAMPLES`
+//!
+//! The window line above answers "what does a submission cost on average over
+//! `every()` of them". Two rounds were read wrong because of exactly that
+//! shape: a mean is dominated by whatever the boot's first seconds did once,
+//! and a distribution that is bimodal (a one-off translation beside a steady
+//! state) has no mean that describes either mode. This switch adds the missing
+//! instrument:
+//!
+//! * unset (the default) or any value other than a truthy one: off, and the
+//!   accounting entry points behave exactly as they did before this switch
+//!   existed — [`recording`] is [`enabled`] and nothing else changes.
+//! * `1` / `on` / `true` / `yes`: on. **Every** completed submission writes one
+//!   line to stderr, and `METAL_API_VULKAN_PHASE_PROFILE` is not needed: the
+//!   accounting entry points ask [`recording`] (either switch) while the window
+//!   line keeps asking [`enabled`] (that switch alone).
+//!
+//!   ```text
+//!   SUBMIT_SAMPLE lane=0 n=1 t_ms=0.000 total_us=... admit_us=... plan_us=...
+//!   pool_us=... resource_build_us=... record_us=... queue_submit_us=...
+//!   fence_wait_us=... read_updates_us=... writebacks_us=... settle_us=...
+//!   render_total_us=... submit_release_us=... submit_seam_us=...
+//!   submit_validate_us=... landing_us=... landing_n=... passes=...
+//!   ```
+//!
+//! The fields are the same regions and the same aggregates the window line
+//! prints, with two differences of *shape* rather than of meaning: the value of
+//! each is **this submission's own** time (the running table minus the snapshot
+//! the previous line was taken against, for that thread), so a reader can take
+//! the distribution instead of a mean; and `n` counts submissions **on that
+//! thread**, with `t_ms` a monotonic millisecond offset from that thread's first
+//! sample. `lane` is the thread's own stable index, so a multi-threaded round
+//! can put each lane back in order without trusting the interleaving of the
+//! lines as they were written.
+//!
+//! `submit_release_us` / `submit_seam_us` / `submit_validate_us` / `landing_us`
+//! are aggregates of nested regions, exactly as on the window line: they are
+//! printed beside the single slots rather than added to them, and
+//! `passes` is the number of executed render passes this submission carried
+//! (`note_render_shape`'s own population), which is the denominator a per-pass
+//! cost needs.
+//!
+//! Cost when off is the one relaxed load every other instrumented site already
+//! pays; when on, one `format!` per submission — which is why the switch exists
+//! apart from the window switch rather than inside it.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -1229,7 +1276,7 @@ impl ReadbackCounts {
 /// bar is.
 #[inline]
 pub(crate) fn note_readback(region: ReadbackRegion) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().readback.note(region));
@@ -1244,7 +1291,7 @@ pub(crate) fn note_readback(region: ReadbackRegion) {
 /// attachment.
 #[inline]
 pub(crate) fn note_landing(bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -1265,7 +1312,7 @@ pub(crate) fn note_landing(bytes: u64) {
 /// apart rather than as one "not a hit".
 #[inline]
 pub(crate) fn note_reuse(outcome: crate::render_setup_reuse::Outcome) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     use crate::render_setup_reuse::Outcome;
@@ -1292,7 +1339,7 @@ pub(crate) fn note_reuse(outcome: crate::render_setup_reuse::Outcome) {
 /// `pool_hit_n=0` can tell which of the others it is looking at.
 #[inline]
 pub(crate) fn note_texture_pool(outcome: crate::render_texture_pool::PoolOutcome) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     use crate::render_texture_pool::PoolOutcome;
@@ -1317,7 +1364,7 @@ pub(crate) fn note_texture_pool(outcome: crate::render_texture_pool::PoolOutcome
 /// pass handed an import back and the pool kept it (or destroyed it instead).
 #[inline]
 pub(crate) fn note_import_pool(outcome: crate::render_import_pool::ImportOutcome) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     use crate::render_import_pool::ImportOutcome;
@@ -1342,7 +1389,7 @@ pub(crate) fn note_import_pool(outcome: crate::render_import_pool::ImportOutcome
 /// buffer back and the pool kept it (or destroyed it instead).
 #[inline]
 pub(crate) fn note_buffer_pool(outcome: crate::render_buffer_pool::UploadOutcome) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     use crate::render_buffer_pool::UploadOutcome;
@@ -1370,7 +1417,7 @@ pub(crate) fn note_buffer_pool(outcome: crate::render_buffer_pool::UploadOutcome
 /// half's reuse on its own.
 #[inline]
 pub(crate) fn note_compute_buffer_pool(outcome: crate::compute_buffer_pool::ComputeBufferOutcome) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     use crate::compute_buffer_pool::ComputeBufferOutcome;
@@ -1401,7 +1448,7 @@ pub(crate) fn note_compute_buffer_pool(outcome: crate::compute_buffer_pool::Comp
 pub(crate) fn note_compute_pipeline_reuse(
     outcome: crate::compute_pipeline_reuse::ComputePipelineOutcome,
 ) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     use crate::compute_pipeline_reuse::ComputePipelineOutcome;
@@ -1434,7 +1481,7 @@ pub(crate) enum RenderShape {
 /// of each the window carried.
 #[inline]
 pub(crate) fn note_render_shape(shape: RenderShape) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -1463,7 +1510,7 @@ pub(crate) fn note_render_shape(shape: RenderShape) {
 /// batched.
 #[inline]
 pub(crate) fn note_render_batch(passes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -1490,7 +1537,7 @@ pub(crate) fn note_render_batch(passes: u64) {
 /// rather than about a predicate here.
 #[inline]
 pub(crate) fn note_render_batch_trace(passes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -1508,7 +1555,7 @@ pub(crate) fn note_render_batch_trace(passes: u64) {
 /// continued.
 #[inline]
 pub(crate) fn note_render_batch_open() {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().render_batch_open_n += 1);
@@ -1519,7 +1566,7 @@ pub(crate) fn note_render_batch_open() {
 /// (`frame_not_kept`: the pass's frame does not stay in the identity's image).
 #[inline]
 pub(crate) fn note_render_batch_refusal(frame_not_kept: bool) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -1536,7 +1583,7 @@ pub(crate) fn note_render_batch_refusal(frame_not_kept: bool) {
 /// the image its predecessor kept).
 #[inline]
 pub(crate) fn note_render_batch_break(load: bool) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -1577,6 +1624,26 @@ struct Local {
     wait_ahead_calls: u64,
     /// `total` bars closed since the last emitted line.
     window: u64,
+    /// The per-submission sample line's own state.
+    ///
+    /// `samples_last` is the running table as of the last line this thread
+    /// wrote, so one line's fields are that submission's own time rather than a
+    /// window sum; `samples_landing_last` and `samples_passes_last` are the two
+    /// counters the line reads beside the bars. `samples_n`, `samples_lane` and
+    /// `samples_started` are the line's identity — that thread's k-th
+    /// submission, its stable lane index, and the monotonic origin `t_ms` is
+    /// measured from.
+    ///
+    /// All of them are reset wherever the window path drains its window (see
+    /// [`Local::note_total`]): the drain empties `ns` and the counters, and a
+    /// snapshot left pointing at a drained table would report the window's
+    /// remainder as the next submission's own time.
+    samples_last: [u64; PHASE_COUNT],
+    samples_landing_last: u64,
+    samples_passes_last: u64,
+    samples_n: u64,
+    samples_lane: Option<usize>,
+    samples_started: Option<Instant>,
     /// The stored attachments this window's submissions read back, by region.
     readback: ReadbackCounts,
     /// The offscreen passes this window's submissions ran, by reuse outcome.
@@ -1740,6 +1807,12 @@ impl Default for Local {
             wait_blocked_ns: [0; PHASE_COUNT],
             wait_blocked_calls: [0; PHASE_COUNT],
             wait_timeout_calls: [0; PHASE_COUNT],
+            samples_last: [0; PHASE_COUNT],
+            samples_landing_last: 0,
+            samples_passes_last: 0,
+            samples_n: 0,
+            samples_lane: None,
+            samples_started: None,
             fence_skipped_calls: 0,
             wait_object_calls: [0; WAIT_OBJECT_COUNT],
             wait_queue_calls: 0,
@@ -1885,6 +1958,9 @@ impl Local {
     fn note_total(&mut self, ns: u64) {
         self.charge(Phase::Total, ns);
         self.window += 1;
+        if samples_on() {
+            self.note_submit_sample();
+        }
         if self.window < every() {
             return;
         }
@@ -2045,6 +2121,19 @@ impl Local {
         let wait_ahead_calls = std::mem::take(&mut self.wait_ahead_calls);
         let build_objects = std::mem::take(&mut self.build_objects);
         self.window = 0;
+        // The drain is the window's, and it happens whether or not the window
+        // line is on: a window is a window, and the sample line's
+        // per-submission fields are taken against a snapshot this drain has to
+        // move. Only the *printing* of the window line belongs to
+        // `METAL_API_VULKAN_PHASE_PROFILE`, so a round that exports the sample
+        // switch alone banks exactly these numbers and prints one line per
+        // submission and no window line at all.
+        if !enabled() {
+            if samples_on() {
+                self.resync_samples_after_drain();
+            }
+            return;
+        }
         let plan_settle_us = micros(plan_settle_ns);
         let render_us = micros(render_ns);
         let render_residual_us = micros(render_residual_ns);
@@ -2153,6 +2242,117 @@ impl Local {
             readback.bounds_n,
             readback.whole_n,
         );
+        if samples_on() {
+            self.resync_samples_after_drain();
+        }
+    }
+
+    /// Move the sample snapshots with a window drain.
+    ///
+    /// The drain emptied `ns` and the two counters the sample line reads beside
+    /// it, so a snapshot left where it was would report the rest of the window
+    /// as the next submission's own time. Called from both exits of
+    /// [`Local::note_total`]'s window path — the window line's, and the
+    /// sample-switch-only one — because the drain itself is not conditional.
+    #[inline]
+    fn resync_samples_after_drain(&mut self) {
+        self.samples_last = [0; PHASE_COUNT];
+        self.samples_landing_last = 0;
+        self.samples_passes_last = 0;
+    }
+
+    /// One `SUBMIT_SAMPLE` line: this submission's own microseconds, taken as
+    /// the difference between the running table and the snapshot the previous
+    /// line left behind.
+    ///
+    /// A subtraction rather than a second set of bars, because the table is
+    /// already charged by every bar this module has: a sample costs one pass
+    /// over the slots (no clock reads) plus one `format!`, and the fields are
+    /// the same regions the window line prints rather than a second reading of
+    /// the same call.
+    fn note_submit_sample(&mut self) {
+        let lane = match self.samples_lane {
+            Some(lane) => lane,
+            None => {
+                let lane = NEXT_SAMPLE_LANE.fetch_add(1, Ordering::Relaxed);
+                self.samples_lane = Some(lane);
+                lane
+            }
+        };
+        let started = *self.samples_started.get_or_insert_with(Instant::now);
+        self.samples_n += 1;
+        let sample = SubmitSample {
+            lane,
+            n: self.samples_n,
+            t_ms: started.elapsed().as_secs_f64() * 1_000.0,
+            total_ns: self.take_sample(Phase::Total),
+            admit_ns: self.take_sample(Phase::Admit),
+            plan_ns: self.take_sample(Phase::Plan),
+            pool_ns: self.take_sample(Phase::Pool),
+            resource_build_ns: self.take_sample(Phase::ResourceBuild),
+            record_ns: self.take_sample(Phase::Record),
+            queue_submit_ns: self.take_sample(Phase::QueueSubmit),
+            fence_wait_ns: self.take_sample(Phase::FenceWait),
+            read_updates_ns: self.take_sample(Phase::ReadUpdates),
+            writebacks_ns: self.take_sample(Phase::Writebacks),
+            settle_ns: self.take_sample(Phase::Settle),
+            render_total_ns: self.take_sample(Phase::RenderTotal),
+            submit_release_ns: self.take_sample_group(&SUBMIT_RELEASE_SLOTS),
+            submit_seam_ns: self.take_sample_group(&SUBMIT_SEAM_SLOTS),
+            submit_validate_ns: self.take_sample_group(&SUBMIT_VALIDATE_SLOTS),
+            landing_ns: self.take_sample_group(&LANDING_SLOTS),
+            landing_n: self.take_landing_sample(),
+            passes: self.take_passes_sample(),
+        };
+        eprintln!("{}", format_submit_sample(&sample));
+    }
+
+    /// One slot's own share of the submission just closed, and the snapshot
+    /// move that makes the next line start where this one ended.
+    #[inline]
+    fn take_sample(&mut self, phase: Phase) -> u64 {
+        let slot = phase as usize;
+        let now = self.ns[slot];
+        let last = std::mem::replace(&mut self.samples_last[slot], now);
+        now.saturating_sub(last)
+    }
+
+    /// One aggregate's own share: the same subtraction over every slot in the
+    /// family, so the members' snapshots stay in step with
+    /// [`Local::take_sample`]'s.
+    ///
+    /// The families are the ones the window line prints
+    /// (`SUBMIT_RELEASE_SLOTS`, `SUBMIT_SEAM_SLOTS`, `SUBMIT_VALIDATE_SLOTS`,
+    /// `LANDING_SLOTS`); they are nested regions, so a reader compares them
+    /// with the single slots rather than adding them.
+    #[inline]
+    fn take_sample_group(&mut self, slots: &[usize]) -> u64 {
+        let mut ns = 0;
+        for &slot in slots {
+            let now = self.ns[slot];
+            let last = std::mem::replace(&mut self.samples_last[slot], now);
+            ns += now.saturating_sub(last);
+        }
+        ns
+    }
+
+    /// The landed kept frames this submission counted, out of the same
+    /// `landing_n` the window line prints.
+    #[inline]
+    fn take_landing_sample(&mut self) -> u64 {
+        let now = self.landing_n;
+        let last = std::mem::replace(&mut self.samples_landing_last, now);
+        now.saturating_sub(last)
+    }
+
+    /// The render passes this submission executed, out of the same two
+    /// counters the window line prints as `render_offscreen_n` /
+    /// `render_present_n`.
+    #[inline]
+    fn take_passes_sample(&mut self) -> u64 {
+        let now = self.render_offscreen_n + self.render_present_n;
+        let last = std::mem::replace(&mut self.samples_passes_last, now);
+        now.saturating_sub(last)
     }
 }
 
@@ -2169,6 +2369,78 @@ fn micros(ns: u64) -> f64 {
     ns as f64 / 1_000.0
 }
 
+/// Hands out one stable lane index per submitting thread, the first time that
+/// thread writes a sample line. Only reached while sampling is on: a thread
+/// that never samples never touches it, and never takes a lane.
+static NEXT_SAMPLE_LANE: AtomicUsize = AtomicUsize::new(0);
+
+/// One submission's own readings, ready to be spelled as a `SUBMIT_SAMPLE`
+/// line.
+///
+/// A plain struct rather than a `format!` at the call site, so that the field
+/// *set and order* — which is what a round's parser depends on — is pinned by a
+/// unit test instead of by capturing stderr.
+struct SubmitSample {
+    lane: usize,
+    n: u64,
+    t_ms: f64,
+    total_ns: u64,
+    admit_ns: u64,
+    plan_ns: u64,
+    pool_ns: u64,
+    resource_build_ns: u64,
+    record_ns: u64,
+    queue_submit_ns: u64,
+    fence_wait_ns: u64,
+    read_updates_ns: u64,
+    writebacks_ns: u64,
+    settle_ns: u64,
+    render_total_ns: u64,
+    submit_release_ns: u64,
+    submit_seam_ns: u64,
+    submit_validate_ns: u64,
+    landing_ns: u64,
+    landing_n: u64,
+    passes: u64,
+}
+
+/// The one line one submission is spelled as.
+///
+/// Field order is [`SubmitSample`]'s declaration order and is pinned by
+/// `submit_sample_line_has_a_stable_field_order`, because the consumer of these
+/// lines is a parser in a round's analysis script rather than a human.
+fn format_submit_sample(sample: &SubmitSample) -> String {
+    format!(
+        "SUBMIT_SAMPLE lane={} n={} t_ms={:.3} total_us={:.3} admit_us={:.3} \
+         plan_us={:.3} pool_us={:.3} resource_build_us={:.3} record_us={:.3} \
+         queue_submit_us={:.3} fence_wait_us={:.3} read_updates_us={:.3} \
+         writebacks_us={:.3} settle_us={:.3} render_total_us={:.3} \
+         submit_release_us={:.3} submit_seam_us={:.3} submit_validate_us={:.3} \
+         landing_us={:.3} landing_n={} passes={}",
+        sample.lane,
+        sample.n,
+        sample.t_ms,
+        micros(sample.total_ns),
+        micros(sample.admit_ns),
+        micros(sample.plan_ns),
+        micros(sample.pool_ns),
+        micros(sample.resource_build_ns),
+        micros(sample.record_ns),
+        micros(sample.queue_submit_ns),
+        micros(sample.fence_wait_ns),
+        micros(sample.read_updates_ns),
+        micros(sample.writebacks_ns),
+        micros(sample.settle_ns),
+        micros(sample.render_total_ns),
+        micros(sample.submit_release_ns),
+        micros(sample.submit_seam_ns),
+        micros(sample.submit_validate_ns),
+        micros(sample.landing_ns),
+        sample.landing_n,
+        sample.passes,
+    )
+}
+
 /// Count one readback staging buffer's memory selection
 /// (`crate::readback_memory`) for the emitting thread's window.
 ///
@@ -2179,7 +2451,7 @@ fn micros(ns: u64) -> f64 {
 /// `STAGING readback memory` line the process prints once.
 #[inline]
 pub(crate) fn note_staging_memory(cached: bool) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2198,7 +2470,7 @@ pub(crate) fn note_staging_memory(cached: bool) {
 /// owned and are not counted here.
 #[inline]
 pub(crate) fn note_binding_copy(bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2213,7 +2485,7 @@ pub(crate) fn note_binding_copy(bytes: u64) {
 /// bytes the mechanism took off `pool` and the release.
 #[inline]
 pub(crate) fn note_binding_borrow(bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2235,7 +2507,7 @@ pub(crate) fn note_binding_borrow(bytes: u64) {
 /// (`Phase::StagingWindow`).
 #[inline]
 pub(crate) fn note_staging_window_copy(bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2254,7 +2526,7 @@ pub(crate) fn note_staging_window_copy(bytes: u64) {
 /// copy count that falls to zero.
 #[inline]
 pub(crate) fn note_staging_window_share(bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2271,7 +2543,7 @@ pub(crate) fn note_staging_window_share(bytes: u64) {
 /// reads `2N` here on the pre-cut path.
 #[inline]
 pub(crate) fn note_resource_copy(views: u64, bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2287,7 +2559,7 @@ pub(crate) fn note_resource_copy(views: u64, bytes: u64) {
 /// which arm ran and how much of the declaration the derivation moved.
 #[inline]
 pub(crate) fn note_resource_borrow(views: u64, bytes: u64) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2306,7 +2578,7 @@ pub(crate) fn note_resource_borrow(views: u64, bytes: u64) {
 /// instrumented site pays, and nothing else is touched.
 #[inline]
 pub(crate) fn counting() -> bool {
-    enabled()
+    recording()
 }
 
 /// One device object a `resource_build` family created.
@@ -2384,7 +2656,7 @@ pub(crate) enum TeardownObject {
 
 #[inline]
 pub(crate) fn note_teardown_object(object: TeardownObject) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| {
@@ -2409,7 +2681,7 @@ pub(crate) fn note_teardown_object(object: TeardownObject) {
 /// pooling decision is made from.
 #[inline]
 pub(crate) fn note_build_object(object: BuildObject) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().build_objects[object as usize] += 1);
@@ -2426,6 +2698,39 @@ pub(crate) fn enabled() -> bool {
                 .as_deref(),
         )
     })
+}
+
+/// Whether the per-submission sample line is on, read once from the process
+/// environment.
+///
+/// Separate from [`enabled`] because the two lines answer different questions
+/// and are read apart: the window line is a mean over `every()` submissions,
+/// this one is the distribution of every single one. A round that wants the
+/// distribution must not be forced to also pay for (or be drowned in) the
+/// window lines.
+#[inline]
+pub(crate) fn samples_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_enabled(
+            std::env::var("METAL_API_VULKAN_SUBMIT_SAMPLES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Whether anything at all should be banked: the window profile, the
+/// per-submission samples, or both.
+///
+/// Every bar and every counter asks this rather than [`enabled`], so that
+/// `METAL_API_VULKAN_SUBMIT_SAMPLES=1` on its own banks the same numbers the
+/// window line would have banked — the sample line's fields are the same
+/// regions. The *printing* gates stay split: only [`enabled`] prints a window
+/// line, only [`samples_on`] prints a sample line.
+#[inline]
+pub(crate) fn recording() -> bool {
+    enabled() || samples_on()
 }
 
 fn every() -> u64 {
@@ -2467,7 +2772,7 @@ pub(crate) struct Bar {
 impl Bar {
     #[inline]
     pub(crate) fn enter(phase: Phase) -> Option<Self> {
-        if !enabled() {
+        if !recording() {
             return None;
         }
         if phase == Phase::Total {
@@ -2487,7 +2792,7 @@ impl Bar {
     /// the window's fields a partition of its own `total`.
     #[inline]
     pub(crate) fn enter_in_submission(phase: Phase) -> Option<Self> {
-        if !enabled() {
+        if !recording() {
             return None;
         }
         if LOCAL.with(|local| local.borrow().depth) == 0 {
@@ -2505,7 +2810,7 @@ impl Bar {
         object: WaitObject,
         ahead: usize,
     ) -> Option<FenceWaitBar> {
-        if !enabled() {
+        if !recording() {
             return None;
         }
         Some(FenceWaitBar {
@@ -2579,7 +2884,7 @@ impl FenceWaitBar {
 /// A wait with no fence behind it: exactly free, and exactly countable.
 #[inline]
 pub(crate) fn note_fence_wait_skipped() {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().fence_skipped_calls += 1);
@@ -2592,7 +2897,7 @@ pub(crate) fn note_fence_wait_skipped() {
 /// every fence the provider waits on while no microsecond is counted twice.
 #[inline]
 pub(crate) fn note_fence_wait_object(object: WaitObject, ahead: usize) {
-    if !enabled() {
+    if !recording() {
         return;
     }
     LOCAL.with(|local| local.borrow_mut().note_wait_object(object, ahead));
@@ -3030,5 +3335,175 @@ mod tests {
         assert_eq!(local.ns[Phase::Plan as usize], 0);
         local.charge(Phase::Plan, 7);
         assert_eq!(local.ns[Phase::Plan as usize], 7);
+    }
+
+    /// A sample line's fields are the submission's own time, not a window sum:
+    /// two submissions charged into the same table must read apart. This is the
+    /// whole reason the line exists — the window line's mean is what two rounds
+    /// were read wrong from.
+    #[test]
+    fn one_sample_line_is_one_submissions_own_time() {
+        let mut local = Local::default();
+
+        // First submission: 100 ns total, 40 of them in `plan`.
+        local.charge(Phase::Plan, 40);
+        local.charge(Phase::Total, 100);
+        assert_eq!(local.take_sample(Phase::Total), 100);
+        assert_eq!(local.take_sample(Phase::Plan), 40);
+
+        // Second submission: a different shape, and no trace of the first.
+        local.charge(Phase::Plan, 7);
+        local.charge(Phase::Total, 250);
+        assert_eq!(local.take_sample(Phase::Total), 250);
+        assert_eq!(local.take_sample(Phase::Plan), 7);
+
+        // A slot this submission never touched reads zero rather than the
+        // previous submission's value.
+        assert_eq!(local.take_sample(Phase::Pool), 0);
+    }
+
+    /// The window drain empties the table the samples are taken against, so the
+    /// snapshot has to move with it. Without this, the submission after a drain
+    /// would report the window's whole remainder as its own time — which is
+    /// exactly what happens when a round exporters *both* switches, the pose
+    /// the frame-scope reading is taken in.
+    #[test]
+    fn a_window_drain_resyncs_the_sample_snapshot() {
+        let mut local = Local::default();
+        local.charge(Phase::Plan, 40);
+        local.charge(Phase::Total, 100);
+        local.landing_n += 3;
+        local.render_offscreen_n += 2;
+        assert_eq!(local.take_sample(Phase::Total), 100);
+        assert_eq!(local.take_landing_sample(), 3);
+        assert_eq!(local.take_passes_sample(), 2);
+
+        // What the window path does to the table, then to the snapshots.
+        local.ns = [0; PHASE_COUNT];
+        local.landing_n = 0;
+        local.render_offscreen_n = 0;
+        local.resync_samples_after_drain();
+
+        // The next submission's own time, with nothing inherited.
+        local.charge(Phase::Plan, 9);
+        local.charge(Phase::Total, 30);
+        local.landing_n += 1;
+        local.render_present_n += 1;
+        assert_eq!(local.take_sample(Phase::Total), 30);
+        assert_eq!(local.take_sample(Phase::Plan), 9);
+        assert_eq!(local.take_landing_sample(), 1);
+        assert_eq!(local.take_passes_sample(), 1);
+    }
+
+    /// The aggregate fields and the single slots share one snapshot table, so
+    /// taking one must not leave the other reading a stale value: a slot inside
+    /// a family that is sampled twice would otherwise be charged twice on the
+    /// second line.
+    #[test]
+    fn sample_groups_and_single_slots_share_one_snapshot() {
+        let mut local = Local::default();
+        let seam = SUBMIT_SEAM_SLOTS[0];
+        // Charge through the phase whose slot the family names, so the test is
+        // about the snapshot rather than about which phase is in the family.
+        local.charge(Phase::Total, 500);
+        for &slot in &SUBMIT_SEAM_SLOTS {
+            local.ns[slot] += 11;
+        }
+        let family = local.take_sample_group(&SUBMIT_SEAM_SLOTS);
+        assert_eq!(family, 11 * SUBMIT_SEAM_SLOTS.len() as u64);
+        // Same submission, second reader: the family is spent, not re-read.
+        assert_eq!(local.take_sample_group(&SUBMIT_SEAM_SLOTS), 0);
+        // The single-slot reader of the first family member agrees.
+        local.ns[seam] += 5;
+        assert_eq!(local.take_sample_group(&SUBMIT_SEAM_SLOTS), 5);
+    }
+
+    /// The line's field names and their order are what a round's parser keys
+    /// on, so they are pinned here rather than left to the call site.
+    #[test]
+    fn submit_sample_line_has_a_stable_field_order() {
+        let sample = SubmitSample {
+            lane: 2,
+            n: 17,
+            t_ms: 1234.5,
+            total_ns: 1_000,
+            admit_ns: 2_000,
+            plan_ns: 3_000,
+            pool_ns: 4_000,
+            resource_build_ns: 5_000,
+            record_ns: 6_000,
+            queue_submit_ns: 7_000,
+            fence_wait_ns: 8_000,
+            read_updates_ns: 9_000,
+            writebacks_ns: 10_000,
+            settle_ns: 11_000,
+            render_total_ns: 12_000,
+            submit_release_ns: 13_000,
+            submit_seam_ns: 14_000,
+            submit_validate_ns: 15_000,
+            landing_ns: 16_000,
+            landing_n: 3,
+            passes: 4,
+        };
+        let line = format_submit_sample(&sample);
+        assert_eq!(
+            line,
+            "SUBMIT_SAMPLE lane=2 n=17 t_ms=1234.500 total_us=1.000 admit_us=2.000 \
+             plan_us=3.000 pool_us=4.000 resource_build_us=5.000 record_us=6.000 \
+             queue_submit_us=7.000 fence_wait_us=8.000 read_updates_us=9.000 \
+             writebacks_us=10.000 settle_us=11.000 render_total_us=12.000 \
+             submit_release_us=13.000 submit_seam_us=14.000 submit_validate_us=15.000 \
+             landing_us=16.000 landing_n=3 passes=4"
+        );
+        let names: Vec<&str> = line
+            .split_whitespace()
+            .skip(1)
+            .map(|field| field.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "lane",
+                "n",
+                "t_ms",
+                "total_us",
+                "admit_us",
+                "plan_us",
+                "pool_us",
+                "resource_build_us",
+                "record_us",
+                "queue_submit_us",
+                "fence_wait_us",
+                "read_updates_us",
+                "writebacks_us",
+                "settle_us",
+                "render_total_us",
+                "submit_release_us",
+                "submit_seam_us",
+                "submit_validate_us",
+                "landing_us",
+                "landing_n",
+                "passes",
+            ]
+        );
+    }
+
+    /// With both switches off nothing is banked and no bar is entered: that is
+    /// the zero-cost claim the module doc makes, and it is the composition of
+    /// the two switches rather than either one alone.
+    #[test]
+    fn with_both_switches_off_a_bar_is_not_entered() {
+        assert_eq!(recording(), enabled() || samples_on());
+        if recording() {
+            // A round may export either switch for the process it runs; the
+            // composition is the part that holds in every environment, and a
+            // run with the switches on is that same composition being true.
+            return;
+        }
+        assert!(Bar::enter(Phase::Plan).is_none());
+        assert!(Bar::enter(Phase::Total).is_none());
+        assert!(Bar::enter_in_submission(Phase::Plan).is_none());
+        assert!(Bar::enter_fence_wait(Phase::FenceWait, WaitObject::SubmitFence, 0).is_none());
+        assert!(!counting());
     }
 }
