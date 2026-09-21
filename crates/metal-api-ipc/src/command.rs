@@ -2767,15 +2767,16 @@ mod tests {
         let mut patched = frame.clone();
         // The blob's eight-byte length precedes the payload, and the source
         // tag precedes that length. `3` is the guest-runs tag since E-TX6
-        // (`research/docs/23` §74), so the probe states a tag that is still
-        // unassigned: the byte after the arm the frame actually carries.
-        patched[payload_at - 9] = 0x04;
+        // (`research/docs/23` §74) and `4` is the statement economy's zero-fill
+        // declaration since W2-A, so the probe states a tag that is still
+        // unassigned: the byte after the last arm this version knows.
+        patched[payload_at - 9] = crate::command_codec::BUFFER_SOURCE_ZERO_FILL + 1;
         let refused = CommandCodec::decode_request(&patched).unwrap_err();
         assert!(matches!(
             refused,
             CodecError::UnknownEnumValue {
                 field: "buffer source",
-                value: 4,
+                value: 5,
             }
         ));
         eprintln!("corrupt stage buffer view refused: {refused}");
