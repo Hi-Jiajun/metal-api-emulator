@@ -21,12 +21,18 @@
 //! This cut materializes once per walk and hands the same values to every gate,
 //! driven by `METAL_API_CORE_ADMIT_SHARED_DRAWS`:
 //!
-//! * unset (the default), or `0` / `off` / `false` / `no` (case-insensitive and
-//!   whitespace-trimmed): off. Every gate builds its own iterator, byte for byte
-//!   as before.
-//! * `1` / `on` / `true` / `yes`: on. The walk builds one
+//! * unset (the default), or any word that is not one of the four control
+//!   words: on. The walk builds one
 //!   `Vec<(usize, Cow<RenderPassDescriptor>)>` before the first gate and each
-//!   gate walks that.
+//!   gate walks that. The cut was flipped on once its A/B had priced it
+//!   (`sa2`/`sa2b`/`sa2c`: one exe, three arms, 300 s each, production pose):
+//!   materializations **0.584 → 0.155 per walk** (the four gates' copies
+//!   collapse to one), the four gate bars **223.2 → 1.92 µs per walk
+//!   (−99.1 %)**, and the walk itself **311.4 → 123.1 µs (−60.5 %)** against a
+//!   16.9 % spread between the two identical control arms.
+//! * `0` / `off` / `false` / `no` (case-insensitive and whitespace-trimmed):
+//!   off. Every gate builds its own iterator, byte for byte as before, and
+//!   stays reachable as the control a round compares against.
 //!
 //! # Why the answers cannot differ
 //!
@@ -53,8 +59,11 @@ static ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether the walk materializes the render entries once instead of per gate.
 ///
-/// Read once from the process environment; off is the default and every call
-/// site is one relaxed load.
+/// Read once from the process environment; **on unless the variable turns it
+/// off** — the tenth cut was flipped on once its A/B had priced it (four gate
+/// bars 223.2 → 1.92 µs per walk, the walk 311.4 → 123.1 µs, against a 16.9 %
+/// spread between the two identical control arms). Every call site is one
+/// relaxed load.
 #[inline]
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
@@ -93,28 +102,28 @@ pub(crate) fn set_arm(arm: Option<bool>) {
 
 /// The enable word, read exactly as a round's launcher spells it.
 fn parse_enabled(value: Option<&str>) -> bool {
-    match value.map(str::trim).map(str::to_ascii_lowercase) {
-        Some(word) => matches!(word.as_str(), "1" | "on" | "true" | "yes"),
-        None => false,
-    }
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_enabled;
 
-    /// Off is the default, and the spellings a launcher may write are the ones
-    /// the other cuts' switches accept.
+    /// On is the default, and the control words a launcher may write are the
+    /// ones the other cuts' switches accept.
     #[test]
-    fn the_switch_is_off_unless_a_truthy_word_says_otherwise() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_a_control_word_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("OFF")));
         assert!(!parse_enabled(Some("false")));
         assert!(!parse_enabled(Some("no")));
-        assert!(!parse_enabled(Some("nope")));
+        assert!(parse_enabled(Some("nope")));
         assert!(parse_enabled(Some("1")));
         assert!(parse_enabled(Some("on")));
         assert!(parse_enabled(Some("ON")));
