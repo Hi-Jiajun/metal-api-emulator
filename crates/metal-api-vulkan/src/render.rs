@@ -6518,7 +6518,7 @@ fn resolve_render_input<'a>(
             // uploads — or, with the eighth cut's mechanism on, a handle on the
             // bytes it already holds (`crate::staging_borrow`).
             let bytes = crate::staging_borrow::resolve_view(
-                &leases.staging,
+                leases.staging,
                 *lease_id,
                 view,
                 leases.device_epoch,
@@ -7535,7 +7535,7 @@ fn resolve_render_texture_source<'a>(
             // The texture arm takes the same window out of the same registry
             // and pays the same copy (`crate::phase_profile::Phase::StagingWindow`).
             let bytes = crate::staging_borrow::resolve_texture(
-                &leases.staging,
+                leases.staging,
                 *lease_id,
                 view,
                 leases.device_epoch,
