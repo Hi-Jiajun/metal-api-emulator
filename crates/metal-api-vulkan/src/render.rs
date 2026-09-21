@@ -1289,6 +1289,13 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// descriptor's channel mapping stays Vulkan's identity default and the
     /// guest's own channel order is what the fragment stage reads.
     pub format: vk::Format,
+    /// The trace's own `TextureFormat` this declaration's view named
+    /// (2026-09-21, the IT3 refusal's reading): [`Self::format`] is the
+    /// `VkFormat` the rail creates the image with, and this is the name the
+    /// declaration arrived under. A refusal about the image states both, so a
+    /// fail line says which of a pass's declarations the device refused
+    /// without the request having to be read beside it.
+    pub declared_format: TextureFormat,
     /// The `VkImageType` this rail creates for the view (2026-09-19, census
     /// b10's `texture_shape` bucket, and 2026-09-20's `D3` arm beside it):
     /// `TYPE_2D` for every lane the window carried before the one-dimensional
@@ -6128,6 +6135,7 @@ fn resolve_render_textures<'a>(
             extent: upload_extent,
             depth,
             format: render_texture_vk_format(view.format)?,
+            declared_format: view.format,
             // The declaration's own spatial axis decides the object type: a
             // one-dimensional view is a single-row `TYPE_1D` image (Vulkan
             // fixes its `height`/`depth` at one, which is the shape the LUT
@@ -14345,12 +14353,19 @@ impl<'a> OffscreenObjects<'a> {
     /// [`Self::bind_render_input`] reads it: a volume is never gathered on the
     /// host (`resolve_render_textures` refuses that combination by name), so
     /// the source's own bytes are the texels and the two never disagree.
+    ///
+    /// `device_copy` is the carrier the caller already decided the image's own
+    /// shape takes (`crate::render_texture_carrier`, 2026-09-21): a volume
+    /// always, and every other uploaded declaration whose linear image the
+    /// device does not admit. It is the same flag the image's tiling, usage and
+    /// initial layout were built from, so the bytes travel in the carrier the
+    /// object was created for.
     fn upload_render_texture_into(
         &self,
         source: &RenderInputSource<'_>,
         target: &RenderTextureImage,
         texels: &[u8],
-        volume: bool,
+        device_copy: bool,
     ) -> Result<Option<RenderUploadBuffer>, ProviderError> {
         // The texels' own trip into the backing (`crate::phase_profile`): the
         // host write for the linear lanes, the staging write a volume takes
@@ -14358,7 +14373,7 @@ impl<'a> OffscreenObjects<'a> {
         // `setup_textures`, so a reading must not add it to that bar
         // (`docs/TEXTURE-BACKING-POOL.md`).
         let _upload = crate::phase_profile::Bar::enter(crate::phase_profile::Phase::TextureUpload);
-        if !volume {
+        if !device_copy {
             self.upload_render_texture(target, texels)?;
             return Ok(None);
         }
@@ -14462,9 +14477,33 @@ impl<'a> OffscreenObjects<'a> {
             // conformant device supports for a sampled three-dimensional
             // format.
             let volume = texture.image_type == vk::ImageType::TYPE_3D;
+            // The uploaded arms' carrier is the *device's* answer when the
+            // fallback is armed (`crate::render_texture_carrier`, 2026-09-21):
+            // Vulkan promises the host-visible `LINEAR` image for the
+            // two-dimensional shape only, so the one-dimensional LUT lane —
+            // a `16384x1` `R32_SFLOAT` view — lost its whole pass to a refused
+            // `vkCreateImage` on an RTX 5060, which is the black window the
+            // IT3 user run of that day showed. A shape the device does not
+            // admit takes the volume's device-copied carrier instead. With the
+            // switch off the question is not asked and this stays `false`: the
+            // pre-fix path, byte for byte.
+            let uploaded = !borrowing
+                && !matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. })
+                && !volume;
             let device_copy = borrowing
                 || matches!(texture.source, RenderInputSource::AttachmentSnapshot { .. })
-                || volume;
+                || volume
+                || (uploaded
+                    && crate::render_texture_carrier::uploaded_shape_takes_device_copy(
+                        self.context,
+                        format,
+                        texture.image_type,
+                        vk::Extent3D {
+                            width,
+                            height,
+                            depth,
+                        },
+                    ));
             let info = vk::ImageCreateInfo::default()
                 // The view's own type (2026-09-19, census b10's
                 // `texture_shape` bucket, and 2026-09-20's `D3` arm beside it):
@@ -14552,7 +14591,13 @@ impl<'a> OffscreenObjects<'a> {
                         "render texture",
                     )
                     .map_err(|error| {
-                        execution_refusal("create render texture image", &error.detail)
+                        render_texture_image_refusal(
+                            self.context,
+                            texture,
+                            &info,
+                            device_copy,
+                            &error.detail,
+                        )
                     })?;
                     (image, memory, requirements, None)
                 }
@@ -14627,11 +14672,11 @@ impl<'a> OffscreenObjects<'a> {
                 }
                 RenderInputSource::TraceBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
+                    self.upload_render_texture_into(&texture.source, &target, texels, device_copy)?
                 }
                 RenderInputSource::StagedBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes.as_slice());
-                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
+                    self.upload_render_texture_into(&texture.source, &target, texels, device_copy)?
                 }
                 // The trace's own production uploads exactly as the two
                 // trace-carried arms do (`research/docs/23` §110, E-TX3):
@@ -14639,14 +14684,14 @@ impl<'a> OffscreenObjects<'a> {
                 // how the rail gets them into the sampled image.
                 RenderInputSource::ProducedBytes(bytes) => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
+                    self.upload_render_texture_into(&texture.source, &target, texels, device_copy)?
                 }
                 // A gathered guest-runs window is the provider's own copy
                 // (`research/docs/23` §74, E-TX6), so it uploads through the
                 // same host-visible path as the staged arm.
                 RenderInputSource::GatheredBytes { bytes, .. } => {
                     let texels = texture.gathered.as_deref().unwrap_or(bytes);
-                    self.upload_render_texture_into(&texture.source, &target, texels, volume)?
+                    self.upload_render_texture_into(&texture.source, &target, texels, device_copy)?
                 }
                 // The pass-entry snapshot arm has no host bytes to upload
                 // (`research/docs/23` §118, E-TX15): the image is a
@@ -18371,6 +18416,121 @@ fn tiling_name(tiling: vk::ImageTiling) -> &'static str {
         vk::ImageTiling::OPTIMAL => "optimal",
         _ => "unknown",
     }
+}
+
+/// The `VkImageType`'s own name, as a fail line spells it.
+fn image_type_name(image_type: vk::ImageType) -> &'static str {
+    match image_type {
+        vk::ImageType::TYPE_1D => "1d",
+        vk::ImageType::TYPE_2D => "2d",
+        vk::ImageType::TYPE_3D => "3d",
+        _ => "unknown",
+    }
+}
+
+/// The arm one sampled declaration's bytes come from, as a fail line spells
+/// it: the same names the provider boundary's own readings use, so a refusal
+/// and the request it belongs to can be read side by side.
+fn render_texture_source_name(source: &RenderInputSource<'_>) -> &'static str {
+    match source {
+        RenderInputSource::TraceBytes(_) => "trace_bytes",
+        RenderInputSource::StagedBytes(_) => "staged_bytes",
+        RenderInputSource::Borrowed { .. } => "owner_window",
+        RenderInputSource::ProducedBytes(_) => "produced_bytes",
+        RenderInputSource::GatheredBytes { .. } => "gathered_bytes",
+        RenderInputSource::AttachmentSnapshot { .. } => "pass_entry_snapshot",
+    }
+}
+
+/// The refusal one refused `vkCreateImage` becomes for a render texture
+/// (2026-09-21, the IT3 reading).
+///
+/// The step and the driver's own text stay exactly what they were: what is
+/// added is the shape the rail asked for — the declaration's own format name
+/// beside the `VkFormat`, the image type, tiling, usage, extent, the carrier
+/// arm and the source arm the bytes came from — and the device's own answer for
+/// the same shape, asked again through
+/// `vkGetPhysicalDeviceImageFormatProperties`. Both halves travel in the
+/// refusal's fields **and** in one sentence appended to its detail, because the
+/// boundary that logs this refusal to the owner carries the class, the step and
+/// the detail and drops the fields.
+///
+/// Without them the IT3 fail line could not say *which* of a pass's
+/// declarations the device refused: the pass carried a `1920x1080`
+/// `bgra8_unorm` window and a `16384x1` `r32_float` LUT, and both went through
+/// this one step.
+fn render_texture_image_refusal(
+    context: &VulkanContext,
+    texture: &OffscreenRenderTexture<'_>,
+    info: &vk::ImageCreateInfo,
+    device_copy: bool,
+    detail: &str,
+) -> ProviderError {
+    let admission = crate::render_texture_carrier::ask_linear_admission(
+        context,
+        info.format,
+        info.image_type,
+        info.extent,
+        info.usage,
+    );
+    let shape = format!(
+        "view_format={:?} vk_format={} type={} extent={}x{}x{} tiling={} usage={:#x} \
+         carrier={} source={}",
+        texture.declared_format,
+        info.format.as_raw(),
+        image_type_name(info.image_type),
+        info.extent.width,
+        info.extent.height,
+        info.extent.depth,
+        tiling_name(info.tiling),
+        info.usage.as_raw(),
+        if device_copy {
+            "device_copy"
+        } else {
+            "host_visible"
+        },
+        render_texture_source_name(&texture.source),
+    );
+    admission
+        .attach(
+            execution_refusal("create render texture image", detail)
+                .with_field(
+                    "vk_format",
+                    FieldValue::Unsigned(info.format.as_raw() as u64),
+                )
+                .with_field(
+                    "view_format",
+                    FieldValue::Text(format!("{:?}", texture.declared_format)),
+                )
+                .with_field(
+                    "image_type",
+                    FieldValue::Text(image_type_name(info.image_type).to_owned()),
+                )
+                .with_field(
+                    "tiling",
+                    FieldValue::Text(tiling_name(info.tiling).to_owned()),
+                )
+                .with_field(
+                    "usage",
+                    FieldValue::Unsigned(u64::from(info.usage.as_raw())),
+                )
+                .with_field(
+                    "extent",
+                    FieldValue::Text(format!(
+                        "{}x{}x{}",
+                        info.extent.width, info.extent.height, info.extent.depth
+                    )),
+                )
+                .with_field("device_copy", FieldValue::Bool(device_copy))
+                .with_field(
+                    "source",
+                    FieldValue::Text(render_texture_source_name(&texture.source).to_owned()),
+                ),
+        )
+        .with_detail(format!(
+            "create render texture image: {detail} (shape: {shape}; device: {})",
+            admission.reading()
+        ))
 }
 
 /// The one structured refusal the core admission and this rail share for a
