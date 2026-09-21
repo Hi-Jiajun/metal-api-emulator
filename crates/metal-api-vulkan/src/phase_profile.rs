@@ -71,6 +71,14 @@
 //!   teardown_named_us=... render_release_reuse_us=... render_release_pool_us=...
 //!   render_release_import_us=... render_release_uploads_us=... render_retire_us=...
 //!   td_image_n=... td_view_n=... td_sampler_n=... td_buffer_n=... td_memory_n=...
+//!   td_image_us=... td_view_us=... td_buffer_us=... td_memory_us=...
+//!   td_object_named_us=... td_unreturned_n=... td_unreturned_<kind>_n=...
+//!   buf_miss_<kind>_n=... buf_return_<kind>_n=... buf_miss_empty_n=...
+//!   buf_miss_occupied_n=... buf_miss_held_sum=... buf_miss_after_evict_n=...
+//!   pool_miss_empty_n=... pool_miss_occupied_n=... pool_miss_held_sum=...
+//!   pool_miss_after_evict_n=... pool_miss_same_extent_n=...
+//!   pool_miss_same_format_n=... pool_miss_same_image_type_n=...
+//!   pool_miss_same_view_type_n=... pool_miss_same_device_copy_n=...
 //!   rb_pipeline_us=... rb_pipeline_n=... rb_buffer_us=... rb_buffer_n=...
 //!   rb_image_us=... rb_image_n=... rb_view_us=... rb_view_n=...
 //!   rb_sampler_us=... rb_sampler_n=... rb_descriptor_us=... rb_descriptor_n=...
@@ -98,6 +106,16 @@
 //! `teardown_named_us` (the ten nested regions inside `render_teardown`). The
 //! aggregates are printed beside the fields they aggregate rather than added to
 //! them, exactly as `plan_settle_us` already was.
+//!
+//! Two further readings are lines of their own rather than fields, because what
+//! they carry is a **value** no counter can state: `BUF_MISS_KEY` (one upload
+//! shape a take asked [`crate::render_buffer_pool`] for and did not find: the
+//! creation site's name, the byte length, the usage flags, and the census of
+//! what the pool held instead) and `POOL_MISS_KEY` (the same for a sampled
+//! declaration's backing: image type, format, extent, view type, carrier arm).
+//! Both are capped per window ([`MISS_KEY_LINES`]) and printed only while
+//! [`enabled`] is on, so the population behind them is the counters' business
+//! and the line only ever answers "which shape".
 //!
 //! Fields are **sums over the line's own window** (`n` submissions), not means,
 //! so a reader can add lines together and divide by the summed `n` without
@@ -839,9 +857,54 @@ pub(crate) enum Phase {
     /// Inside `admit`: the indirect dispatch the compute rail replays, resolved
     /// and shape checked (`indirect_dispatch_threadgroups`).
     AdmitIndirect,
+    /// Inside one of the ten `render_teardown` groups: the microseconds
+    /// `vkDestroyImage` cost for one rail-owned image.
+    ///
+    /// The fourth cut's groups say *where* a pass's teardown spends its
+    /// microseconds; they do not say *what an object costs*, because a group
+    /// holds several families at once (`teardown_attachments` destroys views,
+    /// images and memories in one pass over the same list) and a group's
+    /// population is a mix of sizes. These four bars are entered **once per
+    /// object**, around the single destroy call that object pays, so the
+    /// reading `td_image_us ÷ td_image_n` is one image's own cost — and they
+    /// are *nested inside* the group bars rather than beside them, exactly as
+    /// those are nested inside `render_teardown`:
+    /// `sum(td_*_us) <= sum(teardown children) <= render_teardown_us`, and the
+    /// difference is the objects the four families do not name (fences,
+    /// command pools, pipelines, render passes, descriptor state) plus the
+    /// seam between the groups.
+    ///
+    /// The object the bar encloses is the same one the matching counter counts
+    /// ([`TeardownObject`]), so the two are one population per family: a bar
+    /// with zero microseconds beside a nonzero count is an object the driver
+    /// released for free, and a count of zero is a family the pools already
+    /// emptied ([`Phase::TeardownSync`]'s own doc states the same rule for the
+    /// groups).
+    TeardownObjectImage,
+    /// Inside one of the ten `render_teardown` groups: the microseconds
+    /// `vkDestroyImageView` cost for one rail-owned view (see
+    /// [`Phase::TeardownObjectImage`] for the nesting and the population).
+    TeardownObjectView,
+    /// Inside one of the ten `render_teardown` groups: the microseconds
+    /// `vkDestroyBuffer` cost for one rail-owned buffer (see
+    /// [`Phase::TeardownObjectImage`] for the nesting and the population).
+    ///
+    /// This is the family `teardown_buffers` and `teardown_readbacks` are
+    /// both partly made of, which is why a reading that wants "what does a
+    /// buffer cost" cannot be read off either group alone.
+    TeardownObjectBuffer,
+    /// Inside one of the ten `render_teardown` groups: the microseconds
+    /// `vkFreeMemory` cost for one rail-owned allocation (see
+    /// [`Phase::TeardownObjectImage`] for the nesting and the population).
+    ///
+    /// It is a bar of its own rather than a line inside the two above because
+    /// the three families are *separate* driver calls with separate costs: the
+    /// pool keys one `VkBuffer`/`VkDeviceMemory` pair, so a reading that wants
+    /// to know what pooling a pair saves has to price the two halves apart.
+    TeardownObjectMemory,
 }
 
-const PHASE_COUNT: usize = Phase::AdmitIndirect as usize + 1;
+const PHASE_COUNT: usize = Phase::TeardownObjectMemory as usize + 1;
 
 /// The printed field name of each phase, in slot order.
 const PHASE_NAMES: [&str; PHASE_COUNT] = [
@@ -945,6 +1008,10 @@ const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "admit_epoch",
     "admit_capabilities",
     "admit_indirect",
+    "td_image",
+    "td_view",
+    "td_buffer",
+    "td_memory",
 ];
 
 /// The slots the printed `plan_settle_us` field aggregates: the CPU-only matter
@@ -1007,6 +1074,54 @@ const TEARDOWN_SLOTS: [usize; 10] = [
     Phase::TeardownBuffers as usize,
     Phase::TeardownPrevious as usize,
 ];
+
+/// The object-level split of the teardown groups, added by the E-CT2 round:
+/// one bar per `VkDestroy*` family, each entered once per object inside
+/// whichever group is destroying it. The groups stay their enclosing bars, so
+/// `sum(TEARDOWN_OBJECT_SLOTS) <= sum(TEARDOWN_SLOTS) <= render_teardown_us`,
+/// and the difference is the objects no family names plus the seam between the
+/// groups. Read beside the `td_*_n` counters — the same population, one
+/// counted and one timed — this is the "nanoseconds per object" reading the
+/// content-tail round left open.
+const TEARDOWN_OBJECT_SLOTS: [usize; 4] = [
+    Phase::TeardownObjectImage as usize,
+    Phase::TeardownObjectView as usize,
+    Phase::TeardownObjectBuffer as usize,
+    Phase::TeardownObjectMemory as usize,
+];
+
+/// The upload-buffer kinds the render rail asks [`crate::render_buffer_pool`]
+/// for, in the order their per-kind counters print.
+///
+/// The name is the one the creation site states — the `name` argument of
+/// `OffscreenObjects::create_host_visible_buffer`, which is also the word its
+/// own refusal lines carry — so a reading and the failure it explains spell one
+/// vocabulary. The field is the suffix that name's counters are printed under:
+/// a take that missed the pool and a pair that left it and came back are
+/// counted per kind, because the kinds are created and released by different
+/// code paths and a round has to be able to tell "this shape never comes back"
+/// from "this shape never repeats".
+const UPLOAD_KINDS: [(&str, &str); 7] = [
+    ("vertex input", "vertex"),
+    ("index input", "input_index"),
+    ("stage buffer", "stage"),
+    ("attachment previous bytes", "previous"),
+    ("render texture volume", "volume"),
+    ("index", "index"),
+    ("indirect", "indirect"),
+];
+
+/// How many upload kinds [`UPLOAD_KINDS`] names, and therefore how many slots
+/// each per-kind counter table carries.
+const UPLOAD_KIND_COUNT: usize = UPLOAD_KINDS.len();
+
+/// The slot one creation site's own `name` reads as, or `None` for a name the
+/// table does not know (a creation site added later without a slot here still
+/// counts in the aggregate, and the unit test beside the table is what keeps
+/// that from being silent).
+fn upload_kind_slot(name: &str) -> Option<usize> {
+    UPLOAD_KINDS.iter().position(|(kind, _)| *kind == name)
+}
 
 /// The nested split of `setup_textures`, beside the two upload/backing bars it
 /// already had: `sum(setup_textures children) <= setup_textures_us`.
@@ -1372,7 +1487,30 @@ pub(crate) fn note_texture_pool(outcome: crate::render_texture_pool::PoolOutcome
         let mut local = local.borrow_mut();
         match outcome {
             PoolOutcome::Hit => local.pool_hit_n += 1,
-            PoolOutcome::Miss => local.pool_miss_n += 1,
+            PoolOutcome::Miss(census) => {
+                local.pool_miss_n += 1;
+                // The two arms a miss's census decides: a pool that held
+                // nothing at all (the shape was never handed back, or the cap
+                // evicted it) against one that held shapes this take could not
+                // use. `held_sum` is the occupancy behind both, so
+                // `held_sum ÷ miss_n` is the population a miss saw.
+                if census.held == 0 {
+                    local.pool_miss_empty_n += 1;
+                } else {
+                    local.pool_miss_occupied_n += 1;
+                }
+                local.pool_miss_held_sum += census.held as u64;
+                local.pool_miss_after_evict_n += u64::from(census.evicted_since_last_ask > 0);
+                // The five axes, counted once per miss: how many misses found a
+                // held entry that already agreed with the asked key on that
+                // field. An axis that reads zero across a whole round is one no
+                // key widening could have served.
+                local.pool_miss_same_image_type_n += u64::from(census.same_image_type > 0);
+                local.pool_miss_same_format_n += u64::from(census.same_format > 0);
+                local.pool_miss_same_extent_n += u64::from(census.same_extent > 0);
+                local.pool_miss_same_view_type_n += u64::from(census.same_view_type > 0);
+                local.pool_miss_same_device_copy_n += u64::from(census.same_device_copy > 0);
+            }
             PoolOutcome::Disabled => local.pool_disabled_n += 1,
             PoolOutcome::Returned => local.pool_return_n += 1,
             PoolOutcome::Dropped => local.pool_drop_n += 1,
@@ -1412,21 +1550,152 @@ pub(crate) fn note_import_pool(outcome: crate::render_import_pool::ImportOutcome
 /// pool held a buffer of this shape and handed it over, it held none and the
 /// creation built its own, the switch was off, or a completed pass handed a
 /// buffer back and the pool kept it (or destroyed it instead).
+///
+/// `kind` is the creation site's own name for the buffer (the `name` argument
+/// of `create_host_visible_buffer`, which is also the word its refusals carry),
+/// so the same reading says *which* declaration missed: the per-kind table is
+/// what separates "a shape the round never repeats" from "a kind whose hand-back
+/// is missing", and a name outside [`UPLOAD_KINDS`] still counts in the
+/// aggregate rather than being silently dropped.
 #[inline]
-pub(crate) fn note_buffer_pool(outcome: crate::render_buffer_pool::UploadOutcome) {
+pub(crate) fn note_buffer_pool(kind: &str, outcome: crate::render_buffer_pool::UploadOutcome) {
     if !recording() {
         return;
     }
     use crate::render_buffer_pool::UploadOutcome;
+    let kind_slot = upload_kind_slot(kind);
     LOCAL.with(|local| {
         let mut local = local.borrow_mut();
         match outcome {
             UploadOutcome::Hit => local.buffer_hit_n += 1,
-            UploadOutcome::Miss => local.buffer_miss_n += 1,
+            UploadOutcome::Miss(census) => {
+                local.buffer_miss_n += 1;
+                if census.held == 0 {
+                    local.buffer_miss_empty_n += 1;
+                } else {
+                    local.buffer_miss_occupied_n += 1;
+                }
+                local.buffer_miss_held_sum += census.held as u64;
+                local.buffer_miss_after_evict_n += u64::from(census.evicted_since_last_ask > 0);
+                if let Some(kind_slot) = kind_slot {
+                    local.buffer_miss_kind[kind_slot] += 1;
+                }
+            }
             UploadOutcome::Disabled => local.buffer_disabled_n += 1,
-            UploadOutcome::Returned => local.buffer_return_n += 1,
+            UploadOutcome::Returned => {
+                local.buffer_return_n += 1;
+                if let Some(kind_slot) = kind_slot {
+                    local.buffer_return_kind[kind_slot] += 1;
+                }
+            }
             UploadOutcome::Dropped => local.buffer_drop_n += 1,
         }
+    });
+}
+
+/// Count one upload pair a teardown destroyed while it still carried the pool's
+/// key, for the emitting thread's window.
+///
+/// This is the reading that separates a cold pool from a missing hand-back: the
+/// pair was built or taken under `crate::render_buffer_pool`'s key, so the pass
+/// that owned it *could* have returned it, and instead the teardown destroyed it
+/// — the exact work `OffscreenObjects::release_pooled_uploads` exists to avoid.
+/// A kind whose count here is nonzero cannot be served by the pool however long
+/// the round runs, because its population never grows.
+#[inline]
+pub(crate) fn note_teardown_unreturned_upload(kind: &str) {
+    if !recording() {
+        return;
+    }
+    let kind_slot = upload_kind_slot(kind);
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        if let Some(kind_slot) = kind_slot {
+            local.buffer_unreturned_kind[kind_slot] += 1;
+        }
+    });
+}
+
+/// How many miss-key lines one window prints.
+///
+/// The lines name the shape a take asked for; the cap is what keeps a round of
+/// millions of declarations from turning the reading into the round's own
+/// largest artifact. Sixteen of each pool's misses per window is enough for a
+/// round to read the shapes the tail asks for, and the per-axis counters — which
+/// are unbounded and cheap — carry the population.
+const MISS_KEY_LINES: u32 = 16;
+
+/// Print the shape one upload take asked the pool for and missed, at most
+/// [`MISS_KEY_LINES`] times per window.
+///
+/// Printed only while the window profile is on: the key column is the one
+/// reading a counter cannot carry, because "the tail asks for 8 294 400 bytes
+/// with `TRANSFER_SRC|TRANSFER_DST`" is a value rather than a count.
+#[inline]
+pub(crate) fn note_upload_miss_key(
+    kind: &str,
+    key: crate::render_buffer_pool::UploadKey,
+    census: crate::render_buffer_pool::MissCensus,
+) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        if local.miss_key_lines >= MISS_KEY_LINES {
+            return;
+        }
+        local.miss_key_lines += 1;
+        eprintln!(
+            "BUF_MISS_KEY kind={kind} bytes={} usage=0x{:x} held={} same_length={} \
+             same_usage={} evicted={}",
+            key.byte_length(),
+            key.usage(),
+            census.held,
+            census.same_length,
+            census.same_usage,
+            census.evicted_since_last_ask,
+        );
+    });
+}
+
+/// Print the shape one sampled declaration asked the backing pool for and
+/// missed, at most [`MISS_KEY_LINES`] times per window (see
+/// [`note_upload_miss_key`] for why the line exists and why it is capped).
+#[inline]
+pub(crate) fn note_texture_miss_key(
+    key: crate::render_texture_pool::BackingKey,
+    census: crate::render_texture_pool::MissCensus,
+) {
+    if !enabled() {
+        return;
+    }
+    let extent = key.extent();
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        if local.miss_key_lines >= MISS_KEY_LINES {
+            return;
+        }
+        local.miss_key_lines += 1;
+        eprintln!(
+            "POOL_MISS_KEY image_type={} format=0x{:x} extent={}x{}x{} view_type={} \
+             device_copy={} held={} same_image_type={} same_format={} same_extent={} \
+             same_view_type={} same_device_copy={} evicted={}",
+            key.image_type(),
+            key.format(),
+            extent[0],
+            extent[1],
+            extent[2],
+            key.view_type(),
+            key.device_copy(),
+            census.held,
+            census.same_image_type,
+            census.same_format,
+            census.same_extent,
+            census.same_view_type,
+            census.same_device_copy,
+            census.evicted_since_last_ask,
+        );
     });
 }
 
@@ -1817,6 +2086,62 @@ struct Local {
     td_sampler_n: u64,
     td_buffer_n: u64,
     td_memory_n: u64,
+    /// The upload buffers this window's passes asked [`crate::render_buffer_pool`]
+    /// for and did not find, per kind ([`UPLOAD_KINDS`]).
+    ///
+    /// The aggregate `buffer_miss_n` says a creation built its own pair; this
+    /// table says which creation it was. The two are one population, so a round
+    /// can check the per-kind sum against the aggregate before reading either.
+    buffer_miss_kind: [u64; UPLOAD_KIND_COUNT],
+    /// The upload buffers this window's passes handed back and the pool kept,
+    /// per kind — the counter a per-kind miss is read against, because a shape
+    /// that misses *and* is never returned cannot be served however long the
+    /// round runs.
+    buffer_return_kind: [u64; UPLOAD_KIND_COUNT],
+    /// The upload buffers this window's teardowns destroyed while the pair
+    /// still carried its pool key, per kind.
+    ///
+    /// A pair that was taken or built under the pool's key and reaches the
+    /// teardown still holding that key is one the pass never handed back: the
+    /// destroy the counter sits beside is exactly the work
+    /// `OffscreenObjects::release_pooled_uploads` exists to avoid. A kind that
+    /// reads a nonzero count here is a path whose hand-back is missing or
+    /// conditional, not a pool that is merely cold.
+    buffer_unreturned_kind: [u64; UPLOAD_KIND_COUNT],
+    /// The **census of the upload pool at a miss**: the misses that found the
+    /// pool empty (nothing of any shape was held — the shape was never handed
+    /// back, or the caps evicted it), the misses that found it occupied, the
+    /// sum of the held-entry counts behind them (so `held_sum ÷ miss_n` is the
+    /// average population a miss saw), and the misses that followed at least one
+    /// eviction since the previous ask (`crate::render_buffer_pool`).
+    buffer_miss_empty_n: u64,
+    buffer_miss_occupied_n: u64,
+    buffer_miss_held_sum: u64,
+    buffer_miss_after_evict_n: u64,
+    /// The same two readings for the sampled-texture backing pool
+    /// (`crate::render_texture_pool`), plus the per-axis census: how many
+    /// misses found the pool occupied and holding at least one entry whose
+    /// extent, format, image type, view type or carrier arm was the one asked
+    /// for.
+    ///
+    /// The five axes partition the direction a widening cut could take — a miss
+    /// that agrees on the extent is one a key that ignored the format would
+    /// have served — and they are *not* mutually exclusive: an entry can agree
+    /// on three axes and differ on two.
+    pool_miss_empty_n: u64,
+    pool_miss_occupied_n: u64,
+    pool_miss_held_sum: u64,
+    pool_miss_after_evict_n: u64,
+    pool_miss_same_extent_n: u64,
+    pool_miss_same_format_n: u64,
+    pool_miss_same_image_type_n: u64,
+    pool_miss_same_view_type_n: u64,
+    pool_miss_same_device_copy_n: u64,
+    /// How many bounded miss-key lines this window has printed. The lines name
+    /// the *shape* a miss asked for; they are capped so a round of millions of
+    /// declarations cannot turn the reading into the round's own largest
+    /// artifact.
+    miss_key_lines: u32,
     /// The device objects this window's `resource_build` regions created, by
     /// family — the population behind the `rb_*` bars
     /// ([`BuildObject`]).
@@ -1930,6 +2255,23 @@ impl Default for Local {
             td_sampler_n: 0,
             td_buffer_n: 0,
             td_memory_n: 0,
+            buffer_miss_kind: [0; UPLOAD_KIND_COUNT],
+            buffer_return_kind: [0; UPLOAD_KIND_COUNT],
+            buffer_unreturned_kind: [0; UPLOAD_KIND_COUNT],
+            buffer_miss_empty_n: 0,
+            buffer_miss_occupied_n: 0,
+            buffer_miss_held_sum: 0,
+            buffer_miss_after_evict_n: 0,
+            pool_miss_empty_n: 0,
+            pool_miss_occupied_n: 0,
+            pool_miss_held_sum: 0,
+            pool_miss_after_evict_n: 0,
+            pool_miss_same_extent_n: 0,
+            pool_miss_same_format_n: 0,
+            pool_miss_same_image_type_n: 0,
+            pool_miss_same_view_type_n: 0,
+            pool_miss_same_device_copy_n: 0,
+            miss_key_lines: 0,
             build_objects: [0; BUILD_OBJECT_COUNT],
             depth: 0,
         }
@@ -2014,6 +2356,7 @@ impl Local {
         let mut readback_named_ns = 0u64;
         let mut landing_named_ns = 0u64;
         let mut teardown_named_ns = 0u64;
+        let mut td_object_named_ns = 0u64;
         let mut rb_named_ns = 0u64;
         let mut submit_td_named_ns = 0u64;
         let mut submit_seam_ns = 0u64;
@@ -2043,6 +2386,9 @@ impl Local {
             }
             if TEARDOWN_SLOTS.contains(&slot) {
                 teardown_named_ns += ns;
+            }
+            if TEARDOWN_OBJECT_SLOTS.contains(&slot) {
+                td_object_named_ns += ns;
             }
             if RESOURCE_BUILD_SLOTS.contains(&slot) {
                 rb_named_ns += ns;
@@ -2156,6 +2502,25 @@ impl Local {
         let td_sampler_n = std::mem::take(&mut self.td_sampler_n);
         let td_buffer_n = std::mem::take(&mut self.td_buffer_n);
         let td_memory_n = std::mem::take(&mut self.td_memory_n);
+        let buffer_miss_kind = std::mem::take(&mut self.buffer_miss_kind);
+        let buffer_return_kind = std::mem::take(&mut self.buffer_return_kind);
+        let buffer_unreturned_kind = std::mem::take(&mut self.buffer_unreturned_kind);
+        let buffer_miss_empty_n = std::mem::take(&mut self.buffer_miss_empty_n);
+        let buffer_miss_occupied_n = std::mem::take(&mut self.buffer_miss_occupied_n);
+        let buffer_miss_held_sum = std::mem::take(&mut self.buffer_miss_held_sum);
+        let buffer_miss_after_evict_n = std::mem::take(&mut self.buffer_miss_after_evict_n);
+        let pool_miss_empty_n = std::mem::take(&mut self.pool_miss_empty_n);
+        let pool_miss_occupied_n = std::mem::take(&mut self.pool_miss_occupied_n);
+        let pool_miss_held_sum = std::mem::take(&mut self.pool_miss_held_sum);
+        let pool_miss_after_evict_n = std::mem::take(&mut self.pool_miss_after_evict_n);
+        let pool_miss_same_extent_n = std::mem::take(&mut self.pool_miss_same_extent_n);
+        let pool_miss_same_format_n = std::mem::take(&mut self.pool_miss_same_format_n);
+        let pool_miss_same_image_type_n = std::mem::take(&mut self.pool_miss_same_image_type_n);
+        let pool_miss_same_view_type_n = std::mem::take(&mut self.pool_miss_same_view_type_n);
+        let pool_miss_same_device_copy_n = std::mem::take(&mut self.pool_miss_same_device_copy_n);
+        // The miss-key lines' own budget is a per-window reading, so it restarts
+        // with the window like every counter above.
+        self.miss_key_lines = 0;
         let wait_object_calls = std::mem::take(&mut self.wait_object_calls);
         let wait_queue_calls = std::mem::take(&mut self.wait_queue_calls);
         let wait_timeline_calls = std::mem::take(&mut self.wait_timeline_calls);
@@ -2183,6 +2548,7 @@ impl Local {
         let readback_named_us = micros(readback_named_ns);
         let landing_named_us = micros(landing_named_ns);
         let teardown_named_us = micros(teardown_named_ns);
+        let td_object_named_us = micros(td_object_named_ns);
         let rb_named_us = micros(rb_named_ns);
         let submit_td_named_us = micros(submit_td_named_ns);
         let submit_seam_us = micros(submit_seam_ns);
@@ -2204,6 +2570,19 @@ impl Local {
         for (object_slot, object_name) in BUILD_OBJECT_NAMES.iter().enumerate() {
             build_fields.push_str(&format!(" {object_name}_n={}", build_objects[object_slot]));
         }
+        // The per-kind pool readings print from their own table so the three
+        // counters of one kind sit beside each other: what it asked for and
+        // missed, what it handed back, and what its teardown destroyed while
+        // still holding the pool's key.
+        let mut pool_kind_fields = String::with_capacity(400);
+        for (kind_slot, (_, field)) in UPLOAD_KINDS.iter().enumerate() {
+            pool_kind_fields.push_str(&format!(
+                " buf_miss_{field}_n={} buf_return_{field}_n={} td_unreturned_{field}_n={}",
+                buffer_miss_kind[kind_slot],
+                buffer_return_kind[kind_slot],
+                buffer_unreturned_kind[kind_slot],
+            ));
+        }
         eprintln!(
             "PHASE submit n={n}{fields} fence_wait_skipped_n={skipped} \
              plan_settle_us={plan_settle_us:.3} render_us={render_us:.3} \
@@ -2212,6 +2591,7 @@ impl Local {
              readback_named_us={readback_named_us:.3} \
              landing_named_us={landing_named_us:.3} \
              teardown_named_us={teardown_named_us:.3} \
+             td_object_named_us={td_object_named_us:.3} \
              rb_named_us={rb_named_us:.3} submit_td_named_us={submit_td_named_us:.3} \
              submit_seam_us={submit_seam_us:.3} \
              submit_release_named_us={submit_release_named_us:.3} \
@@ -2274,7 +2654,21 @@ impl Local {
              submit_resource_borrows_bytes={resource_borrow_bytes} \
              pool_derivations_n={pool_derivations_n} \
              td_image_n={td_image_n} td_view_n={td_view_n} td_sampler_n={td_sampler_n} \
-             td_buffer_n={td_buffer_n} td_memory_n={td_memory_n}",
+             td_buffer_n={td_buffer_n} td_memory_n={td_memory_n} \
+             td_unreturned_n={} buf_miss_empty_n={buffer_miss_empty_n} \
+             buf_miss_occupied_n={buffer_miss_occupied_n} \
+             buf_miss_held_sum={buffer_miss_held_sum} \
+             buf_miss_after_evict_n={buffer_miss_after_evict_n} \
+             pool_miss_empty_n={pool_miss_empty_n} \
+             pool_miss_occupied_n={pool_miss_occupied_n} \
+             pool_miss_held_sum={pool_miss_held_sum} \
+             pool_miss_after_evict_n={pool_miss_after_evict_n} \
+             pool_miss_same_extent_n={pool_miss_same_extent_n} \
+             pool_miss_same_format_n={pool_miss_same_format_n} \
+             pool_miss_same_image_type_n={pool_miss_same_image_type_n} \
+             pool_miss_same_view_type_n={pool_miss_same_view_type_n} \
+             pool_miss_same_device_copy_n={pool_miss_same_device_copy_n}{pool_kind_fields}",
+            buffer_unreturned_kind.iter().sum::<u64>(),
             readback.rect_n,
             readback.rect_bytes,
             readback.rect_extent_bytes,
@@ -2464,7 +2858,7 @@ static NEXT_SAMPLE_LANE: AtomicUsize = AtomicUsize::new(0);
 /// How many counters one sample line carries beside its bars. The array's
 /// length and the table's length are the same reading, checked by
 /// `shape_sources_fit_the_sample_array`.
-const SHAPE_COUNT: usize = 36;
+const SHAPE_COUNT: usize = 50;
 
 /// One counter the sample line reads out of the window's own table, named as
 /// the field it is printed as.
@@ -2634,6 +3028,68 @@ const SHAPE_SOURCES: &[ShapeSource] = &[
         name: "staging_plain_n",
         read: |local| local.staging_plain_n,
     },
+    // The per-kind upload-pool columns, in [`UPLOAD_KINDS`] order: a
+    // submission's own answer to "which declarations missed the pool", which
+    // is what lets a round rank the tail's kinds without a second switch. The
+    // slot each closure reads is the kind's own slot in that table
+    // (`the_per_kind_columns_follow_the_upload_kind_table` moves one and reads
+    // the column back).
+    ShapeSource {
+        name: "buf_miss_vertex_n",
+        read: |local| local.buffer_miss_kind[0],
+    },
+    ShapeSource {
+        name: "buf_miss_input_index_n",
+        read: |local| local.buffer_miss_kind[1],
+    },
+    ShapeSource {
+        name: "buf_miss_stage_n",
+        read: |local| local.buffer_miss_kind[2],
+    },
+    ShapeSource {
+        name: "buf_miss_previous_n",
+        read: |local| local.buffer_miss_kind[3],
+    },
+    ShapeSource {
+        name: "buf_miss_volume_n",
+        read: |local| local.buffer_miss_kind[4],
+    },
+    ShapeSource {
+        name: "buf_miss_index_n",
+        read: |local| local.buffer_miss_kind[5],
+    },
+    ShapeSource {
+        name: "buf_miss_indirect_n",
+        read: |local| local.buffer_miss_kind[6],
+    },
+    ShapeSource {
+        name: "td_unreturned_n",
+        read: |local| local.buffer_unreturned_kind.iter().sum(),
+    },
+    ShapeSource {
+        name: "buf_miss_empty_n",
+        read: |local| local.buffer_miss_empty_n,
+    },
+    ShapeSource {
+        name: "buf_miss_occupied_n",
+        read: |local| local.buffer_miss_occupied_n,
+    },
+    ShapeSource {
+        name: "pool_miss_empty_n",
+        read: |local| local.pool_miss_empty_n,
+    },
+    ShapeSource {
+        name: "pool_miss_occupied_n",
+        read: |local| local.pool_miss_occupied_n,
+    },
+    ShapeSource {
+        name: "pool_miss_same_extent_n",
+        read: |local| local.pool_miss_same_extent_n,
+    },
+    ShapeSource {
+        name: "pool_miss_same_format_n",
+        read: |local| local.pool_miss_same_format_n,
+    },
 ];
 
 /// The regions the sample line's named parents are made of, in field order.
@@ -2664,11 +3120,15 @@ const CHILD_BARS: &[(&str, Phase)] = &[
     ("teardown_attachments_us", Phase::TeardownAttachments),
     ("teardown_textures_us", Phase::TeardownTextures),
     ("submit_teardown_us", Phase::SubmitTeardown),
+    ("td_image_us", Phase::TeardownObjectImage),
+    ("td_view_us", Phase::TeardownObjectView),
+    ("td_buffer_us", Phase::TeardownObjectBuffer),
+    ("td_memory_us", Phase::TeardownObjectMemory),
 ];
 
 /// How many child bars one sample line carries beside its parents. Pinned
 /// against the table by `child_bars_fit_the_sample_array`.
-const CHILD_COUNT: usize = 17;
+const CHILD_COUNT: usize = 21;
 
 /// One submission's own readings, ready to be spelled as a `SUBMIT_SAMPLE`
 /// line.
@@ -2975,6 +3435,26 @@ pub(crate) enum TeardownObject {
     Sampler,
     Buffer,
     Memory,
+}
+
+impl TeardownObject {
+    /// The bar this family's destroy calls are charged to, or `None` for a
+    /// family the object bars do not name.
+    ///
+    /// A sampler is the one family without a bar: the E-CT2 round's question is
+    /// what the four pooled families cost (`crate::render_buffer_pool`,
+    /// `crate::render_texture_pool`), and a sampler is neither pooled nor named
+    /// by a pool key, so charging it to a sibling's bar would put a second
+    /// population behind a number a reader divides by one count.
+    pub(crate) const fn bar(self) -> Option<Phase> {
+        match self {
+            Self::Image => Some(Phase::TeardownObjectImage),
+            Self::View => Some(Phase::TeardownObjectView),
+            Self::Buffer => Some(Phase::TeardownObjectBuffer),
+            Self::Memory => Some(Phase::TeardownObjectMemory),
+            Self::Sampler => None,
+        }
+    }
 }
 
 #[inline]
@@ -3312,6 +3792,35 @@ mod tests {
             assert!(!LANDING_SLOTS.contains(&slot));
             assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
         }
+        // The object bars (the E-CT2 round) are nested *inside* the ten groups
+        // rather than beside them: a slot in both sets would count the same
+        // microseconds twice, once as the group and once as the object that
+        // paid them.
+        for slot in TEARDOWN_OBJECT_SLOTS {
+            assert_ne!(slot, Phase::RenderTeardown as usize);
+            assert!(!TEARDOWN_SLOTS.contains(&slot));
+            assert!(!RENDER_RESIDUAL_SLOTS.contains(&slot));
+            assert!(!RENDER_SLOTS.contains(&slot));
+            assert!(!TEXTURE_SLOTS.contains(&slot));
+            assert!(!READBACK_ARM_SLOTS.contains(&slot));
+            assert!(!LANDING_SLOTS.contains(&slot));
+        }
+        assert_eq!(PHASE_NAMES[Phase::TeardownObjectImage as usize], "td_image");
+        assert_eq!(
+            PHASE_NAMES[Phase::TeardownObjectMemory as usize],
+            "td_memory"
+        );
+        // Each bar belongs to the family whose counter names it, and the one
+        // family without a bar says so rather than borrowing a sibling's.
+        assert_eq!(
+            TeardownObject::Image.bar(),
+            Some(Phase::TeardownObjectImage)
+        );
+        assert_eq!(
+            TeardownObject::Buffer.bar(),
+            Some(Phase::TeardownObjectBuffer)
+        );
+        assert_eq!(TeardownObject::Sampler.bar(), None);
         assert_eq!(PHASE_NAMES[Phase::TeardownSync as usize], "teardown_sync");
         assert_eq!(
             PHASE_NAMES[Phase::TeardownPrevious as usize],
@@ -3835,6 +4344,10 @@ mod tests {
                 "teardown_attachments_us",
                 "teardown_textures_us",
                 "submit_teardown_us",
+                "td_image_us",
+                "td_view_us",
+                "td_buffer_us",
+                "td_memory_us",
                 "offscreen_n",
                 "present_n",
                 "batch_n",
@@ -3871,6 +4384,20 @@ mod tests {
                 "td_memory_n",
                 "staging_cached_n",
                 "staging_plain_n",
+                "buf_miss_vertex_n",
+                "buf_miss_input_index_n",
+                "buf_miss_stage_n",
+                "buf_miss_previous_n",
+                "buf_miss_volume_n",
+                "buf_miss_index_n",
+                "buf_miss_indirect_n",
+                "td_unreturned_n",
+                "buf_miss_empty_n",
+                "buf_miss_occupied_n",
+                "pool_miss_empty_n",
+                "pool_miss_occupied_n",
+                "pool_miss_same_extent_n",
+                "pool_miss_same_format_n",
             ]
         );
         // The child bars are the sample's own, in table order: the slot a
@@ -3947,6 +4474,86 @@ mod tests {
     /// The table and the array the line is filled from are the same length, and
     /// no two fields share a name: a duplicate would let a parser keyed on
     /// names read one column twice and never notice the other.
+    #[test]
+    fn the_per_kind_columns_read_their_own_slot() {
+        // Every kind's three counters are given a value only that kind has, and
+        // the sample is asked which column each value lands in: a table entry
+        // and a closure that drifted apart would print one kind's count under
+        // another kind's name, which reads like a finding rather than a bug.
+        let mut local = Local::default();
+        for (slot, _) in UPLOAD_KINDS.iter().enumerate() {
+            local.buffer_miss_kind[slot] = slot as u64 + 1;
+            local.buffer_return_kind[slot] = 10 + slot as u64;
+            local.buffer_unreturned_kind[slot] = 20 + slot as u64;
+        }
+        local.buffer_miss_empty_n = 101;
+        local.buffer_miss_occupied_n = 102;
+        local.pool_miss_empty_n = 103;
+        local.pool_miss_same_extent_n = 104;
+        let sample = local.take_shape_sample();
+        let column = |name: &str| {
+            let slot = SHAPE_SOURCES
+                .iter()
+                .position(|source| source.name == name)
+                .unwrap_or_else(|| panic!("{name} is not on the sample line"));
+            sample[slot]
+        };
+        for (slot, (_, field)) in UPLOAD_KINDS.iter().enumerate() {
+            assert_eq!(
+                column(&format!("buf_miss_{field}_n")),
+                slot as u64 + 1,
+                "buf_miss_{field}_n"
+            );
+        }
+        assert_eq!(column("buf_miss_empty_n"), 101);
+        assert_eq!(column("buf_miss_occupied_n"), 102);
+        assert_eq!(column("pool_miss_empty_n"), 103);
+        assert_eq!(column("pool_miss_same_extent_n"), 104);
+        assert_eq!(
+            column("td_unreturned_n"),
+            (0..UPLOAD_KIND_COUNT)
+                .map(|slot| 20 + slot as u64)
+                .sum::<u64>(),
+            "the total is the kinds' own sum"
+        );
+        // The per-kind columns appear as one block in the table's order, so a
+        // parser that reads them as a run reads the kinds the table names.
+        let first = SHAPE_SOURCES
+            .iter()
+            .position(|source| source.name == format!("buf_miss_{}_n", UPLOAD_KINDS[0].1))
+            .expect("the first kind's column is on the line");
+        for (slot, (_, field)) in UPLOAD_KINDS.iter().enumerate() {
+            assert_eq!(
+                SHAPE_SOURCES[first + slot].name,
+                format!("buf_miss_{field}_n")
+            );
+        }
+    }
+
+    /// The kind table is the creation sites' own vocabulary: every name a site
+    /// states maps to a slot, an unknown name maps to none rather than to a
+    /// neighbour's slot, and the printed suffixes are distinct.
+    #[test]
+    fn upload_kinds_are_the_creation_sites_own_names() {
+        for (slot, (name, field)) in UPLOAD_KINDS.iter().enumerate() {
+            assert_eq!(upload_kind_slot(name), Some(slot));
+            assert!(!field.is_empty(), "{name} has no field suffix");
+        }
+        assert_eq!(upload_kind_slot(""), None);
+        // The field suffix is not a name a creation site states: a read of the
+        // wrong vocabulary has to miss rather than land in a sibling's slot.
+        for (_, field) in UPLOAD_KINDS {
+            if !UPLOAD_KINDS.iter().any(|entry| entry.1 == field) {
+                assert_eq!(upload_kind_slot(field), None);
+            }
+        }
+        let mut names: Vec<&str> = UPLOAD_KINDS.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "kind names are unique");
+    }
+
     #[test]
     fn shape_sources_fit_the_sample_array() {
         assert_eq!(SHAPE_SOURCES.len(), SHAPE_COUNT);
