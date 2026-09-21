@@ -104,14 +104,17 @@ pub(crate) fn enabled_from_env() -> bool {
     })
 }
 
-/// The switch's own reading: **off unless the variable turns it on**
-/// (`1`/`on`/`true`/`yes`, case-insensitively). Unlike the sixth cut's — which
-/// was flipped on once its A/B had read it — this one starts off: the cut lands
-/// the arm beside the copy, and the round that prices it runs both.
+/// The switch's own reading: **on unless the variable turns it off**
+/// (`0`/`off`/`false`/`no`, case-insensitively) — the eighth cut was flipped
+/// on once its A/B had priced it (the `sp23`/`sb` arms read
+/// `staging_window_us` 66.231 → 0.949 → 62.093 µs per submission, 65× the
+/// spread between the two identical control arms, with 6.517 → 0 copies per
+/// submission and 0 → 6.557 windows lent per submission). The off arm stays
+/// reachable as the control a round compares against.
 fn parse_enabled(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "on" | "true" | "yes")
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -332,9 +335,9 @@ mod tests {
     /// Off unless the variable says otherwise: the copy stays the default and
     /// the pre-cut path stays reachable as the control a round compares against.
     #[test]
-    fn the_switch_is_off_unless_the_variable_says_otherwise() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_the_variable_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("no")));
@@ -342,7 +345,7 @@ mod tests {
         assert!(!parse_enabled(Some("OFF")));
         assert!(!parse_enabled(Some("No ")));
         assert!(!parse_enabled(Some("False")));
-        assert!(!parse_enabled(Some("borrow-staging")));
+        assert!(parse_enabled(Some("borrow-staging")));
         assert!(parse_enabled(Some("1")));
         assert!(parse_enabled(Some("on")));
         assert!(parse_enabled(Some("ON")));
