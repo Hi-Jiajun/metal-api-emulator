@@ -5853,6 +5853,12 @@ impl<'a> Iterator for RenderDrawPasses<'a> {
                     // The pass state is stated once and every draw's own
                     // declaration is materialized into a single-draw pass: the
                     // one shape every rule in this contract is written against.
+                    //
+                    // The event is metered for the walk that is running, if one
+                    // is (`crate::admit_profile`): the count is what says how
+                    // many times one walk clones a list, which is the reading
+                    // the tenth cut's own switch moves.
+                    crate::admit_profile::note_draw_list_materialize(list.draw_count());
                     self.materialized = list
                         .materialize()
                         .into_iter()
@@ -5865,6 +5871,73 @@ impl<'a> Iterator for RenderDrawPasses<'a> {
                 }
                 TracePass::Compute(_) | TracePass::Landing(_) => {}
             }
+        }
+    }
+}
+
+/// The render entries one admission walk reads, materialized once when the
+/// tenth cut is on (`crate::admit_shared_draws`).
+///
+/// The two arms hand the gates the same values in the same order: the per-gate
+/// arm builds a fresh [`RenderDrawPasses`] for every gate — and each one
+/// materializes every list entry it meets — while the shared arm walks the one
+/// vector the walk built before the first gate. The type exists so the gates
+/// take one parameter instead of two, and so the switch lives in one place.
+struct RenderDrawSource<'a> {
+    trace: &'a ComputeTrace,
+    shared: Option<&'a [(usize, Cow<'a, RenderPassDescriptor>)]>,
+}
+
+impl<'a> RenderDrawSource<'a> {
+    /// The arm the tenth cut selects: one materialization for the whole walk.
+    fn shared(
+        trace: &'a ComputeTrace,
+        shared: &'a [(usize, Cow<'a, RenderPassDescriptor>)],
+    ) -> Self {
+        Self {
+            trace,
+            shared: Some(shared),
+        }
+    }
+
+    /// The arm every walk had before the cut: each gate materializes what it
+    /// meets, for itself.
+    fn per_gate(trace: &'a ComputeTrace) -> Self {
+        Self {
+            trace,
+            shared: None,
+        }
+    }
+
+    fn trace(&self) -> &'a ComputeTrace {
+        self.trace
+    }
+
+    /// The render entries, in trace order, as the single-draw passes every rule
+    /// in this contract is written against.
+    fn passes(&self) -> DrawPasses<'a> {
+        match self.shared {
+            Some(shared) => DrawPasses::Shared(shared.iter()),
+            None => DrawPasses::PerGate(self.trace.render_draw_passes()),
+        }
+    }
+}
+
+/// [`RenderDrawSource::passes`]'s two arms, as one iterator.
+enum DrawPasses<'a> {
+    Shared(std::slice::Iter<'a, (usize, Cow<'a, RenderPassDescriptor>)>),
+    PerGate(RenderDrawPasses<'a>),
+}
+
+impl<'a> Iterator for DrawPasses<'a> {
+    type Item = (usize, Cow<'a, RenderPassDescriptor>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Shared(iter) => iter
+                .next()
+                .map(|(index, pass)| (*index, Cow::Borrowed(pass.as_ref()))),
+            Self::PerGate(iter) => iter.next(),
         }
     }
 }
@@ -10706,6 +10779,7 @@ fn admit_census(trace: &ComputeTrace, resources: &ResourceTableSnapshot) -> Cens
                 census.render_passes += 1;
                 census.draws += 1;
                 note_render_shape(&mut census, pass);
+                note_render_sources(&mut census, pass);
             }
             TracePass::RenderDraws(list) => {
                 // The list is one pass carrying several draws (B-2): the pass
@@ -10715,8 +10789,18 @@ fn admit_census(trace: &ComputeTrace, resources: &ResourceTableSnapshot) -> Cens
                 census.render_passes += 1;
                 census.draws += list.draw_count() as u64;
                 note_render_shape(&mut census, &list.head);
+                note_render_sources(&mut census, &list.head);
                 for draw in &list.tail {
                     census.vertex_buffers += draw.vertex_buffers.len() as u64;
+                    for view in &draw.vertex_buffers {
+                        note_buffer_source(&mut census, &view.source);
+                    }
+                    if let Some(indices) = &draw.indices {
+                        note_buffer_source(&mut census, &indices.view.source);
+                    }
+                    for stage in &draw.stage_buffers {
+                        note_buffer_source(&mut census, &stage.view.source);
+                    }
                 }
             }
             TracePass::Landing(_) => census.landings += 1,
@@ -10732,6 +10816,36 @@ fn note_render_shape(census: &mut Census, pass: &RenderPassDescriptor) {
     census.samplers += pass.samplers.len() as u64;
     census.color_attachments += pass.color_attachments.len() as u64;
     census.vertex_buffers += pass.vertex_buffers.len() as u64;
+}
+
+/// What one render pass's buffer-shaped declarations carry, added to a census.
+///
+/// Read off the trace's own lists — the head's, and for a list each tail draw's
+/// own halves — and never off a materialization: the census is taken before the
+/// walk runs and may not clone anything (`crate::admit_profile`).
+fn note_render_sources(census: &mut Census, pass: &RenderPassDescriptor) {
+    for view in &pass.vertex_buffers {
+        note_buffer_source(census, &view.source);
+    }
+    if let Some(indices) = &pass.indices {
+        note_buffer_source(census, &indices.view.source);
+    }
+    for stage in &pass.stage_buffers {
+        note_buffer_source(census, &stage.view.source);
+    }
+}
+
+/// One buffer source's own bytes or its own kind, added to a census.
+fn note_buffer_source(census: &mut Census, source: &BufferSource) {
+    match source {
+        BufferSource::OwnedBytes(bytes) => census.owned_bytes += bytes.len() as u64,
+        BufferSource::GuestRuns(runs) => {
+            census.guest_runs += runs.len() as u64;
+            census.guest_run_bytes += runs.iter().map(|run| run.length).sum::<u64>();
+        }
+        BufferSource::BorrowedNoCopy(_) => census.borrowed_no_copy += 1,
+        BufferSource::StagedLease(_) => census.staged_lease += 1,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11964,10 +12078,28 @@ impl ProviderCapabilities {
         // reservation the caller performs after a successful `admit`: a
         // provider that cannot render refuses the whole trace here, and a
         // compute-only trace never enters the walk (`docs/23` §4.2).
+        //
+        // The tenth cut's one materialization sits here
+        // (`crate::admit_shared_draws`): the four render gates below all walk
+        // the trace's render entries as single-draw passes, and off the cut each
+        // of them materializes every multi-draw list for itself.
+        let shared_draws = crate::admit_shared_draws::enabled();
+        let materialized: Vec<(usize, Cow<'_, RenderPassDescriptor>)> = if shared_draws {
+            let _bar =
+                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::DrawPasses);
+            trace.render_draw_passes().collect()
+        } else {
+            Vec::new()
+        };
+        let draws = if shared_draws {
+            RenderDrawSource::shared(trace, &materialized)
+        } else {
+            RenderDrawSource::per_gate(trace)
+        };
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::RenderPasses);
-            self.admit_render_passes(trace)?;
+            self.admit_render_passes(&draws)?;
         }
 
         // Kept-frame landing admission sits beside the render walk rather than
@@ -11991,7 +12123,7 @@ impl ProviderCapabilities {
                 site,
                 crate::admit_profile::Region::RenderTextures,
             );
-            self.admit_render_texture_inputs(trace)?;
+            self.admit_render_texture_inputs(&draws)?;
         }
 
         // Runtime sampler admission is the state gate beside the texture walk
@@ -12003,7 +12135,7 @@ impl ProviderCapabilities {
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::PixelSamplers);
-            self.admit_render_pixel_samplers(trace)?;
+            self.admit_render_pixel_samplers(&draws)?;
         }
 
         // Stage buffer admission is the third render gate and sits in the same
@@ -12017,7 +12149,7 @@ impl ProviderCapabilities {
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::StageBuffers);
-            self.admit_render_stage_buffer_inputs(trace)?;
+            self.admit_render_stage_buffer_inputs(&draws)?;
         }
 
         // Compute texture admission is the compute-side sibling of the render
@@ -12390,7 +12522,8 @@ impl ProviderCapabilities {
     /// only then is its render half compared with the pass. That is the first
     /// gate that can check "this attachment format is the pipeline's own"
     /// without a provider registry.
-    fn admit_render_passes(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+    fn admit_render_passes(&self, draws: &RenderDrawSource<'_>) -> Result<(), ProviderError> {
+        let trace = draws.trace();
         let render_pass_count = trace.render_entries().count();
         if render_pass_count == 0 {
             return Ok(());
@@ -12435,7 +12568,7 @@ impl ProviderCapabilities {
         // (`ComputeTrace::render_draw_passes`): the pass-level checks below run
         // once per draw of a list — they read the pass state, which every draw
         // of one list shares — and the per-draw checks run once per draw.
-        for (pass_index, pass) in trace.render_draw_passes() {
+        for (pass_index, pass) in draws.passes() {
             if pass.color_attachments.len() > self.max_color_attachments as usize {
                 return Err(capability_error("color_attachment_limit")
                     .with_field(
@@ -12699,8 +12832,11 @@ impl ProviderCapabilities {
     /// which is why this gate only answers what the snapshot knows: whether it
     /// samples render-side textures at all, how many it admits, and in which
     /// formats.
-    fn admit_render_texture_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        for (pass_index, pass) in trace.render_draw_passes() {
+    fn admit_render_texture_inputs(
+        &self,
+        draws: &RenderDrawSource<'_>,
+    ) -> Result<(), ProviderError> {
+        for (pass_index, pass) in draws.passes() {
             if pass.textures.is_empty() {
                 continue;
             }
@@ -12942,8 +13078,11 @@ impl ProviderCapabilities {
     /// The walk is per pass and per binding so the refusal can name the
     /// `[[sampler(n)]]` argument that stated the space. A pass that states only
     /// the normalized space — every pre-increment frame — never enters it.
-    fn admit_render_pixel_samplers(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        for (pass_index, pass) in trace.render_draw_passes() {
+    fn admit_render_pixel_samplers(
+        &self,
+        draws: &RenderDrawSource<'_>,
+    ) -> Result<(), ProviderError> {
+        for (pass_index, pass) in draws.passes() {
             for sampler in &pass.samplers {
                 if !sampler.coordinates.is_pixel() {
                     continue;
@@ -13038,8 +13177,11 @@ impl ProviderCapabilities {
     /// storage-mode question is the same one the compute walk asks of its
     /// buffers, because a stage buffer's bytes come from the same three
     /// [`BufferSource`] arms.
-    fn admit_render_stage_buffer_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
-        for (pass_index, pass) in trace.render_draw_passes() {
+    fn admit_render_stage_buffer_inputs(
+        &self,
+        draws: &RenderDrawSource<'_>,
+    ) -> Result<(), ProviderError> {
+        for (pass_index, pass) in draws.passes() {
             if pass.stage_buffers.is_empty() {
                 continue;
             }
@@ -27052,6 +27194,61 @@ mod tests {
         provider.supports_render_multi_draw = true;
         provider.max_draws_per_pass = MAX_DRAWS_PER_PASS as u32;
         provider
+    }
+
+    /// The tenth cut's rail: the two arms of the render-entry walk — one
+    /// materialization for the whole walk, or one per gate — hand the gates the
+    /// same values in the same order, and a walk that refuses refuses with the
+    /// same name on both arms.
+    ///
+    /// The arms are driven through `admit_shared_draws::set_arm`, so one process
+    /// reads both answers off the same fixture. The walk under test is the whole
+    /// admission, not the iterator alone: the claim is about what the gates are
+    /// handed.
+    #[test]
+    fn the_two_arms_of_the_render_entry_walk_answer_the_same() {
+        let trace = attachment_draws_trace(3);
+        let resources = vertex_input_resources();
+        trace.validate().expect("the fixture is structurally valid");
+
+        // The values the two arms walk are equal, index for index: the shared
+        // materialization is the per-gate one, kept.
+        let per_gate = RenderDrawSource::per_gate(&trace)
+            .passes()
+            .collect::<Vec<_>>();
+        let shared_draws = trace.render_draw_passes().collect::<Vec<_>>();
+        let shared = RenderDrawSource::shared(&trace, &shared_draws)
+            .passes()
+            .collect::<Vec<_>>();
+        assert_eq!(per_gate.len(), shared.len());
+        assert_eq!(per_gate.len(), 3, "the list states three draws");
+        for (per_gate, shared) in per_gate.iter().zip(&shared) {
+            assert_eq!(per_gate.0, shared.0, "the entry's own index");
+            assert_eq!(per_gate.1, shared.1, "the materialized pass");
+        }
+
+        for arm in [Some(false), Some(true)] {
+            crate::admit_shared_draws::set_arm(arm);
+            multi_draw_capabilities()
+                .admit(&trace, &resources)
+                .expect("a snapshot that declares the arm admits the list");
+            // The refusals are named the same on both arms: the bit the
+            // snapshot answers, then the count it admits.
+            assert_eq!(
+                render_capabilities()
+                    .admit(&trace, &resources)
+                    .unwrap_err()
+                    .slug,
+                "render_multi_draw_unsupported"
+            );
+            let mut narrow = multi_draw_capabilities();
+            narrow.max_draws_per_pass = 2;
+            assert_eq!(
+                narrow.admit(&trace, &resources).unwrap_err().slug,
+                "render_draw_count_limit"
+            );
+        }
+        crate::admit_shared_draws::set_arm(None);
     }
 
     /// The list's one-draw shape is today's single-draw pass, byte for byte

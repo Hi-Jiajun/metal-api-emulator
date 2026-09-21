@@ -34,27 +34,56 @@
 //!   render_textures_us=... pixel_samplers_us=... stage_buffers_us=...
 //!   compute_textures_us=... present_us=... heap_us=... indirect_us=...
 //!   limits_us=... compute_passes_us=... serial_reuse_us=... resources_us=...
+//!   draw_passes_us=...
 //!   passes_n=... render_passes_n=... compute_passes_n=... draws_n=...
 //!   landings_n=... pipelines_n=... stage_buffers_n=... textures_n=...
 //!   samplers_n=... color_attachments_n=... compute_views_n=...
-//!   vertex_buffers_n=... allocations_n=... leases_n=...
+//!   vertex_buffers_n=... allocations_n=... leases_n=... owned_bytes_n=...
+//!   guest_runs_n=... guest_run_bytes_n=... borrowed_no_copy_n=...
+//!   staged_lease_n=... draw_list_materialize_n=...
+//!   draw_list_materialize_passes=...
 //!   ```
 //!
-//! The fourteen regions are **disjoint consecutive regions of one call**, in
-//! the order `admit` runs them, so `sum(fields) <= total_us` and the difference
-//! is the seam between the brackets. `named_us` is printed beside them as the
+//! The fourteen regions of the walk are **disjoint consecutive regions of one
+//! call**, in the order `admit` runs them — plus the tenth cut's own
+//! `draw_passes` slot, appended after them so every earlier slot kept its index
+//! (`Region::DrawPasses`; it is zero on the arm where the walk does not hoist a
+//! materialization at all). `sum(fields) <= total_us` and the difference is the
+//! seam between the brackets. `named_us` is printed beside them as the
 //! aggregate rather than added to the sum, exactly as `plan_settle_us` is in
 //! `metal-api-vulkan::phase_profile`.
 //!
 //! The `*_n` fields are the shape census of the same window: the number of
 //! passes, pipelines, stage buffers, textures, samplers and views the admitted
-//! traces carried. They are what answers "is this pose's walk slower because it
-//! is called more, or because each trace is bigger" — and they are sums over
-//! the window's walks, so dividing by `n` gives the mean shape of one trace.
+//! traces carried, and what those declarations carry in *bytes* (`owned_bytes`
+//! and the gathered runs are the two arms that state any; an imported window
+//! states a handful of fields and is counted per source instead). They are what
+//! answers "is this pose's walk slower because it is called more, because each
+//! trace states more, or because the same number of declarations carries more
+//! bytes" — and they are sums over the window's walks, so dividing by `n` gives
+//! the mean shape of one trace.
 //!
 //! Fields are **sums**, not means, so a reader can add lines together and
 //! divide by the summed `n` without weighting error. µs fields carry three
 //! decimals, i.e. nanosecond resolution.
+//!
+//! # The materialization meter
+//!
+//! One reading is not a region and not a shape: how many times the walk
+//! materialized a multi-draw list. `ComputeTrace::render_draw_passes` states a
+//! multi-draw pass as one single-draw pass per draw, and every gate that walks
+//! it builds its own iterator — so a walk with a list entry materializes it once
+//! per gate, each time cloning the pass state and every draw's own declarations.
+//! The meter counts those events, and the passes they produced, for the
+//! **current walk**:
+//!
+//! ```text
+//! draw_list_materialize_n=... draw_list_materialize_passes=...
+//! ```
+//!
+//! It is attributed through the walk's own route table (a window is open on the
+//! thread for exactly the length of one walk), so a caller that materializes
+//! outside admission — `serial_resources` does — is counted nowhere.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -116,9 +145,22 @@ pub(crate) enum Region {
     SerialReuse,
     /// `ResourceTableSnapshot::validate_trace`: the resource namespace walk.
     Resources,
+    /// Materializing the trace's render entries once for the whole walk (the
+    /// tenth cut's own region, `METAL_API_CORE_ADMIT_SHARED_DRAWS`).
+    ///
+    /// Off, the walk never enters this bar: every gate that walks
+    /// `ComputeTrace::render_draw_passes` builds its own iterator, and each one
+    /// materializes every multi-draw list it meets — the work is inside the
+    /// gate's own bar and is charged there. On, the walk materializes them once
+    /// and hands the same values to every gate, so this bar carries what the
+    /// gates no longer do.
+    ///
+    /// It is a region of the walk rather than a nested child: it happens once,
+    /// between `trace_validate` and the first gate, and nothing else charges it.
+    DrawPasses,
 }
 
-const REGION_COUNT: usize = Region::Resources as usize + 1;
+const REGION_COUNT: usize = Region::DrawPasses as usize + 1;
 const REGION_NAMES: [&str; REGION_COUNT] = [
     "trace_validate",
     "render_passes",
@@ -134,6 +176,7 @@ const REGION_NAMES: [&str; REGION_COUNT] = [
     "compute_passes",
     "serial_reuse",
     "resources",
+    "draw_passes",
 ];
 
 /// How many shapes the census counts, and what each slot counts.
@@ -142,7 +185,7 @@ const REGION_NAMES: [&str; REGION_COUNT] = [
 /// carried; the last two are the resource snapshot's own size. Together they
 /// are the denominator a bar reading needs: the same 18.9 ms is a different
 /// finding when it is 71.8 small traces a frame than when it is 12 large ones.
-const CENSUS_COUNT: usize = 14;
+const CENSUS_COUNT: usize = 19;
 const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
     "passes_n",
     "render_passes_n",
@@ -158,7 +201,18 @@ const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
     "vertex_buffers_n",
     "allocations_n",
     "leases_n",
+    "owned_bytes_n",
+    "guest_runs_n",
+    "guest_run_bytes_n",
+    "borrowed_no_copy_n",
+    "staged_lease_n",
 ];
+
+/// The walk events the meter counts, beyond the shape census: things that
+/// happen *during* the walk rather than describe its input.
+const EVENT_COUNT: usize = 2;
+const EVENT_NAMES: [&str; EVENT_COUNT] =
+    ["draw_list_materialize_n", "draw_list_materialize_passes"];
 
 const EVERY_DEFAULT: u64 = 256;
 
@@ -179,6 +233,17 @@ pub(crate) struct Census {
     pub vertex_buffers: u64,
     pub allocations: u64,
     pub leases: u64,
+    /// The bytes the declarations carry rather than the counts of them: the
+    /// `OwnedBytes` a trace states, the gathered runs' own count and bytes, and
+    /// the two lease arms that state no bytes at all. Two poses can state the
+    /// same *number* of declarations and differ by an order of magnitude here,
+    /// which is what makes a per-declaration bar readable (`research/docs/23`
+    /// §74: an imported window is a few fields, a staged copy is its bytes).
+    pub owned_bytes: u64,
+    pub guest_runs: u64,
+    pub guest_run_bytes: u64,
+    pub borrowed_no_copy: u64,
+    pub staged_lease: u64,
 }
 
 /// One thread's window of the profile.
@@ -189,6 +254,11 @@ struct Local {
     window: [u64; SITE_COUNT],
     refused: [u64; SITE_COUNT],
     census: [[u64; CENSUS_COUNT]; SITE_COUNT],
+    events: [[u64; EVENT_COUNT]; SITE_COUNT],
+    /// The route whose window is open on this thread, if any. A walk that
+    /// materializes a multi-draw list reports it here (`note_draw_list_materialize`),
+    /// and a caller that materializes outside admission reports nowhere.
+    current_site: Option<usize>,
 }
 
 impl Local {
@@ -200,6 +270,8 @@ impl Local {
             window: [0; SITE_COUNT],
             refused: [0; SITE_COUNT],
             census: [[0; CENSUS_COUNT]; SITE_COUNT],
+            events: [[0; EVENT_COUNT]; SITE_COUNT],
+            current_site: None,
         }
     }
 }
@@ -255,6 +327,7 @@ impl Window {
         if !enabled() {
             return None;
         }
+        LOCAL.with(|local| local.borrow_mut().current_site = Some(site));
         Some(Self {
             site,
             started: Instant::now(),
@@ -288,6 +361,7 @@ impl Drop for Window {
         let refused = self.refused;
         let emit = LOCAL.with(|local| {
             let mut local = local.borrow_mut();
+            local.current_site = None;
             local.total_ns[site] += elapsed;
             local.calls[site] += 1;
             if refused {
@@ -307,6 +381,11 @@ impl Drop for Window {
             local.census[site][11] += census.vertex_buffers;
             local.census[site][12] += census.allocations;
             local.census[site][13] += census.leases;
+            local.census[site][14] += census.owned_bytes;
+            local.census[site][15] += census.guest_runs;
+            local.census[site][16] += census.guest_run_bytes;
+            local.census[site][17] += census.borrowed_no_copy;
+            local.census[site][18] += census.staged_lease;
             local.window[site] += 1;
             local.window[site] >= every()
         });
@@ -349,10 +428,31 @@ impl Drop for Bar {
     }
 }
 
+/// Record one multi-draw list materialization performed by the open walk.
+///
+/// Called where the list is materialized — the trace's own
+/// `render_draw_passes` iterator — so the count is the events themselves and
+/// not a second reading of the trace. One event per list, `passes` of them.
+#[inline]
+pub(crate) fn note_draw_list_materialize(passes: usize) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        let Some(site) = local.current_site else {
+            return;
+        };
+        local.events[site][0] += 1;
+        local.events[site][1] += passes as u64;
+    });
+}
+
 /// One window of one route, taken out of the thread's table.
 struct Taken {
     ns: [u64; REGION_COUNT],
     census: [u64; CENSUS_COUNT],
+    events: [u64; EVENT_COUNT],
     total_ns: u64,
     n: u64,
     refused_n: u64,
@@ -365,12 +465,14 @@ fn take_window(site: usize) -> Taken {
         let taken = Taken {
             ns: local.ns[site],
             census: local.census[site],
+            events: local.events[site],
             total_ns: local.total_ns[site],
             n: local.window[site],
             refused_n: local.refused[site],
         };
         local.ns[site] = [0; REGION_COUNT];
         local.census[site] = [0; CENSUS_COUNT];
+        local.events[site] = [0; EVENT_COUNT];
         local.total_ns[site] = 0;
         local.calls[site] = 0;
         local.window[site] = 0;
@@ -390,6 +492,9 @@ fn format_line(site: usize, taken: &Taken) -> String {
     }
     for (slot, name) in CENSUS_NAMES.iter().enumerate() {
         fields.push_str(&format!(" {name}={}", census[slot]));
+    }
+    for (slot, name) in EVENT_NAMES.iter().enumerate() {
+        fields.push_str(&format!(" {name}={}", taken.events[slot]));
     }
     format!(
         "ADMIT route={} n={} refused_n={} total_us={:.3} named_us={:.3}{fields}",
@@ -424,8 +529,9 @@ mod tests {
         assert_eq!(SITE_NAMES.len(), SITE_COUNT);
         assert_eq!(REGION_NAMES.len(), REGION_COUNT);
         assert_eq!(CENSUS_NAMES.len(), CENSUS_COUNT);
+        assert_eq!(EVENT_NAMES.len(), EVENT_COUNT);
         assert_eq!(Region::TraceValidate as usize, 0);
-        assert_eq!(Region::Resources as usize + 1, REGION_COUNT);
+        assert_eq!(Region::DrawPasses as usize + 1, REGION_COUNT);
     }
 
     /// Off is the default: the switch reads the environment once, and every
@@ -462,6 +568,7 @@ mod tests {
         let taken = Taken {
             ns: [0; REGION_COUNT],
             census: [0; CENSUS_COUNT],
+            events: [0; EVENT_COUNT],
             total_ns: 1_000,
             n: 4,
             refused_n: 1,
@@ -472,6 +579,9 @@ mod tests {
             assert!(line.contains(&format!(" {name}_us=")), "missing {name}");
         }
         for name in CENSUS_NAMES {
+            assert!(line.contains(&format!(" {name}=")), "missing {name}");
+        }
+        for name in EVENT_NAMES {
             assert!(line.contains(&format!(" {name}=")), "missing {name}");
         }
         let named: u64 = taken.ns.iter().sum();
