@@ -47,6 +47,19 @@
 //! caps are a wiring guard rather than a second policy. A device epoch change
 //! empties both, because the bytes a provider holds do not survive it.
 //!
+//! One reading that paragraph does not cover is *within* a statement:
+//! [`PayloadLedger::plan`] is called once per declaration of a statement, and
+//! each call reads the ledger as the statement found it — its own earlier
+//! declarations are filed only once the statement crossed — so a statement can
+//! state declarations that each fit the bound and do not fit it together (a
+//! small one into a fresh slot, a larger one into the entry it replaces,
+//! together one payload past the byte bound). The provider refuses such a
+//! statement by name and files **none** of it ([`PayloadTable::declare_all`]),
+//! so the price is the one statement rather than a table whose `used_bytes`
+//! drift apart from the ledger's: a provider that filed the declarations before
+//! the one it could not hold would be refusing the sender's *next* plans for
+//! entries the sender's ledger does not know it holds.
+//!
 //! Reading one bound and not the other is the shape census v65 caught, and it
 //! is worth stating as a shape rather than as a caution. The *first* branch of a
 //! plan — a slot no declaration has used yet — used to return without asking
@@ -331,6 +344,51 @@ impl PayloadTable {
         Ok(())
     }
 
+    /// File every declaration one statement stated, **all of them or none**.
+    ///
+    /// A statement's declarations take effect together, because the sender
+    /// commits its whole plan only once this end resolved the statement — and
+    /// drops that plan whole when this end refuses it. Filing the first k−1
+    /// declarations of a statement whose k-th one the bounds cannot hold would
+    /// therefore leave this table holding entries the sender's ledger never
+    /// committed: the two `used_bytes` diverge, and from then on this end's
+    /// bound refuses declarations the ledger read as fitting — the shape it6's
+    /// user run read as one `statement_payload_table_full` refusal at
+    /// t≈209.5 s, with the ledger and the table one payload apart under it.
+    ///
+    /// The statement is therefore read once over a shadow of the table (the
+    /// same slot bound and the same `payload_fits` [`Self::declare`] applies,
+    /// each declaration's bytes standing in for the slot it names as the walk
+    /// goes), and only a statement every one of whose declarations the shadow
+    /// takes is filed at all. The refusal reports the slot and the bound that
+    /// refused it, so a caller can still name what the statement carried.
+    pub fn declare_all(
+        &mut self,
+        staged: Vec<(u32, Vec<u8>)>,
+    ) -> Result<(), (u32, PayloadTableFull)> {
+        let lengths: Vec<(u32, u64)> = staged
+            .iter()
+            .map(|(slot, bytes)| (*slot, u64::try_from(bytes.len()).unwrap_or(u64::MAX)))
+            .collect();
+        admit_declarations(
+            self.used_bytes,
+            self.entries
+                .iter()
+                .map(|(slot, entry)| (*slot, u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX))),
+            &lengths,
+        )?;
+        for (slot, bytes) in staged {
+            // The walk above read the same bounds on a shadow of this table, so
+            // every declaration here is one it took.
+            let filed = self.declare(slot, bytes);
+            debug_assert!(
+                filed.is_ok(),
+                "the declaration pre-check took every declaration, not {filed:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// The slots the table holds, and the bytes they stand for.
     pub fn entries(&self) -> usize {
         self.entries.len()
@@ -353,11 +411,46 @@ fn payload_fits(used: u64, held: u64, incoming: u64) -> bool {
     used.saturating_sub(held).saturating_add(incoming) <= PAYLOAD_TABLE_BYTES
 }
 
+/// Whether the table could take every one of one statement's declarations, in
+/// the wire's own order, **without filing any of them**.
+///
+/// `used` is what the table holds and `occupied` is the slot each of its
+/// entries stands under with the bytes it stands for; `staged` is the
+/// statement's own declarations, as the slot each names and the bytes it
+/// carries. The walk is [`PayloadTable::declare`]'s own reading — the slot
+/// bound on a slot no entry holds yet, and `payload_fits` on the bytes — with
+/// the statement's own declarations standing in for the slots they name as it
+/// goes. That is what makes a statement that names one slot twice, or one whose
+/// own earlier declaration spends the room a later one needs, read exactly the
+/// way filing it would.
+fn admit_declarations(
+    used: u64,
+    occupied: impl Iterator<Item = (u32, u64)>,
+    staged: &[(u32, u64)],
+) -> Result<(), (u32, PayloadTableFull)> {
+    let mut held: BTreeMap<u32, u64> = occupied.collect();
+    let mut used = used;
+    for (slot, length) in staged {
+        if !held.contains_key(slot)
+            && u32::try_from(held.len()).unwrap_or(u32::MAX) >= PAYLOAD_TABLE_SLOTS
+        {
+            return Err((*slot, PayloadTableFull::Slots));
+        }
+        let replaced = held.get(slot).copied().unwrap_or(0);
+        if !payload_fits(used, replaced, *length) {
+            return Err((*slot, PayloadTableFull::Bytes));
+        }
+        used = used - replaced + *length;
+        held.insert(*slot, *length);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        payload_digest, PayloadLedger, PayloadLookup, PayloadPlan, PayloadTable, PayloadTableFull,
-        PAYLOAD_TABLE_BYTES, PAYLOAD_TABLE_SLOTS,
+        admit_declarations, payload_digest, PayloadLedger, PayloadLookup, PayloadPlan,
+        PayloadTable, PayloadTableFull, PAYLOAD_TABLE_BYTES, PAYLOAD_TABLE_SLOTS,
     };
     use crate::provider::DeviceEpoch;
 
@@ -668,6 +761,109 @@ mod tests {
         );
         // Replacing a slot the table already holds is not a new slot.
         assert_eq!(table.declare(0, vec![9; 1]), Ok(()));
+    }
+
+    /// The declaration phase is all or nothing: a statement whose k-th
+    /// declaration the bounds cannot hold files none of the k−1 before it,
+    /// because the sender commits its plan only for a statement both ends
+    /// processed — it drops the whole plan when this end refuses one.
+    #[test]
+    fn a_statement_the_table_cannot_hold_whole_files_none_of_it() {
+        let slots = usize::try_from(PAYLOAD_TABLE_SLOTS).unwrap();
+        let last = PAYLOAD_TABLE_SLOTS - 1;
+        let mut table = PayloadTable::new();
+        table.scope(epoch());
+        for slot in 0..last {
+            assert_eq!(table.declare(slot, vec![1]), Ok(()));
+        }
+        let before = (table.entries(), table.used_bytes());
+        assert_eq!(before, (slots - 1, u64::try_from(slots - 1).unwrap()));
+        // The statement fills the table's last free slot and then names one
+        // more: the second declaration is the one the slot bound refuses, and
+        // it takes the first one back with it.
+        assert_eq!(
+            table.declare_all(vec![(last, vec![2; 8]), (PAYLOAD_TABLE_SLOTS, vec![3; 8]),]),
+            Err((PAYLOAD_TABLE_SLOTS, PayloadTableFull::Slots))
+        );
+        assert_eq!(
+            (table.entries(), table.used_bytes()),
+            before,
+            "the refusal filed the statement's first declaration"
+        );
+        // A statement's own two declarations into one slot are taken whole:
+        // the walk reads the table the statement itself builds, so the second
+        // one replaces the slot the first one filled rather than asking for a
+        // fresh one.
+        assert_eq!(
+            table.declare_all(vec![(last, vec![4; 8]), (last, vec![5; 16])]),
+            Ok(())
+        );
+        assert_eq!(table.entries(), slots);
+        assert_eq!(table.used_bytes(), before.1 + 16);
+    }
+
+    /// The same reading, taken off lengths alone, so the byte bound's own arm
+    /// of the pre-check costs nothing to keep beside the walk that spends half
+    /// a gigabyte: `used` and the entries the slots already stand for are the
+    /// table's state, and the statement's own declarations take their slots as
+    /// the walk goes.
+    #[test]
+    fn the_declaration_precheck_reads_the_statement_in_the_wires_order() {
+        let bound = PAYLOAD_TABLE_BYTES;
+        let full: Vec<(u32, u64)> = (0..PAYLOAD_TABLE_SLOTS - 1).map(|slot| (slot, 1)).collect();
+        let slot_bound = u64::from(PAYLOAD_TABLE_SLOTS);
+        for (used, occupied, staged, expected) in [
+            // A statement whose own first declaration spends the room its
+            // second one needs: 8 KiB then 8 KiB, with 16 KiB of the bound
+            // left. One byte less of room and the second one is the refusal.
+            (
+                bound - 16 * 1024 + 1,
+                Vec::new(),
+                vec![(0, 8 * 1024), (1, 8 * 1024)],
+                Err((1, PayloadTableFull::Bytes)),
+            ),
+            (
+                bound - 16 * 1024,
+                Vec::new(),
+                vec![(0, 8 * 1024), (1, 8 * 1024)],
+                Ok(()),
+            ),
+            // it6's shape: the statement's small declaration plans a fresh slot
+            // and its larger one the entry it replaces, and it is the room the
+            // small one took that makes that replacement impossible.
+            (
+                bound - 4 * 1024,
+                vec![(0, 4 * 1024), (1, bound - 8 * 1024)],
+                vec![(2, 4 * 1024), (0, 8 * 1024)],
+                Err((0, PayloadTableFull::Bytes)),
+            ),
+            // One slot named twice: the second declaration replaces what the
+            // statement's own first one filed, so the bytes it reports against
+            // the bound are its own and not the whole budget's.
+            (bound - 16, Vec::new(), vec![(7, 16), (7, 16)], Ok(())),
+            // The slot bound is read on the slots no entry holds yet: the last
+            // free slot is the statement's to fill, one more is not — while the
+            // same statement's second declaration into the slot its own first
+            // one filled is a replacement, not a fresh slot.
+            (
+                slot_bound - 1,
+                full.clone(),
+                vec![(PAYLOAD_TABLE_SLOTS - 1, 1), (PAYLOAD_TABLE_SLOTS, 1)],
+                Err((PAYLOAD_TABLE_SLOTS, PayloadTableFull::Slots)),
+            ),
+            (
+                slot_bound - 1,
+                full,
+                vec![(PAYLOAD_TABLE_SLOTS - 1, 1), (PAYLOAD_TABLE_SLOTS - 1, 2)],
+                Ok(()),
+            ),
+        ] {
+            assert_eq!(
+                admit_declarations(used, occupied.into_iter(), &staged),
+                expected,
+                "used={used} staged={staged:?}"
+            );
+        }
     }
 
     /// Census v65's shape, with both ends fed the same statements: one boot's

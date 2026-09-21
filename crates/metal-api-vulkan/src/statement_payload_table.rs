@@ -25,6 +25,18 @@
 //! both ends processed. Applying as we go would leave the provider holding
 //! entries the sender never committed, and the *next* statement that referenced
 //! one would be refused — a lost draw bought by an optimization.
+//!
+//! The same reading covers the declaration phase itself, and it has to. The
+//! sender plans a statement's declarations against the ledger **as the
+//! statement found it** — its own earlier declarations are filed only once the
+//! statement crossed — so a statement can state declarations that fit one at a
+//! time and not together (it6's user run: one small declaration planned into a
+//! fresh slot, one larger one into the entry it replaced, together one payload
+//! past the byte bound). Such a statement is refused by name, and the refusal
+//! files **none** of it ([`PayloadTable::declare_all`]): filing the
+//! declarations before the one that did not fit would leave entries the sender
+//! never committed, which is the divergence this module's staging half already
+//! rules out for the reference arms.
 
 use metal_api_core::provider::{
     ComputeTrace, FieldValue, ProviderError, ProviderErrorClass, ProviderPhase, TextureSource,
@@ -125,13 +137,12 @@ pub(crate) fn resolve_statement_payloads(
             other => texture.source = other,
         }
     }
-    // Every arm resolved: the statement's own declarations take effect, which
-    // is the point after which the two ends hold the same table.
-    for (slot, bytes) in staged {
-        if let Err(full) = table.declare(slot, bytes) {
-            counts.full_n = counts.full_n.saturating_add(1);
-            return Err(table_full(slot, full));
-        }
+    // Every arm resolved: the statement's own declarations take effect, all of
+    // them or none, which is the point after which the two ends hold the same
+    // table.
+    if let Err((slot, full)) = table.declare_all(staged) {
+        counts.full_n = counts.full_n.saturating_add(1);
+        return Err(table_full(slot, full));
     }
     Ok(resolved)
 }
@@ -215,7 +226,10 @@ mod tests {
         TextureFormat, TextureSource, TextureType, TextureView, TracePass, ViewId,
         PROVIDER_SCHEMA_VERSION,
     };
-    use metal_api_core::statement_payload::{payload_digest, PayloadTable};
+    use metal_api_core::statement_payload::{
+        payload_digest, PayloadLedger, PayloadLookup, PayloadPlan, PayloadTable,
+        PAYLOAD_TABLE_BYTES,
+    };
 
     const PAYLOAD: usize = 4096;
 
@@ -422,6 +436,103 @@ mod tests {
         resolve_statement_payloads(&mut table, &mut again, &mut counts)
             .expect("the next statement's declaration resolves");
         assert_eq!(table.entries(), 1);
+    }
+
+    /// The declaration phase of one statement, when a **later** declaration of
+    /// that same statement is the one the byte bound cannot hold.
+    ///
+    /// The sender plans every declaration of a statement against the ledger as
+    /// the statement found it — its own earlier declarations are filed only
+    /// once the statement crossed — so a declaration is planned against room an
+    /// earlier declaration of the same statement is about to take. it6's user
+    /// run read exactly this shape as one `statement_payload_table_full`
+    /// refusal at t≈209.5 s. The provider has to file **none** of such a
+    /// statement's declarations: the sender drops the whole plan when this end
+    /// refuses the statement, so anything filed here is an entry the ledger
+    /// never commits, and the next statement that names that slot is refused in
+    /// its turn.
+    #[test]
+    fn a_statement_a_later_declaration_cannot_hold_files_none_of_it() {
+        /// The entry the plan replaces: small, so that it is the statement's
+        /// own second declaration that crosses the bound.
+        const VICTIM_SLOT: u32 = 0;
+        /// The bulk of the budget, leaving the plan one 4 KiB payload of room.
+        const BULK_SLOT: u32 = 1;
+        const ROOM: usize = 4096;
+        const CROSSING: usize = 8192;
+
+        let bulk = usize::try_from(PAYLOAD_TABLE_BYTES).unwrap() - ROOM - ROOM;
+        let mut table = PayloadTable::new();
+        table.scope(DeviceEpoch::new(1));
+        assert_eq!(table.declare(VICTIM_SLOT, vec![0x11; ROOM]), Ok(()));
+        assert_eq!(table.declare(BULK_SLOT, vec![0x22; bulk]), Ok(()));
+        assert_eq!(table.used_bytes(), PAYLOAD_TABLE_BYTES - ROOM as u64);
+
+        // The sender's ledger, holding exactly what the table holds. Only the
+        // lengths are read below, so the digests here are this test's own.
+        let mut ledger = PayloadLedger::new();
+        ledger.scope(DeviceEpoch::new(1));
+        ledger.commit(VICTIM_SLOT, 0x1, ROOM as u64);
+        ledger.commit(BULK_SLOT, 0x2, bulk as u64);
+        assert_eq!(
+            (ledger.entries(), ledger.used_bytes()),
+            (table.entries(), table.used_bytes())
+        );
+
+        // The statement's two declarations, planned the way the sender plans
+        // them: both read the ledger as the statement found it, so the 4 KiB
+        // payload plans the slot no declaration has used yet and the 8 KiB one
+        // the entry it replaces — each of them inside the bound on its own, and
+        // the two of them together one payload past it.
+        let fresh = vec![0x33; ROOM];
+        let crossing = vec![0x44; CROSSING];
+        let planned = [
+            ledger.plan(payload_digest(&fresh), ROOM as u64),
+            ledger.plan(payload_digest(&crossing), CROSSING as u64),
+        ];
+        assert_eq!(
+            planned,
+            [PayloadPlan::Declare(2), PayloadPlan::Declare(VICTIM_SLOT)],
+            "the statement's own two declarations, as the sender plans them"
+        );
+
+        // What the provider reads: those two arms, in the wire's own order.
+        let mut counts = StatementPayloadCounts::default();
+        let mut statement = trace(vec![
+            texture(
+                1,
+                TextureSource::OwnedInSlot {
+                    slot: 2,
+                    bytes: fresh.clone(),
+                },
+            ),
+            texture(
+                2,
+                TextureSource::OwnedInSlot {
+                    slot: VICTIM_SLOT,
+                    bytes: crossing,
+                },
+            ),
+        ]);
+        let refusal = resolve_statement_payloads(&mut table, &mut statement, &mut counts)
+            .expect_err("the statement's own second declaration crosses the byte bound");
+        assert_eq!(refusal.slug, "statement_payload_table_full");
+        assert_eq!(counts.full_n, 1, "one declaration was refused by name");
+
+        // And the whole statement is what the bound refused: the two ends hold
+        // the same table afterwards, which is what the sender's dropped plan
+        // means — the 4 KiB declaration filed nothing either.
+        assert_eq!(
+            (ledger.entries(), ledger.used_bytes()),
+            (table.entries(), table.used_bytes()),
+            "a refused statement left entries the sender's ledger never committed"
+        );
+        assert_eq!(table.entries(), 2);
+        assert_eq!(table.used_bytes(), PAYLOAD_TABLE_BYTES - ROOM as u64);
+        match table.lookup(2, payload_digest(&fresh), ROOM as u64) {
+            PayloadLookup::Unknown => {}
+            other => panic!("the refused statement filed its first declaration: {other:?}"),
+        }
     }
 
     #[test]
