@@ -23,6 +23,12 @@ the executed commands are byte for byte what they were before this module
 existed; the conformance suites are the evidence for that, because they compare
 captured bytes rather than timings.
 
+A second switch, `METAL_API_VULKAN_SUBMIT_SAMPLES`, prints **one line per
+completed submission** instead of one line per window — the distribution rather
+than the mean. It is described under [One line per
+submission](#one-line-per-submission); the two switches are read apart, so
+either one works without the other.
+
 ## The line
 
 With the profile on, each thread that submits prints one line to **stderr** every
@@ -513,6 +519,58 @@ The accumulator is thread-local because a line has to describe one population.
 A process-wide table would put two submitting threads' bars in the same window,
 and then a line's `n`, its fields and its `total` would disagree — the one thing
 the identity above is supposed to catch.
+
+## One line per submission
+
+`PHASE submit` is a mean over `METAL_API_VULKAN_PHASE_PROFILE_EVERY` submissions,
+and two rounds were read wrong from exactly that shape: most of a two-digit
+millisecond mean came from what the boot's first seconds did *once*, and a
+distribution with two modes (a one-off translation beside a steady state) has no
+mean that describes either mode. `METAL_API_VULKAN_SUBMIT_SAMPLES` adds the
+missing instrument — the same truth table as the profile switch, and the two are
+read apart:
+
+| `METAL_API_VULKAN_PHASE_PROFILE` | `METAL_API_VULKAN_SUBMIT_SAMPLES` | what is printed |
+|---|---|---|
+| off | off | nothing (the default) |
+| on | off | the window line, as above |
+| off | on | one `SUBMIT_SAMPLE` line per submission |
+| on | on | both |
+
+```text
+SUBMIT_SAMPLE lane=0 n=1 t_ms=0.000 total_us=... admit_us=... plan_us=...
+pool_us=... resource_build_us=... record_us=... queue_submit_us=...
+fence_wait_us=... read_updates_us=... writebacks_us=... settle_us=...
+render_total_us=... submit_release_us=... submit_seam_us=...
+submit_validate_us=... landing_us=... landing_n=... passes=...
+```
+
+Every field is one of the regions or aggregates the window line already prints,
+so the two read the same way — with three differences of *shape* rather than of
+meaning:
+
+* the value of each field is **this submission's own** time, taken as the
+  running table minus the snapshot the previous line left for that thread, so a
+  reader can take the distribution instead of a mean. No second clock is read;
+* `n` counts submissions **on that thread** and `t_ms` is a monotonic millisecond
+  offset from that thread's first sample, so the lanes of a multi-threaded round
+  can be put back in order without trusting the interleaving of the lines as
+  they were written;
+* `passes` is the number of executed render passes the submission carried, out
+  of the same `render_offscreen_n` / `render_present_n` population the window
+  line prints — the denominator a per-pass cost needs.
+
+`submit_release_us`, `submit_seam_us`, `submit_validate_us` and `landing_us` are
+aggregates of nested regions, exactly as on the window line: they are printed
+beside the single slots rather than added to them, so a reader who wants to
+decompose a submission uses the single slots and treats these four as "what this
+family cost".
+
+A window still closes when `every()` submissions have filled it — a window is a
+window — and it empties the table the samples are taken against, so the
+snapshots move with that drain. Without that, the one submission after every
+drain would report the whole window's remainder as its own time; that is the
+pose this switch is read in, with both switches on.
 
 ## Aligning the line with the rail's own bars
 
