@@ -7631,6 +7631,23 @@ impl ResourceTableSnapshot {
 
     pub fn validate_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         trace.validate()?;
+        self.validate_trace_after_validate(trace)
+    }
+
+    /// The same walk with the trace's own structural validation **already
+    /// answered** (`crate::admit_validate_once`).
+    ///
+    /// Skipping `trace.validate()` is only sound for a caller that has just
+    /// seen `Ok` from it on this very `&ComputeTrace` with nothing able to
+    /// mutate the trace in between, so this entry is crate-private: the one
+    /// such caller is
+    /// [`ProviderCapabilities::admit`](crate::provider::ProviderCapabilities::admit),
+    /// whose first region is that validation and whose refusal ends the walk
+    /// before this one runs. Every entry outside this crate keeps validating.
+    pub(crate) fn validate_trace_after_validate(
+        &self,
+        trace: &ComputeTrace,
+    ) -> Result<(), ContractError> {
         // One declaration per view, in the order the identity is compared in:
         // the allocation, the range, the source's *kind*, and then the source's
         // own coordinates. `LeaseId` carries the single-window arms' lease; the
@@ -9651,6 +9668,20 @@ impl ComputeTrace {
     /// path unchanged.
     pub fn validate_serial_buffer_reuse(&self) -> Result<(), ContractError> {
         self.validate()?;
+        self.validate_serial_buffer_reuse_after_validate()
+    }
+
+    /// The same walk with the trace's own structural validation **already
+    /// answered** (`crate::admit_validate_once`).
+    ///
+    /// Every rule the doc comment above states is this function's; only the
+    /// `self.validate()?` opening line belongs to
+    /// [`Self::validate_serial_buffer_reuse`], which is the entry a caller who
+    /// has not admitted anything yet reaches. The entry is crate-private for
+    /// the reason [`ResourceTableSnapshot::validate_trace_after_validate`]
+    /// states: skipping the validation is only sound immediately after the same
+    /// walk's first region answered `Ok`.
+    pub(crate) fn validate_serial_buffer_reuse_after_validate(&self) -> Result<(), ContractError> {
         if self.passes.len() > 1 && self.encoder_dispatch_type != DispatchType::Serial {
             return Err(ContractError::ConcurrentPassesUnsupported);
         }
@@ -12087,6 +12118,13 @@ impl ProviderCapabilities {
         trace: &ComputeTrace,
         resources: &ResourceTableSnapshot,
     ) -> Result<(), ProviderError> {
+        // The eleventh cut (`crate::admit_validate_once`): the first region
+        // below validates the trace, and the walk only reaches the two regions
+        // that follow if that answer was `Ok`. Off the cut each of those two
+        // regions asks the same question again through its own public entry;
+        // on it they call the crate-private entries that state the same rules
+        // without repeating the validation, so one walk validates once.
+        let validate_once = crate::admit_validate_once::enabled();
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::TraceValidate);
@@ -12455,16 +12493,22 @@ impl ProviderCapabilities {
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::SerialReuse);
-            trace
-                .validate_serial_buffer_reuse()
-                .map_err(contract_error_refusal)?;
+            let reuse = if validate_once {
+                trace.validate_serial_buffer_reuse_after_validate()
+            } else {
+                trace.validate_serial_buffer_reuse()
+            };
+            reuse.map_err(contract_error_refusal)?;
         }
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::Resources);
-            resources
-                .validate_trace(trace)
-                .map_err(contract_error_refusal)?;
+            let table = if validate_once {
+                resources.validate_trace_after_validate(trace)
+            } else {
+                resources.validate_trace(trace)
+            };
+            table.map_err(contract_error_refusal)?;
         }
         Ok(())
     }
@@ -27268,6 +27312,142 @@ mod tests {
             );
         }
         crate::admit_shared_draws::set_arm(None);
+    }
+
+    /// The eleventh cut's rail: the walk that asks the trace's own structural
+    /// question once and the walk that asks it three times answer the same,
+    /// item by item and in the same order — the walk's own answer, the name of
+    /// every refusal it raises, and what the two entries the cut's crate-private
+    /// functions state.
+    ///
+    /// The arms are driven through `admit_validate_once::set_arm`, so one
+    /// process reads both answers off the same fixtures. The walk under test is
+    /// the whole admission, not the validation alone: the claim is about the
+    /// trace a snapshot admits, and about the name a snapshot refuses it by.
+    #[test]
+    fn the_two_arms_of_the_validate_once_walk_answer_the_same() {
+        let trace = attachment_draws_trace(3);
+        let resources = vertex_input_resources();
+        trace.validate().expect("the fixture is structurally valid");
+        // The shape that refuses the serial pool: two entries, not serial. That
+        // is the tail's own rule, so the snapshot has to declare concurrent
+        // dispatch for the walk to reach the region at all.
+        let mut concurrent_trace = attachment_draws_trace(3);
+        concurrent_trace.encoder_dispatch_type = DispatchType::Concurrent;
+        let mut concurrent = multi_draw_capabilities();
+        concurrent.supports_concurrent = true;
+        // The pool that never saw the trace's own view: the resource table's
+        // walk, which is where the cut's second removed call sat.
+        let empty_pool = ResourceTableSnapshot::new();
+        // The trace that is structurally broken before any gate runs: the
+        // region the cut keeps on both arms is the one that has to refuse it.
+        let mut broken_trace = attachment_draws_trace(3);
+        broken_trace.passes.clear();
+        // A snapshot that bounds a list below the three draws it states.
+        let mut narrow = multi_draw_capabilities();
+        narrow.max_draws_per_pass = 2;
+        let admitted = multi_draw_capabilities();
+        let no_multi_draw = render_capabilities();
+
+        let fixtures = vec![
+            (
+                "the list a declaring snapshot admits",
+                &trace,
+                &resources,
+                &admitted,
+                None,
+            ),
+            (
+                "the count the snapshot declares",
+                &trace,
+                &resources,
+                &narrow,
+                Some("render_draw_count_limit"),
+            ),
+            (
+                "the arm the snapshot never declared",
+                &trace,
+                &resources,
+                &no_multi_draw,
+                Some("render_multi_draw_unsupported"),
+            ),
+            (
+                "the pool the trace's own view is missing from",
+                &trace,
+                &empty_pool,
+                &admitted,
+                Some("resource_contract_invalid"),
+            ),
+            (
+                "the trace's own serial rule",
+                &concurrent_trace,
+                &resources,
+                &concurrent,
+                Some("trace_contract_invalid"),
+            ),
+            (
+                "the trace's own structural rule",
+                &broken_trace,
+                &resources,
+                &admitted,
+                Some("trace_contract_invalid"),
+            ),
+        ];
+
+        let mut arms = Vec::new();
+        for arm in [Some(false), Some(true)] {
+            crate::admit_validate_once::set_arm(arm);
+            let mut answers = Vec::new();
+            for (name, trace, resources, provider, expected) in &fixtures {
+                let answer = provider.admit(trace, resources);
+                let slug = answer.as_ref().err().map(|error| error.slug.clone());
+                assert_eq!(
+                    slug.as_deref(),
+                    *expected,
+                    "{name}: the walk refuses by the name this fixture is about"
+                );
+                answers.push((name.to_string(), answer.is_ok(), slug));
+            }
+            arms.push(answers);
+        }
+        crate::admit_validate_once::set_arm(None);
+        assert_eq!(
+            arms[0], arms[1],
+            "the two arms admit every fixture — and refuse every refusal — the same, in order"
+        );
+
+        // The two entries the cut's arm reaches are the same rules as the
+        // public ones *after* the trace's own validation answered `Ok`, which
+        // is the only state the walk reaches them in.
+        assert_eq!(trace.validate_serial_buffer_reuse(), Ok(()));
+        assert_eq!(trace.validate_serial_buffer_reuse_after_validate(), Ok(()));
+        assert_eq!(resources.validate_trace(&trace), Ok(()));
+        assert_eq!(resources.validate_trace_after_validate(&trace), Ok(()));
+        // … and where those rules do refuse, both entries say the same thing:
+        // the serial pool's own name here, the resource table's own family
+        // there (the pool that never saw the draws' allocations).
+        assert_eq!(
+            concurrent_trace.validate_serial_buffer_reuse_after_validate(),
+            Err(ContractError::ConcurrentPassesUnsupported)
+        );
+        assert!(matches!(
+            empty_pool.validate_trace_after_validate(&trace),
+            Err(ContractError::UnknownAllocation(_))
+        ));
+        // The one call the cut removes is the *only* difference between the two
+        // entries, and this is the reading of it: on a trace whose own
+        // validation refuses, the public entry refuses with that name while the
+        // crate-private entry — reached only after the walk answered `Ok` —
+        // does not. That is why the entry stays crate-private: a caller who has
+        // not validated must not be able to reach it.
+        assert_eq!(
+            broken_trace.validate_serial_buffer_reuse(),
+            Err(ContractError::EmptyTrace)
+        );
+        assert_eq!(
+            broken_trace.validate_serial_buffer_reuse_after_validate(),
+            Ok(())
+        );
     }
 
     /// The list's one-draw shape is today's single-draw pass, byte for byte

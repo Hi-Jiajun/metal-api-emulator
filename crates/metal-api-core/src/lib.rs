@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 mod admit_profile;
 mod admit_shared_draws;
+mod admit_validate_once;
 pub mod completion;
 pub mod provider;
 pub mod provider_api;
