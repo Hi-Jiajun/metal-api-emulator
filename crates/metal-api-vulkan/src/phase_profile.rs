@@ -321,6 +321,31 @@
 //! (`note_render_shape`'s own population), which is the denominator a per-pass
 //! cost needs.
 //!
+//! # What a submission was made of, on the same line
+//!
+//! A distribution of microseconds says *which bar* the slow submissions spent
+//! their time in; it does not say what those submissions **were**. The same
+//! snapshot subtraction is therefore applied to the window line's counters —
+//! the ones the window line already prints — and they are appended to every
+//! sample line as `<name>=<delta>` (`offscreen_n`, `present_n`, `batch_n`,
+//! `reuse_*`, `pool_*`, `buf_*`, `cp_*`, `cb_*`, `views_*`, `vcopies_*`,
+//! `wshare_*`, `rb_*`, `landing_bytes`, `td_*`, `staging_*`). Each is that
+//! submission's own contribution to the counter, so one line reads as "this
+//! submission cost this much, in these bars, and it was made of this".
+//!
+//! The sources are [`SHAPE_SOURCES`]: a counter that is not in the table is not
+//! on the line, and a counter that leaves the table leaves the line, so a
+//! round's parser keys on the names rather than on positions (the whole line's
+//! field order is still pinned by a test).
+//!
+//! The same line also carries [`CHILD_BARS`]: the regions the named parents are
+//! made of (`plan_resources` inside `plan`, the three `submit_validate_*` inside
+//! `submit_validate`, the readback and teardown children the render half is read
+//! by). They are nested inside their parents, exactly as the parents are nested
+//! inside `total`, so a reader compares them rather than adding them — the point
+//! is to see *inside* the lane the slow submissions were slow in without a
+//! second round.
+//!
 //! Cost when off is the one relaxed load every other instrumented site already
 //! pays; when on, one `format!` per submission — which is why the switch exists
 //! apart from the window switch rather than inside it.
@@ -1641,6 +1666,12 @@ struct Local {
     samples_last: [u64; PHASE_COUNT],
     samples_landing_last: u64,
     samples_passes_last: u64,
+    /// The same snapshot move for the shape counters ([`SHAPE_SOURCES`]): one
+    /// line's shape fields are the counters this submission itself moved.
+    samples_shape_last: [u64; SHAPE_COUNT],
+    /// The same move for the child bars ([`CHILD_BARS`]), in their own table
+    /// because a child can also be a member of a parent's aggregate.
+    samples_child_last: [u64; PHASE_COUNT],
     samples_n: u64,
     samples_lane: Option<usize>,
     samples_started: Option<Instant>,
@@ -1810,6 +1841,8 @@ impl Default for Local {
             samples_last: [0; PHASE_COUNT],
             samples_landing_last: 0,
             samples_passes_last: 0,
+            samples_shape_last: [0; SHAPE_COUNT],
+            samples_child_last: [0; PHASE_COUNT],
             samples_n: 0,
             samples_lane: None,
             samples_started: None,
@@ -2259,6 +2292,8 @@ impl Local {
         self.samples_last = [0; PHASE_COUNT];
         self.samples_landing_last = 0;
         self.samples_passes_last = 0;
+        self.samples_shape_last = [0; SHAPE_COUNT];
+        self.samples_child_last = [0; PHASE_COUNT];
     }
 
     /// One `SUBMIT_SAMPLE` line: this submission's own microseconds, taken as
@@ -2303,8 +2338,50 @@ impl Local {
             landing_ns: self.take_sample_group(&LANDING_SLOTS),
             landing_n: self.take_landing_sample(),
             passes: self.take_passes_sample(),
+            children: self.take_child_sample(),
+            shapes: self.take_shape_sample(),
         };
         eprintln!("{}", format_submit_sample(&sample));
+    }
+
+    /// The child bars this submission moved, taken one slot at a time through
+    /// [`CHILD_BARS`].
+    ///
+    /// These keep their **own** snapshot table rather than the parents'. A slot
+    /// can be both a child here and a member of a parent's aggregate
+    /// (`val_derive` is in `SUBMIT_VALIDATE_SLOTS`, `submit_teardown` is in
+    /// `SUBMIT_SEAM_SLOTS`), and one table is spent by whoever reads it first
+    /// ([`Local::take_sample_group`] advances every member it sums), so a shared
+    /// table would print whichever of the two readers ran second as zero. Two
+    /// tables, one move each, and both readings are the submission's own.
+    #[inline]
+    fn take_child_sample(&mut self) -> [u64; CHILD_COUNT] {
+        let mut children = [0u64; CHILD_COUNT];
+        for (slot, (_, phase)) in CHILD_BARS.iter().enumerate() {
+            let index = *phase as usize;
+            let now = self.ns[index];
+            let last = std::mem::replace(&mut self.samples_child_last[index], now);
+            children[slot] = now.saturating_sub(last);
+        }
+        children
+    }
+
+    /// The shape counters this submission moved, taken as the same snapshot
+    /// subtraction the bars use ([`Local::take_sample`]), through the table
+    /// that names them.
+    ///
+    /// The counters are the window line's own, so a round reads two things at
+    /// once: what the submission cost (the bars) and what it was made of (these
+    /// fields), on one line, with no second accounting of any call.
+    #[inline]
+    fn take_shape_sample(&mut self) -> [u64; SHAPE_COUNT] {
+        let mut shapes = [0u64; SHAPE_COUNT];
+        for (slot, source) in SHAPE_SOURCES.iter().enumerate() {
+            let now = (source.read)(self);
+            let last = std::mem::replace(&mut self.samples_shape_last[slot], now);
+            shapes[slot] = now.saturating_sub(last);
+        }
+        shapes
     }
 
     /// One slot's own share of the submission just closed, and the snapshot
@@ -2374,6 +2451,211 @@ fn micros(ns: u64) -> f64 {
 /// that never samples never touches it, and never takes a lane.
 static NEXT_SAMPLE_LANE: AtomicUsize = AtomicUsize::new(0);
 
+/// How many counters one sample line carries beside its bars. The array's
+/// length and the table's length are the same reading, checked by
+/// `shape_sources_fit_the_sample_array`.
+const SHAPE_COUNT: usize = 35;
+
+/// One counter the sample line reads out of the window's own table, named as
+/// the field it is printed as.
+///
+/// The table is the answer to "what was this submission made of": the window
+/// line's counters at one submission's resolution. Adding a counter here is
+/// what puts it on the line — nothing else reads the table — so the names and
+/// their order are the line's own field order and are pinned beside it.
+struct ShapeSource {
+    /// The sample line's field name, without the trailing `=`.
+    name: &'static str,
+    /// The counter's current value in this thread's table.
+    read: fn(&Local) -> u64,
+}
+
+/// The window line's counters a sample line reports, in field order.
+///
+/// Every one of them is a counter the window line prints as well, so a round
+/// can cross-check a sample column's total against the window's own reading of
+/// the same name; none of them is a second accounting of the same call. The
+/// families are the ones the bars above are read against: the render passes by
+/// shape, the reuse and pool outcomes a pass decided, the declared bytes the
+/// two pool derivations moved, the readback regions by decision, and the
+/// device objects the teardowns destroyed.
+const SHAPE_SOURCES: &[ShapeSource] = &[
+    ShapeSource {
+        name: "offscreen_n",
+        read: |local| local.render_offscreen_n,
+    },
+    ShapeSource {
+        name: "present_n",
+        read: |local| local.render_present_n,
+    },
+    ShapeSource {
+        name: "batch_n",
+        read: |local| local.render_batch_n,
+    },
+    ShapeSource {
+        name: "batch_passes",
+        read: |local| local.render_batch_passes,
+    },
+    ShapeSource {
+        name: "reuse_hit_n",
+        read: |local| local.reuse_hit_n,
+    },
+    ShapeSource {
+        name: "reuse_miss_n",
+        read: |local| local.reuse_miss_n,
+    },
+    ShapeSource {
+        name: "reuse_unkeyed_n",
+        read: |local| local.reuse_unkeyed_n,
+    },
+    ShapeSource {
+        name: "pool_hit_n",
+        read: |local| local.pool_hit_n,
+    },
+    ShapeSource {
+        name: "pool_miss_n",
+        read: |local| local.pool_miss_n,
+    },
+    ShapeSource {
+        name: "buf_hit_n",
+        read: |local| local.buffer_hit_n,
+    },
+    ShapeSource {
+        name: "buf_miss_n",
+        read: |local| local.buffer_miss_n,
+    },
+    ShapeSource {
+        name: "cp_hit_n",
+        read: |local| local.compute_pipeline_hit_n,
+    },
+    ShapeSource {
+        name: "cp_miss_n",
+        read: |local| local.compute_pipeline_miss_n,
+    },
+    ShapeSource {
+        name: "cb_hit_n",
+        read: |local| local.compute_buffer_hit_n,
+    },
+    ShapeSource {
+        name: "cb_miss_n",
+        read: |local| local.compute_buffer_miss_n,
+    },
+    ShapeSource {
+        name: "views_n",
+        read: |local| local.resource_borrow_views,
+    },
+    ShapeSource {
+        name: "views_bytes",
+        read: |local| local.resource_borrow_bytes,
+    },
+    ShapeSource {
+        name: "vcopies_n",
+        read: |local| local.resource_copy_views,
+    },
+    ShapeSource {
+        name: "vcopies_bytes",
+        read: |local| local.resource_copy_bytes,
+    },
+    ShapeSource {
+        name: "wshare_n",
+        read: |local| local.staging_window_shares,
+    },
+    ShapeSource {
+        name: "wshare_bytes",
+        read: |local| local.staging_window_share_bytes,
+    },
+    ShapeSource {
+        name: "rb_rect_n",
+        read: |local| local.readback.rect_n,
+    },
+    ShapeSource {
+        name: "rb_rect_bytes",
+        read: |local| local.readback.rect_bytes,
+    },
+    ShapeSource {
+        name: "rb_full_n",
+        read: |local| local.readback.full_n,
+    },
+    ShapeSource {
+        name: "rb_full_bytes",
+        read: |local| local.readback.full_bytes,
+    },
+    ShapeSource {
+        name: "rb_shape_n",
+        read: |local| local.readback.shape_n,
+    },
+    ShapeSource {
+        name: "rb_bounds_n",
+        read: |local| local.readback.bounds_n,
+    },
+    ShapeSource {
+        name: "rb_whole_n",
+        read: |local| local.readback.whole_n,
+    },
+    ShapeSource {
+        name: "landing_bytes",
+        read: |local| local.landing_bytes,
+    },
+    ShapeSource {
+        name: "td_buffer_n",
+        read: |local| local.td_buffer_n,
+    },
+    ShapeSource {
+        name: "td_view_n",
+        read: |local| local.td_view_n,
+    },
+    ShapeSource {
+        name: "td_image_n",
+        read: |local| local.td_image_n,
+    },
+    ShapeSource {
+        name: "td_memory_n",
+        read: |local| local.td_memory_n,
+    },
+    ShapeSource {
+        name: "staging_cached_n",
+        read: |local| local.staging_cached_n,
+    },
+    ShapeSource {
+        name: "staging_plain_n",
+        read: |local| local.staging_plain_n,
+    },
+];
+
+/// The regions the sample line's named parents are made of, in field order.
+///
+/// Each entry is `(field name, phase)`, and each is charged inside the parent
+/// the window line already prints (`plan_resources` inside `plan`,
+/// `val_derive`/`val_check`/`val_release` inside `submit_validate`,
+/// `admit_*` inside `admit`, `render_*`/`rb_*`/`td_*` inside `render_total` and
+/// its children, `submit_teardown` inside `submit_seam`). None of them is a new
+/// region: they are the same charging sites the window line's own children are
+/// read from, sampled one submission at a time so a round can see *inside* the
+/// lane the slow submissions were slow in.
+const CHILD_BARS: &[(&str, Phase)] = &[
+    ("plan_resources_us", Phase::PlanResources),
+    ("admit_epoch_us", Phase::AdmitEpoch),
+    ("admit_capabilities_us", Phase::AdmitCapabilities),
+    ("submit_validate_derive_us", Phase::SubmitValidateDerive),
+    ("submit_validate_check_us", Phase::SubmitValidateCheck),
+    ("submit_validate_release_us", Phase::SubmitValidateRelease),
+    ("render_setup_us", Phase::RenderSetup),
+    ("render_readback_us", Phase::RenderReadback),
+    ("readback_rect_us", Phase::ReadbackRect),
+    ("readback_full_us", Phase::ReadbackFull),
+    ("render_resolve_us", Phase::RenderResolve),
+    ("render_teardown_us", Phase::RenderTeardown),
+    ("teardown_buffers_us", Phase::TeardownBuffers),
+    ("teardown_readbacks_us", Phase::TeardownReadbacks),
+    ("teardown_attachments_us", Phase::TeardownAttachments),
+    ("teardown_textures_us", Phase::TeardownTextures),
+    ("submit_teardown_us", Phase::SubmitTeardown),
+];
+
+/// How many child bars one sample line carries beside its parents. Pinned
+/// against the table by `child_bars_fit_the_sample_array`.
+const CHILD_COUNT: usize = 17;
+
 /// One submission's own readings, ready to be spelled as a `SUBMIT_SAMPLE`
 /// line.
 ///
@@ -2402,6 +2684,10 @@ struct SubmitSample {
     landing_ns: u64,
     landing_n: u64,
     passes: u64,
+    /// The child bars, in [`CHILD_BARS`] order, in nanoseconds.
+    children: [u64; CHILD_COUNT],
+    /// The shape counters, in [`SHAPE_SOURCES`] order.
+    shapes: [u64; SHAPE_COUNT],
 }
 
 /// The one line one submission is spelled as.
@@ -2410,13 +2696,21 @@ struct SubmitSample {
 /// `submit_sample_line_has_a_stable_field_order`, because the consumer of these
 /// lines is a parser in a round's analysis script rather than a human.
 fn format_submit_sample(sample: &SubmitSample) -> String {
+    let mut child_fields = String::with_capacity(400);
+    for (slot, (name, _)) in CHILD_BARS.iter().enumerate() {
+        child_fields.push_str(&format!(" {name}={:.3}", micros(sample.children[slot])));
+    }
+    let mut shape_fields = String::with_capacity(600);
+    for (source, value) in SHAPE_SOURCES.iter().zip(sample.shapes.iter()) {
+        shape_fields.push_str(&format!(" {}={}", source.name, value));
+    }
     format!(
         "SUBMIT_SAMPLE lane={} n={} t_ms={:.3} total_us={:.3} admit_us={:.3} \
          plan_us={:.3} pool_us={:.3} resource_build_us={:.3} record_us={:.3} \
          queue_submit_us={:.3} fence_wait_us={:.3} read_updates_us={:.3} \
          writebacks_us={:.3} settle_us={:.3} render_total_us={:.3} \
          submit_release_us={:.3} submit_seam_us={:.3} submit_validate_us={:.3} \
-         landing_us={:.3} landing_n={} passes={}",
+         landing_us={:.3} landing_n={} passes={}{child_fields}{shape_fields}",
         sample.lane,
         sample.n,
         sample.t_ms,
@@ -3444,22 +3738,33 @@ mod tests {
             landing_ns: 16_000,
             landing_n: 3,
             passes: 4,
+            // One distinguishable value per slot, a thousand nanoseconds
+            // apart, so a child read from the wrong slot is a failed
+            // assertion rather than a number that happens to match.
+            children: std::array::from_fn(|slot| 1_000 * (slot as u64 + 1)),
+            // One distinguishable value per slot, so a field that is printed
+            // from the wrong slot is a failed assertion rather than a number
+            // that happens to match its neighbour.
+            shapes: std::array::from_fn(|slot| 100 + slot as u64),
         };
         let line = format_submit_sample(&sample);
-        assert_eq!(
-            line,
-            "SUBMIT_SAMPLE lane=2 n=17 t_ms=1234.500 total_us=1.000 admit_us=2.000 \
+        assert!(
+            line.starts_with(
+                "SUBMIT_SAMPLE lane=2 n=17 t_ms=1234.500 total_us=1.000 admit_us=2.000 \
              plan_us=3.000 pool_us=4.000 resource_build_us=5.000 record_us=6.000 \
              queue_submit_us=7.000 fence_wait_us=8.000 read_updates_us=9.000 \
              writebacks_us=10.000 settle_us=11.000 render_total_us=12.000 \
              submit_release_us=13.000 submit_seam_us=14.000 submit_validate_us=15.000 \
              landing_us=16.000 landing_n=3 passes=4"
+            ),
+            "the bars' own spelling and order are pinned: {line}"
         );
-        let names: Vec<&str> = line
+        let fields: Vec<(&str, &str)> = line
             .split_whitespace()
             .skip(1)
-            .map(|field| field.split('=').next().unwrap())
+            .map(|field| field.split_once('=').unwrap())
             .collect();
+        let names: Vec<&str> = fields.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
             vec![
@@ -3484,8 +3789,181 @@ mod tests {
                 "landing_us",
                 "landing_n",
                 "passes",
+                "plan_resources_us",
+                "admit_epoch_us",
+                "admit_capabilities_us",
+                "submit_validate_derive_us",
+                "submit_validate_check_us",
+                "submit_validate_release_us",
+                "render_setup_us",
+                "render_readback_us",
+                "readback_rect_us",
+                "readback_full_us",
+                "render_resolve_us",
+                "render_teardown_us",
+                "teardown_buffers_us",
+                "teardown_readbacks_us",
+                "teardown_attachments_us",
+                "teardown_textures_us",
+                "submit_teardown_us",
+                "offscreen_n",
+                "present_n",
+                "batch_n",
+                "batch_passes",
+                "reuse_hit_n",
+                "reuse_miss_n",
+                "reuse_unkeyed_n",
+                "pool_hit_n",
+                "pool_miss_n",
+                "buf_hit_n",
+                "buf_miss_n",
+                "cp_hit_n",
+                "cp_miss_n",
+                "cb_hit_n",
+                "cb_miss_n",
+                "views_n",
+                "views_bytes",
+                "vcopies_n",
+                "vcopies_bytes",
+                "wshare_n",
+                "wshare_bytes",
+                "rb_rect_n",
+                "rb_rect_bytes",
+                "rb_full_n",
+                "rb_full_bytes",
+                "rb_shape_n",
+                "rb_bounds_n",
+                "rb_whole_n",
+                "landing_bytes",
+                "td_buffer_n",
+                "td_view_n",
+                "td_image_n",
+                "td_memory_n",
+                "staging_cached_n",
+                "staging_plain_n",
             ]
         );
+        // The child bars are the sample's own, in table order: the slot a
+        // value came from is checked beside the name it was printed under.
+        let child_start = names.len() - SHAPE_COUNT - CHILD_COUNT;
+        for (slot, (name, value)) in fields
+            .iter()
+            .skip(child_start)
+            .take(CHILD_COUNT)
+            .enumerate()
+        {
+            assert_eq!(*name, CHILD_BARS[slot].0);
+            assert_eq!(*value, format!("{:.3}", slot as f64 + 1.0));
+        }
+        // The shape values are the sample's own, in table order: a value read
+        // from the wrong counter is caught here rather than in a round.
+        for (slot, (name, value)) in fields.iter().skip(names.len() - SHAPE_COUNT).enumerate() {
+            assert_eq!(*name, SHAPE_SOURCES[slot].name);
+            assert_eq!(*value, (100 + slot as u64).to_string());
+        }
+    }
+
+    /// The child table and the array it fills are the same length, every name
+    /// is unique, and every one of them is on the line.
+    #[test]
+    fn child_bars_fit_the_sample_array() {
+        assert_eq!(CHILD_BARS.len(), CHILD_COUNT);
+        // A child's field name is the window line's own name for that phase,
+        // with the line's unit suffix: the two lines can be read side by side
+        // without a translation table.
+        for (name, phase) in CHILD_BARS {
+            assert_eq!(*name, format!("{}_us", PHASE_NAMES[*phase as usize]));
+        }
+        let mut names: Vec<&str> = CHILD_BARS.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "child field names are unique");
+        let line = format_submit_sample(&SubmitSample {
+            lane: 0,
+            n: 0,
+            t_ms: 0.0,
+            total_ns: 0,
+            admit_ns: 0,
+            plan_ns: 0,
+            pool_ns: 0,
+            resource_build_ns: 0,
+            record_ns: 0,
+            queue_submit_ns: 0,
+            fence_wait_ns: 0,
+            read_updates_ns: 0,
+            writebacks_ns: 0,
+            settle_ns: 0,
+            render_total_ns: 0,
+            submit_release_ns: 0,
+            submit_seam_ns: 0,
+            submit_validate_ns: 0,
+            landing_ns: 0,
+            landing_n: 0,
+            passes: 0,
+            children: [0; CHILD_COUNT],
+            shapes: [0; SHAPE_COUNT],
+        });
+        let line_names: Vec<&str> = line
+            .split_whitespace()
+            .skip(1)
+            .map(|field| field.split_once('=').unwrap().0)
+            .collect();
+        for (name, _) in CHILD_BARS {
+            assert!(
+                line_names.iter().any(|printed| *printed == *name),
+                "{name} is on the line"
+            );
+        }
+    }
+
+    /// The table and the array the line is filled from are the same length, and
+    /// no two fields share a name: a duplicate would let a parser keyed on
+    /// names read one column twice and never notice the other.
+    #[test]
+    fn shape_sources_fit_the_sample_array() {
+        assert_eq!(SHAPE_SOURCES.len(), SHAPE_COUNT);
+        let mut names: Vec<&str> = SHAPE_SOURCES.iter().map(|source| source.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "shape field names are unique");
+        let line_names: Vec<&str> = format_submit_sample(&SubmitSample {
+            lane: 0,
+            n: 0,
+            t_ms: 0.0,
+            total_ns: 0,
+            admit_ns: 0,
+            plan_ns: 0,
+            pool_ns: 0,
+            resource_build_ns: 0,
+            record_ns: 0,
+            queue_submit_ns: 0,
+            fence_wait_ns: 0,
+            read_updates_ns: 0,
+            writebacks_ns: 0,
+            settle_ns: 0,
+            render_total_ns: 0,
+            submit_release_ns: 0,
+            submit_seam_ns: 0,
+            submit_validate_ns: 0,
+            landing_ns: 0,
+            landing_n: 0,
+            passes: 0,
+            children: [0; CHILD_COUNT],
+            shapes: [0; SHAPE_COUNT],
+        })
+        .split_whitespace()
+        .skip(1)
+        .map(|field| field.split_once('=').unwrap().0)
+        .collect();
+        for source in SHAPE_SOURCES {
+            assert!(
+                line_names.iter().any(|name| *name == source.name),
+                "{} is on the line",
+                source.name
+            );
+        }
     }
 
     /// With both switches off nothing is banked and no bar is entered: that is
