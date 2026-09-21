@@ -3910,10 +3910,7 @@ mod tests {
             .map(|field| field.split_once('=').unwrap().0)
             .collect();
         for (name, _) in CHILD_BARS {
-            assert!(
-                line_names.iter().any(|printed| *printed == *name),
-                "{name} is on the line"
-            );
+            assert!(line_names.contains(name), "{name} is on the line");
         }
     }
 
@@ -3960,7 +3957,7 @@ mod tests {
             .collect();
         for source in SHAPE_SOURCES {
             assert!(
-                line_names.iter().any(|name| *name == source.name),
+                line_names.contains(&source.name),
                 "{} is on the line",
                 source.name
             );
