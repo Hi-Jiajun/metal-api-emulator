@@ -66,7 +66,9 @@ pub(crate) fn stands_for(bytes: &[u8]) -> bool {
 
 /// The bytes the arm materializes for a declaration of `length` bytes.
 pub(crate) fn materialize(length: u64) -> Option<Vec<u8>> {
-    usize::try_from(length).ok().map(|length| vec![0_u8; length])
+    usize::try_from(length)
+        .ok()
+        .map(|length| vec![0_u8; length])
 }
 
 /// The switch's own parser, apart from the process-global it caches into so a
@@ -106,5 +108,20 @@ mod tests {
         assert_eq!(materialize(0), Some(Vec::new()));
         assert_eq!(materialize(4), Some(vec![0, 0, 0, 0]));
         assert_eq!(materialize(u64::MAX), None);
+    }
+
+    /// The switch itself can be forced for the rest of the process, which is
+    /// what a caller that has to compare the two arms **in one process** does —
+    /// an environment variable cannot be put back, and two arms in two
+    /// processes are two scenarios rather than two readings of one.
+    #[test]
+    fn the_arm_can_be_forced_and_read_back() {
+        set_enabled(true);
+        assert!(enabled());
+        set_enabled(false);
+        assert!(!enabled());
+        // Hand the process back the answer its own launcher gave it, so this
+        // case decides nothing for the cases beside it.
+        set_enabled(parse(std::env::var(SWITCH).ok().as_deref()));
     }
 }

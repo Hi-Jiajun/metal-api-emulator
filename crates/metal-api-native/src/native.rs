@@ -3330,7 +3330,12 @@ mod tests {
             &provider,
             &compute,
             &quad,
-            quad_pass(quad.pipeline_id, LoadOp::Clear, StoreOp::Store, &quad_vertices(true)),
+            quad_pass(
+                quad.pipeline_id,
+                LoadOp::Clear,
+                StoreOp::Store,
+                &quad_vertices(true),
+            ),
             declared_attachment(16, BufferSource::zero_fill(16)),
             16,
         );

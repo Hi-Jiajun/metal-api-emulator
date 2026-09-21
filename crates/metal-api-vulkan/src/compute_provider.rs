@@ -14,14 +14,13 @@ use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, Observati
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, AttachmentFormat, BufferAccess, BufferSource,
-    BufferView,
-    BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken,
-    ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
-    FunctionSource, GuestRun, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind,
-    KeptFrame, KeptFrameLanding, LeaseId, LeaseImporter, LeaseRegistry, LoadOp,
-    PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    BufferView, BufferWriteback, CompletionDisposition, CompletionPolicy, CompletionReadback,
+    CompletionToken, ComputeProvider, ComputeTrace, DeviceEpoch, DispatchKind, FieldValue,
+    FunctionIdentity, FunctionSource, GuestRun, HeapId, HeapResource, IndirectCommandDescriptor,
+    IndirectCommandKind, KeptFrame, KeptFrameLanding, LeaseId, LeaseImporter, LeaseRegistry,
+    LoadOp, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
+    PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, SerialResource,
     ShaderSource, StagedLease, StorageMode, SubmissionId, TerminalState, TextureSource, TracePass,
     ValidatedComputeTrace, ViewId,
@@ -4513,8 +4512,8 @@ impl ComputeProvider for VulkanComputeProvider {
                 // the payload the arm replaced used to be copied in. Nothing
                 // downstream of this point can tell the two encodings apart.
                 BufferSource::ZeroFill { length } => {
-                    let materialized = crate::zero_fill_arm::materialize(*length)
-                        .ok_or_else(&overflow)?;
+                    let materialized =
+                        crate::zero_fill_arm::materialize(*length).ok_or_else(&overflow)?;
                     push_owned_binding(
                         &mut buffers,
                         heap_plan.as_ref(),

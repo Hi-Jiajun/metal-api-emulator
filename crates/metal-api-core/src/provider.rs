@@ -17626,7 +17626,8 @@ mod tests {
     fn a_zero_fill_declaration_states_the_views_length_and_no_bytes() {
         let view = sourced_buffer_view(BufferSource::zero_fill(16), 16);
         assert_eq!(
-            view.validate_shape().expect("the arm states the view's own length"),
+            view.validate_shape()
+                .expect("the arm states the view's own length"),
             16
         );
         assert_eq!(view.source.kind(), BufferSourceKind::ZeroFill);
