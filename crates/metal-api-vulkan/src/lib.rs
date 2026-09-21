@@ -49,6 +49,7 @@ mod render_texture_carrier;
 mod render_texture_pool;
 mod serial_resources_borrow;
 mod staging_borrow;
+mod statement_payload_table;
 mod submit_binding_borrow;
 mod zero_fill_arm;
 
@@ -65,6 +66,7 @@ pub use render_buffer_pool::RenderBufferPoolCounts;
 pub use render_import_pool::RenderImportPoolCounts;
 pub use render_setup_reuse::RenderSetupReuseCounts;
 pub use render_texture_pool::RenderTexturePoolCounts;
+pub use statement_payload_table::StatementPayloadCounts;
 
 /// The canonical descriptor layout for a folded pair of render stages
 /// (`research/docs/23` §3.3, E-TX9).

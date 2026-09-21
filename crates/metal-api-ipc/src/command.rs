@@ -1657,6 +1657,105 @@ mod tests {
         value
     }
 
+    /// The compute fixture with one sampled texture declaration added: the
+    /// shape the statement payload table's two arms travel as (statement
+    /// economy W4, task E-SW3). The view's extent is the payload's own, which
+    /// is what the contract holds a byte-carrying arm to.
+    fn textured_trace_with_source(source: TextureSource) -> ComputeTrace {
+        let payload = match &source {
+            TextureSource::OwnedBytes(bytes) => bytes.len(),
+            TextureSource::OwnedInSlot { bytes, .. } => bytes.len(),
+            TextureSource::SlottedBytes { length, .. } => usize::try_from(*length).unwrap_or(0),
+            _ => 0,
+        };
+        let compiled = pipeline(&compile_request());
+        let mut value = trace(&compiled);
+        let pass = value
+            .passes
+            .iter_mut()
+            .find_map(|pass| match pass {
+                TracePass::Compute(pass) => Some(pass),
+                _ => None,
+            })
+            .expect("the fixture states a compute pass");
+        pass.textures.push(TextureView {
+            view_id: ViewId::new(9),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(3),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: u64::try_from(payload / 4).unwrap_or(1),
+            height: 1,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source,
+        });
+        value
+    }
+
+    /// The statement payload table's reference arm, as the wire reads it: a
+    /// declaration files its payload and still carries it, a reference names it
+    /// and carries none, and the frame that carries the reference is shorter by
+    /// exactly the payload less the digest the reference writes where the
+    /// declaration wrote the blob's length.
+    #[test]
+    fn a_slotted_reference_carries_no_payload() {
+        let payload = vec![0x5a; 4096];
+        let digest = metal_api_core::statement_payload::payload_digest(&payload);
+        let request = |source: TextureSource| CommandRequest::Submit {
+            trace: textured_trace_with_source(source),
+            resources: resources(),
+        };
+        let owned = request(TextureSource::OwnedBytes(payload.clone()));
+        let declared = request(TextureSource::OwnedInSlot {
+            slot: 3,
+            bytes: payload.clone(),
+        });
+        let referenced = request(TextureSource::SlottedBytes {
+            slot: 3,
+            length: payload.len() as u64,
+            digest,
+        });
+        let owned_frame = CommandCodec::encode_request(&owned).unwrap();
+        let declared_frame = CommandCodec::encode_request(&declared).unwrap();
+        let referenced_frame = CommandCodec::encode_request(&referenced).unwrap();
+
+        // The declaration is the owned arm plus the four-byte slot it files
+        // under; nothing else about the frame moves.
+        assert_eq!(declared_frame.len(), owned_frame.len() + 4);
+        // The reference writes a tag, a slot, a length and a digest where the
+        // declaration wrote a tag, a slot, a blob length and the payload.
+        assert_eq!(
+            declared_frame.len() - referenced_frame.len(),
+            payload.len() - 16,
+            "the saving is the payload less the sixteen bytes a digest costs"
+        );
+
+        // Both arms round-trip, and the codec's own account reads the bytes the
+        // statement *carries*: the declaration's payload, and none at all for
+        // the reference — while the view itself is still declared.
+        assert_eq!(
+            CommandCodec::decode_request(&declared_frame).unwrap(),
+            declared
+        );
+        assert_eq!(
+            CommandCodec::decode_request(&referenced_frame).unwrap(),
+            referenced
+        );
+        let (_, declared_account) =
+            CommandCodec::encode_request_payload_accounted(&declared).unwrap();
+        assert_eq!(declared_account.texture_payload_bytes, payload.len() as u64);
+        let (_, referenced_account) =
+            CommandCodec::encode_request_payload_accounted(&referenced).unwrap();
+        assert_eq!(referenced_account.texture_payload_bytes, 0);
+        assert_eq!(
+            referenced_account.textures_n, 1,
+            "the view is still declared"
+        );
+    }
+
     #[test]
     fn compute_only_submit_keeps_its_pre_render_bytes() {
         let compiled = pipeline(&compile_request());

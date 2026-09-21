@@ -1014,12 +1014,58 @@ pub enum TextureSource {
     /// render pass opens, so no draw of this pass can be a producer of the
     /// bytes it reads.
     PassEntrySnapshot,
+    /// The trace's own copy, *and* an instruction to file it: the bytes below
+    /// are this view's tightly packed extent exactly as
+    /// [`Self::OwnedBytes`]' are, and the provider keeps them in its statement
+    /// payload table under `slot` so a later statement can name them instead of
+    /// carrying them again ([`Self::SlottedBytes`], the statement economy's W4,
+    /// `crate::statement_payload`).
+    ///
+    /// The arm is a *declaration* and not a reference: the bytes travel, and
+    /// the only thing it adds is where they are filed. A slot is written only
+    /// by the arm that states it, and a later declaration into the same slot
+    /// replaces what it held — both ends apply the same arm to the same
+    /// statement, so the sender's ledger and the provider's table cannot drift
+    /// apart without the digest check on the reference side turning the drift
+    /// into a named refusal.
+    OwnedInSlot {
+        /// The slot the provider files these bytes under, in the sender's own
+        /// namespace (it is the sender that plans slots, and the only end that
+        /// decides anything).
+        slot: u32,
+        /// The view's tightly packed extent, byte for byte.
+        bytes: Vec<u8>,
+    },
+    /// The bytes the provider's statement payload table already holds under
+    /// `slot` (the statement economy's W4, `crate::statement_payload`): a
+    /// declaration whose payload an *earlier* statement already carried names
+    /// it instead of repeating it.
+    ///
+    /// The arm carries the payload's own identity — its length and its
+    /// [`crate::statement_payload::payload_digest`] — so a provider whose entry
+    /// does not match either refuses the reference **by name** rather than
+    /// sampling bytes the statement did not state. `length` has to be the
+    /// view's own tightly packed extent, the rule every byte-carrying arm is
+    /// held to; the digest is checked against the entry the slot holds.
+    SlottedBytes {
+        /// The slot an earlier [`Self::OwnedInSlot`] declaration filed.
+        slot: u32,
+        /// The view's tightly packed extent, as the filing declaration stated
+        /// it.
+        length: u64,
+        /// [`crate::statement_payload::payload_digest`] of those bytes.
+        digest: u128,
+    },
 }
 
 impl TextureSource {
     pub const fn lease_id(&self) -> Option<LeaseId> {
         match self {
-            Self::OwnedBytes(_) | Self::TraceView | Self::PassEntrySnapshot => None,
+            Self::OwnedBytes(_)
+            | Self::TraceView
+            | Self::PassEntrySnapshot
+            | Self::OwnedInSlot { .. }
+            | Self::SlottedBytes { .. } => None,
             Self::StagedLease(lease_id) | Self::BorrowedNoCopy(lease_id) => Some(*lease_id),
         }
     }
@@ -1593,16 +1639,31 @@ impl TextureView {
             }
         }
         let expected = self.expected_bytes()?;
-        if let TextureSource::OwnedBytes(bytes) = &self.source {
-            let actual = u64::try_from(bytes.len())
-                .map_err(|_| ContractError::ArithmeticOverflow("owned texture length"))?;
-            if actual != expected {
-                return Err(ContractError::SourceLengthMismatch {
-                    view: self.view_id,
-                    expected,
-                    actual,
-                });
+        // Every arm that states a length is held to the view's own tightly
+        // packed extent: the two byte-carrying arms by the bytes they carry,
+        // and the slotted reference by the length it names — a reference whose
+        // length is not this view's extent would name bytes the view could not
+        // read whole (statement economy W4, `crate::statement_payload`). Which
+        // *bytes* the reference stands for is the table's answer, and the
+        // provider checks its own entry's digest and length against the arm
+        // before it samples them.
+        let stated = match &self.source {
+            TextureSource::OwnedBytes(bytes) | TextureSource::OwnedInSlot { bytes, .. } => {
+                u64::try_from(bytes.len())
+                    .map_err(|_| ContractError::ArithmeticOverflow("owned texture length"))?
             }
+            TextureSource::SlottedBytes { length, .. } => *length,
+            TextureSource::StagedLease(_)
+            | TextureSource::BorrowedNoCopy(_)
+            | TextureSource::TraceView
+            | TextureSource::PassEntrySnapshot => return Ok(()),
+        };
+        if stated != expected {
+            return Err(ContractError::SourceLengthMismatch {
+                view: self.view_id,
+                expected,
+                actual: stated,
+            });
         }
         Ok(())
     }
@@ -9475,6 +9536,55 @@ impl ComputeTrace {
         self.passes
             .iter()
             .any(|pass| matches!(pass, TracePass::Render(_) | TracePass::RenderDraws(_)))
+    }
+
+    /// Every texture declaration this trace states, in the order the wire
+    /// states them (the statement economy's W4, `crate::statement_payload`).
+    ///
+    /// The order is `put_trace`'s own: the passes in the trace's order, and
+    /// within a pass the texture block it writes — the lone pass's own list, or
+    /// the multi-draw list's head followed by each draw the list carries. Two
+    /// readers have to agree on it exactly: the owner's payload-table planner,
+    /// which numbers the declarations it states arms for, and a provider's
+    /// resolution, which resolves a reference against the declaration an
+    /// earlier *position* filed. A second walk written anywhere else would be a
+    /// second order for the same payload, so both read this one.
+    pub fn texture_declarations(&self) -> Vec<&TextureView> {
+        let mut declarations = Vec::new();
+        for pass in &self.passes {
+            match pass {
+                TracePass::Compute(pass) => declarations.extend(pass.textures.iter()),
+                TracePass::Render(pass) => declarations.extend(pass.textures.iter()),
+                TracePass::RenderDraws(list) => {
+                    declarations.extend(list.head.textures.iter());
+                    for draw in &list.tail {
+                        declarations.extend(draw.textures.iter());
+                    }
+                }
+                TracePass::Landing(_) => {}
+            }
+        }
+        declarations
+    }
+
+    /// [`Self::texture_declarations`] with the same order, mutably: the one
+    /// walk a statement's payload arms are rewritten through.
+    pub fn texture_declarations_mut(&mut self) -> Vec<&mut TextureView> {
+        let mut declarations = Vec::new();
+        for pass in &mut self.passes {
+            match pass {
+                TracePass::Compute(pass) => declarations.extend(pass.textures.iter_mut()),
+                TracePass::Render(pass) => declarations.extend(pass.textures.iter_mut()),
+                TracePass::RenderDraws(list) => {
+                    declarations.extend(list.head.textures.iter_mut());
+                    for draw in &mut list.tail {
+                        declarations.extend(draw.textures.iter_mut());
+                    }
+                }
+                TracePass::Landing(_) => {}
+            }
+        }
+        declarations
     }
 
     /// Every present action in pass order, tagged with the index of the trace
