@@ -20,7 +20,7 @@ CT1（`docs/SUBMIT-POOL-ONCE.md`）把 `admit_capabilities` 标成"同一张声�
 | `serial_reuse` | 1.323 | 1.2% | 6.6 |
 | 四个 render 门（`render_passes`/`render_textures`/`pixel_samplers`/`stage_buffers`） | 0.938 | 0.9% | 4.4 |
 | `resources` | 0.319 | 0.3% | 1.7 |
-| 其余七段 | 0.319 | 0.3% | ≤1.2 |
+| 其余七段（含 `compute_passes` 0.204） | 0.441 | 0.4% | ≤1.4 |
 | **合计** | **110.265**（p50 3.3 / p90 14.7 / p99 2 746.1） | 100% | |
 
 两件事把上面那张表钉死：
