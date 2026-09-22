@@ -6200,6 +6200,23 @@ impl RenderDrawsDescriptor {
     /// The list's structural rules, plus every rule each of its draws has to
     /// satisfy as a draw of a single-draw pass.
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_into(|_| ())
+    }
+
+    /// The same rules as [`Self::validate`], with every single-draw pass the
+    /// walk builds handed to `keep` instead of dropped.
+    ///
+    /// The head is handed back **borrowed** — the list still owns it, and the
+    /// one caller that keeps the value (`crate::admit_draws_once`) only ever
+    /// reads it — while each tail draw's pass is built by `with_draw`, exactly
+    /// as [`Self::materialize`] builds it, validated, and handed over. A caller
+    /// whose `keep` drops its argument therefore pays the pre-cut construction
+    /// and nothing else, which is what keeps [`Self::validate`] the control arm
+    /// of that cut.
+    pub(crate) fn validate_into<'a>(
+        &'a self,
+        mut keep: impl FnMut(Cow<'a, RenderPassDescriptor>),
+    ) -> Result<(), ContractError> {
         if self.draw_count() > MAX_DRAWS_PER_PASS {
             return Err(ContractError::DrawsPerPassLimitExceeded {
                 requested: self.draw_count(),
@@ -6207,8 +6224,15 @@ impl RenderDrawsDescriptor {
             });
         }
         self.head.validate()?;
+        keep(Cow::Borrowed(&self.head));
         for draw in &self.tail {
-            self.head.with_draw(draw).validate()?;
+            let pass = self.head.with_draw(draw);
+            // Metered where it is built (`crate::admit_profile`): off the cut
+            // the walk builds the same passes again for its gates, and the two
+            // counts together are the constructions one walk paid.
+            crate::admit_profile::note_draw_list_validate_build(1);
+            pass.validate()?;
+            keep(Cow::Owned(pass));
         }
         Ok(())
     }
@@ -9634,6 +9658,37 @@ impl ComputeTrace {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_into(|_, _| ())
+    }
+
+    /// The same walk as [`Self::validate`], with every render entry's own
+    /// single-draw pass kept instead of dropped (`crate::admit_draws_once`).
+    ///
+    /// The values are the ones [`Self::render_draw_passes`] would hand back, in
+    /// the same order: a single-draw entry borrowed from the trace, a
+    /// multi-draw list's head borrowed and one `head.with_draw(draw)` per tail
+    /// draw. The checks are [`Self::validate`]'s own — same calls, same order,
+    /// same names — so the two entries can never disagree about the trace, and
+    /// the only difference is that this one answers with the passes the list's
+    /// validation built rather than dropping them.
+    pub(crate) fn validate_collecting_draws(
+        &self,
+    ) -> Result<Vec<(usize, Cow<'_, RenderPassDescriptor>)>, ContractError> {
+        let mut draws = Vec::new();
+        self.validate_into(|index, pass| draws.push((index, pass)))?;
+        Ok(draws)
+    }
+
+    /// The one body both entries run, with the render entries it walks handed
+    /// to `keep` (`index`, then the pass).
+    ///
+    /// A caller whose `keep` drops its argument runs exactly the pre-cut walk:
+    /// a multi-draw list still builds one `head.with_draw(draw)` per tail draw
+    /// to validate it, and still drops the value after the check.
+    fn validate_into<'a>(
+        &'a self,
+        mut keep: impl FnMut(usize, Cow<'a, RenderPassDescriptor>),
+    ) -> Result<(), ContractError> {
         if self.schema_version != PROVIDER_SCHEMA_VERSION {
             return Err(ContractError::UnsupportedSchemaVersion(self.schema_version));
         }
@@ -9673,7 +9728,7 @@ impl ComputeTrace {
                 render.validate()?;
             }
         }
-        for pass in &self.passes {
+        for (index, pass) in self.passes.iter().enumerate() {
             // A landing-only entry names no pipeline and draws nothing, so it
             // answers the pipeline walk with `None` and the `used` table below
             // skips it: its own shape rules are the whole of its validation
@@ -9693,16 +9748,22 @@ impl ComputeTrace {
                     // pipeline is in this trace's table and epoch.
                     pass.validate()?;
                     self.pipeline(pass.pipeline)?;
+                    keep(index, Cow::Borrowed(pass));
                     Some(pass.pipeline)
                 }
                 TracePass::RenderDraws(list) => {
                     // The list's own rules are its ceiling plus one validation
                     // of each declared draw, materialized as the single-draw
-                    // pass that draw states (`RenderDrawsDescriptor::validate`).
+                    // pass that draw states
+                    // (`RenderDrawsDescriptor::validate_into`). The passes that
+                    // walk builds are handed to `keep`, so the arm that keeps
+                    // them pays one construction per draw and the walk that
+                    // materializes the entries for its gates pays none
+                    // (`crate::admit_draws_once`).
                     // Every draw's pipeline is then held to this trace's table
                     // and epoch: a list whose second draw names a pipeline the
                     // table does not carry is refused here, not at execution.
-                    list.validate()?;
+                    list.validate_into(|pass| keep(index, pass))?;
                     for pipeline in list.pipelines() {
                         self.pipeline(pipeline)?;
                         *used
@@ -12334,29 +12395,53 @@ impl ProviderCapabilities {
         // on it they call the crate-private entries that state the same rules
         // without repeating the validation, so one walk validates once.
         let validate_once = crate::admit_validate_once::enabled();
+        // The tenth cut's one materialization sits below
+        // (`crate::admit_shared_draws`): the four render gates all walk the
+        // trace's render entries as single-draw passes, and off the cut each of
+        // them materializes every multi-draw list for itself.
+        let shared_draws = crate::admit_shared_draws::enabled();
+        // The twelfth cut (`crate::admit_draws_once`): the list's own validation
+        // builds one single-draw pass per tail draw, and when this walk is the
+        // one that materializes the entries for its gates, that check hands
+        // them over rather than dropping them — one construction per draw
+        // instead of two. It is only a saving while the walk keeps the one
+        // materialization, so the arm requires the tenth cut as well.
+        let draws_once = shared_draws && crate::admit_draws_once::enabled();
+        let mut collected: Option<Vec<(usize, Cow<'_, RenderPassDescriptor>)>> = None;
         {
             let _bar =
                 crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::TraceValidate);
-            trace.validate().map_err(contract_error_refusal)?;
+            if draws_once {
+                collected = Some(
+                    trace
+                        .validate_collecting_draws()
+                        .map_err(contract_error_refusal)?,
+                );
+            } else {
+                trace.validate().map_err(contract_error_refusal)?;
+            }
         }
 
         // Render admission is the first capability gate and precedes every
         // reservation the caller performs after a successful `admit`: a
         // provider that cannot render refuses the whole trace here, and a
         // compute-only trace never enters the walk (`docs/23` §4.2).
-        //
-        // The tenth cut's one materialization sits here
-        // (`crate::admit_shared_draws`): the four render gates below all walk
-        // the trace's render entries as single-draw passes, and off the cut each
-        // of them materializes every multi-draw list for itself.
-        let shared_draws = crate::admit_shared_draws::enabled();
-        let materialized: Vec<(usize, Cow<'_, RenderPassDescriptor>)> = if shared_draws {
-            let _bar =
-                crate::admit_profile::Bar::enter(site, crate::admit_profile::Region::DrawPasses);
-            trace.render_draw_passes().collect()
-        } else {
-            Vec::new()
-        };
+        let materialized: Vec<(usize, Cow<'_, RenderPassDescriptor>)> =
+            match (shared_draws, collected) {
+                // The passes the validation above built, handed over: this arm
+                // builds nothing here and the bar stays at its own zero, which is
+                // the reading that says the construction moved rather than
+                // disappeared.
+                (true, Some(draws)) => draws,
+                (true, None) => {
+                    let _bar = crate::admit_profile::Bar::enter(
+                        site,
+                        crate::admit_profile::Region::DrawPasses,
+                    );
+                    trace.render_draw_passes().collect()
+                }
+                (false, _) => Vec::new(),
+            };
         let draws = if shared_draws {
             RenderDrawSource::shared(trace, &materialized)
         } else {
@@ -27689,6 +27774,127 @@ mod tests {
             );
         }
         crate::admit_shared_draws::set_arm(None);
+    }
+
+    /// The passes a validation hands back are the ones the list materializes:
+    /// the head borrowed (the walk's own arm) is the head cloned (the gates'
+    /// pre-cut arm), field for field, and every tail draw's pass is the same
+    /// value. This is the whole of the twelfth cut's claim about values.
+    #[test]
+    fn the_draws_a_validation_hands_over_are_the_ones_the_list_materializes() {
+        let Some(TracePass::Render(head)) = render_pass_into(attachment_into(7, 9)).into() else {
+            unreachable!("built as a render pass");
+        };
+        // One tail draw that states a per-draw half of its own, so a value that
+        // arrived repeated or swapped shows up in the comparison.
+        let mut draw = head.draw();
+        draw.instance_count = 2;
+        let list = RenderDrawsDescriptor {
+            head,
+            tail: vec![draw],
+        };
+        let mut kept = Vec::new();
+        list.validate_into(|pass| kept.push(pass))
+            .expect("the fixture is structurally valid");
+        let materialized = list.materialize();
+        assert_eq!(kept.len(), materialized.len());
+        assert_eq!(kept.len(), 2, "the list states two draws");
+        for (kept, materialized) in kept.iter().zip(&materialized) {
+            assert_eq!(
+                kept.as_ref(),
+                materialized,
+                "the kept pass is the materialized one"
+            );
+        }
+        // And the same reading through the trace's own entry: what the walk
+        // keeps for its gates is what it would have materialized.
+        let trace = attachment_draws_trace(3);
+        let collected = trace
+            .validate_collecting_draws()
+            .expect("the fixture is structurally valid");
+        let materialized = trace.render_draw_passes().collect::<Vec<_>>();
+        assert_eq!(collected.len(), materialized.len());
+        for (collected, materialized) in collected.iter().zip(&materialized) {
+            assert_eq!(collected.0, materialized.0, "the entry's own index");
+            assert_eq!(collected.1, materialized.1, "the materialized pass");
+        }
+    }
+
+    /// The twelfth cut's rail: the arm that keeps the passes the list's own
+    /// validation built and the arm that builds them again for the gates answer
+    /// the same, and a walk that refuses refuses with the same name.
+    ///
+    /// The arms are driven through `admit_draws_once::set_arm`, so one process
+    /// reads both answers off the same fixture. The walk under test is the whole
+    /// admission, not the validation alone: the claim is about the trace a
+    /// snapshot admits and about the name a snapshot refuses it by.
+    #[test]
+    fn the_two_arms_of_the_draws_once_walk_answer_the_same() {
+        let trace = attachment_draws_trace(3);
+        let resources = vertex_input_resources();
+        trace.validate().expect("the fixture is structurally valid");
+        // A trace whose *list's own* walk refuses: the third draw states no
+        // instance. The name is the tail draw's rule, so both arms have to keep
+        // it — the cut moves the construction, never the check.
+        let mut broken = attachment_draws_trace(3);
+        let Some(TracePass::RenderDraws(list)) = broken.passes.last_mut() else {
+            unreachable!("the fixture's last entry is a draw list");
+        };
+        list.tail[1].instance_count = 0;
+        // A list above the contract's ceiling: refused before any draw is
+        // judged, on both arms and at the same place.
+        let mut over = attachment_draws_trace(3);
+        let Some(TracePass::RenderDraws(list)) = over.passes.last_mut() else {
+            unreachable!("the fixture's last entry is a draw list");
+        };
+        list.tail = vec![list.head.draw(); MAX_DRAWS_PER_PASS];
+        // A snapshot that never declared the arm, and one that bounds the list
+        // below the three draws it states.
+        let mut narrow = multi_draw_capabilities();
+        narrow.max_draws_per_pass = 2;
+
+        for arm in [Some(false), Some(true)] {
+            crate::admit_draws_once::set_arm(arm);
+            multi_draw_capabilities()
+                .admit(&trace, &resources)
+                .expect("a snapshot that declares the arm admits the list");
+            assert_eq!(
+                render_capabilities()
+                    .admit(&trace, &resources)
+                    .unwrap_err()
+                    .slug,
+                "render_multi_draw_unsupported"
+            );
+            assert_eq!(
+                narrow.admit(&trace, &resources).unwrap_err().slug,
+                "render_draw_count_limit"
+            );
+            assert_eq!(
+                multi_draw_capabilities()
+                    .admit(&broken, &resources)
+                    .unwrap_err()
+                    .slug,
+                "trace_contract_invalid"
+            );
+            assert_eq!(
+                multi_draw_capabilities()
+                    .admit(&over, &resources)
+                    .unwrap_err()
+                    .slug,
+                "render_draw_count_limit"
+            );
+            // The two entries themselves: the same answer, name for name.
+            assert_eq!(
+                broken.validate().unwrap_err(),
+                broken.validate_collecting_draws().unwrap_err()
+            );
+            assert_eq!(
+                over.validate().unwrap_err(),
+                over.validate_collecting_draws().unwrap_err()
+            );
+            assert!(trace.validate_collecting_draws().is_ok());
+        }
+        crate::admit_draws_once::set_arm(None);
     }
 
     /// The eleventh cut's rail: the walk that asks the trace's own structural
