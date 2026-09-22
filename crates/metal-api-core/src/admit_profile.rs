@@ -112,7 +112,10 @@ const SITE_NAMES: [&str; SITE_COUNT] = ["validate", "submit", "direct"];
 pub(crate) enum Region {
     /// `ComputeTrace::validate`: the trace's own structural rules — pipeline
     /// identity and epoch, every pass's own shape, the render entries'
-    /// attachment and declaration rules, the heap/ICB payloads.
+    /// attachment and declaration rules, the heap/ICB payloads. On the twelfth
+    /// cut's arm (`crate::admit_draws_once`) it also carries the single-draw
+    /// passes a multi-draw list's own validation builds and hands to the walk,
+    /// which is why [`Region::DrawPasses`] reads zero there.
     TraceValidate = 0,
     /// `admit_render_passes`: the pipeline/pass pair rules and the capability
     /// bits the render shape asks for.
@@ -156,6 +159,11 @@ pub(crate) enum Region {
     /// gate's own bar and is charged there. On, the walk materializes them once
     /// and hands the same values to every gate, so this bar carries what the
     /// gates no longer do.
+    ///
+    /// The twelfth cut (`crate::admit_draws_once`) reads this bar as well: on
+    /// its arm the one materialization is the list validation's own, handed
+    /// over from [`Region::TraceValidate`], so this bar stays at zero and the
+    /// construction is not charged twice.
     ///
     /// It is a region of the walk rather than a nested child: it happens once,
     /// between `trace_validate` and the first gate, and nothing else charges it.
@@ -216,9 +224,12 @@ const CENSUS_NAMES: [&str; CENSUS_COUNT] = [
 
 /// The walk events the meter counts, beyond the shape census: things that
 /// happen *during* the walk rather than describe its input.
-const EVENT_COUNT: usize = 2;
-const EVENT_NAMES: [&str; EVENT_COUNT] =
-    ["draw_list_materialize_n", "draw_list_materialize_passes"];
+const EVENT_COUNT: usize = 3;
+const EVENT_NAMES: [&str; EVENT_COUNT] = [
+    "draw_list_materialize_n",
+    "draw_list_materialize_passes",
+    "draw_list_validate_build_n",
+];
 
 const EVERY_DEFAULT: u64 = 256;
 
@@ -470,6 +481,28 @@ pub(crate) fn note_draw_list_materialize(passes: usize) {
         };
         local.events[site][0] += 1;
         local.events[site][1] += passes as u64;
+    });
+}
+
+/// Record the single-draw passes a multi-draw list's **own validation** built.
+///
+/// Called where `RenderDrawsDescriptor::validate` builds `head.with_draw(draw)`
+/// to validate it (`crate::admit_draws_once`): off the cut that value is
+/// dropped after the check and the walk builds the same passes again, so the
+/// two events together are the constructions one walk paid —
+/// `draw_list_materialize_passes + draw_list_validate_build_n` — and the cut's
+/// own reading is that sum halving.
+#[inline]
+pub(crate) fn note_draw_list_validate_build(passes: usize) {
+    if !enabled() {
+        return;
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        let Some(site) = local.current_site else {
+            return;
+        };
+        local.events[site][2] += passes as u64;
     });
 }
 
