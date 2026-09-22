@@ -1,6 +1,7 @@
 # 准入走查：一条多画列表的单画 pass 只建一遍
 
-E 侧第十二刀。开关 `METAL_API_CORE_ADMIT_DRAWS_ONCE`（**默认关**），机制与证明写在
+E 侧第十二刀。开关 `METAL_API_CORE_ADMIT_DRAWS_ONCE`（**已翻默认：未设即开**，四个控制词
+`0`/`off`/`false`/`no` 回到刀前路径），机制与证明写在
 `crates/metal-api-core/src/admit_draws_once.rs` 的模块文档里；本文记录**为什么是这一处**、
 形状读数、两臂读数与**不碰什么**。
 
@@ -54,16 +55,23 @@ draw_list_materialize_n 0.158/walk`），单画 pass 的建价 ≈ **110–135 �
 
 ## 2. 这一刀：列表自校验建的那批单画 pass 交给走查
 
-`METAL_API_CORE_ADMIT_DRAWS_ONCE`（默认关）：
+`METAL_API_CORE_ADMIT_DRAWS_ONCE`（翻默认后：未设即开）：
 
-* **关**（未设 / 空串 / `0` / `off` / `false` / `no` / 本刀不认识的任何词）：走查先
-  `trace.validate()`（列表自校验照旧建一遍、校验完即丢），再自己物化一遍 render 条目。
-  **语句序列与刀前逐条相同**。
-* **开**（`1` / `on` / `true` / `yes`，大小写不敏感、两端去空白）：走查改调
+* **开**（未设 / 空串 / 本刀不认识的任何词）：走查改调
   `ComputeTrace::validate_collecting_draws()`，它是同一条校验体、**把列表自校验建出的
   单画 pass 留下来**：头画按借用交回（走查全程持有 `&ComputeTrace`，头画不必克隆），
   每个尾画的 pass 就是自校验本来就要建的那份。四个 render 门读到的就是这批值，
   走查自己不再物化，`draw_passes` 段因此读到 0——**构造搬了位置，没有消失**。
+* **关**（`0` / `off` / `false` / `no`，大小写不敏感、两端去空白）：走查先
+  `trace.validate()`（列表自校验照旧建一遍、校验完即丢），再自己物化一遍 render 条目。
+  **语句序列与刀前逐条相同**，是两臂轮与合流后复跑用的对照臂。
+
+翻默认的依据是两臂轮 `aw2a`（关）/`aw2b`（开）：同一 tip、同一 exe 身份、背靠背、各 300 s，
+单画 pass 构造 **0.7137 → 0.2762/走查（−61.3 %）**、`draw_passes` 段
+**44.056 → 0.000 µs/走查**、走查自身 **81.648 → 29.960 µs（−63.3 %）**、
+`admit_capabilities_us` **95.550 → 49.055（−48.7 %）**，而 R 侧独立计时的
+`prov_admit_validate_us_mean` **8.860 → 5.043 ms/帧（−43.1 %）**；两臂控制面同形
+（恒等式闭合、五个零读 0、桶键集 diff 空、红线 0），141 份 capture 逐字节相同。
 
 开关只在第十刀的那一份物化还在时才有意义（关掉第十刀，四个门各建各的，本刀没有可交接
 的对象），所以臂的条件是 `shared_draws && admit_draws_once`。

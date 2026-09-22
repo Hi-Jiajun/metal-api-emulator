@@ -19,13 +19,19 @@
 //!
 //! Driven by `METAL_API_CORE_ADMIT_DRAWS_ONCE`:
 //!
-//! * unset (the default), or any word that is not a truthy one: off. The walk
-//!   validates the trace through [`ComputeTrace::validate`] and then
-//!   materializes the render entries for itself, exactly as before.
-//! * `1` / `on` / `true` / `yes`: on. The walk validates the trace through
-//!   [`ComputeTrace::validate_collecting_draws`], which runs the very same
-//!   checks in the very same order and keeps the passes the list's own
-//!   validation built; the gates read those.
+//! * unset (the default), or any word this cut does not know: on. The walk
+//!   validates the trace through [`ComputeTrace::validate_collecting_draws`],
+//!   which runs the very same checks in the very same order and keeps the
+//!   passes the list's own validation built; the gates read those. The cut was
+//!   flipped on once its two arms had read it (`aw2a`/`aw2b`, one tip, 300 s
+//!   each, back to back): the per-list constructions **0.7137 → 0.2762** a walk
+//!   (`2N−1 → N−1`), the `draw_passes` region **44.056 → 0.000 µs**, the walk
+//!   itself **81.648 → 29.960 µs (−63.3 %)** and `admit_capabilities`
+//!   **95.550 → 49.055 µs (−48.7 %)**.
+//! * `0` / `off` / `false` / `no` (case-insensitive and whitespace-trimmed):
+//!   off. The walk validates the trace through [`ComputeTrace::validate`] and
+//!   then materializes the render entries for itself, byte for byte as before,
+//!   and stays reachable as the control a round compares against.
 //!
 //! # Why the answers cannot differ
 //!
@@ -59,9 +65,10 @@ static ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether one admission walk builds a list's single-draw passes once.
 ///
-/// Read once from the process environment; **off unless a truthy word turns it
-/// on** — the cut lands off and the round that prices it compares the two arms
-/// of this switch. Every call site is one relaxed load.
+/// Read once from the process environment; **on unless a control word turns it
+/// off** — the cut was flipped on once its two arms had priced it, and the
+/// control words restore the double construction byte for byte. Every call site
+/// is one relaxed load.
 #[inline]
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
@@ -100,9 +107,9 @@ pub(crate) fn set_arm(arm: Option<bool>) {
 
 /// The enable word, read exactly as a round's launcher spells it.
 fn parse_enabled(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some("1" | "on" | "ON" | "true" | "yes")
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -110,18 +117,19 @@ fn parse_enabled(value: Option<&str>) -> bool {
 mod tests {
     use super::parse_enabled;
 
-    /// Off is the default, and only the truthy words turn the cut on: a word
-    /// this cut does not know keeps the pre-cut path.
+    /// On is the default, and only the four control words take the cut back to
+    /// the pre-cut path.
     #[test]
-    fn the_switch_is_off_unless_a_truthy_word_turns_it_on() {
-        assert!(!parse_enabled(None));
-        assert!(!parse_enabled(Some("")));
+    fn the_switch_is_on_unless_a_control_word_turns_it_off() {
+        assert!(parse_enabled(None));
+        assert!(parse_enabled(Some("")));
         assert!(!parse_enabled(Some("0")));
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some("false")));
         assert!(!parse_enabled(Some("no")));
-        assert!(!parse_enabled(Some("nope")));
-        assert!(!parse_enabled(Some("2")));
+        assert!(!parse_enabled(Some(" OFF ")));
+        assert!(parse_enabled(Some("nope")));
+        assert!(parse_enabled(Some("2")));
         assert!(parse_enabled(Some("1")));
         assert!(parse_enabled(Some("on")));
         assert!(parse_enabled(Some("ON")));
