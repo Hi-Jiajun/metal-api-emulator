@@ -27,21 +27,24 @@
 //! one would be refused — a lost draw bought by an optimization.
 //!
 //! The same reading covers the declaration phase itself, and it has to. The
-//! sender plans a statement's declarations against the ledger **as the
-//! statement found it** — its own earlier declarations are filed only once the
-//! statement crossed — so a statement can state declarations that fit one at a
-//! time and not together (it6's user run: one small declaration planned into a
-//! fresh slot, one larger one into the entry it replaced, together one payload
-//! past the byte bound). Such a statement is refused by name, and the refusal
-//! files **none** of it ([`PayloadTable::declare_all`]): filing the
-//! declarations before the one that did not fit would leave entries the sender
-//! never committed, which is the divergence this module's staging half already
-//! rules out for the reference arms.
+//! sender plans a statement's declarations **as one batch** over a projection of
+//! the ledger its own earlier plans move (`PayloadLedger::plan_statement`), so a
+//! statement the table cannot hold whole is absorbed by replacing the least
+//! recently used entry or by carrying those bytes — a statement a well-wired
+//! sender states is one this end's walk takes. The walk here is the second line
+//! and reads the same two bounds: a statement whose declarations this end cannot
+//! file whole is refused by name and files **none** of it
+//! ([`PayloadTable::declare_all`]), because filing the declarations before the
+//! one that did not fit would leave entries the sender never committed — the
+//! divergence this module's staging half already rules out for the reference
+//! arms.
 
 use metal_api_core::provider::{
     ComputeTrace, FieldValue, ProviderError, ProviderErrorClass, ProviderPhase, TextureSource,
 };
-use metal_api_core::statement_payload::{PayloadLookup, PayloadTable, PayloadTableFull};
+use metal_api_core::statement_payload::{
+    PayloadLookup, PayloadRefusal, PayloadTable, PayloadTableFull,
+};
 
 /// What this provider's table has done over its own life, for the rail's own
 /// readings and its tests.
@@ -140,9 +143,9 @@ pub(crate) fn resolve_statement_payloads(
     // Every arm resolved: the statement's own declarations take effect, all of
     // them or none, which is the point after which the two ends hold the same
     // table.
-    if let Err((slot, full)) = table.declare_all(staged) {
+    if let Err(refusal) = table.declare_all(staged) {
         counts.full_n = counts.full_n.saturating_add(1);
-        return Err(table_full(slot, full));
+        return Err(table_full(refusal));
     }
     Ok(resolved)
 }
@@ -200,10 +203,19 @@ fn slot_mismatch(
         )
 }
 
-fn table_full(slot: u32, full: PayloadTableFull) -> ProviderError {
-    let (bound, held) = match full {
-        PayloadTableFull::Slots => ("slots", u64::from(slot)),
-        PayloadTableFull::Bytes => ("bytes", u64::from(slot)),
+/// The refusal a statement whose declarations this end cannot file whole is
+/// answered with.
+///
+/// The `held` field is the reading of the bound that refused the declaration,
+/// not the slot it named: the byte bound refuses a declaration for the bytes the
+/// entry it names already stands for, and the slot bound for the slots the table
+/// already holds. The slot travels in its own field either way, and the counts
+/// this refusal feeds stay where they were.
+fn table_full(refused: PayloadRefusal) -> ProviderError {
+    let PayloadRefusal { slot, bound, held } = refused;
+    let bound = match bound {
+        PayloadTableFull::Slots => "slots",
+        PayloadTableFull::Bytes => "bytes",
     };
     refusal("statement_payload_table_full")
         .with_field("slot", FieldValue::Unsigned(u64::from(slot)))
@@ -222,13 +234,13 @@ mod tests {
     use super::{resolve_statement_payloads, StatementPayloadCounts};
     use metal_api_core::provider::{
         AllocationId, CompletionPolicy, ComputePass, ComputeTrace, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, OperationId, PipelineId, ProviderErrorClass, TextureAccess,
-        TextureFormat, TextureSource, TextureType, TextureView, TracePass, ViewId,
+        DispatchKind, DispatchType, FieldValue, OperationId, PipelineId, ProviderErrorClass,
+        TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass, ViewId,
         PROVIDER_SCHEMA_VERSION,
     };
     use metal_api_core::statement_payload::{
         payload_digest, PayloadLedger, PayloadLookup, PayloadPlan, PayloadTable,
-        PAYLOAD_TABLE_BYTES,
+        PAYLOAD_TABLE_BYTES, PAYLOAD_TABLE_SLOTS,
     };
 
     const PAYLOAD: usize = 4096;
@@ -518,6 +530,22 @@ mod tests {
             .expect_err("the statement's own second declaration crosses the byte bound");
         assert_eq!(refusal.slug, "statement_payload_table_full");
         assert_eq!(counts.full_n, 1, "one declaration was refused by name");
+        assert_eq!(
+            refusal.fields.get("held"),
+            Some(&FieldValue::Unsigned(ROOM as u64)),
+            "the byte bound refuses the declaration for the bytes the entry it names stands \
+             for, not for the slot it named"
+        );
+        assert_eq!(
+            refusal.fields.get("slot"),
+            Some(&FieldValue::Unsigned(u64::from(VICTIM_SLOT))),
+            "the slot travels in its own field"
+        );
+        assert_eq!(
+            refusal.fields.get("bound"),
+            Some(&FieldValue::Text("bytes".to_owned())),
+            "and the bound that refused it is named as it always was"
+        );
 
         // And the whole statement is what the bound refused: the two ends hold
         // the same table afterwards, which is what the sender's dropped plan
@@ -533,6 +561,64 @@ mod tests {
             PayloadLookup::Unknown => {}
             other => panic!("the refused statement filed its first declaration: {other:?}"),
         }
+    }
+
+    /// The other branch of the same refusal: the slot bound refuses a
+    /// declaration for the **slots** the table already holds — a count of slots
+    /// and the slot the declaration named, never the bytes some entry stands
+    /// for, which is what the field used to carry.
+    #[test]
+    fn a_slot_bound_refusal_reports_the_slots_the_table_holds() {
+        let last = PAYLOAD_TABLE_SLOTS - 1;
+        let mut table = PayloadTable::new();
+        table.scope(DeviceEpoch::new(1));
+        for slot in 0..last {
+            table
+                .declare(slot, vec![1])
+                .expect("an empty table files every slot below the bound");
+        }
+        let mut counts = StatementPayloadCounts::default();
+        let mut statement = trace(vec![
+            texture(
+                1,
+                TextureSource::OwnedInSlot {
+                    slot: last,
+                    bytes: vec![2; 8],
+                },
+            ),
+            texture(
+                2,
+                TextureSource::OwnedInSlot {
+                    slot: PAYLOAD_TABLE_SLOTS,
+                    bytes: vec![3; 8],
+                },
+            ),
+        ]);
+        let refusal = resolve_statement_payloads(&mut table, &mut statement, &mut counts)
+            .expect_err("the second declaration asks for a slot past the bound");
+        assert_eq!(refusal.slug, "statement_payload_table_full");
+        assert_eq!(counts.full_n, 1);
+        assert_eq!(
+            refusal.fields.get("slot"),
+            Some(&FieldValue::Unsigned(u64::from(PAYLOAD_TABLE_SLOTS))),
+            "the slot the declaration named"
+        );
+        assert_eq!(
+            refusal.fields.get("bound"),
+            Some(&FieldValue::Text("slots".to_owned()))
+        );
+        assert_eq!(
+            refusal.fields.get("held"),
+            Some(&FieldValue::Unsigned(u64::from(PAYLOAD_TABLE_SLOTS))),
+            "the slot bound read the slots the table holds when the walk reached the \
+             declaration — the statement's own first declaration filled the last free slot \
+             before it — and not the slot number the declaration named"
+        );
+        assert_eq!(
+            (table.entries(), table.used_bytes()),
+            (usize::try_from(last).unwrap(), u64::from(last)),
+            "the refused statement filed none of its declarations"
+        );
     }
 
     #[test]
