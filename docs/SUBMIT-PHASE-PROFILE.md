@@ -73,6 +73,15 @@ teardown_readbacks_us=... teardown_buffers_us=... teardown_previous_us=...
 teardown_named_us=... render_release_reuse_us=... render_release_pool_us=...
 render_release_import_us=... render_retire_us=...
 td_image_n=... td_view_n=... td_sampler_n=... td_buffer_n=... td_memory_n=...
+td_image_us=... td_view_us=... td_buffer_us=... td_memory_us=...
+td_object_named_us=... td_unreturned_n=... td_unreturned_<kind>_n=...
+buf_miss_<kind>_n=... buf_return_<kind>_n=... buf_miss_empty_n=...
+buf_miss_occupied_n=... buf_miss_held_sum=... buf_miss_after_evict_n=...
+pool_miss_empty_n=... pool_miss_occupied_n=... pool_miss_held_sum=...
+pool_miss_after_evict_n=... pool_miss_same_extent_n=...
+pool_miss_same_format_n=... pool_miss_same_image_type_n=...
+pool_miss_same_view_type_n=... pool_miss_same_device_copy_n=...
+render_release_draws_us=...
 rb_pipeline_us=... rb_buffer_us=... rb_image_us=... rb_view_us=...
 rb_sampler_us=... rb_descriptor_us=... rb_indirect_us=... rb_named_us=...
 submit_teardown_us=... submit_td_sync_us=... submit_td_sync_n=...
@@ -168,6 +177,7 @@ have their own setup and readback).
 | `render_release_pool` | inside the render half's residual: handing the sampled textures' pooled backing back, eviction included |
 | `render_release_import` | inside the render half's residual: handing the owner-window imports back |
 | `render_retire` | inside the render half's residual: releasing the input retains the pass took |
+| `render_release_draws` | inside the render half's residual: a draw list's **per-draw** objects handing back (`crate::draw_object_release`) — the four families `render_release_reuse` to `render_release_uploads` hand back for the pass's own set. Never entered with the switch off |
 | `teardown_sync` | inside `render_teardown`: the completion fence and the command pool |
 | `teardown_pipeline` | inside `render_teardown`: the pipeline, its layout and the two shader modules the shape cache did not take |
 | `teardown_passes` | inside `render_teardown`: the render pass, the seed render pass and both framebuffers |
@@ -178,6 +188,7 @@ have their own setup and readback).
 | `teardown_readbacks` | inside `render_teardown`: the readback destinations — one unmap, buffer and memory per stored attachment |
 | `teardown_buffers` | inside `render_teardown`: the stage buffers, the indirect and index buffers and the caller-held vertex streams |
 | `teardown_previous` | inside `render_teardown`: the previous-byte staging buffers a `Load` uploaded from |
+| `td_image` / `td_view` / `td_buffer` / `td_memory` | inside the ten `teardown_*` groups, **once per object**: the single `vkDestroyImage` / `vkDestroyImageView` / `vkDestroyBuffer` / `vkFreeMemory` call that object pays. Read with the matching `td_*_n` (`td_memory_us ÷ td_memory_n` is one allocation's cost) |
 | `readback_rect` | inside `render_readback`: one stored attachment's trimmed frame — the written rectangle copied out of the mapping and the seed rebuilt around it |
 | `readback_full` | inside `render_readback`: one stored attachment's whole extent copied out of its mapping |
 | `readback_seed` | inside `readback_rect`: the rebuild itself (the seed and the patch), which only the trimmed arm pays |
@@ -582,7 +593,7 @@ known — a bigger declaration, a wider readback, a first sight of a pipeline,
 more objects torn down. Two tables are therefore appended to every sample line,
 both read through the same snapshot subtraction the bars use:
 
-* **`CHILD_BARS`** — the 17 regions the named parents are made of, each charged
+* **`CHILD_BARS`** — the 21 regions the named parents are made of, each charged
   inside a parent the window line already prints, each carrying the window
   line's own name for that phase (`<phase>_us`), so the two lines read side by
   side without a translation table:
@@ -594,6 +605,7 @@ both read through the same snapshot subtraction the bars use:
   render_resolve_us render_teardown_us teardown_buffers_us
   teardown_readbacks_us teardown_attachments_us teardown_textures_us
   submit_teardown_us
+  td_image_us td_view_us td_buffer_us td_memory_us
   ```
 
   They are *nested* inside their parents exactly as their parents are nested
@@ -603,7 +615,7 @@ both read through the same snapshot subtraction the bars use:
   `SUBMIT_VALIDATE_SLOTS`, `submit_teardown_us` is in `SUBMIT_SEAM_SLOTS`) and
   one table is spent by whoever reads it first.
 
-* **`SHAPE_SOURCES`** — 35 counters the window line already prints, at one
+* **`SHAPE_SOURCES`** — 50 counters the window line already prints, at one
   submission's resolution:
 
   ```text
@@ -617,7 +629,28 @@ both read through the same snapshot subtraction the bars use:
   landing_bytes
   td_buffer_n td_view_n td_image_n td_memory_n
   staging_cached_n staging_plain_n
+  buf_miss_vertex_n buf_miss_input_index_n buf_miss_stage_n
+  buf_miss_previous_n buf_miss_volume_n buf_miss_index_n buf_miss_indirect_n
+  td_unreturned_n buf_miss_empty_n buf_miss_occupied_n
+  pool_miss_empty_n pool_miss_occupied_n
+  pool_miss_same_extent_n pool_miss_same_format_n
   ```
+
+  The last two rows are the teardown round's own ("why is this object not in
+  the pool"): the per-kind misses name *which declaration* missed, `td_unreturned_n`
+  counts the objects that were **destroyed while still carrying their pool
+  key** (a pair that could have been handed back and was not), and the two
+  counts beside it separate "the pool held nothing" from "it held shapes this
+  one differs from" (`docs/DRAW-OBJECT-RELEASE.md` reads them for the cut the
+  round pointed at).
+
+* **`BUF_MISS_KEY` / `POOL_MISS_KEY`** — the miss *shape*, capped at
+  `MISS_KEY_LINES` (16) lines each per window, printed only while
+  `METAL_API_VULKAN_PHASE_PROFILE` is on. They carry the value no counter can:
+  a missed upload's creation-site name, byte length and usage flags, and a
+  missed backing's image type, format, extent, view type and carrier arm, each
+  beside the census of what the pool held instead (how many entries, how many
+  agreed on each axis, how many were evicted since the previous ask).
 
   The families answer the shape questions in the order they were asked: which
   passes the submission ran (`offscreen_n` / `present_n`, the batch bands),
