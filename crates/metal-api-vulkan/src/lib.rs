@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 mod compute_buffer_pool;
 mod compute_pipeline_reuse;
 mod compute_provider;
+mod device_profile;
 mod draw_object_release;
 mod phase_profile;
 mod provider;
@@ -2083,6 +2084,11 @@ impl VulkanContext {
         // literal takes `device`.
         let compute_pipeline_reuse =
             compute_pipeline_reuse::ComputePipelineReuse::new(device.clone());
+        // The device's own answers, as a parseable block in this process's
+        // stderr, when `METAL_API_VULKAN_DEVICE_PROFILE` says so. Off is the
+        // default and costs one relaxed load: the line below is the whole hook,
+        // and the switch is read inside it.
+        device_profile::dump_once(&instance, physical, &device, &properties, &memory);
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
