@@ -101,8 +101,15 @@ impl UploadKey {
     /// counts. The allocation the driver makes for it is never smaller than
     /// this, so the cap is a bound on the keys' sizes rather than on the
     /// device's own rounding — a conservative reading of the same number.
-    fn byte_length(self) -> u64 {
+    pub(crate) fn byte_length(self) -> u64 {
         self.byte_length
+    }
+
+    /// The usage bits the driver was handed, as the key stores them. Read by
+    /// the miss-key line (`crate::phase_profile`), which spells the shape a
+    /// take asked for the way the creation site would have stated it.
+    pub(crate) fn usage(self) -> u32 {
+        self.usage
     }
 }
 
@@ -142,14 +149,69 @@ struct Entry {
 pub(crate) enum UploadOutcome {
     /// The pool held a buffer of this shape.
     Hit,
-    /// The pool held none; the declaration built its own.
-    Miss,
+    /// The pool held none; the declaration built its own. The census says what
+    /// the pool *did* hold, which is what separates "the shape is not resident"
+    /// from "the pool was empty".
+    Miss(MissCensus),
     /// The switch is off: no take, no hold.
     Disabled,
     /// A completed pass handed its buffer back and the pool kept it.
     Returned,
     /// A buffer was destroyed instead of held.
     Dropped,
+}
+
+/// What the pool held when a take missed, as the profile counts it.
+///
+/// A miss is one fact — the pair was built — and three different findings:
+/// the pool held nothing at all (the shape was never handed back, or the cap
+/// evicted it), it held shapes and this one differs on the byte length, or it
+/// held shapes and this one differs on the usage. The census states all three,
+/// and it is a *witness* rather than a partition: an entry can agree with the
+/// asked key on the length and differ on the usage, and another entry the other
+/// way round, in which case both agreement counts move for the same miss.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MissCensus {
+    /// How many entries the pool held when this take asked.
+    pub(crate) held: usize,
+    /// How many of them have the byte length this take asked for.
+    pub(crate) same_length: usize,
+    /// How many of them have the usage this take asked for.
+    pub(crate) same_usage: usize,
+    /// How many entries the pool evicted since the previous take — the "the cap
+    /// took my shape" arm, which a miss cannot otherwise be told apart from.
+    pub(crate) evicted_since_last_ask: u64,
+}
+
+impl MissCensus {
+    /// The census one miss states, read from the keys the pool held and the key
+    /// the take asked for.
+    ///
+    /// A free-standing constructor rather than inline arithmetic in
+    /// [`RenderBufferPool::take`] because it is the whole answer a round reads
+    /// and the one part of the pool a unit test can state without a device: the
+    /// keys are values, so `a_miss_states_what_the_pool_held` reads the three
+    /// arms (empty, length differs, usage differs) off it directly.
+    pub(crate) fn of<'a>(
+        held: impl Iterator<Item = &'a UploadKey>,
+        asked: UploadKey,
+        evicted_since_last_ask: u64,
+    ) -> Self {
+        let mut census = Self {
+            evicted_since_last_ask,
+            ..Self::default()
+        };
+        for key in held {
+            census.held += 1;
+            if key.byte_length == asked.byte_length {
+                census.same_length += 1;
+            }
+            if key.usage == asked.usage {
+                census.same_usage += 1;
+            }
+        }
+        census
+    }
 }
 
 /// How many shapes one device keeps resident.
@@ -188,6 +250,10 @@ pub(crate) struct RenderBufferPool {
     evictions: u64,
     flushes: u64,
     dropped: u64,
+    /// How many evictions the pool had performed the last time a take asked.
+    /// The difference to `evictions` at the next take is what
+    /// [`MissCensus::evicted_since_last_ask`] reports.
+    evictions_at_last_ask: u64,
 }
 
 impl RenderBufferPool {
@@ -205,6 +271,7 @@ impl RenderBufferPool {
             evictions: 0,
             flushes: 0,
             dropped: 0,
+            evictions_at_last_ask: 0,
         }
     }
 
@@ -236,6 +303,8 @@ impl RenderBufferPool {
     /// A buffer leaves the pool with the caller, so the pool never holds one a
     /// command buffer can still be reading or a host can still be writing.
     pub(crate) fn take(&mut self, key: UploadKey) -> (Option<UploadedBuffer>, UploadOutcome) {
+        let evicted_since_last_ask = self.evictions.saturating_sub(self.evictions_at_last_ask);
+        self.evictions_at_last_ask = self.evictions;
         if !self.enabled {
             self.disabled += 1;
             return (None, UploadOutcome::Disabled);
@@ -246,7 +315,14 @@ impl RenderBufferPool {
         // handful of shapes.
         let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
             self.misses += 1;
-            return (None, UploadOutcome::Miss);
+            return (
+                None,
+                UploadOutcome::Miss(MissCensus::of(
+                    self.entries.iter().map(|entry| &entry.key),
+                    key,
+                    evicted_since_last_ask,
+                )),
+            );
         };
         let entry = self.entries.remove(index).expect("index just found");
         self.held_bytes = self.held_bytes.saturating_sub(entry.key.byte_length());
@@ -370,5 +446,39 @@ mod tests {
         assert_ne!(one, longer);
         assert_ne!(one, other_usage);
         assert_eq!(one.byte_length(), 12);
+    }
+
+    /// A miss's census separates the three arms a round has to tell apart: a
+    /// pool that held nothing, one whose entries differ on the byte length, and
+    /// one whose entries differ on the usage. The agreement counts are
+    /// witnesses, so an entry that agrees on one axis is counted on that axis
+    /// even while another entry agrees on the other.
+    #[test]
+    fn a_miss_states_what_the_pool_held() {
+        let asked = UploadKey::new(8_294_400, vk::BufferUsageFlags::TRANSFER_SRC);
+
+        // The cold arm: nothing held at all.
+        let empty = MissCensus::of(std::iter::empty(), asked, 0);
+        assert_eq!(empty, MissCensus::default());
+        assert_eq!(empty.held, 0);
+
+        // One held entry with the asked usage and another length: only the
+        // usage axis could have served, which is what "the length kept it out"
+        // means.
+        let other_length = UploadKey::new(20_480, vk::BufferUsageFlags::TRANSFER_SRC);
+        let census = MissCensus::of([other_length].iter(), asked, 0);
+        assert_eq!(census.held, 1);
+        assert_eq!(census.same_usage, 1);
+        assert_eq!(census.same_length, 0);
+
+        // A held entry with the asked length and another usage, beside one with
+        // neither: both counts are witnesses over the whole population.
+        let other_usage = UploadKey::new(8_294_400, vk::BufferUsageFlags::STORAGE_BUFFER);
+        let neither = UploadKey::new(64, vk::BufferUsageFlags::INDIRECT_BUFFER);
+        let census = MissCensus::of([other_usage, neither].iter(), asked, 3);
+        assert_eq!(census.held, 2);
+        assert_eq!(census.same_length, 1);
+        assert_eq!(census.same_usage, 0);
+        assert_eq!(census.evicted_since_last_ask, 3);
     }
 }

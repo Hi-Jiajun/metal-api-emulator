@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 mod compute_buffer_pool;
 mod compute_pipeline_reuse;
 mod compute_provider;
+mod draw_object_release;
 mod phase_profile;
 mod provider;
 mod readback_memory;

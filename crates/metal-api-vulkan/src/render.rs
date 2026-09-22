@@ -10919,7 +10919,23 @@ fn finish_prepared_offscreen_pass<'a, 'ctx>(
     // pipelines, descriptor sets, uploaded streams and sampled textures — and
     // they retire with the same fence, inside the same named region
     // (`research/docs/23` §3.3, G3-B/B-2).
-    let extra_draws = std::mem::take(&mut pass.extra_draws);
+    let mut extra_draws = std::mem::take(&mut pass.extra_draws);
+    // The fence has retired the submission, so each member's own four pooled
+    // families are the device's no longer: they go back exactly as the pass's
+    // own set's did above, in the same order and for the same reason
+    // (`crate::draw_object_release`). With the switch off nothing here runs and
+    // the members drop as they always have.
+    if crate::draw_object_release::enabled_from_env() {
+        let _release_draws =
+            crate::phase_profile::Bar::enter(crate::phase_profile::Phase::RenderReleaseDraws);
+        for draw in &mut extra_draws {
+            draw.release_reusable();
+            draw.release_pooled_textures();
+            draw.release_imported_windows();
+            draw.release_pooled_uploads();
+        }
+        drop(_release_draws);
+    }
     drop(objects);
     drop(extra_draws);
     drop(_teardown);
@@ -12241,6 +12257,13 @@ struct RenderUploadBuffer {
     /// that is not the pool's business — an owner-window import, whose own pool
     /// keeps it, and every buffer created while the switch was off.
     pooled: Option<crate::render_buffer_pool::UploadKey>,
+    /// The declaration this pair belongs to, spelled exactly as the creation
+    /// site's own refusal lines spell it ([`crate::phase_profile::UPLOAD_KINDS`]).
+    /// It travels with the pair because the hand-back is where a reading has to
+    /// name *which* declaration's pool entry came back — and because the one
+    /// thing the teardown has to be able to state is which kind never came back
+    /// at all.
+    kind: &'static str,
 }
 
 impl RenderUploadBuffer {
@@ -12250,6 +12273,10 @@ impl RenderUploadBuffer {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             pooled: None,
+            // The unbound entry destroys nothing, so it is deliberately not a
+            // kind: the empty name is outside [`crate::phase_profile::UPLOAD_KINDS`]
+            // and would only ever count in a table it does not belong to.
+            kind: "",
         }
     }
 
@@ -12260,19 +12287,25 @@ impl RenderUploadBuffer {
 
     /// Release the pair in the order the pass always released them, counting
     /// what was really destroyed for the profile's `td_*_n` population.
+    ///
+    /// A pair that still carries its pool key here is one the pass never handed
+    /// back: `crate::phase_profile::note_teardown_unreturned_upload` is the
+    /// counter that names it, and it is the reading that tells a cold pool apart
+    /// from a path whose hand-back is missing.
     fn destroy(&self, device: &ash::Device) {
         unsafe {
             if self.buffer != vk::Buffer::null() {
-                device.destroy_buffer(self.buffer, None);
-                crate::phase_profile::note_teardown_object(
-                    crate::phase_profile::TeardownObject::Buffer,
-                );
+                if self.pooled.is_some() {
+                    crate::phase_profile::note_teardown_unreturned_upload(self.kind);
+                }
+                destroy_object(crate::phase_profile::TeardownObject::Buffer, || {
+                    device.destroy_buffer(self.buffer, None)
+                });
             }
             if self.memory != vk::DeviceMemory::null() {
-                device.free_memory(self.memory, None);
-                crate::phase_profile::note_teardown_object(
-                    crate::phase_profile::TeardownObject::Memory,
-                );
+                destroy_object(crate::phase_profile::TeardownObject::Memory, || {
+                    device.free_memory(self.memory, None)
+                });
             }
         }
     }
@@ -12292,7 +12325,7 @@ impl RenderUploadBuffer {
             memory: std::mem::replace(&mut self.memory, vk::DeviceMemory::null()),
         };
         let outcome = context.give_render_upload_back(key, uploaded);
-        crate::phase_profile::note_buffer_pool(outcome);
+        crate::phase_profile::note_buffer_pool(self.kind, outcome);
     }
 }
 
@@ -14647,6 +14680,13 @@ impl<'a> OffscreenObjects<'a> {
             );
             let (pooled, outcome) = self.context.take_render_texture_backing(backing_key);
             crate::phase_profile::note_texture_pool(outcome);
+            // A miss states the shape the pool did not hold — the five fields
+            // the driver was about to be handed (`crate::phase_profile::
+            // note_texture_miss_key`, capped per window) — because "the tail
+            // asks for 1920x1080x1 R8G8B8A8" is a value no counter can carry.
+            if let crate::render_texture_pool::PoolOutcome::Miss(census) = outcome {
+                crate::phase_profile::note_texture_miss_key(backing_key, census);
+            }
             let pooled_backing = pooled.is_some();
             // A declaration that was built while the switch was off has no
             // backing the pool may keep, so it is destroyed with the pass
@@ -14746,6 +14786,7 @@ impl<'a> OffscreenObjects<'a> {
                                 // the hand-back that pools it is
                                 // `release_imported_windows`.
                                 pooled: None,
+                                kind: "render texture",
                             })
                         }
                         Err(error) => {
@@ -16468,6 +16509,7 @@ impl<'a> OffscreenObjects<'a> {
                     // upload pool would be handed back under never described
                     // it, and a window's bytes are the owner's.
                     pooled: None,
+                    kind: name,
                 }),
             // The pass-entry snapshot arm is a *texture* source
             // (`research/docs/23` §118, E-TX15): its bytes live in the
@@ -16882,7 +16924,14 @@ impl<'a> OffscreenObjects<'a> {
         // path states; a miss builds the pair exactly as this rail always did.
         let key = crate::render_buffer_pool::UploadKey::new(byte_length, usage);
         let (taken, outcome) = self.context.take_render_upload(key);
-        crate::phase_profile::note_buffer_pool(outcome);
+        crate::phase_profile::note_buffer_pool(name, outcome);
+        // A miss is also the one place a reading can state the *shape* the
+        // pool did not hold — the byte length and usage the driver was about to
+        // be handed (`crate::phase_profile::note_upload_miss_key`, capped per
+        // window).
+        if let crate::render_buffer_pool::UploadOutcome::Miss(census) = outcome {
+            crate::phase_profile::note_upload_miss_key(name, key, census);
+        }
         let (buffer, memory, mapped_size) = match taken {
             Some(uploaded) => (
                 uploaded.buffer,
@@ -16977,6 +17026,7 @@ impl<'a> OffscreenObjects<'a> {
                 crate::render_buffer_pool::UploadOutcome::Disabled => None,
                 _ => Some(key),
             },
+            kind: name,
         })
     }
 
@@ -18193,9 +18243,34 @@ fn record_draw_binding(
     Ok(())
 }
 
+/// Destroy one device object inside a pass teardown, charging the call to its
+/// own family's bar and to the family's counter.
+///
+/// The two readings are one population: the bar collects the microseconds the
+/// single `vkDestroy*` call cost and the counter increments the object that paid
+/// them, so `td_image_us ÷ td_image_n` is one image's own cost — the "nanoseconds
+/// per object" the content-tail round left open. The bar is left by the inner
+/// block *before* the counter moves, because the count is bookkeeping rather
+/// than part of what a destroy costs; and both are exactly free while the
+/// profile is off (`crate::phase_profile::Bar::enter` and
+/// `note_teardown_object` each return on one relaxed load), so the default-off
+/// arm of a round keeps the teardown it had.
+#[inline]
+fn destroy_object<T>(
+    object: crate::phase_profile::TeardownObject,
+    destroy: impl FnOnce() -> T,
+) -> T {
+    let value = {
+        let _bar = object.bar().and_then(crate::phase_profile::Bar::enter);
+        destroy()
+    };
+    crate::phase_profile::note_teardown_object(object);
+    value
+}
+
 impl<'a> Drop for OffscreenObjects<'a> {
     fn drop(&mut self) {
-        use crate::phase_profile::{note_teardown_object, TeardownObject};
+        use crate::phase_profile::TeardownObject;
         unsafe {
             // The drop is the one region of the render half that the first
             // split left as a single number (`Phase::RenderTeardown`), and it
@@ -18272,21 +18347,25 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 // destroys it.
                 if let Some(sampler) = texture.sampler {
                     if sampler != vk::Sampler::null() {
-                        self.context.device.destroy_sampler(sampler, None);
-                        note_teardown_object(TeardownObject::Sampler);
+                        destroy_object(TeardownObject::Sampler, || {
+                            self.context.device.destroy_sampler(sampler, None)
+                        });
                     }
                 }
                 if texture.view != vk::ImageView::null() {
-                    self.context.device.destroy_image_view(texture.view, None);
-                    note_teardown_object(TeardownObject::View);
+                    destroy_object(TeardownObject::View, || {
+                        self.context.device.destroy_image_view(texture.view, None)
+                    });
                 }
                 if texture.image != vk::Image::null() {
-                    self.context.device.destroy_image(texture.image, None);
-                    note_teardown_object(TeardownObject::Image);
+                    destroy_object(TeardownObject::Image, || {
+                        self.context.device.destroy_image(texture.image, None)
+                    });
                 }
                 if texture.memory != vk::DeviceMemory::null() {
-                    self.context.device.free_memory(texture.memory, None);
-                    note_teardown_object(TeardownObject::Memory);
+                    destroy_object(TeardownObject::Memory, || {
+                        self.context.device.free_memory(texture.memory, None)
+                    });
                 }
                 // The no-copy arm's imported window is the pass's own too
                 // (`research/docs/23` §75, R5c): the object is destroyed once
@@ -18350,29 +18429,35 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 // the four-sample image it was created with.
                 if let Some(resolve) = &depth.resolve {
                     if resolve.view != vk::ImageView::null() {
-                        self.context.device.destroy_image_view(resolve.view, None);
-                        note_teardown_object(TeardownObject::View);
+                        destroy_object(TeardownObject::View, || {
+                            self.context.device.destroy_image_view(resolve.view, None)
+                        });
                     }
                     if resolve.image != vk::Image::null() {
-                        self.context.device.destroy_image(resolve.image, None);
-                        note_teardown_object(TeardownObject::Image);
+                        destroy_object(TeardownObject::Image, || {
+                            self.context.device.destroy_image(resolve.image, None)
+                        });
                     }
                     if resolve.memory != vk::DeviceMemory::null() {
-                        self.context.device.free_memory(resolve.memory, None);
-                        note_teardown_object(TeardownObject::Memory);
+                        destroy_object(TeardownObject::Memory, || {
+                            self.context.device.free_memory(resolve.memory, None)
+                        });
                     }
                 }
                 if depth.view != vk::ImageView::null() {
-                    self.context.device.destroy_image_view(depth.view, None);
-                    note_teardown_object(TeardownObject::View);
+                    destroy_object(TeardownObject::View, || {
+                        self.context.device.destroy_image_view(depth.view, None)
+                    });
                 }
                 if depth.image != vk::Image::null() {
-                    self.context.device.destroy_image(depth.image, None);
-                    note_teardown_object(TeardownObject::Image);
+                    destroy_object(TeardownObject::Image, || {
+                        self.context.device.destroy_image(depth.image, None)
+                    });
                 }
                 if depth.memory != vk::DeviceMemory::null() {
-                    self.context.device.free_memory(depth.memory, None);
-                    note_teardown_object(TeardownObject::Memory);
+                    destroy_object(TeardownObject::Memory, || {
+                        self.context.device.free_memory(depth.memory, None)
+                    });
                 }
             }
             if let Some(stencil) = &self.stencil {
@@ -18382,30 +18467,36 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 // leave the backings to the depth half
                 // (`research/docs/23` §3.3, v60).
                 if stencil.view != vk::ImageView::null() {
-                    self.context.device.destroy_image_view(stencil.view, None);
-                    note_teardown_object(TeardownObject::View);
+                    destroy_object(TeardownObject::View, || {
+                        self.context.device.destroy_image_view(stencil.view, None)
+                    });
                 }
                 if let Some(resolve) = &stencil.resolve {
                     if resolve.view != vk::ImageView::null() {
-                        self.context.device.destroy_image_view(resolve.view, None);
-                        note_teardown_object(TeardownObject::View);
+                        destroy_object(TeardownObject::View, || {
+                            self.context.device.destroy_image_view(resolve.view, None)
+                        });
                     }
                     if resolve.image != vk::Image::null() && !resolve.shares_backing {
-                        self.context.device.destroy_image(resolve.image, None);
-                        note_teardown_object(TeardownObject::Image);
+                        destroy_object(TeardownObject::Image, || {
+                            self.context.device.destroy_image(resolve.image, None)
+                        });
                     }
                     if resolve.memory != vk::DeviceMemory::null() && !resolve.shares_backing {
-                        self.context.device.free_memory(resolve.memory, None);
-                        note_teardown_object(TeardownObject::Memory);
+                        destroy_object(TeardownObject::Memory, || {
+                            self.context.device.free_memory(resolve.memory, None)
+                        });
                     }
                 }
                 if stencil.image != vk::Image::null() && !stencil.shares_backing {
-                    self.context.device.destroy_image(stencil.image, None);
-                    note_teardown_object(TeardownObject::Image);
+                    destroy_object(TeardownObject::Image, || {
+                        self.context.device.destroy_image(stencil.image, None)
+                    });
                 }
                 if stencil.memory != vk::DeviceMemory::null() && !stencil.shares_backing {
-                    self.context.device.free_memory(stencil.memory, None);
-                    note_teardown_object(TeardownObject::Memory);
+                    destroy_object(TeardownObject::Memory, || {
+                        self.context.device.free_memory(stencil.memory, None)
+                    });
                 }
             }
             drop(_depth_stencil);
@@ -18421,33 +18512,39 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 if attachment.owns_resolve {
                     if let Some(resolve) = &attachment.resolve {
                         if resolve.view != vk::ImageView::null() {
-                            self.context.device.destroy_image_view(resolve.view, None);
-                            note_teardown_object(TeardownObject::View);
+                            destroy_object(TeardownObject::View, || {
+                                self.context.device.destroy_image_view(resolve.view, None)
+                            });
                         }
                         if resolve.image != vk::Image::null() {
-                            self.context.device.destroy_image(resolve.image, None);
-                            note_teardown_object(TeardownObject::Image);
+                            destroy_object(TeardownObject::Image, || {
+                                self.context.device.destroy_image(resolve.image, None)
+                            });
                         }
                         if resolve.memory != vk::DeviceMemory::null() {
-                            self.context.device.free_memory(resolve.memory, None);
-                            note_teardown_object(TeardownObject::Memory);
+                            destroy_object(TeardownObject::Memory, || {
+                                self.context.device.free_memory(resolve.memory, None)
+                            });
                         }
                     }
                 }
                 if attachment.owns_image {
                     if attachment.view != vk::ImageView::null() {
-                        self.context
-                            .device
-                            .destroy_image_view(attachment.view, None);
-                        note_teardown_object(TeardownObject::View);
+                        destroy_object(TeardownObject::View, || {
+                            self.context
+                                .device
+                                .destroy_image_view(attachment.view, None)
+                        });
                     }
                     if attachment.image != vk::Image::null() {
-                        self.context.device.destroy_image(attachment.image, None);
-                        note_teardown_object(TeardownObject::Image);
+                        destroy_object(TeardownObject::Image, || {
+                            self.context.device.destroy_image(attachment.image, None)
+                        });
                     }
                     if attachment.memory != vk::DeviceMemory::null() {
-                        self.context.device.free_memory(attachment.memory, None);
-                        note_teardown_object(TeardownObject::Memory);
+                        destroy_object(TeardownObject::Memory, || {
+                            self.context.device.free_memory(attachment.memory, None)
+                        });
                     }
                 }
             }
@@ -18459,12 +18556,14 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     self.context.device.unmap_memory(readback.memory);
                 }
                 if readback.buffer != vk::Buffer::null() {
-                    self.context.device.destroy_buffer(readback.buffer, None);
-                    note_teardown_object(TeardownObject::Buffer);
+                    destroy_object(TeardownObject::Buffer, || {
+                        self.context.device.destroy_buffer(readback.buffer, None)
+                    });
                 }
                 if readback.memory != vk::DeviceMemory::null() {
-                    self.context.device.free_memory(readback.memory, None);
-                    note_teardown_object(TeardownObject::Memory);
+                    destroy_object(TeardownObject::Memory, || {
+                        self.context.device.free_memory(readback.memory, None)
+                    });
                 }
             }
             drop(_readbacks);

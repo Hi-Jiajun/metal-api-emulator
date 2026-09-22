@@ -110,6 +110,31 @@ impl BackingKey {
             device_copy,
         }
     }
+
+    /// The image type the driver was handed.
+    pub(crate) fn image_type(self) -> i32 {
+        self.image_type
+    }
+
+    /// The format the driver was handed.
+    pub(crate) fn format(self) -> i32 {
+        self.format
+    }
+
+    /// The extent the driver was handed, in texels.
+    pub(crate) fn extent(self) -> [u32; 3] {
+        self.extent
+    }
+
+    /// The view type the driver was handed.
+    pub(crate) fn view_type(self) -> i32 {
+        self.view_type
+    }
+
+    /// Whether the texels reach the image through a device copy.
+    pub(crate) fn device_copy(self) -> bool {
+        self.device_copy
+    }
 }
 
 /// The three device objects one sampled declaration creates before it writes a
@@ -160,14 +185,84 @@ struct Entry {
 pub(crate) enum PoolOutcome {
     /// The pool held a backing of this shape.
     Hit,
-    /// The pool held none; the declaration built its own.
-    Miss,
+    /// The pool held none; the declaration built its own. The census says what
+    /// the pool *did* hold, which is what separates "this shape is not resident"
+    /// from "the pool was empty".
+    Miss(MissCensus),
     /// The switch is off: no take, no hold.
     Disabled,
     /// A completed pass handed its backing back and the pool kept it.
     Returned,
     /// A backing was destroyed instead of held.
     Dropped,
+}
+
+/// What the pool held when a take missed, as the profile counts it.
+///
+/// The shape is five fields and each one is an axis a widening cut could take,
+/// so the census counts the held entries that *already agree* with the asked
+/// key on each axis: a miss that agrees on none of them is a shape the pool has
+/// never seen, and a miss that agrees on four and differs on the fifth names the
+/// axis that kept it out. The counts are witnesses rather than a partition —
+/// several axes can agree at once, and different held entries can agree on
+/// different ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MissCensus {
+    /// How many entries the pool held when this take asked.
+    pub(crate) held: usize,
+    /// How many of them have the image type this take asked for.
+    pub(crate) same_image_type: usize,
+    /// How many of them have the format this take asked for.
+    pub(crate) same_format: usize,
+    /// How many of them have the extent this take asked for.
+    pub(crate) same_extent: usize,
+    /// How many of them have the view type this take asked for.
+    pub(crate) same_view_type: usize,
+    /// How many of them have the carrier arm this take asked for.
+    pub(crate) same_device_copy: usize,
+    /// How many entries the pool evicted since the previous take — the "the cap
+    /// took my shape" arm, which a miss cannot otherwise be told apart from.
+    pub(crate) evicted_since_last_ask: u64,
+}
+
+impl MissCensus {
+    /// The census one miss states, read from the keys the pool held and the key
+    /// the take asked for.
+    ///
+    /// A free-standing constructor rather than inline arithmetic in
+    /// [`RenderTexturePool::take`] because it is the whole answer a round reads
+    /// and the one part of the pool a unit test can state without a device: the
+    /// keys are values, so `a_miss_states_which_axis_agreed` reads the five axes
+    /// off it directly.
+    pub(crate) fn of<'a>(
+        held: impl Iterator<Item = &'a BackingKey>,
+        asked: BackingKey,
+        evicted_since_last_ask: u64,
+    ) -> Self {
+        let mut census = Self {
+            evicted_since_last_ask,
+            ..Self::default()
+        };
+        for key in held {
+            census.held += 1;
+            if key.image_type == asked.image_type {
+                census.same_image_type += 1;
+            }
+            if key.format == asked.format {
+                census.same_format += 1;
+            }
+            if key.extent == asked.extent {
+                census.same_extent += 1;
+            }
+            if key.view_type == asked.view_type {
+                census.same_view_type += 1;
+            }
+            if key.device_copy == asked.device_copy {
+                census.same_device_copy += 1;
+            }
+        }
+        census
+    }
 }
 
 /// How many shapes one device keeps resident.
@@ -203,6 +298,10 @@ pub(crate) struct RenderTexturePool {
     evictions: u64,
     flushes: u64,
     dropped: u64,
+    /// How many evictions the pool had performed the last time a take asked.
+    /// The difference to `evictions` at the next take is what
+    /// [`MissCensus::evicted_since_last_ask`] reports.
+    evictions_at_last_ask: u64,
 }
 
 impl RenderTexturePool {
@@ -220,6 +319,7 @@ impl RenderTexturePool {
             evictions: 0,
             flushes: 0,
             dropped: 0,
+            evictions_at_last_ask: 0,
         }
     }
 
@@ -252,6 +352,8 @@ impl RenderTexturePool {
     /// A backing leaves the pool with the caller, so the pool never holds an
     /// image a pass is uploading into or recording with.
     pub(crate) fn take(&mut self, key: BackingKey) -> (Option<Backing>, PoolOutcome) {
+        let evicted_since_last_ask = self.evictions.saturating_sub(self.evictions_at_last_ask);
+        self.evictions_at_last_ask = self.evictions;
         if !self.enabled {
             self.disabled += 1;
             return (None, PoolOutcome::Disabled);
@@ -262,7 +364,14 @@ impl RenderTexturePool {
         // handful of shapes.
         let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
             self.misses += 1;
-            return (None, PoolOutcome::Miss);
+            return (
+                None,
+                PoolOutcome::Miss(MissCensus::of(
+                    self.entries.iter().map(|entry| &entry.key),
+                    key,
+                    evicted_since_last_ask,
+                )),
+            );
         };
         let entry = self.entries.remove(index).expect("index just found");
         self.held_bytes = self.held_bytes.saturating_sub(entry.backing.bytes());
@@ -348,4 +457,57 @@ pub(crate) fn enabled_from_env() -> bool {
             Some("0" | "off" | "OFF" | "no" | "NO" | "false" | "FALSE")
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(extent: [u32; 3], format: vk::Format, device_copy: bool) -> BackingKey {
+        BackingKey::new(
+            vk::ImageType::TYPE_2D,
+            format,
+            extent,
+            vk::ImageViewType::TYPE_2D,
+            device_copy,
+        )
+    }
+
+    /// A miss's census names the axis that kept the shape out: a held entry that
+    /// agrees on four fields and differs on one is exactly the entry a widened
+    /// key would have served, so the axis it differs on has to read as the one
+    /// that did not agree.
+    #[test]
+    fn a_miss_states_which_axis_agreed() {
+        let asked = key([1920, 1080, 1], vk::Format::R8G8B8A8_UNORM, true);
+
+        // Nothing held: every axis is zero, which is the "the pool was empty"
+        // arm rather than "four axes were wrong".
+        let empty = MissCensus::of(std::iter::empty(), asked, 0);
+        assert_eq!(empty, MissCensus::default());
+
+        // One held entry that agrees on everything but the extent.
+        let other_extent = key([128, 64, 1], vk::Format::R8G8B8A8_UNORM, true);
+        let census = MissCensus::of([other_extent].iter(), asked, 0);
+        assert_eq!(census.held, 1);
+        assert_eq!(census.same_extent, 0);
+        assert_eq!(census.same_format, 1);
+        assert_eq!(census.same_image_type, 1);
+        assert_eq!(census.same_view_type, 1);
+        assert_eq!(census.same_device_copy, 1);
+
+        // Two held entries that agree on different axes: the census counts each
+        // entry on every axis it agrees on, so an axis is never "the" answer
+        // unless the population says it is.
+        let other_format = key([1920, 1080, 1], vk::Format::B8G8R8A8_UNORM, true);
+        let other_arm = key([1920, 1080, 1], vk::Format::R8G8B8A8_UNORM, false);
+        let census = MissCensus::of([other_format, other_arm].iter(), asked, 5);
+        assert_eq!(census.held, 2);
+        assert_eq!(census.same_extent, 2);
+        assert_eq!(census.same_format, 1);
+        assert_eq!(census.same_image_type, 2);
+        assert_eq!(census.same_view_type, 2);
+        assert_eq!(census.same_device_copy, 1);
+        assert_eq!(census.evicted_since_last_ask, 5);
+    }
 }
